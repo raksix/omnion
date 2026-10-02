@@ -105,6 +105,46 @@ pub const DEFAULT_ANALYTICS_POLL_MS: u64 = 15_000;
 /// Default beacon budget of one site and caller per minute (`OMNION_ANALYTICS_COLLECT_PER_MINUTE`).
 pub const DEFAULT_ANALYTICS_COLLECT_PER_MINUTE: u64 = 300;
 
+/// Default delay between two AI health probe ticks (`OMNION_AI_HEALTH_POLL_MS`).
+///
+/// 60 s is the interval the request asks for: often enough that three consecutive failures (the
+/// window in which a provider reads as `down`) arrive within five minutes, rarely enough that a
+/// provider the operator just connected is not dialled five times before they can read the Health
+/// tab.
+pub const DEFAULT_AI_HEALTH_POLL_MS: u64 = 60_000;
+
+/// How many agent runs one API process executes at a time (`OMNION_AI_RUNNER_CONCURRENCY`).
+///
+/// 4, not 1 and not 32. One is a runtime that feels broken while a tool takes four seconds; 32
+/// is a runtime that can have thirty-two provider calls in flight on a four-core box, which is
+/// both a timeout story and a bill. Four is what a small installation actually needs, and the
+/// knob exists for the ones that do not.
+pub const DEFAULT_AI_RUNNER_CONCURRENCY: usize = 4;
+
+/// How long a run may stay `running` before the eval runner fails it (`OMNION_AI_EVAL_TIMEOUT`).
+///
+/// 900 s. The arithmetic that produced the number: a suite's cases run one at a time in this
+/// slice, a model turn is on the order of 10 s, and a case carrying `rubric` is two of those
+/// (the one under test plus the judge). 900 s therefore covers roughly forty such cases with
+/// room for a slow provider, which is the largest suite the panel's own import will realistically
+/// produce. Below that the reaper would fail healthy runs; above it a run abandoned by a crashed
+/// process stays `running` past the point where an operator has given up looking.
+pub const DEFAULT_AI_EVAL_TIMEOUT_SECONDS: i64 = 900;
+
+/// How often the eval runner sweeps for suites whose schedule is due (`OMNION_AI_EVAL_SCHEDULER_MS`).
+///
+/// 60 s. A cron string has a one-minute resolution at best, so a faster sweep can only re-check
+/// the same due suites; a slower one makes "hourly" fire up to a minute late, which is inside
+/// the tolerance every other scheduled job in the platform already accepts.
+pub const DEFAULT_AI_EVAL_SCHEDULER_MS: u64 = 60_000;
+
+/// How often stale runs are failed (`OMNION_AI_EVAL_SWEEP_MS`).
+///
+/// Ten minutes. The sweep's predicate is "running longer than the timeout", so once a run has
+/// been found it is already past that window and no second sweep inside the same window could
+/// find anything new — the interval buys recovery speed for the *next* run, nothing else.
+pub const DEFAULT_AI_EVAL_SWEEP_MS: u64 = 600_000;
+
 /// How often the retention worker sweeps (REQ-010, slice 4).
 pub const DEFAULT_RETENTION_POLL_MS: u64 = 900_000;
 
@@ -114,6 +154,26 @@ pub const DEFAULT_RETENTION_MAX_SITES: i64 = 50;
 /// The same bound as a `u64`, because the environment is read through `read_positive`, which
 /// parses into a `u64` and refuses a negative or zero value.
 const DEFAULT_RETENTION_MAX_SITES_U64: u64 = 50;
+
+/// How often the backup retention sweep runs (REQ-013, slice 3).
+///
+/// Six hours, and the number is chosen from the feature rather than from taste: the sweep
+/// only removes runs whose own `retain_until` has passed, the shortest window the panel
+/// allows is a day, and the *newest successful* run is exempt whatever the window. So an
+/// hourly sweep would find the same set as a six-hourly one almost every time — six times
+/// the statements for an identical answer — and a nightly sweep would leave a run whose day
+/// ended at 04:00 sitting on the destination for twenty hours. Six hours sits between the two
+/// and keeps the unattended deletes to one a few hours per site.
+pub const DEFAULT_BACKUP_SWEEP_POLL_MS: u64 = 21_600_000;
+
+/// Tenants one backup sweep walks before the rest waits for the next tick.
+pub const DEFAULT_BACKUP_SWEEP_MAX_TENANTS: i64 = 50;
+
+/// The same bound as a `u64`, for the same reason as [`DEFAULT_RETENTION_MAX_SITES_U64`].
+const DEFAULT_BACKUP_SWEEP_MAX_TENANTS_U64: u64 = 50;
+
+/// How often the schedule worker looks for a backup whose time has come: every minute.
+pub const DEFAULT_BACKUP_SCHEDULE_POLL_MS: u64 = 60_000;
 
 /// Default SMTP host the email action sends through (`OMNION_SMTP_HOST`): Mailpit in the
 /// development stack, which is where `infra/compose/mailpit.yml` publishes it.
@@ -485,6 +545,33 @@ pub struct RetentionConfig {
     pub poll_ms: u64,
     /// How many sites one tick may walk (`OMNION_RETENTION_MAX_SITES`).
     pub max_sites: i64,
+    /// Whether this process sweeps expired backups off the destination (`OMNION_BACKUP_SWEEP`).
+    ///
+    /// A **separate** flag from `runner_enabled` on purpose. The media sweeper removes
+    /// library files and the backup sweeper removes restore points, and an installation
+    /// that wants to keep every backup for ever — an air-gapped archive, a compliance
+    /// deployment that manages retention itself — must be able to stop the second without
+    /// stopping the first. One flag for both would make "never delete my backups" mean "never
+    /// purge my trash" as well, and the only way out would be to turn the whole worker off.
+    pub backup_sweep_enabled: bool,
+    /// Delay between two backup sweeps (`OMNION_BACKUP_SWEEP_POLL_MS`).
+    ///
+    /// The default is long on purpose and it is a **conservative** one: the sweep is
+    /// unattended and its deletes are the only ones in this feature no operator asked for.
+    /// A tick that finds nothing costs one grouped query, so the interval can be hours
+    /// without cost — and an installation that has just restored something and wants the
+    /// space back does not have to wait for a manual sweep to be offered in the panel.
+    pub backup_sweep_poll_ms: u64,
+    /// How many tenants one backup sweep may walk (`OMNION_BACKUP_SWUP_MAX_TENANTS`).
+    pub backup_sweep_max_tenants: i64,
+    /// Delay between two schedule checks (`OMNION_BACKUP_SCHEDULE_POLL_MS`).
+    ///
+    /// A minute, and for a different reason than the sweep's six hours: the sweep's interval
+    /// comes from the feature (retention is measured in days, so a tick that finds nothing
+    /// changes no answer), while a schedule's is measured in minutes — an hourly schedule that
+    /// fires at :37 because the worker happened to wake at :37 is a schedule the operator did
+    /// not write, and every operator notices.
+    pub backup_schedule_poll_ms: u64,
 }
 
 impl Default for RetentionConfig {
@@ -493,6 +580,10 @@ impl Default for RetentionConfig {
             runner_enabled: true,
             poll_ms: DEFAULT_RETENTION_POLL_MS,
             max_sites: DEFAULT_RETENTION_MAX_SITES,
+            backup_sweep_enabled: true,
+            backup_sweep_poll_ms: DEFAULT_BACKUP_SWEEP_POLL_MS,
+            backup_sweep_max_tenants: DEFAULT_BACKUP_SWEEP_MAX_TENANTS,
+            backup_schedule_poll_ms: DEFAULT_BACKUP_SCHEDULE_POLL_MS,
         }
     }
 }
@@ -575,6 +666,263 @@ impl std::fmt::Debug for MailConfig {
     }
 }
 
+/// AI Hub knobs (docs/requests/REQ-097, slice 3).
+///
+/// The probe runner of `apps/api` reads these: every `poll_ms` it runs the **same** connection
+/// test the "Probe now" button runs, once per enabled provider, and prunes the history that fell
+/// out of the retention window. Turning the runner off (`OMNION_AI_HEALTH_RUNNER=false`) leaves
+/// the samples untouched — the Health tab then shows only what an operator probed by hand, which
+/// is a real history, just a sparse one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiHubConfig {
+    /// Whether this process samples provider health (`OMNION_AI_HEALTH_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two probe ticks (`OMNION_AI_HEALTH_POLL_MS`).
+    pub poll_ms: u64,
+    /// How many days of samples and usage rows are kept (`OMNION_AI_HEALTH_RETENTION_DAYS`).
+    ///
+    /// Unsigned on purpose: a negative retention is not a shorter history, it is a `make_interval`
+    /// that deletes everything, and the reader refuses it rather than trusting the spelling.
+    pub retention_days: u64,
+    /// Whether this process runs the agent runner (`OMNION_AI_RUNNER`).
+    ///
+    /// A **third** switch rather than a reading of `runner_enabled`, because the health probe,
+    /// the decision pruner and the agent runner are three different kinds of background work with
+    /// three different risk profiles: the probe makes outbound network calls, the pruner issues a
+    /// bulk delete, and the runner **spends money** — it calls a provider and a tool. An
+    /// installation that wants its providers probed but refuses to let an agent act on its own
+    /// says `OMNION_AI_RUNNER=false`, and the API answers `503 runner_disabled` on a run start
+    /// rather than queueing work nothing will ever pick up. A panel that queued runs forever with
+    /// no worker would look like a bug in the agent.
+    pub agent_runner_enabled: bool,
+    /// How many runs one process executes at a time (`OMNION_AI_RUNNER_CONCURRENCY`).
+    ///
+    /// Default 4, floor 1. Every slot is one in-flight provider call plus one tool, so this is
+    /// the number that decides how many tokens can be in flight at once — it is a money knob and
+    /// not only a thread-pool knob. A floor of 1 rather than 0 because a concurrency of 0 is a
+    /// runner that never runs anything and reports itself healthy.
+    pub runner_concurrency: usize,
+    /// Whether this process prunes the route decision log (`OMNION_AI_LOG_RUNNER`).
+    ///
+    /// A **separate** switch from `runner_enabled`, not a second reading of the same one: the
+    /// health probe dials providers on the network, and the decision pruner only issues a bulk
+    /// delete. An installation that wants to stop outbound probes (a locked-down network, a
+    /// cost policy) still wants its log pruned, and an installation that manages retention
+    /// with an external job does not want a second one deleting rows underneath it. One env
+    /// var for "do not touch my providers" and another for "do not touch my log" is the only
+    /// split that serves both.
+    pub log_runner_enabled: bool,
+    /// Whether this process executes queued eval runs (`OMNION_AI_EVAL_RUNNER`).
+    ///
+    /// A **fourth** switch, and the split is the same one the three above already draw: this
+    /// runner is the second background task that **spends money** — a rubric case costs a second
+    /// model call on top of the one under test, so a suite of twenty rubric cases costs twice a
+    /// chat turn twenty times. An installation that lets an agent talk but refuses to let an
+    /// eval burn a judge budget says `OMNION_AI_EVAL_RUNNER=false`, and the API answers
+    /// `503 runner_disabled` on run start rather than queueing runs that will never be picked
+    /// up and that the history would show as permanently `queued`.
+    ///
+    /// It is not a reading of `agent_runner_enabled` on purpose: an eval run is not an agent
+    /// run, it has no identity and may call no tools, and tying the two would let an operator
+    /// who switched off agent autonomy also switch off the evidence that their agents work —
+    /// which is the switch they most need when they are deciding whether to switch it back on.
+    pub eval_runner_enabled: bool,
+    /// How long a run may stay `running` before the runner fails it (`OMNION_AI_EVAL_TIMEOUT`).
+    ///
+    /// 900 s by default: long enough for a twenty-case suite where each case is a slow model
+    /// turn, short enough that a run whose process died between claim and settle is `error`
+    /// before an operator goes looking for it. The unit is seconds and the floor is 30 —
+    /// below that a healthy run on a slow provider would be failed by the reaper while it was
+    /// still working, which is the one failure this number exists to prevent.
+    pub eval_timeout_seconds: i64,
+    /// How often the eval runner sweeps for suites whose schedule is due (`OMNION_AI_EVAL_SCHEDULER_MS`).
+    ///
+    /// 60 s rather than the agent runner's 250 ms tick: a cron schedule has a resolution of a
+    /// minute anyway, and a sweep that reads every enabled suite is a query per suite per tick —
+    /// cheap once a minute, not four times a second.
+    pub eval_scheduler_ms: u64,
+    /// Whether this process rolls up the per-tool telemetry (`OMNION_AI_TELEMETRY_RUNNER`).
+    ///
+    /// **A sixth switch, and this one is about writes rather than calls.** Every runner above
+    /// dials a provider, scores a suite or deletes rows; this one only re-reads `ai_tool_calls`
+    /// and upserts a roll-up row per tool per day. That makes it the cheapest background task in
+    /// the box by an order of magnitude, and also the one an installation is most likely to
+    /// disable for a reason nobody predicted — an operator who prunes the call log on their own
+    /// schedule does not want a second process reading it, and an operator who restores the
+    /// platform from a snapshot has no use for a roll-up of a window the snapshot predates.
+    ///
+    /// The reader is a **separate** concern from this writer, deliberately: the telemetry screen
+    /// reads `ai_tool_stats_daily` whether or not anything is refreshing it, and an installation
+    /// that turns the runner off still gets the screen — it just gets the numbers the runner last
+    /// wrote. A screen that refused to render because a background task is switched off would
+    /// turn a knob into an outage.
+    pub telemetry_runner_enabled: bool,
+}
+
+impl Default for AiHubConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            poll_ms: DEFAULT_AI_HEALTH_POLL_MS,
+            retention_days: 30,
+            agent_runner_enabled: true,
+            runner_concurrency: DEFAULT_AI_RUNNER_CONCURRENCY,
+            log_runner_enabled: true,
+            eval_runner_enabled: true,
+            eval_timeout_seconds: DEFAULT_AI_EVAL_TIMEOUT_SECONDS,
+            eval_scheduler_ms: DEFAULT_AI_EVAL_SCHEDULER_MS,
+            telemetry_runner_enabled: true,
+        }
+    }
+}
+
+/// The installation's Web Push identity (`OMNION_PUSH_*`, REQ-021 slice 6).
+///
+/// One P-256 key pair per installation, generated at deploy time. The request says it is
+/// "generated at deploy time and kept only in the platform secret store", and this is the
+/// honest form of that for a platform whose secret store is REQ-125's and not yet built: the
+/// key material is read from the environment, **write-only in every rendering**, and the
+/// public half is derived from it so the two can never disagree.
+///
+/// **The private half is a key that can push to every subscribed browser in this
+/// installation.** It is `Debug`-redacted for the same reason the SMTP password is: a
+/// process that logs its own VAPID private key is a process whose subscribers can be
+/// spammed by anybody who can read the log.
+///
+/// `is_usable` is the whole point of the struct and it is deliberately strict. A push service
+/// checks that the JWT's `aud` names the endpoint host and that the signature verifies against
+/// the `public_key` the browser was told to trust; a pair where only one half is present, or
+/// where the public half does not match the private one, produces a token that is refused on
+/// every send. Reporting such an installation as ready is the same green light wired to nothing
+/// that the webhook readiness branch was.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PushConfig {
+    /// The P-256 private key, base64url without padding (`OMNION_PUSH_PRIVATE_KEY`).
+    ///
+    /// Raw scalar bytes when decoded, so the value an operator pastes is the one the
+    /// Web Push specification describes and not a DER wrapper around it.
+    private_key: Option<String>,
+    /// The contact address a push service uses to reach an operator about a failing
+    /// subscription (`OMNION_PUSH_CONTACT`), conventionally `mailto:`.
+    ///
+    /// Not a secret and not optional in the specification: a token whose `sub` is not a
+    /// `mailto:` or `https:` URL is rejected outright by some push services.
+    contact: Option<String>,
+}
+
+impl PushConfig {
+    /// The private key, raw 32 bytes, when one is configured and well-formed.
+    ///
+    /// `None` for absent, for empty, and for a value that is not base64url — the third case
+    /// matters because a truncated or padded paste would otherwise be *some* 32 bytes and
+    /// produce a key that signs correctly and matches nobody's expectation.
+    #[must_use]
+    pub fn private_key_bytes(&self) -> Option<Vec<u8>> {
+        let raw = self.private_key.as_deref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let bytes = crate::base64url::decode(raw)?;
+        (bytes.len() == 32).then_some(bytes)
+    }
+
+    /// Whether a send could be attempted at all: a usable key **and** a contact address.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        self.private_key_bytes().is_some() && self.contact().is_some()
+    }
+
+    /// The contact address, when it is one a push service accepts.
+    ///
+    /// The check is on the *scheme* because the specification requires one and because the
+    /// alternative is a token rejected at send time, days after the operator believed push
+    /// was configured.
+    #[must_use]
+    pub fn contact(&self) -> Option<&str> {
+        let raw = self.contact.as_deref()?.trim();
+        let ok = (raw.starts_with("mailto:") || raw.starts_with("https://"))
+            && !raw.contains(char::is_whitespace);
+        ok.then_some(raw)
+    }
+
+    /// Whether a private key was given at all, well-formed or not.
+    ///
+    /// Separate from [`Self::is_usable`] so the settings screen can tell "no push key was
+    /// configured" from "the push key is configured but unusable", which are different fixes.
+    #[must_use]
+    pub fn has_private_key(&self) -> bool {
+        self.private_key
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+    }
+
+    /// A copy with the private key set, base64url without padding.
+    ///
+    /// **The one writer, and it exists because the fields are private on purpose.** A private
+    /// key is a credential, and a struct whose fields can be built from anywhere is a struct
+    /// that gets one assembled in a test, a fixture and a config file without anybody deciding
+    /// that. But "generated at deploy time" means something has to hand the platform a key it
+    /// did not read from the environment: `vapid::VapidKeys::generate` mints one, and this is
+    /// how it is handed over.
+    ///
+    /// No validation happens here, deliberately. A malformed key is still *present*, and
+    /// [`Self::has_private_key`] is exactly the distinction the settings screen renders against
+    /// [`Self::private_key_bytes`]. Keeping "what was configured" and "what would a push
+    /// service accept" as two separate questions is what lets that screen name which of the two
+    /// problems it has.
+    #[must_use]
+    pub fn with_private_key(mut self, private_key: impl Into<String>) -> Self {
+        self.private_key = Some(private_key.into());
+        self
+    }
+
+    /// A copy with the contact address set.
+    ///
+    /// Same reasoning as [`Self::with_private_key`]; validated on read in [`Self::contact`].
+    #[must_use]
+    pub fn with_contact(mut self, contact: impl Into<String>) -> Self {
+        self.contact = Some(contact.into());
+        self
+    }
+
+    /// The base64url public key, derived from the private half.
+    ///
+    /// Derived rather than configured, because a pair supplied as two strings can disagree and
+    /// the failure is invisible until every send is refused.
+    #[must_use]
+    pub fn public_key(&self) -> Option<String> {
+        let bytes = self.private_key_bytes()?;
+        Some(crate::vapid::public_key_from_private(&bytes)?)
+    }
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            private_key: None,
+            contact: None,
+        }
+    }
+}
+
+/// Render the push settings without the private key.
+impl std::fmt::Debug for PushConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PushConfig")
+            .field(
+                "private_key",
+                &if self.has_private_key() {
+                    "<redacted>"
+                } else {
+                    "<none>"
+                },
+            )
+            .field("contact", &self.contact.as_deref().unwrap_or("<none>"))
+            .finish()
+    }
+}
+
 /// The secret a CSRF token is derived from (REQ-012, slice 2).
 ///
 /// The token itself is `HMAC(this, session id)`, so this is the one value that decides whether a
@@ -635,6 +983,7 @@ impl std::fmt::Debug for CsrfSecret {
     }
 }
 
+
 /// Fully validated runtime configuration of one Omnion service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -658,10 +1007,14 @@ pub struct Config {
     pub search: SearchConfig,
     /// Analytics collection and rollup knobs (REQ-007).
     pub analytics: AnalyticsConfig,
+    /// AI provider health probe knobs (REQ-097).
+    pub ai_hub: AiHubConfig,
     /// Retention worker knobs (REQ-010, slice 4).
     pub retention: RetentionConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
+    /// The installation's Web Push identity (REQ-021, slice 6).
+    pub push: PushConfig,
     /// The secret CSRF tokens are derived from (REQ-012, slice 2).
     pub csrf: CsrfSecret,
     /// Logging.
@@ -843,6 +1196,31 @@ impl Config {
                 DEFAULT_RETENTION_MAX_SITES_U64,
             )?)
             .unwrap_or(DEFAULT_RETENTION_MAX_SITES),
+            // The backup sweep reads its own root out of `backup_settings` every tick, so a
+            // malformed value here would be a worker that kept its default and a destination
+            // that quietly changed. Both knobs get the boot-time treatment every other one gets.
+            backup_sweep_enabled: read_flag(&read, "OMNION_BACKUP_SWEEP", true)?,
+            backup_sweep_poll_ms: read_positive(
+                &read,
+                "OMNION_BACKUP_SWEEP_POLL_MS",
+                DEFAULT_BACKUP_SWEEP_POLL_MS,
+            )?,
+            backup_sweep_max_tenants: i64::try_from(read_positive(
+                &read,
+                "OMNION_BACKUP_SWEEP_MAX_TENANTS",
+                DEFAULT_BACKUP_SWEEP_MAX_TENANTS_U64,
+            )?)
+            .unwrap_or(DEFAULT_BACKUP_SWEEP_MAX_TENANTS),
+            // No `enabled` flag of its own: the schedule worker is the thing an installation
+            // with no schedules wants off, and an installation with no schedules pays one
+            // grouped query a minute for it. `OMNION_BACKUP_SCHEDULE_POLL_MS` is the lever —
+            // set it to an hour and the worker costs nothing measurable, and every schedule
+            // still fires within the hour.
+            backup_schedule_poll_ms: read_positive(
+                &read,
+                "OMNION_BACKUP_SCHEDULE_POLL_MS",
+                DEFAULT_BACKUP_SCHEDULE_POLL_MS,
+            )?,
         };
 
         let analytics = AnalyticsConfig {
@@ -855,6 +1233,43 @@ impl Config {
             )?,
         };
 
+        let ai_hub = AiHubConfig {
+            runner_enabled: read_flag(&read, "OMNION_AI_HEALTH_RUNNER", true)?,
+            poll_ms: read_positive(&read, "OMNION_AI_HEALTH_POLL_MS", DEFAULT_AI_HEALTH_POLL_MS)?,
+            retention_days: read_positive(
+                &read,
+                "OMNION_AI_HEALTH_RETENTION_DAYS",
+                AiHubConfig::default().retention_days,
+            )?,
+            log_runner_enabled: read_flag(&read, "OMNION_AI_LOG_RUNNER", true)?,
+            agent_runner_enabled: read_flag(&read, "OMNION_AI_RUNNER", true)?,
+            runner_concurrency: read_positive(
+                &read,
+                "OMNION_AI_RUNNER_CONCURRENCY",
+                DEFAULT_AI_RUNNER_CONCURRENCY as u64,
+            )?
+            .max(1) as usize,
+            eval_runner_enabled: read_flag(&read, "OMNION_AI_EVAL_RUNNER", true)?,
+            telemetry_runner_enabled: read_flag(&read, "OMNION_AI_TELEMETRY_RUNNER", true)?,
+            // The floor of 30 is enforced here rather than trusted from the operator: the number
+            // decides when the reaper fails a run, and a value under thirty would fail healthy
+            // runs on any provider slower than half a second per case. Clamping is the honest
+            // response — refusing to boot an installation over a too-small timeout is a far
+            // worse outcome than a timeout that ignores their number.
+            eval_timeout_seconds: i64::try_from(read_positive(
+                &read,
+                "OMNION_AI_EVAL_TIMEOUT",
+                DEFAULT_AI_EVAL_TIMEOUT_SECONDS as u64,
+            )?)
+            .unwrap_or(DEFAULT_AI_EVAL_TIMEOUT_SECONDS)
+            .max(30),
+            eval_scheduler_ms: read_positive(
+                &read,
+                "OMNION_AI_EVAL_SCHEDULER_MS",
+                DEFAULT_AI_EVAL_SCHEDULER_MS,
+            )?,
+        };
+
         let mail = MailConfig {
             enabled: read_flag(&read, "OMNION_MAIL_ENABLED", true)?,
             host: read("OMNION_SMTP_HOST").unwrap_or_else(|| DEFAULT_SMTP_HOST.to_owned()),
@@ -863,6 +1278,15 @@ impl Config {
             username: read("OMNION_SMTP_USERNAME"),
             password: read("OMNION_SMTP_PASSWORD"),
             timeout_ms: read_positive(&read, "OMNION_SMTP_TIMEOUT_MS", DEFAULT_SMTP_TIMEOUT_MS)?,
+        };
+
+        // Web Push (REQ-021 slice 6). Read, never generated: a key the platform invents at
+        // boot would change on every restart, and every browser holding a subscription to the
+        // previous key would be silently unreachable. `generate` exists for the deploy-time
+        // step the request describes, and an operator pastes its output into the environment.
+        let push = PushConfig {
+            private_key: read("OMNION_PUSH_PRIVATE_KEY"),
+            contact: read("OMNION_PUSH_CONTACT"),
         };
 
         // The CSRF secret is the one piece of configuration the platform refuses to invent: a
@@ -882,8 +1306,10 @@ impl Config {
             automation,
             search,
             analytics,
+            ai_hub,
             retention,
             mail,
+            push,
             csrf,
             log,
         };
@@ -922,8 +1348,10 @@ impl Default for Config {
             automation: AutomationConfig::default(),
             search: SearchConfig::default(),
             analytics: AnalyticsConfig::default(),
+            ai_hub: AiHubConfig::default(),
             retention: RetentionConfig::default(),
             mail: MailConfig::default(),
+            push: PushConfig::default(),
             // No secret by default, which is the honest default: a default key would be a key
             // every deployment shares, and a shared CSRF secret is no CSRF secret.
             csrf: CsrfSecret::default(),
@@ -994,6 +1422,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base64url;
 
     fn config_from(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
         let map: std::collections::HashMap<String, String> = pairs
@@ -1238,6 +1667,145 @@ mod tests {
         assert_eq!(config.mail.timeout_ms, DEFAULT_SMTP_TIMEOUT_MS);
         assert!(!config.mail.authenticates(), "no credentials by default");
         assert!(config.mail.is_usable());
+
+        // **Push is off by default, and the reason is that it cannot be on by default.**
+        // Readiness has to report "no push key is configured" rather than inventing a key at
+        // boot: a key the platform mints per process would invalidate every existing browser
+        // subscription on every restart.
+        assert!(!config.push.has_private_key());
+        assert!(!config.push.is_usable());
+        assert!(config.push.public_key().is_none());
+    }
+
+    /// A 32-byte private key, base64url — the same 0x01..=0x20 scalar `vapid`'s tests use, so
+    /// the fixture is one the signing code has already proved is a valid P-256 key.
+    const PUSH_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA";
+    /// A contact address the specification accepts.
+    const PUSH_CONTACT: &str = "mailto:push@omnion.invalid";
+
+    #[test]
+    fn a_configured_push_key_is_usable_and_derives_its_own_public_half() {
+        let config = config_from(&[
+            ("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY),
+            ("OMNION_PUSH_CONTACT", PUSH_CONTACT),
+        ])
+        .expect("a valid key must load");
+
+        assert!(config.push.has_private_key());
+        assert!(config.push.is_usable());
+        assert_eq!(
+            config.push.public_key().as_deref(),
+            crate::vapid::public_key_from_private(&base64url::decode(PUSH_KEY).expect("b64"))
+                .as_deref(),
+            "the public half is derived, never configured — the two cannot disagree"
+        );
+        // And the derived key is one a browser can actually subscribe with.
+        let point =
+            base64url::decode(config.push.public_key().expect("derived").as_str()).expect("b64");
+        assert_eq!(point.len(), 65);
+        assert_eq!(point[0], 0x04, "the uncompressed SEC1 point tag");
+    }
+
+    #[test]
+    fn a_malformed_push_key_is_not_a_usable_key_but_is_still_reported_as_present() {
+        // The distinction is the whole point of `has_private_key`: "you pasted something that
+        // is not a key" and "you pasted nothing" are different fixes, and a readiness screen
+        // that says "no push key configured" for the first one sends the operator looking in
+        // the wrong place.
+        for bad in ["not-base64!", "AAAA", "c2hvcnQ=", "not-a-key-at-all"] {
+            let config = config_from(&[
+                ("OMNION_PUSH_PRIVATE_KEY", bad),
+                ("OMNION_PUSH_CONTACT", PUSH_CONTACT),
+            ])
+            .expect("a bad value must not stop the process booting");
+            assert!(!config.push.is_usable(), "{bad:?} must not be a usable key");
+            assert!(
+                config.push.has_private_key(),
+                "{bad:?} is present but unusable — the operator needs to be told which"
+            );
+            assert!(config.push.public_key().is_none());
+        }
+
+        // **Whitespace is absence, not malformedness.** An environment variable holding
+        // spaces is what a templated deployment file produces when the value was never
+        // substituted, and reporting "a push key is configured but broken" for that sends the
+        // operator to debug a key that does not exist. It reads as nothing configured, which
+        // is the truth.
+        for blank in ["", "   ", "\t"] {
+            let config = config_from(&[
+                ("OMNION_PUSH_PRIVATE_KEY", blank),
+                ("OMNION_PUSH_CONTACT", PUSH_CONTACT),
+            ])
+            .expect("loads");
+            assert!(
+                !config.push.has_private_key(),
+                "{blank:?} is an absent key, not a broken one"
+            );
+            assert!(!config.push.is_usable());
+        }
+    }
+
+    #[test]
+    fn a_key_without_a_contact_is_present_but_not_usable() {
+        // A push service rejects a token whose `sub` is not a mailto: or https: URL, so a
+        // half-configured installation must not claim readiness.
+        let config = config_from(&[("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY)]).expect("loads");
+        assert!(config.push.has_private_key());
+        assert!(config.push.contact().is_none());
+        assert!(!config.push.is_usable());
+    }
+
+    #[test]
+    fn a_contact_without_a_scheme_is_refused() {
+        for bad in [
+            "ops@example.com",
+            "mailto:ops@example .com",
+            "ftp://ops@x.test",
+        ] {
+            let config = config_from(&[
+                ("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY),
+                ("OMNION_PUSH_CONTACT", bad),
+            ])
+            .expect("loads");
+            assert!(config.push.contact().is_none(), "{bad:?} must be refused");
+            assert!(!config.push.is_usable());
+        }
+        let good = config_from(&[
+            ("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY),
+            ("OMNION_PUSH_CONTACT", "https://ops.example.com/push"),
+        ])
+        .expect("loads");
+        assert_eq!(
+            good.push.contact(),
+            Some("https://ops.example.com/push"),
+            "an https contact is as valid as a mailto one"
+        );
+    }
+
+    #[test]
+    fn the_push_private_key_is_never_rendered() {
+        // The value that can push to every subscriber must not appear in a log line, a panic
+        // message or a test failure. This is the SMTP password's rule, applied to the key that
+        // outranks it.
+        let config = config_from(&[
+            ("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY),
+            ("OMNION_PUSH_CONTACT", PUSH_CONTACT),
+        ])
+        .expect("loads");
+
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains(PUSH_KEY),
+            "the private key reached a Debug rendering: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // The whole config renders, and the key is absent from all of it.
+        assert!(!format!("{:?}", config.push).contains(PUSH_KEY));
+        // The public half is not a secret — and it is *not* in the Debug output either,
+        // because `Config`'s own rendering is a field list that names the push section and
+        // nothing more. The browser gets it from the API, which is where it belongs: it is
+        // per-installation data, not a boot log.
+        assert!(!rendered.contains(&config.push.public_key().expect("derived")));
     }
 
     #[test]
@@ -1268,6 +1836,141 @@ mod tests {
         assert!(config.mail.authenticates());
         assert_eq!(config.mail.timeout_ms, 1_500);
         assert!(!config.mail.is_usable(), "switched off is not usable");
+    }
+
+    #[test]
+    fn the_ai_health_probe_has_development_defaults_and_is_configurable() {
+        let config = config_from(&[]).expect("defaults must load");
+        assert!(config.ai_hub.runner_enabled);
+        assert_eq!(config.ai_hub.poll_ms, DEFAULT_AI_HEALTH_POLL_MS);
+        assert_eq!(
+            config.ai_hub.retention_days,
+            AiHubConfig::default().retention_days
+        );
+
+        let tuned = config_from(&[
+            ("OMNION_AI_HEALTH_RUNNER", "false"),
+            ("OMNION_AI_HEALTH_POLL_MS", "5000"),
+            ("OMNION_AI_HEALTH_RETENTION_DAYS", "7"),
+        ])
+        .expect("the AI Hub settings are valid");
+        assert!(!tuned.ai_hub.runner_enabled);
+        // The decision pruner is a second switch on purpose: disabling the health probe must
+        // not silently disable the log retention (or the reverse), which is the mistake a
+        // shared env var guarantees somebody will eventually make.
+        assert!(config.ai_hub.log_runner_enabled);
+        let pruner_off = config_from(&[("OMNION_AI_LOG_RUNNER", "false")])
+            .expect("one flag must parse");
+        assert!(!pruner_off.ai_hub.log_runner_enabled);
+        assert!(
+            pruner_off.ai_hub.runner_enabled,
+            "switching the decision pruner off must not switch the health probe off"
+        );
+    }
+
+    #[test]
+    fn the_agent_runner_has_its_own_switch_and_its_own_concurrency() {
+        let config = config_from(&[]).expect("defaults must load");
+        assert!(config.ai_hub.agent_runner_enabled, "the runner is on by default");
+        assert_eq!(
+            config.ai_hub.runner_concurrency, DEFAULT_AI_RUNNER_CONCURRENCY,
+            "four in-flight runs is the documented default"
+        );
+
+        let off = config_from(&[("OMNION_AI_RUNNER", "false")]).expect("one flag must parse");
+        assert!(!off.ai_hub.agent_runner_enabled);
+        // The reason the switch is its own field and not a reading of the health probe's: an
+        // installation that refuses to let an agent spend money must still get its providers
+        // probed, and a shared flag takes both away together.
+        assert!(
+            off.ai_hub.runner_enabled,
+            "switching the agent runner off must leave the health probe running"
+        );
+        assert!(off.ai_hub.log_runner_enabled);
+
+        let narrow = config_from(&[("OMNION_AI_RUNNER_CONCURRENCY", "1")])
+            .expect("one number must parse");
+        assert_eq!(narrow.ai_hub.runner_concurrency, 1);
+
+        // 0 is refused by the positive reader, and a concurrency of zero is a runner that reports
+        // itself healthy and never runs anything.
+        let zero = config_from(&[("OMNION_AI_RUNNER_CONCURRENCY", "0")]);
+        assert!(
+            zero.is_err(),
+            "a runner with no slots would report itself healthy and run nothing"
+        );
+    }
+
+    #[test]
+    fn the_eval_runner_has_a_switch_of_its_own_and_a_floored_timeout() {
+        let config = config_from(&[]).expect("defaults must load");
+        assert!(config.ai_hub.eval_runner_enabled, "the runner is on by default");
+        assert_eq!(
+            config.ai_hub.eval_timeout_seconds, DEFAULT_AI_EVAL_TIMEOUT_SECONDS,
+            "fifteen minutes is the documented default"
+        );
+        assert_eq!(
+            config.ai_hub.eval_scheduler_ms, DEFAULT_AI_EVAL_SCHEDULER_MS,
+            "a schedule is swept once a minute"
+        );
+
+        // The reason this is a fourth switch rather than a reading of the agent runner's: an
+        // eval run is not an agent run — it has no identity and may call no tools — and the
+        // operator who switched off agent autonomy still needs the evidence that their agents
+        // work, which is the thing they most want when deciding whether to switch it back on.
+        let off = config_from(&[("OMNION_AI_EVAL_RUNNER", "false")]).expect("one flag must parse");
+        assert!(!off.ai_hub.eval_runner_enabled);
+        assert!(
+            off.ai_hub.agent_runner_enabled,
+            "switching the eval runner off must leave agent runs working"
+        );
+        assert!(
+            off.ai_hub.runner_enabled,
+            "switching the eval runner off must leave the health probe working"
+        );
+        assert!(
+            config_from(&[("OMNION_AI_RUNNER", "false")])
+            .expect("one flag must parse")
+            .ai_hub
+            .eval_runner_enabled,
+            "switching the agent runner off must leave eval runs working"
+        );
+
+        // A timeout under thirty seconds would fail healthy runs on any provider slower than
+        // half a second a case. It is clamped rather than refused: booting is not the operator's
+        // way to learn their number was too small, and a silent, documented floor is.
+        let tight = config_from(&[("OMNION_AI_EVAL_TIMEOUT", "5")]).expect("a number must parse");
+        assert_eq!(
+            tight.ai_hub.eval_timeout_seconds, 30,
+            "a five-second timeout is clamped to the floor, not honoured"
+        );
+
+        let wide = config_from(&[("OMNION_AI_EVAL_TIMEOUT", "1800")]).expect("a number must parse");
+        assert_eq!(wide.ai_hub.eval_timeout_seconds, 1800, "a real value is kept");
+
+        // 0 is refused by the positive reader: a reaper with a zero window fails the run it is
+        // asked to rescue, on the same statement that finds it.
+        assert!(
+            config_from(&[("OMNION_AI_EVAL_TIMEOUT", "0")]).is_err(),
+            "a zero timeout window would fail every run the sweep found"
+        );
+        assert!(
+            config_from(&[("OMNION_AI_EVAL_SCHEDULER_MS", "0")]).is_err(),
+            "a zero scheduler interval would spin the sweep against every suite"
+        );
+    }
+
+    #[test]
+    fn the_probe_interval_may_not_be_zero() {
+        // A zero interval would spin the runner against every provider as fast as the box
+        // allows; the read helper refuses it rather than letting a typo become a self-inflicted
+        // denial of service on the operator's own API keys.
+        let error = config_from(&[("OMNION_AI_HEALTH_POLL_MS", "0")])
+            .expect_err("a zero probe interval must be refused");
+        assert!(
+            error.to_string().contains("OMNION_AI_HEALTH_POLL_MS"),
+            "got {error}"
+        );
     }
 
     #[test]
@@ -1322,6 +2025,47 @@ mod tests {
         // answer is that the platform starts and refuses cookie-authenticated mutations.
         let config = config_from(&[]).expect("the platform boots without a CSRF secret");
         assert!(!config.csrf.is_usable());
+    }
+
+    /// The backup sweep is gated by its OWN flag, and that is the property worth pinning: an
+    /// installation that wants to keep every backup for ever must be able to stop the sweep
+    /// without stopping the media sweeper, and the reverse must hold too. If these two ever
+    /// share a flag again, this test is the one that notices.
+    #[test]
+    fn the_backup_sweep_has_its_own_switch() {
+        let on = config_from(&[]).expect("the platform boots");
+        assert!(on.retention.backup_sweep_enabled);
+        assert!(on.retention.runner_enabled);
+
+        let media_only = config_from(&[("OMNION_BACKUP_SWEEP", "false")])
+            .expect("stopping the backup sweep is a valid configuration");
+        assert!(!media_only.retention.backup_sweep_enabled);
+        assert!(
+            media_only.retention.runner_enabled,
+            "stopping the backup sweep must not stop the media sweeper"
+        );
+
+        let backups_only = config_from(&[("OMNION_RETENTION_RUNNER", "false")])
+            .expect("stopping the media sweeper is a valid configuration");
+        assert!(!backups_only.retention.runner_enabled);
+        assert!(
+            backups_only.retention.backup_sweep_enabled,
+            "stopping the media sweeper must not stop the backup sweep"
+        );
+    }
+
+    /// A malformed sweep interval is a boot failure, not a worker that quietly kept its
+    /// default — the same treatment every other interval gets, and the reason it matters most
+    /// here is that the interval is how often unattended deletes happen.
+    #[test]
+    fn a_broken_backup_sweep_interval_fails_at_boot() {
+        let error = config_from(&[("OMNION_BACKUP_SWEEP_POLL_MS", "0")])
+            .expect_err("a zero interval is refused");
+        assert_eq!(error.key, "OMNION_BACKUP_SWEEP_POLL_MS");
+
+        let error = config_from(&[("OMNION_BACKUP_SWEEP_MAX_TENANTS", "plenty")])
+            .expect_err("a non-numeric bound is refused");
+        assert_eq!(error.key, "OMNION_BACKUP_SWEEP_MAX_TENANTS");
     }
 
     #[test]

@@ -95,6 +95,19 @@ impl Storage {
         }
     }
 
+    /// Read a window of an object back, so a caller that needs part of a large object does not
+    /// have to read all of it.
+    ///
+    /// A window past the end of the object is a `RangeNotSatisfiable` rather than a short read:
+    /// the caller computed the window from a length it believed, so the disagreement is between
+    /// the row and the object, and only the caller can say which of the two is wrong.
+    pub async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+        match self {
+            Self::S3(storage) => storage.get_range(key, start, end).await,
+            Self::Fs(storage) => storage.get_range(key, start, end).await,
+        }
+    }
+
     /// Remove an object; `true` when one was there.
     pub async fn delete(&self, key: &str) -> Result<bool> {
         match self {

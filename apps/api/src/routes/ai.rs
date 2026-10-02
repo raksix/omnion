@@ -24,16 +24,22 @@
 //! which is where connections become tenant-scoped.
 
 use std::convert::Infallible;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use omnion_ai_hub::{
-    AiHubError, AiModel, ApiKeyChange, ChatEvent, ChatMessage, ChatRequest, ChatRole, ModelChanges,
-    NewAiModel, NewProvider, Provider, ProviderChanges, ProviderTarget, resolve, stream_chat,
+    AiHubError, AiModel, ApiKeyChange, ChatEvent, ChatMessage, ChatRequest, ChatRole, MAX_PRIORITY,
+    MAX_RETRIES_CEILING, MAX_TIMEOUT_MS, MIN_PRIORITY, MIN_TIMEOUT_MS, ModelCapability,
+    ModelChanges, NewAiModel, NewProvider, Provider, ProviderChanges, ProviderTarget, StepStatus,
+    TestReport, protocol_infos, stream_chat, test_provider,
 };
 use omnion_audit::NewAuditEntry;
+use omnion_events::{NewEvent, bus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
@@ -63,10 +69,25 @@ pub struct ProviderBody {
     pub name: String,
     /// Wire protocol.
     pub protocol: String,
+    /// `cloud` or `local`.
+    pub kind: String,
     /// Base URL.
     pub base_url: String,
     /// Whether a key is stored.
     pub has_api_key: bool,
+    /// How long one call may take, in milliseconds.
+    pub timeout_ms: i32,
+    /// How often a pre-first-byte failure is retried.
+    pub max_retries: i32,
+    /// Position in the failover chain.
+    pub priority: i32,
+    /// `ok`, `degraded`, `down` or `unknown`.
+    pub last_health: String,
+    /// When a probe last took a sample here.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_checked_at: Option<OffsetDateTime>,
+    /// What the last failed probe said.
+    pub last_error: Option<String>,
     /// Whether the provider is enabled.
     pub enabled: bool,
     /// Whether it is the installation's default provider.
@@ -88,8 +109,15 @@ impl ProviderBody {
             id: provider.id,
             name: provider.name.clone(),
             protocol: provider.protocol.clone(),
+            kind: provider.kind.clone(),
             base_url: provider.base_url.clone(),
             has_api_key: provider.has_api_key(),
+            timeout_ms: provider.timeout_ms,
+            max_retries: provider.max_retries,
+            priority: provider.priority,
+            last_health: provider.last_health.clone(),
+            last_checked_at: provider.last_checked_at,
+            last_error: provider.last_error.clone(),
             enabled: provider.enabled,
             is_default: provider.is_default,
             model_count,
@@ -122,18 +150,74 @@ pub struct ModelBody {
     pub supports_streaming: bool,
     /// Embedding output.
     pub supports_embeddings: bool,
+    /// Image generation.
+    pub supports_image_generation: bool,
+    /// Audio generation.
+    pub supports_audio_generation: bool,
+    /// Transcription.
+    pub supports_transcription: bool,
+    /// Structured output through the provider's own mode.
+    pub supports_json_mode: bool,
+    /// Largest answer the model advertises.
+    pub max_output_tokens: Option<i32>,
     /// Whether the model is enabled.
     pub enabled: bool,
-    /// Whether it is the installation's default model.
+    /// Whether the model is the installation's default model.
     pub is_default: bool,
     /// `provider/model` — how the router addresses this pair.
     pub model_id: String,
+    /// The closed capability vocabulary, so the panel renders every flag from one list.
+    pub capability_catalog: Vec<CapabilityInfo>,
+    /// The capabilities this model actually claims, in catalog order.
+    pub capabilities: Vec<ModelCapability>,
+    /// What this model costs, with both the per-million figure the column stores and the
+    /// per-1K rendering the table shows (REQ-098).
+    ///
+    /// Sent as one object rather than four loose fields so a client cannot read the per-1K
+    /// rendering of one half and the per-million figure of the other and print them side by
+    /// side as if they described the same number.
+    pub price: PriceBody,
+    /// Where the capability flags came from, and when they were last confirmed.
+    pub capabilities_source: String,
+    /// When the capability flags were last confirmed against something, when ever that was.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub capabilities_verified_at: Option<OffsetDateTime>,
     /// When it was registered.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// When it was last changed.
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+/// One model's price, as the panel reads it.
+///
+/// The `complete` flag is what stops the catalog from quietly pretending a half-priced model is
+/// fully priced: without it a client would format a missing output rate as zero and every cost
+/// estimate built from the table would understate the model.
+#[derive(Debug, Clone, Serialize)]
+pub struct PriceBody {
+    /// Micros per million input tokens.
+    pub input_micros_per_mtok: Option<i64>,
+    /// Micros per million output tokens.
+    pub output_micros_per_mtok: Option<i64>,
+    /// The input half rendered per 1K.
+    pub input_micros_per_1k: Option<i64>,
+    /// The output half rendered per 1K.
+    pub output_micros_per_1k: Option<i64>,
+    /// `manual`, `discovery` or `probe`.
+    pub source: String,
+    /// What that source means, so the panel does not have to hard-code the wording.
+    pub source_note: String,
+    /// When the price was written down.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub updated_at: Option<OffsetDateTime>,
+    /// `true` when both halves are known.
+    pub complete: bool,
+    /// How old the price is in whole days; `null` when none was ever written.
+    pub age_days: Option<i64>,
+    /// `true` when the price is older than the platform's staleness window.
+    pub stale: bool,
 }
 
 impl ModelBody {
@@ -150,13 +234,45 @@ impl ModelBody {
             supports_vision: model.supports_vision,
             supports_streaming: model.supports_streaming,
             supports_embeddings: model.supports_embeddings,
+            supports_image_generation: model.supports_image_generation,
+            supports_audio_generation: model.supports_audio_generation,
+            supports_transcription: model.supports_transcription,
+            supports_json_mode: model.supports_json_mode,
+            max_output_tokens: model.max_output_tokens,
             enabled: model.enabled,
             is_default: model.is_default,
             model_id: omnion_ai_hub::model_id(provider, model),
+            capability_catalog: ModelCapability::ALL
+                .iter()
+                .map(|capability| CapabilityInfo {
+                    capability: *capability,
+                    note: capability.note(),
+                    editable: capability.is_model_flag(),
+                })
+                .collect(),
+            capabilities: model.capabilities(),
+            price: PriceBody::build(&model.price()),
+            capabilities_source: model.capabilities_source.clone(),
+            capabilities_verified_at: model.capabilities_verified_at,
             created_at: model.created_at,
             updated_at: model.updated_at,
         }
     }
+}
+
+/// One entry of the closed capability vocabulary, as the panel's flag editor reads it.
+///
+/// The catalog travels with the models rather than being compiled into the panel, so a flag
+/// added to the crate appears in the editor without a second edit — and the `editable` marker
+/// tells the panel which toggles are a model's to claim and which are facts about the endpoint.
+#[derive(Debug, Serialize)]
+pub struct CapabilityInfo {
+    /// Wire name, used as the toggle key.
+    pub capability: ModelCapability,
+    /// One line the panel shows under the toggle.
+    pub note: &'static str,
+    /// `true` when a model row can turn this on.
+    pub editable: bool,
 }
 
 /// Response of the provider list.
@@ -173,15 +289,56 @@ pub struct ModelListResponse {
     pub models: Vec<ModelBody>,
 }
 
-/// Response of a provider model sync.
+/// Response of a discovery run: what the endpoint serves against what the registry holds.
+///
+/// The endpoint's own list comes back in `reported` so an operator can see what it published,
+/// and `lines` says what *applying* it would do. Nothing is written by this call — that is the
+/// apply endpoint's job, and it is a separate request with a separate confirmation.
 #[derive(Debug, Serialize)]
 pub struct DiscoverResponse {
     /// Provider that was asked.
     pub provider_id: Uuid,
     /// Its name.
     pub provider_name: String,
-    /// Model keys it reported.
-    pub models: Vec<String>,
+    /// Model keys it reported, sorted and deduplicated.
+    pub reported: Vec<String>,
+    /// Model keys the registry held before this run.
+    pub stored: Vec<String>,
+    /// The diff, in key order.
+    pub lines: Vec<omnion_ai_hub::DiscoveryLine>,
+    /// How many keys the endpoint serves.
+    pub reported_count: usize,
+    /// How many models the registry holds for this provider.
+    pub stored_count: usize,
+    /// How many would be added.
+    pub added: usize,
+    /// How many would be removed.
+    pub removed: usize,
+    /// How many would change.
+    pub changed: usize,
+    /// `true` when applying would change nothing.
+    pub up_to_date: bool,
+}
+
+impl DiscoverResponse {
+    /// Describe one discovery run.
+    fn build(diff: omnion_ai_hub::DiscoveryDiff) -> Self {
+        use omnion_ai_hub::DiscoveryAction;
+
+        Self {
+            reported_count: diff.reported.len(),
+            stored_count: diff.stored.len(),
+            added: diff.count(DiscoveryAction::Added),
+            removed: diff.count(DiscoveryAction::Removed),
+            changed: diff.count(DiscoveryAction::Changed),
+            up_to_date: diff.is_empty(),
+            provider_id: diff.provider_id,
+            provider_name: diff.provider_name,
+            reported: diff.reported,
+            stored: diff.stored,
+            lines: diff.lines,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -216,6 +373,21 @@ pub enum ModelInput {
         /// Embedding output.
         #[serde(default)]
         supports_embeddings: Option<bool>,
+        /// Image generation.
+        #[serde(default)]
+        supports_image_generation: Option<bool>,
+        /// Audio generation.
+        #[serde(default)]
+        supports_audio_generation: Option<bool>,
+        /// Transcription.
+        #[serde(default)]
+        supports_transcription: Option<bool>,
+        /// Structured output.
+        #[serde(default)]
+        supports_json_mode: Option<bool>,
+        /// Largest answer the model advertises.
+        #[serde(default)]
+        max_output_tokens: Option<i32>,
     },
 }
 
@@ -232,6 +404,11 @@ impl ModelInput {
                 supports_vision,
                 supports_streaming,
                 supports_embeddings,
+                supports_image_generation,
+                supports_audio_generation,
+                supports_transcription,
+                supports_json_mode,
+                max_output_tokens,
             } => NewAiModel {
                 model_key: key,
                 display_name,
@@ -240,6 +417,11 @@ impl ModelInput {
                 supports_vision,
                 supports_streaming,
                 supports_embeddings,
+                supports_image_generation,
+                supports_audio_generation,
+                supports_transcription,
+                supports_json_mode,
+                max_output_tokens,
             },
         }
     }
@@ -252,10 +434,18 @@ pub struct CreateProviderBody {
     pub name: String,
     /// Wire protocol; the OpenAI-compatible one when absent.
     pub protocol: Option<String>,
+    /// `cloud` or `local`; `cloud` when absent.
+    pub kind: Option<String>,
     /// Base URL, version segment included.
     pub base_url: String,
     /// Key to authenticate with; absent for a local endpoint that wants none.
     pub api_key: Option<String>,
+    /// How long one call may take, in milliseconds (default 30000).
+    pub timeout_ms: Option<i32>,
+    /// How often a pre-first-byte failure is retried (default 1).
+    pub max_retries: Option<i32>,
+    /// Position in the failover chain (default 100).
+    pub priority: Option<i32>,
     /// Whether the provider starts enabled (default `true`).
     pub enabled: Option<bool>,
     /// Whether it becomes the installation's default provider.
@@ -278,6 +468,14 @@ pub struct UpdateProviderBody {
     /// Absent = keep, `null` = clear, string = replace.
     #[serde(default, deserialize_with = "double_option")]
     pub api_key: Option<Option<String>>,
+    /// New kind.
+    pub kind: Option<String>,
+    /// New timeout.
+    pub timeout_ms: Option<i32>,
+    /// New retry ceiling.
+    pub max_retries: Option<i32>,
+    /// New position in the failover chain.
+    pub priority: Option<i32>,
     /// New enabled flag.
     pub enabled: Option<bool>,
     /// `true` makes it the installation's default provider.
@@ -292,19 +490,113 @@ pub struct ReplaceModelsBody {
 }
 
 /// Body of `PATCH /ai/models/{id}`.
+///
+/// `max_output_tokens` distinguishes three cases the way the provider key does: absent keeps the
+/// stored ceiling, `null` forgets it, a number replaces it.
 #[derive(Debug, Deserialize)]
 pub struct UpdateModelBody {
     /// New enabled flag.
     pub enabled: Option<bool>,
-    /// `true` makes it the installation's default model.
+    /// `true` makes this the installation's default model.
     pub is_default: Option<bool>,
+    /// New display name.
+    pub display_name: Option<String>,
+    /// New context window in tokens.
+    pub context_window: Option<i32>,
+    /// New tool-calling flag.
+    pub supports_tools: Option<bool>,
+    /// New image-input flag.
+    pub supports_vision: Option<bool>,
+    /// New streaming flag.
+    pub supports_streaming: Option<bool>,
+    /// New embeddings flag.
+    pub supports_embeddings: Option<bool>,
+    /// New image-generation flag.
+    pub supports_image_generation: Option<bool>,
+    /// New audio-generation flag.
+    pub supports_audio_generation: Option<bool>,
+    /// New transcription flag.
+    pub supports_transcription: Option<bool>,
+    /// New JSON-mode flag.
+    pub supports_json_mode: Option<bool>,
+    /// Absent = keep, `null` = clear, number = replace.
+    #[serde(default, deserialize_with = "double_option_i32")]
+    pub max_output_tokens: Option<Option<i32>>,
+    /// Absent = keep, `null` = clear, number = replace (REQ-098 slice 1).
+    #[serde(default, deserialize_with = "double_option_i64")]
+    pub input_cost_micros_per_mtok: Option<Option<i64>>,
+    /// Absent = keep, `null` = clear, number = replace.
+    #[serde(default, deserialize_with = "double_option_i64")]
+    pub output_cost_micros_per_mtok: Option<Option<i64>>,
+    /// New price source: `manual`, `discovery` or `probe`.
+    ///
+    /// Optional rather than defaulted because a PATCH that says nothing about the source must not
+    /// restamp one: setting it implicitly on every flag toggle would make a capability edit
+    /// silently claim the price had been re-verified today, which is the one claim this column
+    /// exists to keep honest.
+    pub price_source: Option<String>,
+    /// New capability source: `manual`, `discovery` or `probe`.
+    pub capabilities_source: Option<String>,
+    /// When the capability flags were last confirmed against something.
+    pub capabilities_verified_at: Option<OffsetDateTime>,
+}
+
+/// Read `null` as "forget this price", an absent field as "leave it".
+fn double_option_i64<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer).map(Some)
+}
+
+/// Read `null` as "forget this limit", an absent field as "leave it".
+fn double_option_i32<'de, D>(deserializer: D) -> Result<Option<Option<i32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i32>::deserialize(deserializer).map(Some)
+}
+
+impl PriceBody {
+    /// Describe one model's price, with its age measured against the clock.
+    ///
+    /// The age is computed here rather than in the panel so the staleness window lives next to
+    /// the number it judges: a client with its own copy of the threshold would drift from the
+    /// server's the first time somebody tuned it, and the two would disagree about whether a
+    /// price is old.
+    fn build(price: &omnion_ai_hub::ModelPrice) -> Self {
+        let now = OffsetDateTime::now_utc();
+        Self {
+            input_micros_per_mtok: price.input_micros_per_mtok,
+            output_micros_per_mtok: price.output_micros_per_mtok,
+            input_micros_per_1k: price.per_1k_micros(omnion_ai_hub::PriceHalf::Input),
+            output_micros_per_1k: price.per_1k_micros(omnion_ai_hub::PriceHalf::Output),
+            source: price.source.as_str().to_owned(),
+            source_note: price.source.note().to_owned(),
+            updated_at: price.updated_at,
+            complete: price.is_complete(),
+            age_days: omnion_ai_hub::price_age_days(price.updated_at, now),
+            stale: omnion_ai_hub::price_is_stale(price.updated_at, now),
+        }
+    }
 }
 
 /// Query of `GET /ai/models`.
+///
+/// Every narrowing is optional and independent, so a caller may send any combination — and a
+/// caller that sends none gets the whole registry, which is what the panel asks for on load.
 #[derive(Debug, Deserialize)]
 pub struct ModelQuery {
     /// Narrow the list to one provider.
     pub provider_id: Option<Uuid>,
+    /// Free text, matched against the model key, the display name and the provider name.
+    pub q: Option<String>,
+    /// Comma-separated capability flags a row must **all** claim (REQ-098).
+    pub capability: Option<String>,
+    /// `enabled` or `disabled`.
+    pub status: Option<String>,
+    /// Which column the table is sorted by; an unknown key falls back to `model`.
+    pub sort: Option<String>,
 }
 
 /// One message of a chat request.
@@ -327,6 +619,11 @@ pub struct ChatBody {
     pub temperature: Option<f64>,
     /// Answer budget in tokens.
     pub max_tokens: Option<u32>,
+    /// Agent run this request belongs to, so the decision log can link the row to the run.
+    pub run_id: Option<Uuid>,
+    /// Feature pin to resolve against (`copilot`, `translate`, …) — the key the override table
+    /// stores, so a caller can ask as a feature rather than as a raw model name.
+    pub feature: Option<String>,
 }
 
 /// Read `null` as "clear this", an absent field as "leave it".
@@ -378,8 +675,12 @@ pub async fn create_provider(
         NewProvider {
             name: body.name,
             protocol,
+            kind: body.kind.unwrap_or_else(|| "cloud".to_owned()),
             base_url: body.base_url,
             api_key: body.api_key,
+            timeout_ms: body.timeout_ms.unwrap_or(30_000),
+            max_retries: body.max_retries.unwrap_or(1),
+            priority: body.priority.unwrap_or(100),
             enabled: body.enabled.unwrap_or(true),
             is_default: body.is_default.unwrap_or(false),
         },
@@ -399,6 +700,7 @@ pub async fn create_provider(
         .metadata(json!({
             "name": provider.name,
             "protocol": provider.protocol,
+            "kind": provider.kind,
             "base_url": provider.base_url,
             "has_api_key": provider.has_api_key(),
             "models": models.len(),
@@ -433,6 +735,10 @@ pub async fn update_provider(
             name: body.name,
             base_url: body.base_url,
             api_key,
+            kind: body.kind,
+            timeout_ms: body.timeout_ms,
+            max_retries: body.max_retries,
+            priority: body.priority,
             enabled: body.enabled,
             is_default: body.is_default,
         },
@@ -448,6 +754,10 @@ pub async fn update_provider(
             "name": provider.name,
             "enabled": provider.enabled,
             "is_default": provider.is_default,
+            "kind": provider.kind,
+            "timeout_ms": provider.timeout_ms,
+            "max_retries": provider.max_retries,
+            "priority": provider.priority,
         }))
         .ip_address(address.as_text());
     omnion_audit::record(state.db().pool(), entry).await?;
@@ -482,17 +792,148 @@ pub async fn delete_provider(
 // Handlers — models
 // ---------------------------------------------------------------------------------------------
 
-/// `GET /api/v1/ai/models` — the model registry.
+/// `GET /api/v1/ai/models` — the model registry, narrowed (REQ-098 slice 1).
+///
+/// The narrowing happens here rather than in the panel so the API and the table agree about
+/// which rows a query means: a client that filtered client-side would see a different set than
+/// the server describes, and the acceptance criterion that the capability chips narrow the
+/// *listing* would be true of the panel but not of the endpoint.
 pub async fn list_models(
     State(state): State<AppState>,
     Query(query): Query<ModelQuery>,
 ) -> Result<Json<ModelListResponse>, ApiError> {
     let providers = omnion_ai_hub::list_providers(state.db().pool()).await?;
-    let models = omnion_ai_hub::list_models(state.db().pool(), query.provider_id).await?;
+    let all = omnion_ai_hub::list_models(state.db().pool(), query.provider_id).await?;
 
-    Ok(Json(ModelListResponse {
-        models: models_in_provider_order(&providers, &models),
-    }))
+    // An unknown capability key or an unknown status is a refusal, not a silently empty list: a
+    // caller that misspells a filter and gets `[]` cannot tell a broken query from an empty
+    // registry, and will conclude the wrong one.
+    let capabilities =
+        omnion_ai_hub::CatalogQuery::capabilities_from_param(query.capability.as_deref())?;
+    let status = match query.status.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some("enabled") | Some("active") => Some(true),
+        Some("disabled") | Some("inactive") => Some(false),
+        Some(other) => {
+            return Err(ApiError::bad_request(
+                "invalid_status",
+                format!("status \"{other}\" is not one of (enabled, disabled)"),
+            ));
+        }
+    };
+
+    let query = omnion_ai_hub::CatalogQuery {
+        q: query.q,
+        capabilities,
+        provider_id: query.provider_id,
+        status,
+        sort: omnion_ai_hub::CatalogSort::parse(query.sort.as_deref().unwrap_or_default()),
+    };
+
+    // The narrowing runs against the **stored** model rather than the response body, because the
+    // capability flags and the enabled flag the filter reads are the crate's own fields. Reading
+    // them off a `ModelBody` would make the filter a second implementation of the flags that
+    // could disagree with the router's — and a disagreement here means a table that offers a
+    // model the router will refuse.
+    let provider_name_of = |id: Uuid| {
+        providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .map(|provider| provider.name.clone())
+            .unwrap_or_default()
+    };
+    let kept: Vec<Uuid> = all
+        .iter()
+        // A model whose provider row is missing cannot happen (the foreign key cascades), but
+        // the fallback is the empty string rather than a panic: a text search that finds nothing
+        // is an absent row, not a 500.
+        .filter(|model| query.matches(model, &provider_name_of(model.provider_id)))
+        .map(|model| model.id)
+        .collect();
+
+    let mut models: Vec<ModelBody> = models_in_provider_order(&providers, &all)
+        .into_iter()
+        .filter(|model| kept.contains(&model.id))
+        .collect();
+
+    sort_catalog(&mut models, &providers, query.sort);
+
+    Ok(Json(ModelListResponse { models }))
+}
+
+/// Order a narrowed catalog the way the table's header says it is.
+///
+/// Done after the narrowing so the text search and the capability filter see the registry in
+/// provider order — the order the empty state and the row numbering read from — and so the
+/// `nulls last` rules live in one function rather than in two orderings that can disagree.
+fn sort_catalog(
+    models: &mut [ModelBody],
+    providers: &[Provider],
+    sort: omnion_ai_hub::CatalogSort,
+) {
+    let name_of = |id: Uuid| {
+        providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .map(|provider| provider.name.clone())
+            .unwrap_or_default()
+    };
+
+    match sort {
+        omnion_ai_hub::CatalogSort::Model => {
+            models.sort_by(|left, right| {
+                left.model_key
+                    .cmp(&right.model_key)
+                    .then_with(|| name_of(left.provider_id).cmp(&name_of(right.provider_id)))
+            });
+        }
+        omnion_ai_hub::CatalogSort::Provider => {
+            models.sort_by(|left, right| {
+                name_of(left.provider_id)
+                    .cmp(&name_of(right.provider_id))
+                    .then_with(|| left.model_key.cmp(&right.model_key))
+            });
+        }
+        omnion_ai_hub::CatalogSort::Context => {
+            // A model whose window nobody recorded sorts last rather than first: an unknown
+            // window is not the smallest one, and putting the least-known row at the top of a
+            // column an operator reads to find the model that can hold a document inverts it.
+            models.sort_by(|left, right| {
+                right
+                    .context_window
+                    .cmp(&left.context_window)
+                    .then_with(|| left.model_key.cmp(&right.model_key))
+            });
+        }
+        omnion_ai_hub::CatalogSort::Price => {
+            models.sort_by(|left, right| {
+                // `cmp_price`, not the raw `Option::cmp`: the derived ordering ranks `None`
+                // **first**, which would print every unpriced model as the cheapest one in a
+                // column the operator reads to answer "what can I afford". The `nulls last`
+                // in `CatalogSort::order_by` says the same thing for the SQL path, so both
+                // orderings now express one rule instead of two that can disagree.
+                omnion_ai_hub::cmp_price(
+                    left.price.input_micros_per_mtok,
+                    right.price.input_micros_per_mtok,
+                )
+                .then_with(|| {
+                    omnion_ai_hub::cmp_price(
+                        left.price.output_micros_per_mtok,
+                        right.price.output_micros_per_mtok,
+                    )
+                })
+                .then_with(|| left.model_key.cmp(&right.model_key))
+            });
+        }
+        omnion_ai_hub::CatalogSort::Updated => {
+            models.sort_by(|left, right| {
+                right
+                    .updated_at
+                    .cmp(&left.updated_at)
+                    .then_with(|| left.model_key.cmp(&right.model_key))
+            });
+        }
+    }
 }
 
 /// `PUT /api/v1/ai/providers/{id}/models` — replace the set one provider serves.
@@ -529,6 +970,11 @@ pub async fn replace_provider_models(
 }
 
 /// `POST /api/v1/ai/providers/{id}/discover-models` — ask the provider which models it serves.
+///
+/// The endpoint is dialled and its list compared with the registry; **nothing is written**. The
+/// panel renders the diff and the operator confirms by calling the apply route, so an endpoint
+/// that suddenly reports two hundred models cannot rewrite the registry by being asked a
+/// question.
 pub async fn discover_provider_models(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -538,13 +984,48 @@ pub async fn discover_provider_models(
         .ok_or(AiHubError::ProviderNotFound)?;
 
     let target = ProviderTarget::from_provider(&provider);
-    let models = omnion_ai_hub::list_remote_models(&target).await?;
+    let reported = omnion_ai_hub::list_remote_models(&target).await?;
+    let diff = omnion_ai_hub::discovery_diff(state.db().pool(), &provider, &reported).await?;
 
-    Ok(Json(DiscoverResponse {
-        provider_id: provider.id,
-        provider_name: provider.name,
-        models,
-    }))
+    Ok(Json(DiscoverResponse::build(diff)))
+}
+
+/// `POST /api/v1/ai/providers/{id}/apply-discovery` — apply the diff a discovery run reported.
+///
+/// The apply reconciles **keys** and nothing else: what the endpoint serves is added, what it
+/// stopped serving is removed, and every row that survives keeps the capability flags the
+/// operator gave it. Running it twice is a no-op, which is what makes a second discovery run
+/// report an empty diff.
+pub async fn apply_provider_discovery(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(id): Path<Uuid>,
+) -> Result<Json<DiscoverResponse>, ApiError> {
+    let provider = omnion_ai_hub::find_provider(state.db().pool(), id)
+        .await?
+        .ok_or(AiHubError::ProviderNotFound)?;
+
+    let target = ProviderTarget::from_provider(&provider);
+    let reported = omnion_ai_hub::list_remote_models(&target).await?;
+    let diff = omnion_ai_hub::apply_discovery(state.db().pool(), &provider, &reported).await?;
+
+    let models = omnion_ai_hub::list_models(state.db().pool(), Some(provider.id)).await?;
+
+    let entry = NewAuditEntry::by_user(current.user.id, "ai.provider.discovery_applied")
+        .organization(current.user.organization_id)
+        .target("ai_provider", provider.id.to_string())
+        .metadata(json!({
+            "name": provider.name,
+            "added": diff.count(omnion_ai_hub::DiscoveryAction::Added),
+            "removed": diff.count(omnion_ai_hub::DiscoveryAction::Removed),
+            "changed": diff.count(omnion_ai_hub::DiscoveryAction::Changed),
+            "models": models.len(),
+        }))
+        .ip_address(address.as_text());
+    omnion_audit::record(state.db().pool(), entry).await?;
+
+    Ok(Json(DiscoverResponse::build(diff)))
 }
 
 /// `PATCH /api/v1/ai/models/{id}`.
@@ -561,6 +1042,22 @@ pub async fn update_model(
         ModelChanges {
             enabled: body.enabled,
             is_default: body.is_default,
+            display_name: body.display_name,
+            context_window: body.context_window,
+            supports_tools: body.supports_tools,
+            supports_vision: body.supports_vision,
+            supports_streaming: body.supports_streaming,
+            supports_embeddings: body.supports_embeddings,
+            supports_image_generation: body.supports_image_generation,
+            supports_audio_generation: body.supports_audio_generation,
+            supports_transcription: body.supports_transcription,
+            supports_json_mode: body.supports_json_mode,
+            max_output_tokens: body.max_output_tokens,
+            input_cost_micros_per_mtok: body.input_cost_micros_per_mtok,
+            output_cost_micros_per_mtok: body.output_cost_micros_per_mtok,
+            price_source: body.price_source,
+            capabilities_source: body.capabilities_source,
+            capabilities_verified_at: body.capabilities_verified_at,
         },
     )
     .await?;
@@ -577,11 +1074,408 @@ pub async fn update_model(
             "model": model.model_key,
             "enabled": model.enabled,
             "is_default": model.is_default,
+            "capabilities": model.capabilities(),
+            "context_window": model.context_window,
+            "max_output_tokens": model.max_output_tokens,
+            // The price is in the audit trail because a price edit is the change an operator
+            // would want explained six months later: "why did last month's bill look like that"
+            // is answered by this row and by nothing else.
+            "input_cost_micros_per_mtok": model.input_cost_micros_per_mtok,
+            "output_cost_micros_per_mtok": model.output_cost_micros_per_mtok,
+            "price_source": model.price_source,
         }))
         .ip_address(address.as_text());
     omnion_audit::record(state.db().pool(), entry).await?;
 
     Ok(Json(ModelBody::build(&provider, &model)))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Handlers — protocols and the connection test
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/ai/protocols` — what the provider form offers.
+///
+/// The form's select is driven by this call rather than by a list compiled into the panel, so a
+/// protocol added to the crate appears in the UI without a second edit, and the ranges the form
+/// validates against come from the same place the API validates against.
+pub async fn list_protocols(
+    State(_state): State<AppState>,
+) -> Result<Json<ProtocolListResponse>, ApiError> {
+    Ok(Json(ProtocolListResponse {
+        protocols: protocol_infos()
+            .iter()
+            .map(|info| ProtocolBody {
+                protocol: info.protocol,
+                note: info.note,
+                chat_path: info.chat_path,
+                auth: info.auth,
+            })
+            .collect(),
+        bounds: ProtocolBounds {
+            timeout_ms_min: MIN_TIMEOUT_MS,
+            timeout_ms_max: MAX_TIMEOUT_MS,
+            max_retries_max: MAX_RETRIES_CEILING,
+            priority_min: MIN_PRIORITY,
+            priority_max: MAX_PRIORITY,
+        },
+    }))
+}
+
+/// `POST /api/v1/ai/providers/{id}/test` — the connection test, run server-side.
+///
+/// The five steps report individually, with the provider's own message on a failure (clipped, and
+/// with anything key-shaped stripped). A failing test records the verdict on the provider row and
+/// writes an `ai.provider.test_failed` audit entry; a passing one clears the stored error.
+pub async fn test_provider_connection(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(id): Path<Uuid>,
+) -> Result<Json<TestReport>, ApiError> {
+    let provider = omnion_ai_hub::find_provider(state.db().pool(), id)
+        .await?
+        .ok_or(AiHubError::ProviderNotFound)?;
+
+    let known: Vec<String> = omnion_ai_hub::list_models(state.db().pool(), Some(id))
+        .await?
+        .into_iter()
+        .map(|model| model.model_key)
+        .collect();
+
+    let report = test_provider(&provider, &known).await;
+    let status = if report.ok { "ok" } else { "down" };
+    let error = report
+        .failing_step
+        .as_ref()
+        .and_then(|_| {
+            report
+                .steps
+                .iter()
+                .find(|step| matches!(step.status, StepStatus::Failed))
+        })
+        .and_then(|step| step.error.clone());
+    // A test that failed is evidence, not noise: the verdict is stored so the list can show it,
+    // and a passing test clears the previous failure instead of leaving a stale error behind.
+    let _ = omnion_ai_hub::record_health(state.db().pool(), id, status, 0, error.as_deref()).await;
+
+    if !report.ok {
+        let entry = NewAuditEntry::by_user(current.user.id, "ai.provider.test_failed")
+            .organization(current.user.organization_id)
+            .target("ai_provider", provider.id.to_string())
+            .metadata(json!({
+                "name": provider.name,
+                "failing_step": report.failing_step,
+                "error": error,
+            }))
+            .ip_address(address.as_text());
+        omnion_audit::record(state.db().pool(), entry).await?;
+    }
+
+    Ok(Json(report))
+}
+
+/// One protocol the installation can connect, as the form reads it.
+#[derive(Debug, Serialize)]
+pub struct ProtocolBody {
+    /// Protocol key as it is stored and sent.
+    pub protocol: &'static str,
+    /// One line about what the protocol covers.
+    pub note: &'static str,
+    /// Where a call goes, relative to the base URL.
+    pub chat_path: &'static str,
+    /// How the key is sent.
+    pub auth: &'static str,
+}
+
+/// The ranges the provider form validates against, from the same constants the API uses.
+#[derive(Debug, Serialize)]
+pub struct ProtocolBounds {
+    /// Smallest accepted timeout.
+    pub timeout_ms_min: i32,
+    /// Largest accepted timeout.
+    pub timeout_ms_max: i32,
+    /// Largest accepted retry ceiling.
+    pub max_retries_max: i32,
+    /// Lowest accepted priority.
+    pub priority_min: i32,
+    /// Highest accepted priority.
+    pub priority_max: i32,
+}
+
+/// Response of `GET /ai/protocols`.
+#[derive(Debug, Serialize)]
+pub struct ProtocolListResponse {
+    /// The protocols the form offers.
+    pub protocols: Vec<ProtocolBody>,
+    /// The numeric bounds the form validates against.
+    pub bounds: ProtocolBounds,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Handlers — health, usage and the failover chain
+// ---------------------------------------------------------------------------------------------
+
+/// The window the Health and Usage tabs read, when the caller does not name one.
+const DEFAULT_WINDOW_HOURS: i64 = 24;
+
+/// Every window the tabs offer. A caller may ask for any of them; a caller that asks for
+/// something absurd is answered from the disk rather than refused, because "show me a year of
+/// health" is a real question an operator asks while a provider is misbehaving.
+const WINDOW_CHOICES: &[(&str, i64)] = &[
+    ("1h", 1),
+    ("6h", 6),
+    ("24h", 24),
+    ("7d", 24 * 7),
+    ("30d", 24 * 30),
+];
+
+/// `GET /api/v1/ai/providers/{id}/health?window=24h` — the Health tab in one call.
+///
+/// The header, the samples and the sparkline come from a single request on purpose: three calls
+/// would let the header and the list describe two different moments, and a panel whose uptime
+/// disagrees with the samples under it is a panel nobody trusts during an incident.
+#[derive(Debug, Deserialize)]
+pub struct HealthQuery {
+    /// The window key from [`WINDOW_CHOICES`]; an unknown key falls back to 24 h.
+    #[serde(default)]
+    pub window: Option<String>,
+}
+
+/// The resolved window, echoed back so the client renders the same label the server used.
+#[derive(Debug, Serialize)]
+pub struct HealthView {
+    /// Provider the view is about.
+    pub provider_id: Uuid,
+    /// Provider name, for the tab header.
+    pub provider_name: String,
+    /// The window key that was applied.
+    pub window: &'static str,
+    /// The computed status and its numbers.
+    pub summary: omnion_ai_hub::health_store::HealthSummary,
+    /// The recent samples, newest first.
+    pub samples: Vec<omnion_ai_hub::health_store::HealthSample>,
+    /// The window keys the tab offers.
+    pub windows: Vec<&'static str>,
+}
+
+/// `GET /api/v1/ai/providers/{id}/health`.
+pub async fn provider_health(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<HealthQuery>,
+) -> Result<Json<HealthView>, ApiError> {
+    let provider = omnion_ai_hub::find_provider(state.db().pool(), id)
+        .await?
+        .ok_or(AiHubError::ProviderNotFound)?;
+    let (key, hours) = resolve_window(query.window.as_deref());
+
+    Ok(Json(HealthView {
+        provider_id: provider.id,
+        provider_name: provider.name,
+        window: key,
+        summary: omnion_ai_hub::health_store::health_summary(state.db().pool(), id, hours).await?,
+        samples: omnion_ai_hub::health_store::recent_samples(state.db().pool(), id, hours, 50)
+            .await?,
+        windows: WINDOW_CHOICES.iter().map(|(key, _)| *key).collect(),
+    }))
+}
+
+/// `GET /api/v1/ai/providers/{id}/usage?window=24h` — the Usage tab in one call.
+pub async fn provider_usage(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<HealthQuery>,
+) -> Result<Json<UsageView>, ApiError> {
+    let provider = omnion_ai_hub::find_provider(state.db().pool(), id)
+        .await?
+        .ok_or(AiHubError::ProviderNotFound)?;
+    let (key, hours) = resolve_window(query.window.as_deref());
+
+    Ok(Json(UsageView {
+        provider_id: provider.id,
+        provider_name: provider.name,
+        window: key,
+        summary: omnion_ai_hub::health_store::usage_summary(state.db().pool(), id, hours).await?,
+        windows: WINDOW_CHOICES.iter().map(|(key, _)| *key).collect(),
+    }))
+}
+
+/// The Usage tab's payload: the totals and the per-day breakdown, in one call.
+#[derive(Debug, Serialize)]
+pub struct UsageView {
+    /// Provider the view is about.
+    pub provider_id: Uuid,
+    /// Provider name, for the tab header.
+    pub provider_name: String,
+    /// The window key that was applied.
+    pub window: &'static str,
+    /// Totals over the window.
+    pub summary: omnion_ai_hub::health_store::UsageSummary,
+    /// The window keys the tab offers.
+    pub windows: Vec<&'static str>,
+}
+
+/// `POST /api/v1/ai/providers/{id}/probe` — "Probe now": exactly one sample, taken now.
+///
+/// This is the same [`probe_now`](omnion_ai_hub::health_store::probe_now) the background runner
+/// calls, so the button and the tick cannot disagree about what a probe is. It runs the stored
+/// provider's own connection test and records what that saw — a sample with the endpoint's own
+/// words, not a synthetic "the button was pressed" row.
+pub async fn probe_provider(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ProbeOutcome>, ApiError> {
+    let provider = omnion_ai_hub::find_provider(state.db().pool(), id)
+        .await?
+        .ok_or(AiHubError::ProviderNotFound)?;
+
+    let known: Vec<String> = omnion_ai_hub::list_models(state.db().pool(), Some(id))
+        .await?
+        .into_iter()
+        .map(|model| model.model_key)
+        .collect();
+    let report = omnion_ai_hub::test_provider(&provider, &known).await;
+
+    let failing = report
+        .steps
+        .iter()
+        .find(|step| matches!(step.status, StepStatus::Failed));
+    let sample = omnion_ai_hub::health_store::NewSample {
+        provider_id: id,
+        ok: report.ok,
+        // The report is a whole five-step test; its total is the honest cost of the probe, and a
+        // sample that reported 0 ms would make every p95 a lie.
+        latency_ms: report.total_ms.clamp(0, i32::MAX as i64) as i32,
+        http_status: None,
+        error: failing
+            .and_then(|step| step.error.clone())
+            .or_else(|| (!report.ok).then(|| report.summary.clone())),
+    };
+
+    let transition = omnion_ai_hub::health_store::probe_now(state.db().pool(), id, sample).await?;
+    let summary = omnion_ai_hub::health_store::health_summary(state.db().pool(), id, 24).await?;
+
+    // The status changed, so the event fires — the same trigger a background transition emits, so
+    // an automation on "a provider went down" cannot tell the button from the tick.
+    if let Some((from, to)) = &transition {
+        let entry = NewAuditEntry::by_user(current.user.id, "ai.provider.health_changed")
+            .organization(current.user.organization_id)
+            .target("ai_provider", provider.id.to_string())
+            .metadata(json!({
+                "name": provider.name,
+                "from": from.as_str(),
+                "to": to.as_str(),
+                "source": "manual_probe",
+            }))
+            .ip_address(address.as_text());
+        omnion_audit::record(state.db().pool(), entry).await?;
+    }
+
+    let failing_step = report.failing_step.clone();
+    Ok(Json(ProbeOutcome {
+        provider_id: provider.id,
+        ok: report.ok,
+        latency_ms: report.total_ms,
+        failing_step,
+        transition: transition
+            .as_ref()
+            .map(|(from, to)| json!({ "from": from.as_str(), "to": to.as_str() })),
+        summary,
+        report,
+    }))
+}
+
+/// What "Probe now" answers with: the sample's own outcome, the transition it caused (if any) and
+/// the refreshed header the tab swaps in — no reload, because the caller already has everything.
+#[derive(Debug, Serialize)]
+pub struct ProbeOutcome {
+    /// Provider that was probed.
+    pub provider_id: Uuid,
+    /// Whether the endpoint answered.
+    pub ok: bool,
+    /// How long the probe took.
+    pub latency_ms: i64,
+    /// The step that failed, when one did.
+    pub failing_step: Option<String>,
+    /// The status transition, when the status actually changed.
+    pub transition: Option<serde_json::Value>,
+    /// The header as it reads after the probe.
+    pub summary: omnion_ai_hub::health_store::HealthSummary,
+    /// The full five-step report.
+    pub report: TestReport,
+}
+
+/// `GET /api/v1/ai/failover` — the chain as the router walks it right now.
+pub async fn failover_chain(State(state): State<AppState>) -> Result<Json<FailoverView>, ApiError> {
+    let chain = omnion_ai_hub::health_store::failover_preview(state.db().pool()).await?;
+    Ok(Json(FailoverView {
+        chain,
+        // Every enabled provider, so the panel can offer a row the operator forgot to rank
+        // instead of leaving it unreachable from the order editor.
+        providers: omnion_ai_hub::health_store::enabled_providers(state.db().pool()).await?,
+    }))
+}
+
+/// The chain preview and the membership it is drawn from.
+#[derive(Debug, Serialize)]
+pub struct FailoverView {
+    /// The ordered chain.
+    pub chain: Vec<omnion_ai_hub::health_store::FailoverEntry>,
+    /// Every provider the chain may contain, in order.
+    pub providers: Vec<Uuid>,
+}
+
+/// Body of `PUT /api/v1/ai/failover`.
+#[derive(Debug, Deserialize)]
+pub struct FailoverOrderBody {
+    /// The provider ids, in the order a request should try them.
+    pub provider_ids: Vec<Uuid>,
+}
+
+/// `PUT /api/v1/ai/failover` — persist the failover order.
+///
+/// The store rejects an empty list, a repeat and a stranger, so this handler does not re-check
+/// them: a validation that exists twice is a validation that will disagree with itself. What the
+/// handler adds is the audit entry and the answer, which is the chain as it now stands — the
+/// client renders the server's order rather than its own guess at it.
+pub async fn set_failover_order(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Json(body): Json<FailoverOrderBody>,
+) -> Result<Json<FailoverView>, ApiError> {
+    omnion_ai_hub::health_store::set_failover_order(state.db().pool(), &body.provider_ids).await?;
+
+    let view = FailoverView {
+        chain: omnion_ai_hub::health_store::failover_preview(state.db().pool()).await?,
+        providers: omnion_ai_hub::health_store::enabled_providers(state.db().pool()).await?,
+    };
+
+    let names: Vec<&str> = view.chain.iter().map(|entry| entry.name.as_str()).collect();
+    let entry = NewAuditEntry::by_user(current.user.id, "ai.failover.reordered")
+        .organization(current.user.organization_id)
+        .target("ai_failover", "chain".to_owned())
+        .metadata(json!({ "order": names }))
+        .ip_address(address.as_text());
+    omnion_audit::record(state.db().pool(), entry).await?;
+
+    Ok(Json(view))
+}
+
+/// Resolve a window key to `(label, hours)`; an unknown or missing key is the 24 h default.
+///
+/// The label is returned as a `&'static str` from the same table the hours came from, so a client
+/// can never render a window the server did not actually apply.
+fn resolve_window(window: Option<&str>) -> (&'static str, i64) {
+    let key = window.unwrap_or("24h");
+    WINDOW_CHOICES
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .copied()
+        .unwrap_or(("24h", DEFAULT_WINDOW_HOURS))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -603,6 +1497,35 @@ enum Frame {
         finish_reason: Option<String>,
         chars: usize,
         usage: Option<omnion_ai_hub::ChatUsage>,
+        /// The requester's own view of the answer (REQ-105 slice 3).
+        ///
+        /// A field rather than a replacement for `delta`, because the deltas already went out
+        /// carrying placeholders and cannot be taken back. The client renders the deltas while
+        /// the answer streams and this text when it ends.
+        answer: String,
+        /// Tokens the guard saw and refused to put back, so the screen can say so out loud.
+        guard_withheld: Vec<String>,
+    },
+    /// The answer proposed a change set that could not be filed (REQ-101, slice 3g).
+    ///
+    /// Its own frame rather than `Failed`, and the reason is the client's contract: the `error`
+    /// event makes the chat helper **throw**, and a thrown stream means "the answer failed".
+    /// The answer did not — it is complete and on the screen. What failed is the bookkeeping
+    /// that follows it, and reporting that as a failed answer would replace a good reply with
+    /// an error message and hide the proposal the person was reading about.
+    ProposalInvalid { message: String },
+    /// The answer proposed a change set and it was filed (REQ-101, slice 3g).
+    ///
+    /// Its own frame rather than a field on `done`, because the client renders it as a
+    /// different thing: an answer is text, a filed set is a **row in another screen**. Carried
+    /// on `done` a client would have to re-read the whole payload to find out whether the chat
+    /// it just rendered has somewhere to send the reviewer, and a client that forgot would
+    /// show a proposal nobody can open — a described action with no way to take it.
+    Proposal {
+        change_set_id: uuid::Uuid,
+        title: String,
+        operations: usize,
+        needs_approval: bool,
     },
     /// The answer failed; `code` is stable, `message` is for a person.
     Failed { code: &'static str, message: String },
@@ -626,15 +1549,40 @@ impl Frame {
                 finish_reason,
                 chars,
                 usage,
+                answer,
+                guard_withheld,
             } => Event::default().event("done").data(
                 json!({
                     "finish_reason": finish_reason,
                     "chars": chars,
+                    "answer": answer,
+                    "guard_withheld": guard_withheld,
                     "usage": usage.map(|usage| json!({
                         "prompt_tokens": usage.prompt_tokens,
                         "completion_tokens": usage.completion_tokens,
                         "total_tokens": usage.total_tokens,
                     })),
+                })
+                .to_string(),
+            ),
+            Self::Proposal {
+                change_set_id,
+                title,
+                operations,
+                needs_approval,
+            } => Event::default().event("proposal").data(
+                json!({
+                    "change_set_id": change_set_id,
+                    "title": title,
+                    "operations": operations,
+                    "needs_approval": needs_approval,
+                })
+                .to_string(),
+            ),
+            Self::ProposalInvalid { message } => Event::default().event("proposal_error").data(
+                json!({
+                    "code": "ai.changeset.proposal_invalid",
+                    "message": message,
                 })
                 .to_string(),
             ),
@@ -645,6 +1593,40 @@ impl Frame {
 
         Ok(event)
     }
+}
+
+/// `GET /api/v1/ai/chat/proposal-instruction` — the instruction that makes proposals possible.
+///
+/// **Served, not sent by the client.** The parser reads a fenced block with one exact tag and
+/// one exact shape, and the instruction that describes it lives in the crate beside the parser
+/// ([`omnion_ai_hub::proposal::system_instruction`]). A panel that carried its own copy of that
+/// sentence would be right until the format changed, and then the screen would keep working
+/// perfectly while never once filing a set — a feature that looks built and does nothing.
+///
+/// The client cannot learn the instruction from the stream: the stream is the answer to a
+/// request that is **sent** with the instruction already in it, so it is a message before the
+/// first byte, and this is a normal GET.
+///
+/// # Errors
+///
+/// Never: the only failure would be a body write, and the answer is a constant.
+pub async fn proposal_instruction() -> Result<Json<ProposalInstruction>, ApiError> {
+    Ok(Json(ProposalInstruction {
+        instruction: omnion_ai_hub::proposal::system_instruction(),
+        fence_tag: omnion_ai_hub::proposal::FENCE_TAG,
+        max_operations: omnion_ai_hub::change_sets::MAX_OPERATIONS,
+    }))
+}
+
+/// What [`proposal_instruction`] answers with.
+#[derive(Debug, Serialize)]
+pub struct ProposalInstruction {
+    /// The system message to send with a chat that may propose changes.
+    pub instruction: String,
+    /// The fence tag the parser reads, so a client can show it and never has to repeat it.
+    pub fence_tag: &'static str,
+    /// The ceiling, which the instruction states and the parser enforces.
+    pub max_operations: usize,
 }
 
 /// `POST /api/v1/ai/chat` — a streamed answer.
@@ -658,104 +1640,642 @@ pub async fn chat(
     address: ClientAddress,
     Json(body): Json<ChatBody>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    // Read before the loop consumes `body.messages`, and carried into the task so a filed
+    // proposal is linked to the run it came out of (REQ-101 slice 3g). The loop below moves
+    // the messages out of `body`, so a `body.run_id` read afterwards would not compile — and
+    // the fix that *does* compile, reading it from a body that is already moved, is a borrow
+    // error at best. Read it once, here, where the value is obviously still whole.
+    let body_run_id = body.run_id;
+
     let mut messages = Vec::with_capacity(body.messages.len());
     for message in body.messages {
         let role = ChatRole::parse(&message.role)?;
         messages.push(ChatMessage {
             role,
             content: message.content,
+            tool_call_id: None,
+            name: None,
+            tool_calls: Vec::new(),
         });
     }
 
-    let resolved = resolve(state.db().pool(), body.model.as_deref()).await?;
+    // Everything decidable before the first byte is decided here, with a normal HTTP status: a
+    // stream asked of a model that cannot stream is refused with 400 and the model's key in the
+    // message, rather than opening a stream that can only end in an error frame.
+    //
+    // This is also where REQ-098's decision log gets written: the routing decision is settled
+    // here, before any provider is dialled, so the row exists whether the call answers, times
+    // out or is refused. A log written after the answer would lose exactly the rows an operator
+    // needs — the ones where nothing answered.
+    let requirements = chat_requirements(&messages);
+    let organization_id = current.user.organization_id;
+    let decision = omnion_ai_hub::resolve_and_record(
+        state.db().pool(),
+        omnion_ai_hub::DecisionContext {
+            organization_id,
+            site_id: None,
+            user_id: Some(current.user.id),
+            run_id: body.run_id,
+            task: Some("chat"),
+            feature: body.feature.as_deref(),
+            requested: body.model.as_deref(),
+            requirements: &requirements,
+        },
+        omnion_ai_hub::Scope::Installation,
+        body.model.as_deref(),
+    )
+    .await?;
+
+    // A walk that could not answer is the operator's problem, not a 500: the request named no
+    // model and no map could supply one. The row is already written with the reasons, so the
+    // panel can show the walk — and the event fires here, which is the moment it is about.
+    let Some(resolved) = decision.model.clone() else {
+        // The event is about routing, and an installation with nothing configured has no
+        // routing to report: the alert would fire once per request against an operator who has
+        // not finished the setup, which is a webhook that is noise by construction. The walk is
+        // still written and the decision still carries its reasons — only the announcement is
+        // withheld, and only for the case where there was nothing to consider.
+        if decision.had_candidates {
+            announce_unresolved(
+                state.db().pool(),
+                &decision,
+                "chat",
+                body.feature.as_deref(),
+                body.model.as_deref(),
+                current.user.id,
+                organization_id,
+            )
+            .await;
+        }
+        // Two different failures, and the status is the only thing telling them apart.
+        //
+        // **Nothing was ever configured** — no default model, no map, an empty installation.
+        // That is a setup problem: `409 Conflict` with `no_default_model`, the code callers
+        // have handled since the route existed, and a message that names the thing to go and
+        // set. Slice 4 answered this case with `422 ai.route.unresolved`, which sent an
+        // operator with nothing configured to a routing screen and a log screen that were both
+        // empty *for the same reason* the answer was — the two screens could not disagree
+        // because neither had anything to show.
+        //
+        // **A candidate existed and was refused** — a missing capability, a pin naming a model
+        // that is switched off. That is a routing problem: `422`, the walk's reasons, and the
+        // event, because something *is* wrong and it is visible in a specific row.
+        let (status, code) = if decision.had_candidates {
+            (StatusCode::UNPROCESSABLE_ENTITY, "ai.route.unresolved")
+        } else {
+            (StatusCode::CONFLICT, "no_default_model")
+        };
+        let reason = if decision.had_candidates {
+            decision_reason(&decision)
+        } else {
+            "no model is configured for this request. Set a default model, or give the \
+             feature a route, before sending one."
+                .to_owned()
+        };
+        return Err(ApiError::new(status, code, reason));
+    };
+
+    // The capabilities the chosen model still has to claim, checked inside the process with the
+    // model's key in the message rather than through a provider that answers 400.
+    //
+    // `Chat` and `Streaming` are **not** in `requirements` and never can be: they are properties
+    // of the endpoint, not of the request. Dropping them when the routing walk replaced
+    // `resolve_for` is the kind of regression that only shows on a model an operator has
+    // deliberately configured — a streamed answer to a model that cannot stream reaches the
+    // provider as a malformed request and comes back as somebody else's error.
+    omnion_ai_hub::require_capability(&resolved.model, ModelCapability::Chat)?;
+    omnion_ai_hub::require_capability(&resolved.model, ModelCapability::Streaming)?;
+
+    // Then whatever the request itself needs: a long conversation wants a long window, a
+    // tool-using caller wants the tools flag.
+    for requirement in &requirements {
+        if let Some(capability) = omnion_ai_hub::requirement_capability(requirement) {
+            omnion_ai_hub::require_capability(&resolved.model, capability)?;
+        }
+    }
+
+    // The data guard's outbound checkpoint (REQ-105 slice 1). Placed here — after the routing
+    // decision is settled and after the capability check, and before `ChatRequest` is built —
+    // for two reasons that both matter:
+    //
+    // 1. A refused payload must never reach a provider, and the last thing between the store and
+    //    `stream_chat` is the request itself. Whatever this returns *is* what the provider sees.
+    // 2. After the capabilities means the message names a real provider and a real model, so a
+    //    refusal can say which one was going to answer, and a rule scoped to a provider can be
+    //    evaluated against the provider that was actually chosen rather than the one requested.
+    //
+    // The messages are handed back **positionally**: a masked turn is replaced by its masked
+    // text and a blocked turn never gets that far, because `checkpoint_messages` raises the
+    // refusal. A `403 ai_guard_blocked` names the label and the rule, which is the difference
+    // between a support ticket and a five-second fix.
+    //
+    // A request from a user with **no organization** still passes through, against the platform
+    // rules only. That is a real case here rather than a hypothetical — the rest of this AI
+    // family treats the organization as optional for exactly this reason — and skipping the
+    // checkpoint for those users would make the guard's coverage depend on how the account was
+    // created, which is the kind of gap nobody notices until it matters. `load_guard` takes the
+    // nil id for such a call, which yields exactly the `organization_id is null` platform rows
+    // and no policy row: everything `allow`, which is the documented default.
+    let mut ctx =
+        omnion_ai_hub::guard_checkpoint::CheckpointContext::new(organization_id, Uuid::new_v4());
+    ctx.user_id = Some(current.user.id);
+    ctx.feature = body.feature.clone();
+    ctx.provider_id = Some(resolved.model.provider_id);
+
+    let guard = match omnion_ai_hub::guard_store::load_guard(
+        state.db().pool(),
+        organization_id.unwrap_or(Uuid::nil()),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        // A guard that cannot be built must not silently stop guarding. `load_guard` only fails
+        // on a configuration fault (the rule budget), and the alternative — skipping the
+        // checkpoint — would send exactly the traffic the operator installed the guard to stop,
+        // while the screen kept showing the rules as active.
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                organization_id = ?organization_id,
+                "the data guard could not be loaded; refusing the request instead of sending it unguarded"
+            );
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "guard_configuration",
+                "the data guard is misconfigured, so this request was not sent",
+            ));
+        }
+    };
+
+    let outbound_texts: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+    let (guarded, reports) = omnion_ai_hub::guard_checkpoint::checkpoint_messages(
+        state.db().pool(),
+        &guard,
+        &ctx,
+        &outbound_texts,
+        &omnion_ai_hub::guard_checkpoint::value_salt(organization_id.unwrap_or(Uuid::nil()), None),
+    )
+    .await?;
+    // REQ-105: an exemption that lapsed stops applying on the **next** request, and that lapse is
+    // announced. The announcement runs here, off traffic, rather than off a scheduler — see
+    // `crate::guard_announce` for why that is the deliberate trade. It is placed *after* the
+    // checkpoint because the checkpoint is what read liveness: by the time this runs, the guard
+    // above has already decided this request without the lapsed exemption, which is the
+    // behaviour the criterion asks for. Doing it before would announce a lapse that had not yet
+    // affected anything.
+    if let Some(tenant) = organization_id {
+        crate::guard_announce::announce_lapsed_exemptions(state.db().pool(), tenant).await;
+    }
+    for failure in omnion_ai_hub::guard_checkpoint::audit_failures(&reports) {
+        // The verdict stands, but an operator reading the events screen must learn that the
+        // screen is behind. A `warn` here rather than an error: the request was answered.
+        tracing::warn!(
+            error = %failure,
+            organization_id = ?organization_id,
+            "the data guard could not write an audit row"
+        );
+    }
+    for (message, text) in messages.iter_mut().zip(guarded) {
+        message.content = text;
+    }
+    // REQ-105 slice 3: the one answer map for this request, built from every message's own map.
+    // It is carried into the task and **never persisted** — it holds the original values, so a
+    // stored copy would be exactly the data this control exists to contain. It dies with the
+    // request, which is why the only two things derived from it are the requester's answer and a
+    // redacted copy for everybody else.
+    let remap = omnion_ai_hub::guard_checkpoint::CheckpointReport::merged_map(&reports);
     let request = ChatRequest {
         model: resolved.model.model_key.clone(),
         messages,
         temperature: body.temperature,
         max_tokens: body.max_tokens,
+        // The chat endpoint is a conversation, not an agent: a run is what offers tools, and
+        // offering them here would let a caller reach a tool the route never checked a
+        // permission for.
+        tools: Vec::new(),
     };
     // The request shape is checked before the stream opens, so a bad one answers 400.
     omnion_ai_hub::validate_request(&request)?;
 
+    // The chain this call may walk. A request that named `provider/model` is pinned: the plan
+    // carries that one provider and no successor, so the walk below cannot move it — it is the
+    // decision itself, not a flag the walk re-decides. A request that named only a task gets the
+    // enabled providers in the order the Failover panel draws.
+    let pinned = omnion_ai_hub::pinned_provider(state.db().pool(), body.model.as_deref()).await?;
+    let all = omnion_ai_hub::store::failover_chain(state.db().pool()).await?;
+    let providers = match omnion_ai_hub::plan(&all, pinned, omnion_ai_hub::Progress::Nothing) {
+        omnion_ai_hub::Plan::Pinned { .. } => vec![resolved.provider.clone()],
+        omnion_ai_hub::Plan::Chain { .. } | omnion_ai_hub::Plan::Exhausted { .. } => all,
+    };
+
     let target = ProviderTarget::from_provider(&resolved.provider);
-    let provider_name = resolved.provider.name.clone();
+    let provider_id = resolved.provider.id;
     let model_key = resolved.model.model_key.clone();
     let model_id = resolved.id();
     let pool = state.db().pool().clone();
     let user_id = current.user.id;
     let organization_id = current.user.organization_id;
     let ip_address = address.as_text();
+    // The proposal entry point (REQ-101 slice 3g) files the set from **inside** the task,
+    // because the answer only exists there — and an `AppState` is an `Arc`, so carrying one
+    // into the task costs a pointer. The alternative, filing after the task returns, would
+    // read the answer off a channel the task owns, which is the shape where the file happens
+    // whether or not the client is still listening.
+    let proposal_state = state.clone();
 
     let (frames, receiver) = mpsc::channel::<Frame>(STREAM_BUFFER);
 
     tokio::spawn(async move {
-        let (deltas, mut delta_receiver) = mpsc::channel::<ChatEvent>(STREAM_BUFFER);
-        let relay = frames.clone();
-        let pump = tokio::spawn(async move {
-            while let Some(event) = delta_receiver.recv().await {
-                let frame = match event {
-                    ChatEvent::Start {
-                        provider,
-                        model,
-                        protocol,
-                    } => Frame::Start {
-                        provider,
-                        model,
-                        protocol,
-                    },
-                    ChatEvent::Delta(content) => Frame::Delta(content),
-                };
-                if relay.send(frame).await.is_err() {
+        // The failover walk (REQ-097, slice 3). A failure *before the first streamed byte* is
+        // retried against the next provider in the chain — and only when the request named no
+        // provider, because a pinned request puts exactly one entry in `candidates` and the walk
+        // below therefore has nowhere to move to.
+        let mut attempts: Vec<omnion_ai_hub::Attempt> = Vec::new();
+        let mut current = target;
+        let mut served_by = provider_id;
+        let mut outcome = None;
+        let started = Instant::now();
+
+        loop {
+            let attempt = omnion_ai_hub::Attempt {
+                provider_id: current.id,
+                provider_name: current.name.clone(),
+                error: None,
+            };
+
+            // # The air gap, inside the walk and before any byte
+            //
+            // This is the one check that cannot be a failover *retry*: a refused call must never
+            // move to the next provider, because every non-local provider is refused the same
+            // way, and a walk that advanced would keep dialling hosts the operator has switched
+            // off. So the refusal ends the request rather than feeding the retry path — it is a
+            // `Failed` frame, not an `Err` on the attempt, and `attempts` records it as the
+            // attempt that produced the answer the user sees.
+            //
+            // `check_call` reads the switch and re-derives locality from the URL and the
+            // allow-list rather than trusting `ai_providers.locality`, which was written at save
+            // time and can be stale. It returns `Ok(None)` on the hot path for an installation
+            // that never enables the gap, so this costs one row read when it is off and is the
+            // entire price of the guarantee when it is on.
+            if let Some(refusal) =
+                match omnion_ai_hub::airgap_store::check_call(
+                    &pool,
+                    &current.name,
+                    &current.base_url,
+                )
+                .await
+                {
+                    Ok(decision) => decision,
+                    // The check itself failed — the switch row or the allow-list could not be
+                    // read. `?` is NOT available here (the task returns `()`), and that is
+                    // correct: this is an outage, not a refusal, and the two must not be
+                    // confused. Fail CLOSED but say so. A gap whose check cannot run is a gap
+                    // that cannot be trusted, and the message tells the operator exactly that
+                    // instead of pretending the call was blocked for policy.
+                    Err(error) => {
+                        let message = format!(
+                            "the air-gap check could not run ({error}), so the call to \"{}\" \
+                             ({}) was stopped rather than sent. This is a platform fault, not \
+                             the air gap refusing it: check that the AI settings tables are \
+                             reachable.",
+                            current.name,
+                            omnion_ai_hub::local_host::host_of(&current.base_url)
+                                .unwrap_or_else(|| "an unparseable host".to_owned()),
+                        );
+                        tracing::error!(%error, "the air-gap check could not be read");
+                        attempts.push(omnion_ai_hub::Attempt {
+                            error: Some(message.clone()),
+                            ..attempt
+                        });
+                        record_usage(
+                            &pool,
+                            &attempts,
+                            &served_by,
+                            &model_key,
+                            None,
+                            "error",
+                            started.elapsed(),
+                        )
+                        .await;
+                        let _ = frames
+                            .send(Frame::Failed {
+                                code: "airgap_check_failed",
+                                message,
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            {
+                attempts.push(omnion_ai_hub::Attempt {
+                    error: Some(refusal.message()),
+                    ..attempt
+                });
+                record_usage(
+                    &pool,
+                    &attempts,
+                    &served_by,
+                    &model_key,
+                    None,
+                    // A fourth vocabulary word, and the only call path that writes it: `refused`
+                    // means the PROVIDER said no (its own filter, its own 4xx) and an operator
+                    // reading that row looks upstream for a cause that is not there. This row
+                    // says the switch stopped it, which has a different owner and a different
+                    // fix.
+                    "blocked_airgap",
+                    started.elapsed(),
+                )
+                .await;
+                announce_airgap_refusal(&pool, &refusal, "chat", &model_key).await;
+                let _ = frames
+                    .send(Frame::Failed {
+                        code: refusal.code(),
+                        message: refusal.message(),
+                    })
+                    .await;
+                return;
+            }
+
+            // The first byte is the boundary failover may act on: after it the caller has seen
+            // part of an answer, and a replay would be a second, different answer.
+            let first_byte = Arc::new(AtomicBool::new(false));
+            let mark = Arc::clone(&first_byte);
+            // One channel per attempt, dropped when the attempt ends, so the pump below finishes
+            // on its own and a substitute provider never inherits the failed one's deltas.
+            let (attempt_deltas, mut watched) = mpsc::channel::<ChatEvent>(STREAM_BUFFER);
+            let relay = frames.clone();
+            let pump_attempt = tokio::spawn(async move {
+                while let Some(event) = watched.recv().await {
+                    let frame = match event {
+                        ChatEvent::Start {
+                            provider,
+                            model,
+                            protocol,
+                        } => Frame::Start {
+                            provider,
+                            model,
+                            protocol,
+                        },
+                        ChatEvent::Delta(content) => {
+                            // Marked here, at the one place a byte is handed to a subscriber —
+                            // the client may already have received it.
+                            mark.store(true, Ordering::SeqCst);
+                            Frame::Delta(content)
+                        }
+                    };
+                    if relay.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let result = stream_chat(&current, &request, &attempt_deltas).await;
+            // The provider stopped writing: close the channel so the pump ends and the flag holds
+            // whatever this attempt actually delivered.
+            drop(attempt_deltas);
+            let _ = pump_attempt.await;
+            let streamed = first_byte.load(Ordering::SeqCst);
+
+            match result {
+                Ok(answer) => {
+                    attempts.push(omnion_ai_hub::Attempt {
+                        error: None,
+                        ..attempt
+                    });
+                    outcome = Some(answer);
                     break;
                 }
+                Err(error) => {
+                    attempts.push(omnion_ai_hub::Attempt {
+                        error: Some(error.to_string()),
+                        ..attempt
+                    });
+
+                    let progress = if streamed {
+                        omnion_ai_hub::Progress::AfterFirstByte
+                    } else {
+                        omnion_ai_hub::Progress::BeforeFirstByte
+                    };
+                    let substitute = if omnion_ai_hub::is_retryable(&error) {
+                        omnion_ai_hub::next(&providers, &attempts, progress)
+                    } else {
+                        None
+                    };
+
+                    let Some(substitute) = substitute else {
+                        // The chain is spent, or this request was never allowed to move. The
+                        // caller gets the first provider's complaint with the later ones
+                        // appended, because the first is the provider they asked for.
+                        let final_error = omnion_ai_hub::final_error(&attempts).unwrap_or(error);
+                        record_usage(
+                            &pool,
+                            &attempts,
+                            &served_by,
+                            &model_key,
+                            None,
+                            "error",
+                            started.elapsed(),
+                        )
+                        .await;
+                        let _ = frames
+                            .send(Frame::Failed {
+                                code: final_error.code(),
+                                message: final_error.to_string(),
+                            })
+                            .await;
+                        let entry = NewAuditEntry::by_user(user_id, "ai.chat.failed")
+                            .organization(organization_id)
+                            .target("ai_model", model_id.clone())
+                            .metadata(json!({
+                                "provider": current.name,
+                                "model": model_key,
+                                "error": final_error.to_string(),
+                                "attempts": attempts.len(),
+                            }))
+                            .ip_address(ip_address.clone());
+                        if let Err(error) = omnion_audit::record(&pool, entry).await {
+                            tracing::warn!(%error, "the AI chat audit row could not be written");
+                        }
+                        return;
+                    };
+
+                    // Record the attempt that failed *and* announce the substitution, both
+                    // before any byte of the new provider's answer reaches the caller.
+                    record_usage(
+                        &pool,
+                        &attempts,
+                        &attempt.provider_id,
+                        &model_key,
+                        None,
+                        "error",
+                        started.elapsed(),
+                    )
+                    .await;
+                    announce_failover(
+                        &pool,
+                        &attempts,
+                        &substitute,
+                        &model_key,
+                        user_id,
+                        organization_id,
+                        ip_address.as_deref(),
+                    )
+                    .await;
+
+                    let Some(provider) =
+                        omnion_ai_hub::find_provider(&pool, substitute.provider_id)
+                            .await
+                            .ok()
+                            .flatten()
+                    else {
+                        // The substitute was removed between planning and dialling: there is
+                        // nothing left to try, and the error the caller already has is the truth.
+                        break;
+                    };
+                    served_by = provider.id;
+                    current = ProviderTarget::from_provider(&provider);
+                }
             }
+        }
+
+        let answer = outcome.expect("an answer or an early return above");
+        // REQ-105 slice 3: the two readers of this answer, and they are not the same.
+        //
+        // `answer.content` is what the **provider** wrote, so it holds placeholders wherever it
+        // echoed the user's own values. From here the text has two destinations with different
+        // entitlements, and conflating them is the failure this whole slice exists to prevent:
+        //
+        // * the requester typed the address, so their answer puts the value back (`substitute`).
+        //   A model that echoed `[EMAIL_1]` gets a coherent sentence rather than a token.
+        // * the audit row is read by a second person, so it carries the **redacted** text. Writing
+        //   the substituted answer into the audit would copy the very values the guard removed into
+        //   a table it does not control, which is a strictly worse leak than sending them to a model.
+        //
+        // `redact` starts from the answer and puts placeholders back over any original it still
+        // contains, so an answer that quoted the address out of the conversation is covered too.
+        let requester_answer = remap.substitute(&answer.content);
+        let audited_answer = remap.redact(&answer.content);
+
+        // The counts the provider reported ride on the row that served the call, and nowhere
+        // else: a failed attempt produced no answer and therefore spent no tokens.
+        record_usage(
+            &pool,
+            &attempts,
+            &served_by,
+            &model_key,
+            answer.usage.as_ref(),
+            "ok",
+            started.elapsed(),
+        )
+        .await;
+
+        // `current` is the provider that actually answered, which after a substitution is *not*
+        // the one the request was routed to. The caller is told the final provider, because "the
+        // standby served this" is the fact the operator needs to see next to the answer.
+        let metadata = json!({
+            "provider": current.name,
+            "model": model_key,
+            "chars": answer.content.chars().count(),
+            "finish_reason": answer.finish_reason,
+            "substitutions": attempts.len().saturating_sub(1),
+            // The **redacted** answer, and the tokens the guard declined to put back. Recorded
+            // rather than omitted so an operator can see that a token appeared and was refused
+            // rather than conclude the guard never fired.
+            "answer": audited_answer,
+            "guard_withheld": remap.withheld(),
+            "usage": answer.usage.as_ref().map(|usage| json!({
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+            })),
         });
 
-        let outcome = stream_chat(&target, &request, &deltas).await;
-        drop(deltas);
-        let _ = pump.await;
-
-        let (action, code, metadata) = match &outcome {
-            Ok(outcome) => (
-                "ai.chat.completed",
-                None,
-                json!({
-                    "provider": provider_name,
-                    "model": model_key,
-                    "chars": outcome.content.chars().count(),
-                    "finish_reason": outcome.finish_reason,
-                    "usage": outcome.usage.as_ref().map(|usage| json!({
-                        "prompt_tokens": usage.prompt_tokens,
-                        "completion_tokens": usage.completion_tokens,
-                        "total_tokens": usage.total_tokens,
-                    })),
-                }),
-            ),
-            Err(error) => (
-                "ai.chat.failed",
-                Some(error.code()),
-                json!({
-                    "provider": provider_name,
-                    "model": model_key,
-                    "error": error.to_string(),
-                }),
-            ),
+        // REQ-101 slice 3g: a chat answer that proposed a change set **files it**, so the
+        // reviewer finds it in the same inbox every other request lands in. This is the whole
+        // criterion -- "a change set confirmed from the chat reply lands in the same inbox
+        // (one pipeline, one screen)" -- and the alternative, printing a block of JSON and
+        // hoping somebody copies it into the editor, is a proposal nobody reviews.
+        //
+        // It happens after `done`, and the frame goes out whether or not the file succeeded:
+        // the answer is already on the caller's screen, and swallowing it because the *file*
+        // failed would be a lie about work that did happen. A failure is logged and travels as
+        // its own frame, because "the answer is here but the proposal was lost" is the one
+        // thing the person reading the screen must be told.
+        // A set is organization-scoped, and the chat route is not: its decision log writes with
+        // `current.user.organization_id`, which is `None` for an installation account. There
+        // is no organization to file such a proposal into, and inventing one is not an option —
+        // so the answer is kept, the proposal is not, and the log says which happened and why.
+        // Branching here rather than passing `Option<Uuid>` into the helper keeps `Ok(None)`
+        // meaning "this answer proposed nothing" and nothing else; a helper that returned `None`
+        // for both would make the two indistinguishable to the caller and to its tests.
+        let proposal = match organization_id {
+            Some(organization) => {
+                // A filed change set is read by a **reviewer**, which is a second reader: the parser gets the
+                // redacted text, so a proposal row never becomes a second copy of the address the
+                // guard removed. The requester's own answer is unaffected — it is the frame above.
+                crate::routes::ai_change_sets::file_from_chat(
+                    &proposal_state,
+                    organization,
+                    user_id,
+                    None,
+                    body_run_id,
+                    &audited_answer,
+                )
+                .await
+            }
+            None => {
+                tracing::debug!(
+                    "the answer was kept but its proposal was not filed: this account has no \
+                     primary organization, and a change set is organization-scoped"
+                );
+                Ok(None)
+            }
         };
 
-        let frame = match outcome {
-            Ok(outcome) => Frame::Done {
-                finish_reason: outcome.finish_reason,
-                chars: outcome.content.chars().count(),
-                usage: outcome.usage,
-            },
-            Err(error) => Frame::Failed {
-                code: code.unwrap_or("internal_error"),
-                message: error.to_string(),
-            },
+        match proposal {
+            Ok(Some(set)) => {
+                let _ = frames
+                    .send(Frame::Proposal {
+                        change_set_id: set.set.id,
+                        title: set.set.title.clone(),
+                        operations: set.set.operations.len(),
+                        // The view already computed it, from the same `has_gated_operations` the
+                        // confirm route calls — re-deriving it here would be a second answer
+                        // about whether a set needs a second person.
+                        needs_approval: set.needs_approval,
+                    })
+                    .await;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "a chat answer proposed a change set that could not be filed");
+                let _ = frames
+                    .send(Frame::ProposalInvalid {
+                        message: format!(
+                            "the answer described changes the platform could not turn into a change set: {error}"
+                        ),
+                    })
+                    .await;
+            }
+        }
+
+        let frame = Frame::Done {
+            finish_reason: answer.finish_reason,
+            chars: answer.content.chars().count(),
+            usage: answer.usage,
+            // REQ-105 slice 3: the requester's own view of the answer. Carried on the **done**
+            // frame and not on the deltas, because a delta the client has already read cannot be
+            // recalled — substituting into a stream would either leak the value to a reader who
+            // must not see it, or leave a rendered transcript that disagrees with what was sent.
+            // The screen shows placeholders while the answer is written and this text at the end.
+            answer: requester_answer,
+            // The tokens the guard saw and declined to put back, so a requester whose answer
+            // still shows `[EMAIL_1]` learns it was withheld rather than assuming a bug.
+            guard_withheld: remap.withheld().to_vec(),
         };
         let _ = frames.send(frame).await;
 
-        let entry = NewAuditEntry::by_user(user_id, action)
+        let entry = NewAuditEntry::by_user(user_id, "ai.chat.completed")
             .organization(organization_id)
             .target("ai_model", model_id)
             .metadata(metadata)
@@ -771,8 +2291,302 @@ pub async fn chat(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Failover bookkeeping
+// ---------------------------------------------------------------------------------------------
+
+/// Record the usage row of every attempt a chat walk made.
+///
+/// One row per attempt, not one per request: the Usage tab shows requests **and** errors per
+/// provider, and a substitution is two provider-level facts — the one that failed and the one
+/// that answered. A single row would make the failed provider look like it never served anything
+/// and the substitute look like it served a request nobody made.
+///
+/// `reported` is the usage the answering provider actually sent. It rides on the **successful**
+/// row only: the tokens belong to the answer, and a failed attempt produced none. Passing it here
+/// is the whole difference between a Usage tab with numbers on it and a tab where every call
+/// reads "unknown" — the counts arrive on the `done` frame, so dropping them here threw away the
+/// only place they existed.
+async fn record_usage(
+    pool: &sqlx::PgPool,
+    attempts: &[omnion_ai_hub::Attempt],
+    served_by: &uuid::Uuid,
+    model_key: &str,
+    reported: Option<&omnion_ai_hub::ChatUsage>,
+    outcome: &str,
+    elapsed: std::time::Duration,
+) {
+    let latency_ms = i32::try_from(elapsed.as_millis()).unwrap_or(i32::MAX);
+    // REQ-098 slice 5: the price is read ONCE, here, before the first insert — the catalog's
+    // price at the instant of the call. Every row below carries the same snapshot, including the
+    // failed attempts, because a failed call consumed nothing but its token counts are part of
+    // what the operator is reconciling. Reading the price per row inside `record_usage` would
+    // make a concurrent price edit produce a call whose attempts disagree about what it cost.
+    let price = omnion_ai_hub::cost::price_for(
+        &std::sync::Arc::new(load_model_prices(pool).await),
+        model_key,
+    );
+    for (index, attempt) in attempts.iter().enumerate() {
+        // The last attempt is the one whose row carries the substitution; the earlier ones are
+        // the failures that led to it.
+        let substituted_from = if index + 1 == attempts.len() && outcome == "ok" {
+            attempts.first().map(|first| first.provider_id)
+        } else {
+            None
+        };
+        let served = outcome == "ok";
+        let row = omnion_ai_hub::health_store::NewUsage {
+            provider_id: if served {
+                *served_by
+            } else {
+                attempt.provider_id
+            },
+            model_key: (!model_key.is_empty()).then(|| model_key.to_owned()),
+            task: "chat".to_owned(),
+            outcome: if attempt.error.is_some() && !served {
+                "error".to_owned()
+            } else {
+                outcome.to_owned()
+            },
+            http_status: None,
+            // Counts belong to the answer, so they land on the row that served it and nowhere
+            // else. A stream that reported none stays `None`, and `missing_usage` counts it —
+            // which is the difference between "unknown" and a real zero.
+            prompt_tokens: if served {
+                reported.and_then(|usage| token_count(usage.prompt_tokens))
+            } else {
+                None
+            },
+            completion_tokens: if served {
+                reported.and_then(|usage| token_count(usage.completion_tokens))
+            } else {
+                None
+            },
+            latency_ms,
+            substituted_from,
+            first_byte_at: None,
+            // REQ-098 slice 5: the snapshot, computed from the price read above and written once.
+            // `record_usage` never updates these columns, so a price edit tomorrow cannot restate
+            // this row — the promise 0043 made in prose and nothing enforced until now.
+            cost: omnion_ai_hub::cost::call_cost(
+                price,
+                if served {
+                    reported.and_then(|usage| token_count(usage.prompt_tokens))
+                } else {
+                    None
+                },
+                if served {
+                    reported.and_then(|usage| token_count(usage.completion_tokens))
+                } else {
+                    None
+                },
+            ),
+        };
+        if let Err(error) = omnion_ai_hub::health_store::record_usage(pool, row).await {
+            tracing::warn!(%error, "a provider usage row could not be written");
+        }
+    }
+}
+
+/// Every model's key and price, as the catalog holds them right now (REQ-098 slice 5).
+///
+/// Read as a `Vec` of pairs rather than a map because the call site needs a *snapshot*, not a
+/// live view: the cost is bound into the insert as values, so by the time a second attempt's row
+/// is written the catalog may already say something else. A `HashMap` here would hide that —
+/// it would look like a lookup, and a lookup re-reads the future.
+///
+/// A model with no price is returned as [`ModelPrice::unpriced`] rather than omitted, so a key
+/// that *is* in the catalog and a key that is not are told apart by the cost function instead of
+/// both collapsing into "no price".
+async fn load_model_prices(pool: &sqlx::PgPool) -> Vec<(String, omnion_ai_hub::cost::ModelPrice)> {
+    sqlx::query(
+        "select model_key, input_cost_micros_per_mtok, output_cost_micros_per_mtok \
+         from ai_models where enabled",
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        use sqlx::Row as _;
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("model_key"),
+                    omnion_ai_hub::cost::ModelPrice {
+                        input_micros_per_mtok: row.get("input_cost_micros_per_mtok"),
+                        output_micros_per_mtok: row.get("output_cost_micros_per_mtok"),
+                    },
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_else(|error| {
+        // A catalog that cannot be read prices nothing, which stores `null` on every row. That
+        // is the safe direction to fail: the alternative — guessing — writes a number nobody can
+        // reconcile. The warn keeps it visible.
+        tracing::warn!(%error, "model prices could not be read; this call will record no cost");
+        Vec::new()
+    })
+}
+
+/// A reported token count as the `int` the column stores.
+///
+/// A provider's count arrives as `u64` and a column that cannot hold it must not turn a
+/// five-billion-token run into a negative number, so the value saturates: a count beyond what
+/// the column can hold is stored as the largest count it can hold, which is visibly wrong and
+/// far better than a wrapped one.
+fn token_count(tokens: Option<u64>) -> Option<i32> {
+    tokens.map(|count| i32::try_from(count).unwrap_or(i32::MAX))
+}
+
+/// Announce a substitution: the requested provider, the one that took over, and why.
+///
+/// This is the `ai.provider.failover_used` event the request names, and it is written **before**
+/// the substitute's first byte reaches the caller. A substitution the operator can only discover
+/// afterwards, in a bill, is not a failover they can trust.
+#[allow(clippy::too_many_arguments)]
+async fn announce_failover(
+    pool: &sqlx::PgPool,
+    attempts: &[omnion_ai_hub::Attempt],
+    substitute: &omnion_ai_hub::Attempt,
+    model_key: &str,
+    user_id: uuid::Uuid,
+    organization_id: Option<uuid::Uuid>,
+    ip_address: Option<&str>,
+) {
+    let requested = attempts
+        .first()
+        .map(|attempt| attempt.provider_name.clone())
+        .unwrap_or_default();
+    let reason = attempts
+        .last()
+        .and_then(|attempt| attempt.error.clone())
+        .unwrap_or_default();
+
+    let mut entry = NewAuditEntry::by_user(user_id, "ai.provider.failover_used")
+        .target("ai_provider", substitute.provider_id.to_string())
+        .metadata(json!({
+            "requested_provider": requested,
+            "substitute_provider": substitute.provider_name,
+            "model": model_key,
+            "task": "chat",
+            "reason": reason,
+        }));
+    if let Some(organization_id) = organization_id {
+        entry = entry.organization(organization_id);
+    }
+    if let Some(ip_address) = ip_address {
+        entry = entry.ip_address(Some(ip_address.to_owned()));
+    }
+    if let Err(error) = omnion_audit::record(pool, entry).await {
+        tracing::warn!(%error, "the failover event could not be written");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
+
+/// The routing requirements a chat request carries.
+///
+/// These are the same four vocabulary words the task routes use (`tools`, `vision`, `json`,
+/// `long_context`) and they are derived from **what the request actually is**, not from what a
+/// route happens to demand: a route that names a `tools` requirement must refuse a model that
+/// cannot call tools, and the only honest way to know this request needs tools is to look at the
+/// request.
+///
+/// The one judgement call is `long_context`, which is a size rather than a capability. It is
+/// measured in characters because that is what the conversation holds before the tokenizer sees
+/// it, and the threshold is the crate's own constant — the same line the panel draws, so a
+/// request the router skipped for length is one the operator would have predicted.
+fn chat_requirements(messages: &[ChatMessage]) -> Vec<String> {
+    let mut requirements = Vec::new();
+
+    // A conversation carrying an image is a vision request whatever the caller called it.
+    // (Multipart image input arrives on the vision routes, not here; a caller that has images
+    // to send names the capability on the route, so this stays a pure function of the text.)
+    let characters: usize = messages.iter().map(|message| message.content.len()).sum();
+    if characters >= omnion_ai_hub::LONG_CONTEXT_TOKENS as usize * 4 {
+        requirements.push("long_context".to_owned());
+    }
+
+    requirements
+}
+
+/// Why an unresolved walk refused, in the sentence the caller and the panel both read.
+///
+/// The row the decision was written to already carries the walk, so this does not re-derive the
+/// reasons — it names the rule and hands over the decision id, which is enough for a caller to
+/// open the log and a panel to link to it. A refusal that only says "unresolved" sends the
+/// operator back to the routing screen to work out the same thing a second time.
+fn decision_reason(decision: &omnion_ai_hub::Resolved) -> String {
+    format!(
+        "no candidate could answer (rule: {}; decision #{}). Open the route log for the walk.",
+        decision.rule, decision.decision_id
+    )
+}
+
+/// Announce a routing failure: `ai.route.unresolved`.
+///
+/// This is the event the request names, and it fires on the **resolve** path rather than on the
+/// delete path. That is the moment that matters: a model removed from a route is a configuration
+/// change an operator already knows about, while a request that *nothing could answer* is the
+/// thing nobody is watching for until somebody notices a feature stopped working. The payload
+/// carries the decision id, so the webhook and the log row are the same fact.
+async fn announce_unresolved(
+    pool: &sqlx::PgPool,
+    decision: &omnion_ai_hub::Resolved,
+    task: &str,
+    feature: Option<&str>,
+    requested: Option<&str>,
+    user_id: uuid::Uuid,
+    organization_id: Option<uuid::Uuid>,
+) {
+    let mut event = NewEvent::new("ai.route.unresolved")
+        .actor(user_id)
+        .payload(json!({
+            "decision_id": decision.decision_id,
+            "task": task,
+            "feature": feature,
+            "requested": requested,
+            "rule": decision.rule,
+            "requirements": decision.requirements,
+        }));
+
+    // An installation-wide event carries no organization: it is not a tenant's fact, and
+    // delivering it to one tenant's endpoints would be a leak in the other direction.
+    if let Some(organization_id) = organization_id {
+        event = event.organization(organization_id);
+    }
+
+    if let Err(error) = bus::emit(pool, event).await {
+        tracing::warn!(%error, "the ai.route.unresolved event could not be emitted");
+    }
+}
+
+/// Announce one air-gap refusal (REQ-106 slice 2).
+///
+/// Best-effort and installation-wide, exactly like `announce_unresolved`: the gap is a property
+/// of the installation rather than of a tenant, and the count of these events is the switch's
+/// evidence that it is doing anything. A `warn` rather than an error is deliberate — the call was
+/// refused correctly whatever happens to the bus, and an operator must not see a failed request
+/// because a webhook subscriber was down. But it is never swallowed silently: a switch that
+/// refuses quietly is a switch nobody can verify.
+async fn announce_airgap_refusal(
+    pool: &sqlx::PgPool,
+    refusal: &omnion_ai_hub::airgap_store::Refusal,
+    task: &str,
+    model_key: &str,
+) {
+    let event = NewEvent::new("ai.airgap.call_refused").payload(json!({
+        "provider": refusal.provider,
+        "host": refusal.host,
+        "task": task,
+        "model_key": model_key,
+    }));
+
+    if let Err(error) = bus::emit(pool, event).await {
+        tracing::warn!(%error, "the ai.airgap.call_refused event could not be emitted");
+    }
+}
 
 /// Describe models against the providers they belong to, in the providers' own order.
 fn models_in_provider_order(providers: &[Provider], models: &[AiModel]) -> Vec<ModelBody> {

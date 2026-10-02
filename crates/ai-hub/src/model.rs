@@ -19,10 +19,158 @@ use crate::error::{AiHubError, Result};
 
 /// Wire protocols an installation can connect.
 ///
-/// v0 speaks the OpenAI-compatible protocol only — the one OpenAI itself, OpenCode,
-/// CommandCode, Ollama and a local vLLM server all expose (docs/06-AI-HUB.md §1: "almost any
-/// service exposing an OpenAI-compatible API can connect").
-pub const SUPPORTED_PROTOCOLS: &[&str] = &["openai_compatible"];
+/// The OpenAI-compatible protocol is the one OpenAI itself, OpenCode, CommandCode, Ollama and a
+/// local vLLM server all expose (docs/06-AI-HUB.md §1: "almost any service exposing an
+/// OpenAI-compatible API can connect"); the other two cover the messages and generateContent
+/// shapes (docs/requests/REQ-097). A fourth adapter attaches through the trait in
+/// [`crate::protocol`] without a fourth value here.
+pub const SUPPORTED_PROTOCOLS: &[&str] =
+    &["openai_compatible", "anthropic_messages", "google_gemini"];
+
+/// Where a provider lives. The runtime dials both the same way; the kind is what a screen groups
+/// by and what tells an operator that a provider answers on their own network.
+pub const PROVIDER_KINDS: &[&str] = &["cloud", "local"];
+
+/// Health verdicts a provider carries. `unknown` is a real value: never probed yet.
+pub const HEALTH_STATUSES: &[&str] = &["ok", "degraded", "down", "unknown"];
+
+/// One named thing a model can do — the typed capability flags of REQ-097, as a closed set rather
+/// than a column list every caller has to memorise.
+///
+/// The set is closed on purpose. A caller asks "can this model do X" and gets an answer it can
+/// print and a code it can branch on; nothing anywhere guesses by looking at a model *name*.
+///
+/// `Chat` is the one flag that is not a column: every row in `ai_models` is a chat model by
+/// construction (a provider that serves embeddings lists them the same way), so it answers `true`
+/// and the registry lists it so an operator can see the flag is on rather than missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapability {
+    /// Answers a conversation.
+    Chat,
+    /// Calls tools.
+    Tools,
+    /// Accepts images in the request.
+    Vision,
+    /// Answers as a stream.
+    Streaming,
+    /// Produces embedding vectors.
+    Embeddings,
+    /// Generates images.
+    ImageGeneration,
+    /// Generates audio.
+    AudioGeneration,
+    /// Transcribes audio.
+    Transcription,
+    /// Answers in the provider's structured-output mode.
+    JsonMode,
+    /// The endpoint can list its own models. A provider fact, kept in the closed set so a screen
+    /// can show the whole vocabulary in one place.
+    ListModels,
+}
+
+impl ModelCapability {
+    /// Every capability, in the order the panel renders them.
+    pub const ALL: &'static [Self] = &[
+        Self::Chat,
+        Self::Streaming,
+        Self::Tools,
+        Self::Vision,
+        Self::JsonMode,
+        Self::Embeddings,
+        Self::ImageGeneration,
+        Self::AudioGeneration,
+        Self::Transcription,
+        Self::ListModels,
+    ];
+
+    /// Wire name, as stored in JSON and as the panel's toggle key.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Tools => "tools",
+            Self::Vision => "vision",
+            Self::Streaming => "streaming",
+            Self::Embeddings => "embeddings",
+            Self::ImageGeneration => "image_generation",
+            Self::AudioGeneration => "audio_generation",
+            Self::Transcription => "transcription",
+            Self::JsonMode => "json_mode",
+            Self::ListModels => "list_models",
+        }
+    }
+
+    /// One line the panel shows under the toggle.
+    #[must_use]
+    pub fn note(self) -> &'static str {
+        match self {
+            Self::Chat => "Answers a conversation.",
+            Self::Tools => "Calls the platform's tools.",
+            Self::Vision => "Accepts images in a request.",
+            Self::Streaming => "Answers as a stream.",
+            Self::Embeddings => "Produces embedding vectors.",
+            Self::ImageGeneration => "Generates images.",
+            Self::AudioGeneration => "Generates audio.",
+            Self::Transcription => "Transcribes audio.",
+            Self::JsonMode => "Answers in the provider's structured-output mode.",
+            Self::ListModels => "The endpoint can list its own models.",
+        }
+    }
+
+    /// Read a wire name.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|capability| capability.as_str() == value)
+    }
+
+    /// `true` for the flags a model row can turn on; `ListModels` belongs to the provider and
+    /// `Chat` is true for every row, so neither is editable here.
+    #[must_use]
+    pub fn is_model_flag(self) -> bool {
+        !matches!(self, Self::Chat | Self::ListModels)
+    }
+}
+
+impl std::fmt::Display for ModelCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Check one capability against a model and refuse with a message a person can act on.
+///
+/// This is the enforcement half of "the flags are data the registry edits and the router
+/// enforces": a request that needs a capability the model does not claim is refused **before any
+/// call leaves the process**, and the refusal names the model and the capability, so the fix is
+/// obvious from the error alone.
+pub fn require_capability(
+    model: &AiModel,
+    capability: ModelCapability,
+) -> std::result::Result<(), AiHubError> {
+    if model.capability(capability) {
+        return Ok(());
+    }
+
+    Err(AiHubError::CapabilityUnsupported {
+        model: model.model_key.clone(),
+        capability: capability.as_str(),
+    })
+}
+
+/// Smallest timeout a provider may be given, in milliseconds.
+pub const MIN_TIMEOUT_MS: i32 = 1000;
+/// Largest timeout a provider may be given, in milliseconds.
+pub const MAX_TIMEOUT_MS: i32 = 120_000;
+/// Retry ceiling for one call, before the first byte.
+pub const MAX_RETRIES_CEILING: i32 = 5;
+/// Priority bounds, lowest asked first.
+pub const MIN_PRIORITY: i32 = 1;
+/// Priority bounds, lowest asked first.
+pub const MAX_PRIORITY: i32 = 1000;
 
 /// Protocol used when a request does not name one.
 pub const DEFAULT_PROTOCOL: &str = "openai_compatible";
@@ -33,6 +181,8 @@ pub const MAX_NAME_LEN: usize = 64;
 pub const MAX_MODEL_KEY_LEN: usize = 200;
 /// Longest base URL.
 pub const MAX_BASE_URL_LEN: usize = 512;
+/// Longest model display name — a label for the panel, not a description.
+pub const MAX_DISPLAY_NAME_LEN: usize = 120;
 
 /// One connected AI provider.
 #[derive(Debug, Clone, FromRow)]
@@ -41,8 +191,22 @@ pub struct Provider {
     pub id: Uuid,
     /// Display name, unique per installation (case-insensitive).
     pub name: String,
-    /// Wire protocol (`openai_compatible`).
+    /// Wire protocol (`openai_compatible`, `anthropic_messages`, `google_gemini`).
     pub protocol: String,
+    /// `cloud` or `local` (docs/requests/REQ-097).
+    pub kind: String,
+    /// How long one call may take, in milliseconds.
+    pub timeout_ms: i32,
+    /// How often a failure before the first byte is retried.
+    pub max_retries: i32,
+    /// Position in the failover chain; lower is asked first.
+    pub priority: i32,
+    /// `ok`, `degraded`, `down` or `unknown` as the last probe left it.
+    pub last_health: String,
+    /// When a probe last took a sample here.
+    pub last_checked_at: Option<OffsetDateTime>,
+    /// What the last failed probe said, clipped.
+    pub last_error: Option<String>,
     /// Base URL of the API, version segment included (e.g. `https://api.example.com/v1`).
     pub base_url: String,
     /// Key the platform authenticates with. Never leaves the platform again.
@@ -72,10 +236,18 @@ pub struct NewProvider {
     pub name: String,
     /// Wire protocol (validated by [`validate_protocol`]).
     pub protocol: String,
+    /// `cloud` or `local` (validated by [`validate_kind`]).
+    pub kind: String,
     /// Base URL (normalized by [`normalize_base_url`]).
     pub base_url: String,
     /// Key to authenticate with; `None` for a local endpoint that wants none.
     pub api_key: Option<String>,
+    /// How long one call may take, in milliseconds (validated by [`validate_timeout`]).
+    pub timeout_ms: i32,
+    /// How often a pre-first-byte failure is retried (validated by [`validate_retries`]).
+    pub max_retries: i32,
+    /// Position in the failover chain (validated by [`validate_priority`]).
+    pub priority: i32,
     /// Whether the provider starts enabled.
     pub enabled: bool,
     /// Whether the provider becomes the installation's default.
@@ -103,6 +275,14 @@ pub struct ProviderChanges {
     pub base_url: Option<String>,
     /// What happens to the key.
     pub api_key: ApiKeyChange,
+    /// New kind.
+    pub kind: Option<String>,
+    /// New timeout.
+    pub timeout_ms: Option<i32>,
+    /// New retry ceiling.
+    pub max_retries: Option<i32>,
+    /// New position in the failover chain.
+    pub priority: Option<i32>,
     /// New enabled flag.
     pub enabled: Option<bool>,
     /// `true` makes this provider the installation's default.
@@ -130,6 +310,32 @@ pub struct AiModel {
     pub supports_streaming: bool,
     /// Whether the model produces embeddings.
     pub supports_embeddings: bool,
+    /// Whether the model generates images.
+    pub supports_image_generation: bool,
+    /// Whether the model generates audio.
+    pub supports_audio_generation: bool,
+    /// Whether the model transcribes audio.
+    pub supports_transcription: bool,
+    /// Whether the model answers in the provider's own JSON mode.
+    pub supports_json_mode: bool,
+    /// Largest answer the model advertises, when it says.
+    pub max_output_tokens: Option<i32>,
+    /// Micros of a currency per million input tokens, when known (REQ-098).
+    ///
+    /// Stored in micros and per **million** so a whole-cent price never rounds away and so the
+    /// number can be compared with a vendor's own price page. The panel renders it per 1K; the
+    /// column does not change when the panel does.
+    pub input_cost_micros_per_mtok: Option<i64>,
+    /// Micros of a currency per million output tokens, when known (REQ-098).
+    pub output_cost_micros_per_mtok: Option<i64>,
+    /// Where the price came from: `manual`, `discovery` or `probe` (REQ-098).
+    pub price_source: String,
+    /// When the price was last written down (REQ-098).
+    pub price_updated_at: Option<OffsetDateTime>,
+    /// Where the capability flags came from: `manual`, `discovery` or `probe` (REQ-098).
+    pub capabilities_source: String,
+    /// When the capability flags were last confirmed against something (REQ-098).
+    pub capabilities_verified_at: Option<OffsetDateTime>,
     /// `false` when the operator switched the model off.
     pub enabled: bool,
     /// `true` for the installation's default model.
@@ -148,6 +354,59 @@ impl AiModel {
             .as_deref()
             .filter(|name| !name.trim().is_empty())
             .unwrap_or(&self.model_key)
+    }
+
+    /// What one named capability flag says about this model.
+    ///
+    /// The router and the panel ask the same question through this one function, so a flag the
+    /// panel shows and a flag the router reads can never drift: there is one row, one accessor,
+    /// one answer.
+    #[must_use]
+    pub fn capability(&self, capability: ModelCapability) -> bool {
+        match capability {
+            ModelCapability::Chat => true,
+            ModelCapability::Tools => self.supports_tools,
+            ModelCapability::Vision => self.supports_vision,
+            ModelCapability::Streaming => self.supports_streaming,
+            ModelCapability::Embeddings => self.supports_embeddings,
+            ModelCapability::ImageGeneration => self.supports_image_generation,
+            ModelCapability::AudioGeneration => self.supports_audio_generation,
+            ModelCapability::Transcription => self.supports_transcription,
+            ModelCapability::JsonMode => self.supports_json_mode,
+            // Whether the endpoint can list its own models is a fact about the *provider*, not
+            // about one model of it; the answer is carried by the provider, so a model answers
+            // "no" and the caller asks the provider instead.
+            ModelCapability::ListModels => false,
+        }
+    }
+
+    /// The `true` capabilities of this model, in the closed order the panel renders them in.
+    #[must_use]
+    pub fn capabilities(&self) -> Vec<ModelCapability> {
+        ModelCapability::ALL
+            .iter()
+            .copied()
+            .filter(|capability| self.capability(*capability))
+            .collect()
+    }
+
+    /// What this model costs, as the catalog reads it.
+    ///
+    /// One accessor so the table, the detail screen, the CSV export and the cost estimator all
+    /// read the *same* two columns — a screen that built its own `PriceView` from the raw fields
+    /// would be one refactor away from rounding differently from the screen beside it.
+    #[must_use]
+    pub fn price(&self) -> crate::catalog::ModelPrice {
+        crate::catalog::ModelPrice {
+            input_micros_per_mtok: self.input_cost_micros_per_mtok,
+            output_micros_per_mtok: self.output_cost_micros_per_mtok,
+            // An unrecognised source string in the database must not read as `Manual` — that
+            // would file a discovery-reported price as an operator's estimate. The fallback is
+            // the honest middle: it *is* a price somebody found, and the panel will say so.
+            source: crate::catalog::PriceSource::parse(&self.price_source)
+                .unwrap_or(crate::catalog::PriceSource::Manual),
+            updated_at: self.price_updated_at,
+        }
     }
 }
 
@@ -171,6 +430,16 @@ pub struct NewAiModel {
     pub supports_streaming: Option<bool>,
     /// Embedding output.
     pub supports_embeddings: Option<bool>,
+    /// Image generation.
+    pub supports_image_generation: Option<bool>,
+    /// Audio generation.
+    pub supports_audio_generation: Option<bool>,
+    /// Transcription.
+    pub supports_transcription: Option<bool>,
+    /// Structured output through the provider's own mode.
+    pub supports_json_mode: Option<bool>,
+    /// Largest answer the model advertises.
+    pub max_output_tokens: Option<i32>,
 }
 
 impl NewAiModel {
@@ -185,6 +454,49 @@ impl NewAiModel {
             supports_vision: None,
             supports_streaming: None,
             supports_embeddings: None,
+            supports_image_generation: None,
+            supports_audio_generation: None,
+            supports_transcription: None,
+            supports_json_mode: None,
+            max_output_tokens: None,
+        }
+    }
+
+    /// Turn on one capability flag.
+    #[must_use]
+    pub fn with(mut self, capability: ModelCapability, on: bool) -> Self {
+        let slot = match capability {
+            ModelCapability::Tools => &mut self.supports_tools,
+            ModelCapability::Vision => &mut self.supports_vision,
+            ModelCapability::Streaming => &mut self.supports_streaming,
+            ModelCapability::Embeddings => &mut self.supports_embeddings,
+            ModelCapability::ImageGeneration => &mut self.supports_image_generation,
+            ModelCapability::AudioGeneration => &mut self.supports_audio_generation,
+            ModelCapability::Transcription => &mut self.supports_transcription,
+            ModelCapability::JsonMode => &mut self.supports_json_mode,
+            // Chat and list-models are not model-row columns; a caller that asks to set them is
+            // answered with the value it already has rather than a silent no-op.
+            ModelCapability::Chat | ModelCapability::ListModels => return self,
+        };
+        *slot = Some(on);
+
+        self
+    }
+
+    /// The value this input carries for one capability; `None` means "the caller said nothing".
+    #[must_use]
+    pub fn capability(&self, capability: ModelCapability) -> Option<bool> {
+        match capability {
+            ModelCapability::Chat => Some(true),
+            ModelCapability::ListModels => None,
+            ModelCapability::Tools => self.supports_tools,
+            ModelCapability::Vision => self.supports_vision,
+            ModelCapability::Streaming => self.supports_streaming,
+            ModelCapability::Embeddings => self.supports_embeddings,
+            ModelCapability::ImageGeneration => self.supports_image_generation,
+            ModelCapability::AudioGeneration => self.supports_audio_generation,
+            ModelCapability::Transcription => self.supports_transcription,
+            ModelCapability::JsonMode => self.supports_json_mode,
         }
     }
 }
@@ -196,6 +508,209 @@ pub struct ModelChanges {
     pub enabled: Option<bool>,
     /// `true` makes this model the installation's default.
     pub is_default: Option<bool>,
+    /// New display name.
+    pub display_name: Option<String>,
+    /// New context window.
+    pub context_window: Option<i32>,
+    /// New tool-calling flag.
+    pub supports_tools: Option<bool>,
+    /// New image-input flag.
+    pub supports_vision: Option<bool>,
+    /// New streaming flag.
+    pub supports_streaming: Option<bool>,
+    /// New embeddings flag.
+    pub supports_embeddings: Option<bool>,
+    /// New image-generation flag.
+    pub supports_image_generation: Option<bool>,
+    /// New audio-generation flag.
+    pub supports_audio_generation: Option<bool>,
+    /// New transcription flag.
+    pub supports_transcription: Option<bool>,
+    /// New JSON-mode flag.
+    pub supports_json_mode: Option<bool>,
+    /// New answer ceiling.
+    pub max_output_tokens: Option<Option<i32>>,
+    /// New input price in micros per million tokens; `Some(None)` clears it.
+    ///
+    /// Double-`Option` for the same reason `max_output_tokens` is: `None` means "the caller said
+    /// nothing" and `Some(None)` means "erase the price". A single `Option<i64>` cannot say
+    /// "remove this" and would make a price impossible to clear.
+    pub input_cost_micros_per_mtok: Option<Option<i64>>,
+    /// New output price in micros per million tokens; `Some(None)` clears it.
+    pub output_cost_micros_per_mtok: Option<Option<i64>>,
+    /// New price source (`manual`, `discovery` or `probe`).
+    pub price_source: Option<String>,
+    /// When the capability flags were last confirmed against something.
+    pub capabilities_verified_at: Option<OffsetDateTime>,
+    /// New capability source (`manual`, `discovery` or `probe`).
+    pub capabilities_source: Option<String>,
+}
+
+impl ModelChanges {
+    /// Set one capability flag.
+    #[must_use]
+    pub fn with(mut self, capability: ModelCapability, on: bool) -> Self {
+        let slot = match capability {
+            ModelCapability::Tools => &mut self.supports_tools,
+            ModelCapability::Vision => &mut self.supports_vision,
+            ModelCapability::Streaming => &mut self.supports_streaming,
+            ModelCapability::Embeddings => &mut self.supports_embeddings,
+            ModelCapability::ImageGeneration => &mut self.supports_image_generation,
+            ModelCapability::AudioGeneration => &mut self.supports_audio_generation,
+            ModelCapability::Transcription => &mut self.supports_transcription,
+            ModelCapability::JsonMode => &mut self.supports_json_mode,
+            ModelCapability::Chat | ModelCapability::ListModels => return self,
+        };
+        *slot = Some(on);
+
+        self
+    }
+}
+
+/// What one discovery line means for the registry: the key is new, the metadata moved, or the
+/// endpoint stopped serving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryAction {
+    /// The endpoint serves it and the registry does not carry it.
+    Added,
+    /// The endpoint serves it and the registry carries it with different metadata.
+    Changed,
+    /// The registry carries it and the endpoint no longer lists it.
+    Removed,
+}
+
+impl DiscoveryAction {
+    /// Wire name, as the panel's diff badge reads it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Changed => "changed",
+            Self::Removed => "removed",
+        }
+    }
+}
+
+/// One line of a discovery diff.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryLine {
+    /// Wire key the endpoint reported.
+    pub model_key: String,
+    /// What this line means.
+    pub action: DiscoveryAction,
+    /// Field names whose value moved, for a `changed` line; empty otherwise.
+    ///
+    /// `String` rather than `&'static str`: the only field names that exist are the ones this
+    /// module writes, but a serializable response type is also deserialized on the way back
+    /// in the test harness, and a borrowed `'static` cannot be built from an incoming buffer.
+    pub changed_fields: Vec<String>,
+}
+
+/// What a discovery run found, and what applying it would do.
+///
+/// The diff is computed and returned, never written: the panel shows it and the operator
+/// confirms. That is the whole point of a diff — an endpoint that suddenly reports two hundred
+/// models must not be able to rewrite the registry by being asked a question.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryDiff {
+    /// Provider that was asked.
+    pub provider_id: Uuid,
+    /// Its name.
+    pub provider_name: String,
+    /// Keys the endpoint reported.
+    pub reported: Vec<String>,
+    /// Keys the registry carried before.
+    pub stored: Vec<String>,
+    /// The lines, in key order.
+    pub lines: Vec<DiscoveryLine>,
+}
+
+impl DiscoveryDiff {
+    /// How many lines carry one action.
+    #[must_use]
+    pub fn count(&self, action: DiscoveryAction) -> usize {
+        self.lines
+            .iter()
+            .filter(|line| line.action == action)
+            .count()
+    }
+
+    /// `true` when applying the diff would change nothing — the case a second discovery run has
+    /// to reach, because a diff that re-reports itself is a diff nobody trusts.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+}
+
+/// Compare what an endpoint reports against what the registry carries.
+///
+/// Metadata is compared field by field rather than as a whole row, so the diff says *what*
+/// changed. An endpoint that lists only keys — which is most of them, including Ollama's and
+/// OpenAI's own — produces no `changed` lines at all rather than claiming every model was
+/// edited, because discovery knows the keys and nothing else; the capability flags stay the
+/// operator's.
+#[must_use]
+pub fn diff_discovery(stored: &[AiModel], reported: &[String]) -> Vec<DiscoveryLine> {
+    let mut reported_keys: Vec<&String> = reported.iter().collect();
+    reported_keys.sort();
+    reported_keys.dedup();
+
+    let mut lines = Vec::new();
+    for key in &reported_keys {
+        match stored.iter().find(|model| model.model_key == key.as_str()) {
+            None => lines.push(DiscoveryLine {
+                model_key: (*key).clone(),
+                action: DiscoveryAction::Added,
+                changed_fields: Vec::new(),
+            }),
+            Some(model) => {
+                let changed = model_diff(model, key.as_str());
+                if !changed.is_empty() {
+                    lines.push(DiscoveryLine {
+                        model_key: (*key).clone(),
+                        action: DiscoveryAction::Changed,
+                        changed_fields: changed,
+                    });
+                }
+            }
+        }
+    }
+
+    for model in stored {
+        if !reported_keys
+            .iter()
+            .any(|key| key.as_str() == model.model_key)
+        {
+            lines.push(DiscoveryLine {
+                model_key: model.model_key.clone(),
+                action: DiscoveryAction::Removed,
+                changed_fields: Vec::new(),
+            });
+        }
+    }
+
+    lines.sort_by(|left, right| left.model_key.cmp(&right.model_key));
+    lines
+}
+
+/// The fields a discovery apply would write, or nothing when the row already agrees.
+///
+/// A reported key carries no metadata, so this compares what the reported list *can* say: the
+/// key itself, and whether the row is enabled against the fact the endpoint still serves it. The
+/// capability flags are deliberately absent — they are the operator's, and an endpoint that does
+/// not publish them must not be able to switch them off.
+fn model_diff(model: &AiModel, _reported_key: &str) -> Vec<String> {
+    let mut changed: Vec<String> = Vec::new();
+    if !model.enabled {
+        // The endpoint serves it while the registry has it switched off. Applying the diff does
+        // not re-enable it — the operator decides — so this line is reported as a change of
+        // *visibility* and the apply leaves the flag alone. It is listed so the panel can say
+        // "served but switched off" rather than leaving the operator to notice.
+        changed.push("enabled".to_owned());
+    }
+    changed
 }
 
 /// Check a protocol key against [`SUPPORTED_PROTOCOLS`].
@@ -207,6 +722,51 @@ pub fn validate_protocol(protocol: &str) -> Result<()> {
     Err(AiHubError::InvalidProvider(format!(
         "protocol \"{protocol}\" is not supported yet (supported: {})",
         SUPPORTED_PROTOCOLS.join(", ")
+    )))
+}
+
+/// Check a provider kind against [`PROVIDER_KINDS`].
+pub fn validate_kind(kind: &str) -> Result<()> {
+    if PROVIDER_KINDS.contains(&kind) {
+        return Ok(());
+    }
+
+    Err(AiHubError::InvalidProvider(format!(
+        "kind \"{kind}\" is not supported (supported: {})",
+        PROVIDER_KINDS.join(", ")
+    )))
+}
+
+/// Check a provider timeout: the bounds the form and the database both enforce.
+pub fn validate_timeout(timeout_ms: i32) -> Result<()> {
+    if (MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
+        return Ok(());
+    }
+
+    Err(AiHubError::InvalidProvider(format!(
+        "a timeout must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS} milliseconds"
+    )))
+}
+
+/// Check a provider retry ceiling.
+pub fn validate_retries(max_retries: i32) -> Result<()> {
+    if (0..=MAX_RETRIES_CEILING).contains(&max_retries) {
+        return Ok(());
+    }
+
+    Err(AiHubError::InvalidProvider(format!(
+        "max retries must be between 0 and {MAX_RETRIES_CEILING}"
+    )))
+}
+
+/// Check a provider priority.
+pub fn validate_priority(priority: i32) -> Result<()> {
+    if (MIN_PRIORITY..=MAX_PRIORITY).contains(&priority) {
+        return Ok(());
+    }
+
+    Err(AiHubError::InvalidProvider(format!(
+        "a priority must be between {MIN_PRIORITY} and {MAX_PRIORITY}"
     )))
 }
 
@@ -291,6 +851,43 @@ pub fn validate_model_key(model_key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check a model's answer ceiling, and its context window beside it.
+///
+/// Both are "how many tokens" and both are optional, so `None` passes. A ceiling of zero is
+/// refused rather than stored: a model that can produce no tokens cannot answer, and a row that
+/// says so would break the router at request time instead of at edit time.
+pub fn validate_token_limits(
+    context_window: Option<i32>,
+    max_output_tokens: Option<i32>,
+) -> Result<()> {
+    if let Some(window) = context_window
+        && window <= 0
+    {
+        return Err(AiHubError::InvalidModel(
+            "a context window must be a positive number of tokens".to_owned(),
+        ));
+    }
+    if let Some(ceiling) = max_output_tokens
+        && ceiling <= 0
+    {
+        return Err(AiHubError::InvalidModel(
+            "a max output token count must be a positive number of tokens".to_owned(),
+        ));
+    }
+    // An answer longer than the context that holds it is a fact about the model, not about the
+    // platform, and every provider refuses it — so the registry refuses it first, in the field
+    // the operator is editing, instead of at request time.
+    if let (Some(window), Some(ceiling)) = (context_window, max_output_tokens)
+        && ceiling > window
+    {
+        return Err(AiHubError::InvalidModel(format!(
+            "a max output of {ceiling} tokens cannot fit in a context window of {window}"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Serialized shape of one provider row (the `Serialize` half of the model for the CLI and any
 /// future SDK; the API has its own response bodies).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,10 +898,24 @@ pub struct ProviderSummary {
     pub name: String,
     /// Wire protocol.
     pub protocol: String,
+    /// `cloud` or `local`.
+    pub kind: String,
     /// Base URL.
     pub base_url: String,
     /// Whether a key is stored.
     pub has_api_key: bool,
+    /// How long one call may take, in milliseconds.
+    pub timeout_ms: i32,
+    /// How often a pre-first-byte failure is retried.
+    pub max_retries: i32,
+    /// Position in the failover chain.
+    pub priority: i32,
+    /// `ok`, `degraded`, `down` or `unknown`.
+    pub last_health: String,
+    /// When a probe last took a sample here.
+    pub last_checked_at: Option<OffsetDateTime>,
+    /// What the last failed probe said.
+    pub last_error: Option<String>,
     /// Whether the provider is enabled.
     pub enabled: bool,
     /// Whether the provider is the installation's default.
@@ -317,8 +928,15 @@ impl From<&Provider> for ProviderSummary {
             id: provider.id,
             name: provider.name.clone(),
             protocol: provider.protocol.clone(),
+            kind: provider.kind.clone(),
             base_url: provider.base_url.clone(),
             has_api_key: provider.has_api_key(),
+            timeout_ms: provider.timeout_ms,
+            max_retries: provider.max_retries,
+            priority: provider.priority,
+            last_health: provider.last_health.clone(),
+            last_checked_at: provider.last_checked_at,
+            last_error: provider.last_error.clone(),
             enabled: provider.enabled,
             is_default: provider.is_default,
         }
@@ -367,8 +985,38 @@ mod tests {
     }
 
     #[test]
+    fn the_runtime_ranges_are_checked() {
+        assert!(validate_kind("cloud").is_ok());
+        assert!(validate_kind("local").is_ok());
+        assert!(validate_kind("on-premises").is_err());
+        assert!(validate_kind("").is_err());
+
+        assert!(validate_timeout(MIN_TIMEOUT_MS).is_ok());
+        assert!(validate_timeout(MAX_TIMEOUT_MS).is_ok());
+        assert!(validate_timeout(MIN_TIMEOUT_MS - 1).is_err());
+        assert!(validate_timeout(MAX_TIMEOUT_MS + 1).is_err());
+
+        assert!(validate_retries(0).is_ok());
+        assert!(validate_retries(MAX_RETRIES_CEILING).is_ok());
+        assert!(validate_retries(-1).is_err());
+        assert!(validate_retries(MAX_RETRIES_CEILING + 1).is_err());
+
+        assert!(validate_priority(MIN_PRIORITY).is_ok());
+        assert!(validate_priority(MAX_PRIORITY).is_ok());
+        assert!(validate_priority(0).is_err());
+        assert!(validate_priority(MAX_PRIORITY + 1).is_err());
+    }
+
+    #[test]
+    fn the_health_vocabulary_is_closed() {
+        assert_eq!(HEALTH_STATUSES, &["ok", "degraded", "down", "unknown"]);
+    }
+
+    #[test]
     fn protocols_are_checked() {
-        assert!(validate_protocol(DEFAULT_PROTOCOL).is_ok());
+        for protocol in SUPPORTED_PROTOCOLS {
+            assert!(validate_protocol(protocol).is_ok(), "{protocol}");
+        }
         assert!(validate_protocol("anthropic").is_err());
         assert_eq!(
             AiHubError::InvalidProvider(String::new())
@@ -391,6 +1039,17 @@ mod tests {
             supports_vision: false,
             supports_streaming: true,
             supports_embeddings: false,
+            supports_image_generation: false,
+            supports_audio_generation: false,
+            supports_transcription: false,
+            supports_json_mode: false,
+            max_output_tokens: None,
+            input_cost_micros_per_mtok: None,
+            output_cost_micros_per_mtok: None,
+            price_source: "manual".to_owned(),
+            price_updated_at: None,
+            capabilities_source: "manual".to_owned(),
+            capabilities_verified_at: None,
             enabled: true,
             is_default: false,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -417,8 +1076,15 @@ mod tests {
             id: Uuid::nil(),
             name: "Local".to_owned(),
             protocol: DEFAULT_PROTOCOL.to_owned(),
+            kind: "local".to_owned(),
             base_url: "http://127.0.0.1:11434/v1".to_owned(),
             api_key: Some(String::new()),
+            timeout_ms: 30_000,
+            max_retries: 1,
+            priority: 100,
+            last_health: "unknown".to_owned(),
+            last_checked_at: None,
+            last_error: None,
             enabled: true,
             is_default: false,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -432,5 +1098,179 @@ mod tests {
         });
         assert!(summary.has_api_key);
         assert_eq!(summary.name, "Local");
+    }
+
+    /// A model with every flag off, for the capability and diff tests.
+    fn bare(key: &str) -> AiModel {
+        AiModel {
+            id: Uuid::new_v4(),
+            provider_id: Uuid::new_v4(),
+            model_key: key.to_owned(),
+            display_name: None,
+            context_window: None,
+            supports_tools: false,
+            supports_vision: false,
+            supports_streaming: true,
+            supports_embeddings: false,
+            supports_image_generation: false,
+            supports_audio_generation: false,
+            supports_transcription: false,
+            supports_json_mode: false,
+            max_output_tokens: None,
+            input_cost_micros_per_mtok: None,
+            output_cost_micros_per_mtok: None,
+            price_source: "manual".to_owned(),
+            price_updated_at: None,
+            capabilities_source: "manual".to_owned(),
+            capabilities_verified_at: None,
+            enabled: true,
+            is_default: false,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn the_capability_vocabulary_is_closed_and_round_trips() {
+        assert_eq!(ModelCapability::ALL.len(), 10);
+        for capability in ModelCapability::ALL {
+            assert_eq!(
+                ModelCapability::parse(capability.as_str()),
+                Some(*capability)
+            );
+            assert!(!capability.note().is_empty(), "{capability} needs a note");
+        }
+        assert_eq!(ModelCapability::parse("telepathy"), None);
+        assert!(
+            !ModelCapability::Chat.is_model_flag(),
+            "chat is true for every row"
+        );
+        assert!(
+            !ModelCapability::ListModels.is_model_flag(),
+            "list-models is a provider fact"
+        );
+        assert!(ModelCapability::Vision.is_model_flag());
+    }
+
+    #[test]
+    fn a_models_capabilities_come_from_the_row_and_nothing_else() {
+        let mut model = bare("m");
+        // Chat is a fact about the row existing; list-models is a fact about the endpoint.
+        assert!(model.capability(ModelCapability::Chat));
+        assert!(
+            model.capability(ModelCapability::Streaming),
+            "the default is on"
+        );
+        assert!(!model.capability(ModelCapability::ListModels));
+        assert!(!model.capability(ModelCapability::Vision));
+
+        model.supports_vision = true;
+        model.supports_json_mode = true;
+        model.supports_image_generation = true;
+        assert!(model.capability(ModelCapability::Vision));
+        assert!(model.capability(ModelCapability::JsonMode));
+        assert!(model.capability(ModelCapability::ImageGeneration));
+
+        let claimed = model.capabilities();
+        assert!(claimed.contains(&ModelCapability::Chat));
+        assert!(claimed.contains(&ModelCapability::Vision));
+        assert!(!claimed.contains(&ModelCapability::Transcription));
+    }
+
+    #[test]
+    fn a_refused_capability_names_the_model_and_the_flag() {
+        let model = bare("plain-model");
+        let error = require_capability(&model, ModelCapability::Vision).expect_err("refused");
+        assert_eq!(error.code(), "capability_unsupported");
+        let message = error.to_string();
+        assert!(message.contains("plain-model"), "{message}");
+        assert!(message.contains("vision"), "{message}");
+
+        assert!(require_capability(&model, ModelCapability::Chat).is_ok());
+        assert!(require_capability(&model, ModelCapability::Streaming).is_ok());
+    }
+
+    #[test]
+    fn token_limits_are_checked_against_each_other() {
+        assert!(validate_token_limits(None, None).is_ok());
+        assert!(validate_token_limits(Some(128_000), Some(4096)).is_ok());
+        assert!(validate_token_limits(Some(0), None).is_err());
+        assert!(validate_token_limits(None, Some(0)).is_err());
+        assert!(validate_token_limits(Some(-1), Some(10)).is_err());
+        let error = validate_token_limits(Some(4096), Some(8192)).expect_err("cannot fit");
+        assert!(error.to_string().contains("cannot fit"), "{error}");
+    }
+
+    #[test]
+    fn a_discovery_diff_says_what_would_change() {
+        let stored = vec![bare("kept"), bare("gone"), bare("off")];
+        let reported = vec!["kept".to_owned(), "fresh".to_owned()];
+
+        let lines = diff_discovery(&stored, &reported);
+        let by_key = |key: &str| {
+            lines
+                .iter()
+                .find(|line| line.model_key == key)
+                .map(|line| (line.action, line.changed_fields.clone()))
+        };
+
+        assert_eq!(by_key("fresh").expect("new").0, DiscoveryAction::Added);
+        assert_eq!(by_key("gone").expect("dropped").0, DiscoveryAction::Removed);
+        // "kept" is served and enabled, so it produces no line at all — a diff that reported
+        // every agreeing model would be unreadable at two hundred rows.
+        assert!(by_key("kept").is_none());
+    }
+
+    #[test]
+    fn a_switched_off_model_the_endpoint_still_serves_is_reported_not_reset() {
+        let mut stored = vec![bare("served")];
+        stored[0].enabled = false;
+        let reported = vec!["served".to_owned()];
+
+        let lines = diff_discovery(&stored, &reported);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].action, DiscoveryAction::Changed);
+        assert_eq!(lines[0].changed_fields, vec!["enabled"]);
+    }
+
+    #[test]
+    fn a_diff_of_the_same_endpoint_twice_is_empty() {
+        let stored = vec![bare("a"), bare("b")];
+        let reported = vec!["b".to_owned(), "a".to_owned()];
+
+        assert!(diff_discovery(&stored, &reported).is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_report_is_one_model() {
+        let reported = vec!["a".to_owned(), "a".to_owned(), "b".to_owned()];
+        let lines = diff_discovery(&[], &reported);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].model_key, "a");
+        assert_eq!(lines[1].model_key, "b");
+    }
+
+    #[test]
+    fn a_new_model_carries_no_flag_until_asked() {
+        let plain = NewAiModel::new("m");
+        for capability in ModelCapability::ALL {
+            if capability.is_model_flag() {
+                assert_eq!(
+                    plain.capability(*capability),
+                    None,
+                    "{capability} must stay unset by default"
+                );
+            }
+        }
+
+        let flagged = NewAiModel::new("m")
+            .with(ModelCapability::Vision, true)
+            .with(ModelCapability::Streaming, false);
+        assert_eq!(flagged.supports_vision, Some(true));
+        assert_eq!(flagged.supports_streaming, Some(false));
+        // Chat is always true and list-models is not a model column, so asking to set them is a
+        // no-op rather than a silently dropped field.
+        let ignored = NewAiModel::new("m").with(ModelCapability::Chat, false);
+        assert_eq!(ignored.capability(ModelCapability::Chat), Some(true));
     }
 }

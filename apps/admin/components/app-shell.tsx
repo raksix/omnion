@@ -6,19 +6,30 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, Workflow, X } from "lucide-react";
+import { Activity, BarChart3, Bell, BookMarked, Bot, ClipboardCheck, Code2, Cpu, FileStack, FileText, Fingerprint, Globe, Grid3x3, HardDriveDownload, HeartPulse, History as HistoryIcon, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Stethoscope, Timer, UserCog, UsersRound, Webhook, Wrench, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
 import { SiteSwitcher } from "@/components/site-switcher";
 import { GlobalSearch } from "@/components/global-search";
 import { NotificationBell } from "@/components/notification-bell";
+import { useDeveloperAccess } from "@/lib/developer-access";
 import { useSession } from "@/lib/session";
 
 const NAV = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/pages", label: "Pages", icon: FileText },
   { href: "/media", label: "Media", icon: Images },
+  // Backups sit beside Media rather than under Settings: an operator asking "where are my
+  // files and can I get them back" is one question, and burying half of it under a
+  // settings sub-path is what makes somebody believe the platform has no restore point.
+  { href: "/backups", label: "Backups", icon: HardDriveDownload },
+  // System health (REQ-014, slice 1). It sits with Backups rather than under Settings for
+  // the same reason: "can I get my data back" and "is anything answering" are both questions
+  // an operator asks at the same moment, usually while something is already wrong — and
+  // burying the liveness screen under a settings sub-path is how a platform looks healthy
+  // to the person who opened the admin panel to find out that it is not.
+  { href: "/health", label: "System Health", icon: HeartPulse },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/notifications", label: "Notifications", icon: Bell },
   // The event console (REQ-016, slice 1). It sits beside Notifications rather than under
@@ -30,9 +41,78 @@ const NAV = [
   // rather than under Settings because the two are the same investigation from both ends:
   // the feed says what happened, this says who was told and whether they got it.
   { href: "/webhooks", label: "Webhooks", icon: Webhook },
-  { href: "/workflows/nodes", label: "Node library", icon: Workflow },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
+  // The agent runtime (REQ-099, slice 1). Two entries rather than one, because the two screens
+  // answer two different questions: "what may I let this do" (the configuration) and "what did
+  // it already do, and what did that cost" (the history). An operator reads them in that order
+  // and very rarely in the other one.
+  { href: "/ai/agents", label: "Agents", icon: Bot },
+  // The skills registry (REQ-099, slice 3) is its own entry because it is a *library* rather
+  // than a runtime screen: an operator maintains the guidance here and attaches it over there.
+  { href: "/ai/skills", label: "Skills", icon: BookMarked },
+  // The tool registry, the identities that grant them, and the matrix that shows both
+  // (REQ-100). Three entries because they answer three different questions in the order an
+  // operator asks them: what exists → what this organization decided → who ends up able to use
+  // it. The registry entry was missing from the nav entirely until now, which is the sort of
+  // omission that makes a finished feature look unfinished.
+  { href: "/ai/tools", label: "Tool registry", icon: Wrench },
+  { href: "/ai/identities", label: "AI identities", icon: ShieldCheck },
+  { href: "/ai/permissions", label: "AI permissions", icon: Grid3x3 },
+  // The review inbox (REQ-101). It sits right after the permission matrix because it answers the
+  // question the matrix raises: knowing who may act still leaves "what is waiting for them" — and
+  // an approval gate with no inbox is a gate nobody ever opens.
+  { href: "/ai/approvals", label: "AI approvals", icon: ClipboardCheck },
+  // The proposed operation lists (REQ-101 slice 3). Beside the inbox rather than under it: the
+  // inbox decides one frozen call, a change set is a list a person edits first, and routing
+  // "my agent proposed something" to a screen that can only reject it is a dead end.
+  { href: "/ai/change-sets", label: "Change sets", icon: FileStack },
+  { href: "/ai/runs", label: "Agent runs", icon: HistoryIcon },
+  // The data guard (REQ-105). Two entries, not one: the policy is a *configuration* an operator
+  // sets once and then forgets, while the event log is the thing they open when a call came back
+  // refused and they need to know why. Routing both into one screen would mean the log — the only
+  // reason an operator goes to the guard in the middle of an incident — sits behind a settings
+  // page. The rules table is reachable from the policy panel's own rows.
+  { href: "/ai/guard", label: "Data guard", icon: ShieldCheck },
+  { href: "/ai/guard/events", label: "Guard events", icon: ScrollText },
+  // Local inference (REQ-106). Beside the guard rather than under settings/iam because it is an
+  // AI-Hub screen answering the same question the guard does from the other side: the guard asks
+  // "what did the last call contain", this asks "where can a call go at all". The models table is
+  // reachable from the endpoint row rather than from the sidebar, because a screen reached from a
+  // specific endpoint is about that endpoint — listing it beside configuration invites an
+  // operator to pull a model with no endpoint chosen.
+  { href: "/ai/local", label: "Local AI", icon: Cpu },
+  // The doctor (REQ-106 slice 4). Beside "Local AI" rather than inside it: the endpoints screen
+  // answers "what does this installation talk to" and the doctor answers "does any of it work
+  // with the internet unplugged". The second is the question before switching the air gap on, so
+  // it has to be one click away rather than buried under a specific endpoint.
+  { href: "/ai/local/doctor", label: "Local AI doctor", icon: Stethoscope },
+  // The manual (REQ-106 slice 4). Last of the three local-AI entries, because it is the one a
+  // person reads *before* touching the other two and then never needs again — a guide placed above
+  // the doctor would imply the doctor is optional. Beside the switch rather than under docs/,
+  // since every step on it names one of the three screens in this group.
+  { href: "/ai/local/guide", label: "Run AI locally", icon: BookMarked },
+  // The air-gap switch (REQ-106). Under "Local AI" rather than in the settings block, because it is
+  // the second half of the same question — the endpoint list says where a call can still go, this
+  // says what happens to the ones that cannot. It is the screen an operator opens mid-incident, so
+  // burying it in /settings would put the control furthest from the incident.
+  { href: "/ai/settings/airgap", label: "Air gap", icon: LockKeyhole },
+  // The eval suites (REQ-107 slice 1). Beside the air gap rather than under settings: it is the
+  // screen an engineer opens when a model or prompt change is about to be promoted, and the
+  // question it answers — "does this still hold?" — is the same one the air-gap switch answers
+  // about locality. It is the only AI entry that measures the platform rather than configuring
+  // it, so it reads as the last of the AI group.
+  { href: "/ai/evals", label: "Agent evals", icon: ClipboardCheck },
+  // The alias, not the bare `History`: this file also carries Next's `History` type, and the
+  // import has to disambiguate once — reusing the alias the agent-runs entry already made is
+  // the cheaper half of that answer.
+  { href: "/ai/evals/runs", label: "Eval runs", icon: HistoryIcon },
+  // The tool telemetry (REQ-107 slice 5) reads as the last of the AI group for the same reason
+  // the evals do: it *measures* the platform rather than configuring it. It sits after the runs
+  // rather than among the tools, because the unit here is a call over a window rather than a tool
+  // definition — an operator comparing this row against that table is reading two different
+  // grains, and putting them side by side in the tools list would invite exactly that.
+  { href: "/ai/telemetry", label: "Tool telemetry", icon: Activity },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
@@ -47,7 +127,39 @@ const NAV = [
   { href: "/settings/iam/sessions", label: "Sessions", icon: Timer },
   { href: "/settings/iam/devices", label: "Devices", icon: Fingerprint },
   { href: "/settings/search", label: "Search settings", icon: SlidersHorizontal },
+  // The developer portal (REQ-022, slice 2). Three entries rather than eight: the brief lists
+  // eight, but OAuth apps, plugins, themes, docs and the sandbox are slices 3 and 4, and a nav
+  // link to a screen that does not exist is the dead control the definition of done forbids.
+  // These three are the whole of what slice 2 ships.
+  { href: "/developer", label: "Developer", icon: Code2, needsDeveloper: true },
+  { href: "/developer/api-keys", label: "API keys", icon: KeyRound, needsDeveloper: true },
+  { href: "/developer/logs", label: "Request log", icon: ScrollText, needsDeveloper: true },
 ] as const;
+
+/**
+ * A navigation entry that only exists for accounts allowed into the developer portal.
+ *
+ * The property is on the entry rather than in a filter above, so "which entries are conditional"
+ * is one list a reader can scan instead of a second list somewhere else that has to be kept in
+ * step with it.
+ */
+type NavItem = (typeof NAV)[number];
+
+/**
+ * Whether an entry is shown to this account.
+ *
+ * `needsDeveloper` is resolved against a route the API guards for `developer.read`, and the
+ * answer is `null` while it is in flight — which means the group is hidden for that first paint
+ * and appears a moment later. That is the right trade: a group that appears, then vanishes, then
+ * reappears as the answer lands is a flicker, and a group that briefly shows an account who will
+ * be refused is a lie. See `lib/developer-access.tsx` for why the sidebar asks at all.
+ */
+function visible(item: NavItem, canOpen: boolean | null): boolean {
+  if (!("needsDeveloper" in item) || item.needsDeveloper !== true) {
+    return true;
+  }
+  return canOpen === true;
+}
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against
 /// `/settings/iam/users`): the parent highlights only when it is exactly the open screen.
@@ -92,6 +204,7 @@ export function AppShell({ title, description, children }: AppShellProps) {
   const pathname = usePathname();
   const router = useRouter();
   const { user, signOut } = useSession();
+  const { canOpen: canOpenDeveloper } = useDeveloperAccess();
   const [navOpen, setNavOpen] = useState(false);
 
   const handleSignOut = async () => {
@@ -115,7 +228,7 @@ export function AppShell({ title, description, children }: AppShellProps) {
       </Link>
 
       <nav aria-label="Sections" className="flex flex-col gap-1">
-        {NAV.map((item) => {
+        {NAV.filter((item) => visible(item, canOpenDeveloper)).map((item) => {
           const active = isActive(item.href, pathname);
           const Icon = item.icon;
           return (

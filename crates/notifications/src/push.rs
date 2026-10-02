@@ -605,10 +605,40 @@ fn readiness_for(configured: &[ConfiguredChannel]) -> Vec<ChannelReadiness> {
                         }
                     }
                 },
-                "webhook" => (
-                    true,
-                    "delivery rides the platform's existing event bus".to_owned(),
-                ),
+                "webhook" => match find("webhook") {
+                    None => (
+                        false,
+                        "the webhook channel has no destination configured for this organization"
+                            .to_owned(),
+                    ),
+                    Some((false, _)) => (
+                        false,
+                        "the webhook channel is switched off for this organization".to_owned(),
+                    ),
+                    Some((true, config)) => {
+                        // **The endpoint resolution lives here too, not only in the
+                        // transport.** This branch used to say `delivery rides the platform's
+                        // existing event bus` — unconditionally true, on an installation with
+                        // no bus endpoint and no URL — which is how a webhook channel looked
+                        // configured on the settings screen for as long as it existed while
+                        // every delivery it queued failed with a relative-URL error. Readiness
+                        // that cannot notice a missing destination is not readiness, it is a
+                        // green light wired to nothing.
+                        if has_destination(&config) {
+                            (
+                                true,
+                                "delivery rides the platform's existing event bus".to_owned(),
+                            )
+                        } else {
+                            (
+                                false,
+                                "the webhook channel has no endpoint — set one on the \
+                                 notification settings"
+                                    .to_owned(),
+                            )
+                        }
+                    }
+                },
                 "chat" => (
                     false,
                     "no chat connector is installed on this installation".to_owned(),
@@ -628,6 +658,25 @@ fn readiness_for(configured: &[ConfiguredChannel]) -> Vec<ChannelReadiness> {
             }
         })
         .collect()
+}
+
+/// Whether a channel's `config` names somewhere the webhook transport can POST.
+///
+/// **The destination is read from the `config` document, not from a column.** The migration
+/// adds `endpoint_id`/`endpoint_url` as real columns (so the constraint can enforce the shape
+/// and the claim query can join on them), but the settings screen writes the whole channel
+/// through one `config` object and the readiness read here is handed `config` — so the two
+/// keys are accepted here as well. Accepting both shapes is what stops the two from drifting:
+/// a channel saved by the screen is ready, and one written by a migration is ready, and a
+/// channel with neither is honestly *not* ready instead of a green light wired to nothing.
+fn has_destination(config: &serde_json::Value) -> bool {
+    let named = |key: &str| {
+        config
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    named("endpoint_url") || named("endpoint_id") || named("endpointId") || named("endpointUrl")
 }
 
 #[cfg(test)]
@@ -650,6 +699,100 @@ mod tests {
         assert!(validate_endpoint("https://push.example/abc", "k", "  ").is_err());
         assert!(validate_endpoint("", "k", "a").is_err());
         assert!(validate_endpoint("https://push.example/abc", "k", "a").is_ok());
+    }
+
+    #[test]
+    fn a_webhook_channel_with_no_destination_is_not_ready() {
+        // **The green light that was wired to nothing.** This branch used to answer
+        // `(true, "delivery rides the platform's existing event bus")` unconditionally, for
+        // an installation with no bus endpoint and no URL — so the settings screen showed the
+        // webhook channel as configured while every delivery it queued failed. Readiness
+        // that cannot notice a missing destination is not readiness.
+        let configured = vec![("webhook".to_owned(), true, serde_json::json!({}))];
+        let rows = readiness_for(&configured);
+        let webhook = rows
+            .iter()
+            .find(|row| row.channel == "webhook")
+            .expect("the closed list always carries the webhook channel");
+        assert!(!webhook.ready, "an unconfigured webhook channel claimed to be ready");
+        assert!(
+            webhook.reason.contains("endpoint"),
+            "the reason must name what is missing: {}",
+            webhook.reason
+        );
+    }
+
+    #[test]
+    fn a_webhook_channel_with_a_destination_is_ready_and_keeps_its_sentence() {
+        // Both destination shapes are accepted, because both can be written: the column the
+        // migration added, and the `config` key the settings screen writes. A check that
+        // accepted only one would make readiness disagree with the writer.
+        for config in [
+            serde_json::json!({"endpoint_url": "https://collector.example/hook"}),
+            serde_json::json!({"endpoint_id": "0d9f4a2c-0000-4000-8000-000000000000"}),
+            serde_json::json!({"endpointUrl": "https://collector.example/hook"}),
+        ] {
+            // The label is built before the move: `assert!` formats its arguments lazily, so
+            // a `{config}` in the message would borrow a value the call already consumed.
+            let label = config.to_string();
+            let rows = readiness_for(&[("webhook".to_owned(), true, config)]);
+            let webhook = rows
+                .iter()
+                .find(|row| row.channel == "webhook")
+                .expect("the closed list always carries the webhook channel");
+            assert!(webhook.ready, "{label} was read as not ready");
+            assert!(!webhook.reason.is_empty(), "a ready channel still explains itself");
+        }
+    }
+
+    #[test]
+    fn an_empty_destination_string_is_the_same_as_none() {
+        // A cleared input posts `{"endpoint_url": ""}`, and "configured with a blank URL" is
+        // the same state as "not configured" — reporting it ready would send the transport
+        // to an empty string.
+        let rows = readiness_for(&[(
+            "webhook".to_owned(),
+            true,
+            serde_json::json!({"endpoint_url": "   "}),
+        )]);
+        let webhook = rows
+            .iter()
+            .find(|row| row.channel == "webhook")
+            .expect("the closed list always carries the webhook channel");
+        assert!(!webhook.ready);
+    }
+
+    #[test]
+    fn a_switched_off_webhook_channel_says_so_rather_than_that_it_has_no_destination() {
+        // Two different mistakes with one wrong sentence: an operator who switched the channel
+        // off needs to know it is off, not that it is misconfigured.
+        let rows = readiness_for(&[(
+            "webhook".to_owned(),
+            false,
+            serde_json::json!({"endpoint_url": "https://collector.example/hook"}),
+        )]);
+        let webhook = rows
+            .iter()
+            .find(|row| row.channel == "webhook")
+            .expect("the closed list always carries the webhook channel");
+        assert!(!webhook.ready);
+        assert!(
+            webhook.reason.contains("switched off"),
+            "{}",
+            webhook.reason
+        );
+    }
+
+    #[test]
+    fn the_in_app_channel_is_still_ready_without_any_configuration() {
+        // The one channel that needs nothing — guarding it because the fix above touched the
+        // same match, and "every channel now needs config" would be a regression.
+        let rows = readiness_for(&[]);
+        let in_app = rows
+            .iter()
+            .find(|row| row.channel == "in_app")
+            .expect("the closed list always carries the in-app channel");
+        assert!(in_app.ready);
     }
 
     #[test]

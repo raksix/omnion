@@ -19,53 +19,19 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
-pub mod completion;
-pub mod credential_store;
-pub mod credentials;
 pub mod cron;
 pub mod definition;
 pub mod engine;
 pub mod error;
-pub mod expression;
-pub mod graph;
-pub mod graph_store;
 pub mod handler;
 pub mod model;
-pub mod node_package;
-pub mod oauth;
-pub mod oauth_client;
-pub mod oauth_refresh;
-pub mod oauth_store;
-pub mod registry;
 pub mod store;
 
 pub use definition::{StepDefinition, Trigger, WorkflowDefinition};
 pub use engine::{RunnerConfig, SweepReport, TickReport};
 pub use error::{Result, WorkflowError};
-pub use graph::{
-    Compiled, Connection, Graph, GraphNode, Issue, Position, StickyNote, compile,
-    compile_or_refuse, validate,
-};
-pub use graph_store::{SaveOutcome, StoredGraph};
 pub use handler::{ActionContext, ActionFuture, ActionHandler, NoActionHandler};
 pub use model::{
     ExecutionStatus, NewWorkflow, StepKind, StepStatus, TriggerKind, Workflow, WorkflowExecution,
     WorkflowStep,
-};
-pub use registry::{
-    Capability, CredentialDefinition, CredentialField, CredentialKind, FieldType, LintFinding,
-    NodeCategory, NodeDefinition, OAuthConfig, ParamHint, ParamSpec, Port, PortKind, Sandbox,
-    credential_type_keys, credential_types, find_credential_type, find_node, lint, node_keys,
-    nodes,
-};
-// The credential entity of REQ-087 slice 2. Re-exported because the API layer names these
-// types in its bodies, and a caller reaching two modules for one entity is how the two halves
-// of a feature end up disagreeing about what a credential is.
-pub use credential_store::{
-    CredentialUpdate, DeleteOutcome, NewNodePackage, NodePackage, PACKAGE_COLUMNS,
-};
-pub use credentials::{
-    Credential, CredentialUsage, CredentialUsageReport, Health, ListQuery as CredentialListQuery,
-    NewCredential, SCOPES as CREDENTIAL_SCOPES, SHARINGS as CREDENTIAL_SHARINGS, SecretPayload,
-    Settings, TestOutcome,
 };

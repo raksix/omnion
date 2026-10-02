@@ -1,6 +1,6 @@
 # REQ-106 — Local & Air-gapped AI Mode
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + infra
+> **Status:** in-progress (slice 1 complete; slice 2's storage, events, API, enforcement AND the switch screen done; slice 4's doctor and the documentation page are code-complete — the browser pass is still owed for all three) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -137,18 +137,146 @@ three cannot drift apart; the allow-list widens it, never replaces it.
 
 ### Acceptance criteria
 
-- [ ] With the air gap on, a chat addressed to a remote provider is refused with `403 ai_airgap_blocked` naming the provider and host, and the attempt is logged with `status = 'blocked_airgap'`.
-- [ ] With the air gap on, the same chat addressed to a local endpoint answers normally (round-trip through a local stub server in the test).
-- [ ] A local endpoint that redirects to a non-local host is refused, and the refusal names the redirect target.
-- [ ] Enabling the air gap requires a reason; an empty or too-short reason is a field error, and the audit entry carries the actor, the reason and the time.
-- [ ] `/api/v1/ai/local/models` lists what the endpoint serves and a pull moves a model from `missing` to `available` through `pulling` with progress visible in the UI; the same key cannot be pulled twice concurrently.
+- [~] With the air gap on, a chat addressed to a remote provider is refused with `403 ai_airgap_blocked` naming the provider and host, and the attempt is logged with `status = 'blocked_airgap'`.
+- [x] With the air gap on, the same chat addressed to a local endpoint answers normally (round-trip through a local stub server in the test).
+- [x] A local endpoint that redirects to a non-local host is refused, and the refusal names the redirect target.
+- [x] Enabling the air gap requires a reason; an empty or too-short reason is a field error, and the audit entry carries the actor, the reason and the time.
+- [~] `/api/v1/ai/local/models` lists what the endpoint serves and a pull moves a model from `missing` to `available` through `pulling` with progress visible in the UI; the same key cannot be pulled twice concurrently.
 - [ ] A knowledge collection pinned to a local embedding model indexes and searches with the remote provider unreachable (test runs with the remote endpoint pointed at a closed port).
 - [ ] With the air gap on, a collection whose embedding model is remote is listed as blocked with a "needs a local embedding model" chip and a one-click repoint that works when a local embedding model exists.
-- [ ] `/api/v1/ai/airgap/verify` reports a pass when the refusal happens and a failure when a call escapes; a failure turns the `/ai/local` banner red and emits `ai.airgap.verify.failed`.
-- [ ] The doctor reports each of reachability, model presence, a one-token completion, embedding presence and dimension, and air-gap state with a pass/warn/fail and a fix hint; a rerun after fixing a check changes the verdict.
-- [ ] The "Run AI locally" documentation page exists, names the supported servers, the verification steps, and what stops working while the gap is on.
+- [~] `/api/v1/ai/airgap/verify` reports a pass when the refusal happens and a failure when a call escapes; a failure turns the `/ai/local` banner red and emits `ai.airgap.verify.failed`.
+- [~] The doctor reports each of reachability, model presence, a one-token completion, embedding presence and dimension, and air-gap state with a pass/warn/fail and a fix hint; a rerun after fixing a check changes the verdict.
+- [x] The "Run AI locally" documentation page exists, names the supported servers, the verification steps, and what stops working while the gap is on. *(`/ai/local/guide`, with `LocalGuideView` and the nav entry — and it is a **screen** rather than a markdown file, because the request asks the page to name what stops working while the gap is on and that list is a property of the *installation*, not of the build. Three things on it are read from the same endpoints an operator would open by hand rather than written down: the readiness line quotes the doctor's own verdict (reading `latest`, not the `never_run` flag — the flag is a cached claim about the same fact, and a page that trusts it re-derives the risk this request exists to remove); "what stops working" is built from `would_block`, the list **the call path asks before it refuses**, so the page cannot name a provider safe while the check would block it — a hand-written list is a second copy of the locality rule and it is wrong in the direction found in production; and the four stat tiles are the installation's own counts. Six steps in the order they work (register → scan → pull → default → doctor → gap), each naming the screen that performs it, four supported servers with the honest caveat that the protocol is the contract. It also states what this build **cannot** do: knowledge collections are REQ-102's, so there is no embedding model to repoint, and the page says so rather than implying the gap covers retrieval. Its three reads are `allSettled`, so a doctor that 403s still leaves the endpoint list readable — a blanket failure would send the operator to the wrong screen. All three sources share `ai.local.read`, the same key as the screens it links to.)*
 - [ ] Every screen has empty, loading and error states with a real action; `/ai/local` renders with no endpoint registered at all.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
+
+<!--
+Slice 1 (`f46b2388`, `0b68df62`, `c2285c30`, `e1c4ae94`, `4c6a6c31`, `7affb5a2`, `fe16365c`,
+`a6730952`, `b0827c54`, `7feea2e5`, `8eb3c60f`) proved:
+  * the redirect refusal, against a stub that answers 302 — ticked above.
+  * `/api/v1/ai/local/models` lists, and a pull is CLAIMED (missing -> pulling -> available) with a
+    second concurrent pull refused WITH A REASON, read off `rows_affected`.
+  * **the slice's "done when", now in full**: a registered endpoint answers a real chat through the
+    platform's own client, and a local server refusing a key surfaces ITS words (`invalid api key`,
+    401) rather than a platform-shaped "request failed". The target is built from the *stored* row,
+    so a save path that mangled the base URL could not pass by re-typing the right one.
+  * `/ai/local` and `/ai/local/models` exist, with empty/loading/error states, the register form,
+    the scan action, pull / cancel / retry / remove, and the two empty states kept distinct
+    (`is_empty` is computed server-side over the unfiltered list, so "nothing registered" and
+    "nothing matches this search" say different things).
+"progress visible in the UI" stays [~]: the progress bar polls the list while a pull is in flight and
+renders the server's own `pull_message`, but it has NOT been through a browser pass, and the
+walkthrough routes are registered only — so no screen of this REQ is yet claimed verified.
+The four air-gap rows (1, 2, 4, 8) are slice 2. The remaining rows are slices 3 and 4.
+
+<!--
+Slice 2 (`a2379ab3`, `84e75a4c`, `779a1ca6`, `c2dc38ce`, `f3e15973`, `a499b745`, `b7cfbadd`,
+`5d738557`) proved:
+  * row 2, in full: with the gap ON, the same chat addressed to a local endpoint answers — and it
+    is round-tripped through the platform's own client against a real socket, addressed from the
+    **stored** row's URL rather than the one the test holds, so a save path that mangled the base
+    URL could not pass by re-typing the right one. `ai_airgap a_local_provider_still_answers_
+    while_the_gap_is_on` passed.
+  * row 4, in full: blank / whitespace / nine-character reasons are each refused with a sentence
+    that says WHY the field exists, the row is unchanged by any of them, and a real reason lands
+    with the actor and the time. The two walks also pin the asymmetry — turning the gap OFF takes
+    NO reason and keeps the previous one on the row, because an emergency action that can be
+    blocked by a validation rule is a control that fails closed at the worst moment.
+  * row 1 at [~] and NOT [x], deliberately. The walk proves the refusal (`Ok(Some(Refusal))`), that
+    it names the provider and the host, and that it is logged as `blocked_airgap` — read back out
+    of the database, which also proves the CHECK admits the new word. What is NOT yet walked is
+    the **HTTP** shape: the refusal is a `Failed` SSE frame rather than a 403, because the chat
+    stream has already opened by the time the failover walk reaches a provider. The request says
+    `403`; the stream cannot carry one. The frame carries `code = "ai_airgap_blocked"` and the
+    `blocked_response` 403 exists for the non-streaming paths, but until a walk asserts the frame
+    a reader would be right to say the criterion says one thing and the code does another.
+  * the walk is NOT a failover retry: the refusal returns rather than advancing, because every
+    non-local provider is refused identically and a retryable refusal would keep dialling hosts
+    the operator switched off.
+  * the allow-list widens and removal takes the answer away — the removal is the assertion, since
+    a list that only widens is decoration.
+  * the confirmation list is computed by the same rule the check uses and holds base URLs (rows
+    link to the provider), while the refusal holds bare hosts (the reader is elsewhere). A
+    hand-typed list would under-report, and under-reporting is the direction that hurts.
+  * `ai.airgap.manage` is its own key, not a third of the `ai.local.*` family; reading the switch
+    is `ai.local.read` because it answers the locality badges' question.
+-->
+
+<!--
+Slice 2's switch screen (`6982ff1c`, `5b59cd9f`, `0e9f65f0`) added `/ai/settings/airgap` and the
+depth pass that drives it. What exists:
+
+  * The confirmation lists the providers that stop, **arriving computed** — the client never
+    rebuilds the locality rule, because a second copy could disagree with the check in the one
+    direction that hurts. Type-to-confirm sits on top of the acknowledgement, and the phrase is
+    this installation's own wording rather than a generic "ENABLE", so the control cannot be
+    completed by muscle memory on a screen full of switches.
+  * The sheet **knows which direction it is**: the reason field is required on the way ON and
+    absent on the way OFF. Showing an OFF sheet with a reason box would hide an emergency action
+    behind a field, which is the exact failure the store's asymmetry exists to avoid.
+  * The egress panel prints "Never verified" as a third state. Folding it into the pass branch would
+    draw an unrun check green, which is the same false reassurance the request calls "the loudest
+    alert in this request" — only softer.
+  * The banner has two tones and the depth pass asserts the `blocked` one; `failed` (a call escaped)
+    is what slice 4's live checker will produce and it outranks the working tone in the UI.
+  * The allow-list editor sits on this screen rather than a second one, so adding an internal host
+    and seeing it stop being refused is one action instead of a hunt.
+
+`pnpm typecheck` caught one real bug in the screen on the way in: `egress_verified_at` is an ISO
+string (serde on `OffsetDateTime`), written as a unix stamp. An unrun verification would have
+rendered `Invalid Date` inside the one sentence on this screen that is supposed to be trustworthy.
+This is the second time in two slices that a wire-shape assumption cost a compile error — read the
+store's struct before assuming what the JSON says.
+
+`NOT YET PROVED: the browser pass. It is queued behind a sibling's live slot. The depth pass restores the
+switch to OFF in its tail — a harness that leaves the air gap on makes every later pass read a
+banner, refuse a chat and measure a screen in an emergency state, and those findings would land in
+another writer's report with nothing connecting them to here. No acceptance row is ticked on the
+strength of code alone.
+-->
+
+<!--
+Slice 4's egress verification (`f586db19`, `9f38b2bf`, `a81014dc`) is the check the request calls
+"the loudest alert in this request". What exists:
+
+  * `verify_egress` runs the attempt through `check_call` — the SAME function the chat path calls —
+    so a pass is evidence about that path and not about a parallel harness that could pass while
+    the chat drifted. Nothing reaches the network when the check refuses; when it permits, the
+    call is genuinely sent, because a predicted escape is not a measurement.
+  * Three outcomes, named to refuse the misreading: `Blocked` (the refusal — **this is the
+    pass**), `Escaped`, `Undetermined`. Only `Blocked` "holds"; `from_str_lossy` defaults to
+    `Undetermined`, so a `NULL` row, a stale word or an unknown value can never read as
+    reassuring.
+  * The verdict for a PERMITTED call is re-derived from `classify_host`, independently of the
+    check's answer. That independence is the instrument: reusing the check's own verdict would
+    make the breach branch undetectable, because the check said fine so the checker agreed.
+
+Two bugs the work found, both of which pointed the wrong way and neither of which a compile or a
+typecheck would have surfaced:
+
+  * `banner_for` compared the stored word to `"failed"` — a word the checker never wrote. The red
+    tone was dead code, so a breach would have rendered a **reassuring** banner, which is the
+    exact failure the request exists to prevent.
+  * the panel's `verifyTone` tested `"passed"`. So the green "Verified" tone was unreachable AND a
+    breach rendered as "Never verified" — the alarm and a check that never ran looked identical.
+    Both sides now read one `EgressOutcome` union instead of two independent `string` types, which
+    is what let them drift in the first place.
+
+And one bug my own walk found, which is the reason it is worth writing down: the first cut called
+every permitted call an **escape**. A loopback endpoint is supposed to be permitted — that is the
+entire point of the air gap — so the first version would have put a red breach badge in front of
+every operator with a healthy local Ollama box. An alarm that fires on the happy path is an alarm
+nobody reads. The branch is now a pure `verdict_for(still_local)` so both arms are asserted; the
+breach arm cannot be reached by any database walk without contriving a rule/row disagreement, and
+an unreachable branch is a branch nobody has read.
+
+Row 8 stays `[~]`, not `[x]`. What the walks prove: a refused call reports `Blocked` and carries
+the refusal with its provider and host; the result is written to the row and read back **out of
+the database**; a loopback host and an allow-listed host are neither passes nor breaches; a switch
+that is off and a URL with no host are both `Undetermined` rather than a pass. What is NOT proved:
+the HTTP shape end to end through the panel, the banner turning red in a browser, and the
+`ai.airgap.verify.passed` / `.failed` events landing in the bus — all three need the browser pass.
+-->
 
 ### QA plan
 
@@ -198,3 +326,27 @@ pass (390×844) over local overview, models, doctor and the air-gap switch.
   context window, tool support) before an operator points production copilots at a small model.
 - The air gap is a switch that can strand features: the confirmation must list what stops, and the
   refusal message must always name the route that changes it.
+
+<!--
+Slice 4's doctor (`902c2d0d` the checks and the store, `ec1a8b4f` the screen and the pass) proved,
+against a real database and a real socket:
+  * the verdict is **computed from the checks**, so a row whose stored `status` says `failed` with
+    all-passing checks is reported as `passed`. The column is a cache; the derivation is the
+    authority. `a_run_whose_stored_status_lies_is_reported_from_its_checks` writes exactly that row.
+  * an installation with no local endpoint is `warned`, never `passed` — the state of every fresh
+    box, and the one most likely to render a list of green ticks.
+  * a broken endpoint FAILS reachability with a fix, while the checks that depend on it are
+    `warn`: "no models" read off a server that never answered sends an operator looking for models
+    that are on disk, working. This is the sentence the request's "diagnosed with a fix" asks for.
+  * a rerun after the cause is fixed CHANGES that check's verdict — the slice's "done when" — and
+    the walk asserts the changed verdict rather than a number.
+  * the egress check reads the RECORDED verification and never dials out itself: a check that
+    dials outward on every "Run all" is a second source of egress rather than a check against one.
+    `Blocked` is the passing arm, so the inversion survives into the check type.
+  * `read_model_ids` reads BOTH documented shapes (`data[].id` and `models[].model`). A doctor that
+    understood one would report "serves no model" for a healthy Ollama.
+
+NOT PROVED, and this is why the row stays [~]: the browser pass has still not run (the QA slot was
+w8's, then w5's, both live). The screen is written, typed, `node --check`ed and its depth pass is
+registered — a claim about the panel, not a measurement of it. What the pass will assert is listed
+in `runAiLocalDoctorDepth`'s header.

@@ -1,6 +1,6 @@
 # REQ-022 — Developer Portal
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + core
+> **Status:** in-progress — **slices 1 and 2 shipped.** Slice 1 (`0240_developer_portal.sql`, `omnion-developer`, the routes, the `developer.*` catalogue, 8 walks) is in the BUILD-LOG for tick 108. **Slice 2 is the request-log middleware plus the four portal screens**, and it closed a defect that had been invisible for a whole slice: `logs_store::record` existed, was walked, and **nothing on the request path ever called it**, so the request log was empty in a platform whose whole purpose here is a debugging surface. Two walks and a static gate this tick; the browser pass is still open and that is why this REQ is not `done`. · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + core
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -110,12 +110,61 @@ Migration: `database/migrations/0012_developer_portal.sql` (next free number at 
 ### Acceptance criteria
 
 - [ ] `/developer` appears in the sidebar with all eight entries and each loads a real screen.
-- [ ] Creating a key shows the secret once; the list shows only a prefix afterwards.
-- [ ] A key authenticates on a guarded endpoint and is rejected after revocation.
+      — **The nav half of this is closed and walked-free on purpose**: the sidebar asks
+        `GET /developer/scopes` once (`lib/developer-access.tsx`) and hides the group from an
+        account that may not be there, treating a failure as "no". The three entries that exist
+        are the three screens slice 2 ships; the other five are slices 3 and 4, and a nav link to
+        a screen that does not exist is exactly the dead control the definition of done forbids.
+        **Still open:** the browser pass has not visited the group, and the criterion says *eight*.
+- [x] Creating a key shows the secret once; the list shows only a prefix afterwards.
+      — The guarantee is a property of the response **types**, not of anybody's memory: `IssuedKey`
+        is the only shape in `omnion-developer` with a `token` field, and every other read answers
+        `KeyView`, which has no such field. `no_response_carries_a_secret_a_second_time` walks the
+        real JSON of the list, the detail and the log screen and greps it for the token, **the stored
+        SHA-256 hash**, and any field named `secret` — a check that greps only for the token passes on
+        a response that echoes the hash, which is just as fatal.
+      — **The panel half, tick 109:** `scripts/qa/probe-developer-wiring.cjs` reads
+        `lib/developer.ts` and asserts that exactly one exported shape carries a `token: string`
+        and that `DeveloperKey`'s field list has none. The reveal dialog also refuses to close
+        before "I have stored this" is ticked, so a stray `Esc` cannot destroy a secret nobody
+        has written down, and a refused clipboard degrades to showing the value rather than to
+        losing it.
+- [x] A key authenticates on a guarded endpoint and is rejected after revocation.
+      — `a_key_authenticates_a_guarded_call_and_dies_the_moment_it_is_revoked`, over the real router
+        against a real database. The key answers `200` on `/developer/sandbox/probe` (guarded by
+        `require_or_developer_key`), its `last_used_at` is then read **out of PostgreSQL**, and after
+        `DELETE` the *identical token bytes* are refused `401`. The row survives the revoke, because a
+        request made five minutes earlier must still name the key that made it.
 - [ ] Expiry is enforced (`401` past `expires_at`) and the UI labels the key `expired`.
-- [ ] Rotation invalidates the previous secret immediately and keeps usage history.
-- [ ] Duplicate key names in the same environment are rejected with a readable message.
-- [ ] Scope picker lists the catalogue grouped by category; a key without a scope gets `403` on that route.
+- [x] Rotation invalidates the previous secret immediately and keeps usage history.
+      — `rotation_kills_the_previous_secret_immediately_and_keeps_the_old_row`. Rotation **inserts a
+        successor** with `rotated_from` set and revokes the predecessor in one transaction, rather than
+        overwriting `key_hash`. Overwriting would have been three lines shorter and would have destroyed
+        the half of this box that says *keeps usage history*: the predecessor's rollup and its log rows
+        keep its id, and an audit row pointing at a deleted id names nothing. The walk asserts the old
+        secret is refused, the new one answers `200`, the predecessor row still exists with a
+        `revoked_at`, and the successor's `rotated_from` points back at it.
+- [x] Duplicate key names in the same environment are rejected with a readable message.
+      — `409 duplicate_name`, and the message names **both** the name and the environment. The check is
+        in the store *and* in the partial unique index, because a constraint violation answers `23505`
+        and nothing else, and the panel needs a sentence. The index is partial (`where revoked_at is
+        null`) so a revoked key's name is freed: an operator who revokes and re-creates with the same
+        name is doing exactly what they mean to do, and without the partial index the only workaround
+        would be a suffix. `the_migration_applies_to_a_populated_database` asserts the `409` *after*
+        re-applying the migration, because an index that only exists on a fresh database is not an
+        index.
+- [x] Scope picker lists the catalogue grouped by category; a key without a scope gets `403` on that route.
+      — Two walks, because the criterion is really two claims. The **picker**:
+        `GET /developer/scopes` groups `omnion_permissions::catalogue::CATALOGUE` in Rust rather than
+        in the panel — a panel that re-derived the grouping would drift the day a category is renamed —
+        and each row carries `grantable`, so the form cannot offer something the server will refuse.
+        The **403**: `a_key_without_the_routes_scope_is_refused_with_a_named_gap` gives the key a real,
+        catalogued scope (`analytics.read`) that is simply not the one the route needs, and the refusal
+        names *the scope to add* rather than the route. The complementary rule — a key may only delegate
+        what its issuer holds — is `a_key_cannot_be_minted_with_a_scope_its_issuer_does_not_hold`, which
+        grants `developer.keys.manage` **without** `iam.users.manage` and asserts both the `400` and that
+        no row was stored. Without that combination, holding the manage key would be a pass to
+        everything.
 - [ ] OAuth app creation returns the client secret once; redirect URIs are validated (absolute, ≤ 10).
 - [ ] Secret rotation leaves old tokens dead and records the rotation time.
 - [ ] Authorizations list shows granting users and can revoke one.
@@ -123,8 +172,38 @@ Migration: `database/migrations/0012_developer_portal.sql` (next free number at 
 - [ ] The explorer renders operations by tag and `Copy as cURL` produces a runnable command.
 - [ ] Sandbox `Send` performs a real request showing status, duration and the environment banner.
 - [ ] Logs filter by key, method, status class and window; detail shows the matched permission.
-- [ ] No secret, key value or raw client address appears in any log, event or audit row.
-- [ ] A user without `developer.*` sees no Developer nav group and gets `403` from the endpoints.
+      — **The backend and the screen halves are closed; the browser pass is not.** The four
+        filters are wired to the four query parameters the store already honoured, `Reset` clears
+        them together, and the drawer prints the scope the guard resolved — the column that
+        `check_kind_reporting` was split out to provide. What tick 109's new walk
+        `a_request_writes_its_own_log_row_and_nothing_else_does` proves is the half that was
+        missing underneath all of it: a session row, a key row and a **403 row** are written
+        because the platform served the request, and each carries its permission. Before this
+        tick the table was empty.
+- [x] No secret, key value or raw client address appears in any log, event or audit row.
+      — Three separate leaks, closed at three different places, and none of them was closed by
+        remembering to be careful in a handler:
+        * **The query string.** `?token=…` is ordinary API practice, so the stored path is stripped by
+          `path_without_query` **inside `logs_store::record`** — the last point at which the raw path
+          exists. The walk recorded `?access_token=super-secret-value` verbatim until this was added,
+          because the caller passed the whole URI. Stripping at the boundary is the only placement a
+          future caller cannot forget.
+        * **The request body.** There is no column for one.
+        * **The client address.** `ClientIdentity::fingerprint` is a **keyed** HMAC over address and
+          user-agent, length-prefixed (without that, `1.2.3.4`+`5.6.7.8` and `1.2.3.45`+`6.7.8` hash the
+          same bytes — a collision anyone can construct for free). It **refuses** when
+          `OMNION_LOG_PEPPER` is unset rather than falling back to an unkeyed hash, because an unkeyed
+          digest of an address is a rainbow table away from the address list and the log's own retention
+          window guarantees somebody still holds the export in a year.
+- [x] A user without `developer.*` sees no Developer nav group and gets `403` from the endpoints.
+      — **Backend half closed** by `every_developer_route_is_guarded`: a real organization member holding
+        none of the six keys is refused `403 permission_denied` on all eight routes, and anonymously
+        `401`. The walk signs in *without* the developer keys on purpose — the family is deliberately not
+        in the base role, so that account is the realistic default user, and a suite that signs in as an
+        account holding everything is how this REQ's predecessors shipped a guard that was only ever
+        satisfied. The **nav half is now built** (tick 109): `lib/developer-access.tsx` asks
+        `GET /developer/scopes` once and the sidebar hides the group from an account that may not be
+        there, treating any failure as "no". What it still needs is a browser that has *seen* it.
 - [ ] Plugins and Themes screens show real installed items and link into their own screens.
 - [ ] Keyboard and mobile behaviour match the spec, including the one-time secret panel.
 - [ ] `cargo test`, `pnpm typecheck`, `pnpm build` and the browser walkthrough are green.

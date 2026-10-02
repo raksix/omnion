@@ -185,7 +185,6 @@ pub struct LogRow {
     /// The keyed client fingerprint.
     pub client_fingerprint: Option<String>,
     /// When it happened.
-    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 

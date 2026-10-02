@@ -584,7 +584,21 @@ pub async fn import(
         )
         .await
         {
-            Ok((_row, true)) => created += 1,
+            // Only a finding that was **not already known** opens, and the difference is the
+            // whole reason a receiver can act on this: a nightly CI job re-ingests the same
+            // report every morning, and an endpoint that paged on every one of those would be
+            // muted by the second run. `upsert_finding`'s `false` return *is* that answer —
+            // it comes from `xmax`, the statement's own record of which branch it took.
+            Ok((row, true)) => {
+                created += 1;
+                announce_finding_opened(
+                    &state,
+                    session.user.organization_id,
+                    session.user.id,
+                    &row,
+                )
+                .await;
+            }
             // The idempotence the acceptance criteria ask for: ingesting the same report
             // twice must not double the count, and the *return* is what proves it did.
             Ok((_row, false)) => refreshed += 1,
@@ -600,6 +614,63 @@ pub async fn import(
         refreshed,
         rejected,
     }))
+}
+
+/// Announce a finding that was not there before, on `security.finding.opened`.
+///
+/// **The payload is the finding's identity, never its content.** `title`, `description` and
+/// `evidence` are all absent, and that is the whole design of this emitter rather than an
+/// omission:
+///
+/// * `title` is attacker-influenced free text — a dependency report can call its package
+///   anything — and this event fans out to every third-party receiver the operator connected.
+///   The panel reads the row back through `security.read`, so `finding_id` is enough for a
+///   receiver to open the same finding in the same place the operator is looking.
+/// * `description` is a CI vendor's prose and `evidence` is the raw entry. The ingest path
+///   refuses a report whose *keys* look like credentials, but that is a heuristic on names,
+///   and a bus is not the place to bet on a heuristic holding.
+///
+/// What is carried is what a receiver cannot compute from the id: how bad it is, where it came
+/// from, and which package and version it is about — the triage triple, with no prose.
+///
+/// **The failure mode is a log line, never a `500`.** The finding is already committed by the
+/// time this runs, and the caller is the CI job that just uploaded a report it will not re-read
+/// by hand; answering `500` would report an ingest that landed as lost, which is the one thing
+/// the store's `created`/`refreshed` count would then contradict.
+///
+/// The fan-out is per new finding, so a first-time report of `n` findings queues `n`
+/// deliveries per subscribed endpoint — bounded by the report's size, which is a document the
+/// uploader controls, and by the ceiling the report parser already enforces. Nothing here is
+/// sampled: a finding that opens and is never delivered is a finding that quietly did not
+/// happen as far as the receiver is concerned, and the volume is the uploader's own choice.
+async fn announce_finding_opened(
+    state: &AppState,
+    organization_id: Option<Uuid>,
+    actor: Uuid,
+    finding: &Finding,
+) {
+    if let Err(error) = bus::emit(
+        state.db().pool(),
+        NewEvent::new("security.finding.opened")
+            .organization(organization_id)
+            .actor(actor)
+            .payload(json!({
+                "finding_id": finding.id,
+                "severity": finding.severity,
+                "source": finding.source,
+                "component": finding.component,
+                "component_version": finding.component_version,
+                "fixed_in": finding.fixed_in,
+            })),
+    )
+    .await
+    {
+        tracing::warn!(
+            error = %error,
+            finding = %finding.id,
+            "the finding was stored but the event was not emitted"
+        );
+    }
 }
 
 /// What an ingest did.
@@ -929,12 +1000,8 @@ async fn gather(
     env.database_encryption = Some(Probe::unreadable(
         "storage encryption is a deployment fact; the application cannot verify it",
     ));
-    env.rate_limiting = Some(Probe::unreadable(
-        "rate limit policy is configured in slice 3; nothing to verify yet",
-    ));
-    env.csp = Some(Probe::unreadable(
-        "header policy is configured in slice 2; nothing to verify yet",
-    ));
+    env.rate_limiting = Some(rate_limit_probe(state).await);
+    env.csp = Some(csp_probe(state).await);
     env.ip_rules = match sqlx::query_scalar::<_, i64>(
         "select count(*) from information_schema.tables \
          where table_schema = current_schema() and table_name = 'security_ip_rules'",
@@ -946,7 +1013,7 @@ async fn gather(
         Ok(count) => Some(count),
         Err(_) => None,
     };
-    env.last_backup_hours = backup_age(state).await;
+    env.last_backup_hours = backup_age(state, organization).await;
     Ok(env)
 }
 
@@ -976,6 +1043,80 @@ async fn factor_probe(state: &AppState) -> Probe {
             Err(error) => Probe::unreadable(format!("the factor table could not be read: {error}")),
         },
         Err(error) => Probe::unreadable(format!("the factor table could not be probed: {error}")),
+    }
+}
+
+/// Whether a content security policy is configured, and in which mode.
+///
+/// **This probe used to be a `Probe::unreadable` naming slice 2, and slice 2 shipped a year
+/// earlier than this line was written.** `security_settings.headers` exists, is seeded by
+/// migration `0135`, and is what the `/security/headers` screen has been editing all along —
+/// while `csp_configured` sat at `unknown` with the reason *"header policy is configured in
+/// slice 2; nothing to verify yet"*. The screen therefore told an operator who had just
+/// enforced a policy that the platform could not find out, and its "Header policy" action
+/// link led to a page that plainly showed one. No test could catch it: the check's contract
+/// is "never claim `pass` without a fact", and this answer is honest *about its own probe*
+/// while saying nothing about the platform.
+///
+/// The read goes through [`omnion_security::load_headers`] rather than a second query, for the
+/// same reason the retention sweep delegates in REQ-010: two readers of one document is how
+/// they drift, and the drift here would be a security row.
+///
+/// A **missing row** is `absent`, not `unknown`: the migration inserts the singleton, so a row
+/// that is not there is a fact about this database, and the honest state for "there is no
+/// policy document" is the one `from_probe` maps to a failing row.
+async fn csp_probe(state: &AppState) -> Probe {
+    match omnion_security::load_headers(state.db().pool()).await {
+        Ok(stored) => {
+            if stored.document.is_null() {
+                return Probe::missing("the settings row holds no header policy document");
+            }
+            // The stored document is parsed by the *same* constructor the header middleware
+            // uses, so the fact the check reports is the policy that will actually be sent —
+            // not a second, looser reading of the same JSON that could disagree with it.
+            let policy = omnion_security::HeaderPolicy::from_json(Some(&stored.document));
+            Probe::value(json!({
+                "mode": policy.csp_mode.as_str(),
+                "directives": policy.csp.len(),
+                "saved_at": stored.updated_at.to_string(),
+            }))
+        }
+        Err(error) => Probe::unreadable(format!("the header policy could not be read: {error}")),
+    }
+}
+
+/// Whether the rate limiter is configured with at least one enabled scope.
+///
+/// The same defect as [`csp_probe`], one slice later: a frozen `unknown` whose reason named
+/// slice 3, on a table (`security_settings.rate_limits`) that slice 3 created and that the
+/// limiter middleware has been enforcing from ever since. `merge_with_defaults` is used rather
+/// than a raw array length because the middleware resolves the *merged* policy — a document
+/// that omits a scope still gets that scope's default, so counting stored rows would report a
+/// narrower platform than the one actually enforcing requests.
+///
+/// **All scopes disabled is `fail`, not `pass`.** A limiter with nothing enabled is a limiter
+/// that is not limiting, and it is the one state in this check where a green row would be the
+/// over-claim the whole crate exists to prevent.
+async fn rate_limit_probe(state: &AppState) -> Probe {
+    match omnion_security::load_rate_limits(state.db().pool()).await {
+        Ok(document) => {
+            let policies = omnion_security::merge_with_defaults(&document);
+            let enabled: Vec<&str> = policies
+                .iter()
+                .filter(|policy| policy.enabled)
+                .map(|policy| policy.scope.as_str())
+                .collect();
+            if enabled.is_empty() {
+                return Probe::missing(
+                    "every rate-limit scope is disabled, so no request is being limited",
+                );
+            }
+            Probe::value(json!({
+                "enabled_scopes": enabled,
+                "scopes": policies.len(),
+            }))
+        }
+        Err(error) => Probe::unreadable(format!("the rate limit policy could not be read: {error}")),
     }
 }
 
@@ -1056,19 +1197,29 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
 /// a screen that says "we could not ask" where the truth is "there are no backups" is the
 /// over-claim this crate exists to prevent, and the reverse — a green row on a platform with
 /// no backup — is the failure that costs somebody their data.
-async fn backup_age(state: &AppState) -> Option<i64> {
-    // The backup subsystem's own table, read only if it exists. This is REQ-013's table, and
-    // the probe answers `None` before that request lands rather than failing the whole run.
-    let completed: Result<Option<(time::OffsetDateTime,)>, sqlx::Error> = sqlx::query_as(
-        "select completed_at from backup_runs where status = 'succeeded' \
-         order by completed_at desc limit 1",
-    )
-    .fetch_optional(state.db().pool())
-    .await;
-    let Some((completed_at,)) = completed.ok().flatten() else {
-        return None;
-    };
-    let hours = (time::OffsetDateTime::now_utc() - completed_at).whole_hours();
+///
+/// **This reads `backups`, the table migration `0157` creates, and nothing ever read
+/// `backup_runs`.** The first version of this function queried a table that no migration has
+/// ever created — the request that asked for the backup subsystem was written before its
+/// schema existed, and the table name was never revisited when it did. A missing table makes
+/// `fetch_optional` answer `Err`, `Err` was flattened into "no backup", and the
+/// `backup_healthy` row sat at **`fail` on every installation, for ever** — the one check in
+/// this registry that could never go green, on a platform that had taken a backup every night
+/// for a year. A test could not have caught it: the row *was* red, exactly as the fallback
+/// says it should be for a platform with no backup, and the message named the right rule for
+/// the wrong reason. The read is now a call into the backup crate, so a rename of the table
+/// is a compile error rather than a permanent red.
+///
+/// The scope is the caller's tenant, for the same reason every other read in this file is: an
+/// unscoped read answers "fresh backup" from a *stranger's* run, which is a false green on
+/// the one check whose false green is the expensive direction. `is not distinct from` keeps
+/// the platform row a real tenant, because on a single-tenant installation it is the tenant.
+async fn backup_age(state: &AppState, organization: Option<Uuid>) -> Option<i64> {
+    let finished_at = omnion_backup::last_succeeded_at(state.db().pool(), organization)
+        .await
+        .ok()
+        .flatten()?;
+    let hours = (time::OffsetDateTime::now_utc() - finished_at).whole_hours();
     // A clock skew that puts the last backup in the future means we do not know when it ran,
     // and clamping to 0 would turn "we cannot tell" into "the backup is fresh".
     (hours >= 0).then_some(hours)

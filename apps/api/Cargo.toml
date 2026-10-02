@@ -33,12 +33,20 @@ omnion-automation = { path = "../../crates/automation" }
 omnion-content = { path = "../../crates/content" }
 omnion-core = { path = "../../crates/core" }
 omnion-events = { path = "../../crates/events" }
+# System health (REQ-014). Its own crate rather than a module of the security centre: the
+# security centre makes a claim about *safety* and this one about *liveness*, and a
+# deployment that could not disable one without the other would be unable to answer
+# "who may see that the database is down" separately from "who may see that we have
+# findings".
+omnion-health = { path = "../../crates/health" }
 omnion-identity = { path = "../../crates/identity" }
+omnion-backup = { path = "../../crates/backup" }
 omnion-media = { path = "../../crates/media" }
 omnion-notifications = { path = "../../crates/notifications" }
 omnion-security = { path = "../../crates/security" }
 omnion-module-analytics = { path = "../../modules/analytics" }
 omnion-onboarding = { path = "../../crates/onboarding" }
+omnion-developer = { path = "../../crates/developer" }
 omnion-permissions = { path = "../../crates/permissions" }
 omnion-policy-engine = { path = "../../crates/policy-engine" }
 omnion-search = { path = "../../crates/search" }

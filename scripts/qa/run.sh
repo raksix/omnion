@@ -39,8 +39,39 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # put the machine at a load average of 20 with a half-full swap. Half the cores per
 # build keeps a pass readable and leaves the rest of the box alone.
 export CARGO_BUILD_JOBS="${QA_CARGO_JOBS:-3}"
+export CARGO_SLOTS="${QA_CARGO_SLOTS:-2}"
 
 step() { printf '\n[qa] %s\n' "$*"; }
+
+# The connection URL the API is started with.
+#
+# **The password is read from the environment, never written into this file.** The line used
+# to carry a literal `***` where the password goes, which arrived through a tool that masks
+# credential-shaped output on the way to the screen and then had the masked text pasted back
+# into the file — the exact trap the memory notes describe, and it is a *committed* one, on
+# `main`, so every writer's pass was starting an API with a wrong password. The symptom was
+# "the API did not answer" with `password authentication failed` in the log, and it pointed at
+# the database rather than at the harness for the same reason the stale-binary bug did.
+#
+# Resolution order: an explicit `OMNION_DATABASE_URL` (the owner's own), the project's `.env`
+# when it has one, and finally the documented development default. A file that has to carry a
+# secret to start a test stack is a file whose secret ends up in a public repository.
+qa_db_url() {
+  if [ -n "${OMNION_DATABASE_URL:-}" ]; then
+    # Rewrite only the database name, so a caller's own credentials and host are respected.
+    printf '%s\n' "${OMNION_DATABASE_URL%/*}/$QA_DB_NAME"
+    return
+  fi
+  if [ -f "$ROOT/.env" ] && grep -q '^OMNION_DATABASE_URL=' "$ROOT/.env"; then
+    local configured
+    configured="$(grep '^OMNION_DATABASE_URL=' "$ROOT/.env" | head -1 | cut -d= -f2-)"
+    printf '%s\n' "${configured%/*}/$QA_DB_NAME"
+    return
+  fi
+  # The development container's own credentials. Not a secret: it is the published local
+  # Postgres in `docker-compose.yml`, bound to loopback, and it exists to be thrown away.
+  printf 'postgres://omnion:omnion@127.0.0.1:5433/%s\n' "$QA_DB_NAME"
+}
 
 wait_http() { # url, seconds
   local url="$1" deadline=$(( $(date +%s) + ${2:-120} ))
@@ -74,6 +105,13 @@ fi
 # begins from a clean set and the box is not carrying yesterday's processes.
 stop_stack() {
   pm2 delete "$API_NAME" "$ADMIN_NAME" "$WEB_NAME" >/dev/null 2>&1 || true
+  # Turbopack leaves a build cache behind when the server is killed, and the cache is
+  # the largest thing any worktree holds: ten stacks held 13 GB of it and filled the
+  # disk twice. The next pass rebuilds what it needs, so this is pure waste — but only
+  # drop it when the pass actually ran, so a stack that failed to start keeps its cache.
+  if [ "${QA_KEEP_NEXT:-0}" != "1" ]; then
+    rm -rf "$ROOT/apps/admin/.next" "$ROOT/apps/web/.next" 2>/dev/null || true
+  fi
 }
 # One trap, both cleanups: a second trap would replace the first and leave the slot held.
 release() {
@@ -82,7 +120,62 @@ release() {
   return 0
 }
 trap release EXIT INT TERM
-stop_stack
+# Only the exit path drops the build cache: the pre-pass call below is here to clear
+# stale servers, and deleting .next there would throw away a warm cache every tick and
+# turn each QA pass into a cold Turbopack build.
+QA_KEEP_NEXT=1 stop_stack
+
+# A place in the global slot is not the same thing as the right to use *this* stack.
+#
+# `qa-slot.sh` counts places in one shared directory, so it correctly serialises two passes
+# that want two DIFFERENT stacks — each stack owns its own database and its own ports, and
+# they are safe to run side by side. What nothing stopped was a second pass taking the SAME
+# stack, and that is destructive rather than merely wasteful: both passes resolve to
+# `QA_DB_NAME` and to ports 18080/3100/3200, so the later one runs `reset-db.sh` —
+# `DROP DATABASE … WITH (FORCE)` — while the earlier one is mid-walkthrough.
+#
+# Observed on 2026-10-01 (tick 90). Tick 89's pass was still walking when the tick ended,
+# so tick 90 started a second pass on the same stack:
+#
+#   02:47:57  tick-89 pass: reset-db.sh drops and recreates omnion_qa
+#   02:48:07  tick-89 pass: API boots, "no accounts exist yet"
+#   02:48:14  a user appears: qa-sample@omnion.test / "QA Provider" / organization_id NULL
+#   02:48:16  tick-89 pass: session created for that user
+#
+# `qa-sample@omnion.test` and "QA Provider" are literal return values of the walkthrough's own
+# `sampleValueFor()` / `fillSubtree()` helpers — the generic form filler, not a credential.
+# Tick-89 had filled a dialog on its way past. Tick 90 then opened `/`, found an account
+# already present, was told `needs_setup: false`, correctly skipped the wizard, and failed to
+# sign in as `CREDS.email` — an account that had never been created. The sign-in failure had
+# nothing to do with sign-in, and every browser box in wave 1 stayed open for a reason that
+# reads exactly like a broken product.
+#
+# The lock is per stack, so sibling stacks keep their parallelism and only the same stack is
+# serialised. It is taken around the whole pass rather than just the reset, because the second
+# pass would otherwise `pm2 delete` the first pass's servers three lines later — the reset is
+# only the first of several ways two passes on one stack destroy each other.
+QA_STACK_LOCK="${QA_STACK_LOCK_DIR:-/tmp/omnion-qa-stack}-${STACK}.lock"
+# `9>>` and not `9>`: the redirect mode is the whole bug. `9>` truncates on open, so a waiter
+# empties the file *as it opens it* and then reads back the zero bytes it just wrote — the
+# holder's recorded pid is destroyed by the act of asking who the holder is, and the refusal
+# degrades to "unknown" in exactly the situation where an operator wants the pid most. Appending
+# opens without truncating, so the waiter's read sees what the holder wrote.
+exec 9>>"$QA_STACK_LOCK"
+if ! flock -n 9; then
+  holder="$(head -n 1 "$QA_STACK_LOCK" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+    holder="unknown (the pass holding this stack did not record a live pid)"
+  fi
+  echo "[qa] stack '${STACK}' already has a pass running (pid ${holder}); refusing to start a second one" >&2
+  echo "[qa] two passes on one stack reset the database out from under each other — wait for the running pass to finish" >&2
+  exit 4
+fi
+# Written after the lock is held, so a waiter reports the pass that actually owns the stack
+# rather than the one that merely got there first. `BASHPID`, not `$$`: `$$` is the pid of the
+# *shell* and does not change inside a subshell or a `bash -c`, so a pass launched through one
+# would record its parent's pid and the refusal would name a process that has nothing to do
+# with the stack.
+printf '%s\n' "$BASHPID" >&9
 
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
@@ -92,88 +185,110 @@ step "API on :$API_PORT (database omnion_qa)"
 # a migration edited after the last build is silently the previous version — and a syntax error in
 # it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
 # than the newest migration, which is cheap when nothing changed and correct when something did.
-# A writer whose worktree cannot hold a build (a full /mnt/apopic) builds elsewhere and points
-# at the result. Without this the pass rebuilds into a full disk and then reports "script not
-# found" for a binary that exists — a failure that reads as a broken API rather than a full
-# filesystem. `QA_API_BIN` is the escape hatch; the default is unchanged.
-QA_API_BIN="${QA_API_BIN:-$ROOT/target/debug/omnion-api}"
-if [ ! -x "$QA_API_BIN" ] \
-   || [ -n "$(find database/migrations -name '*.sql' -newer "$QA_API_BIN" -print -quit)" ]; then
-  step "building the API (missing or stale at $QA_API_BIN)"
-  step "building the API (first pass, or a migration changed since the last build)"
-  # `CARGO_TARGET_DIR` has to be honoured, or a caller that points `QA_API_BIN` at an
-  # out-of-tree build gets a rebuild into the default `target/` — the full disk this override
-  # exists to avoid.
-  # `omnion-core` is the crate that owns `sqlx::migrate!("../../database/migrations")`, and
-  # sqlx embeds the directory at *that* crate's compile. So a renamed or added migration does
-  # not reach the binary through `-p omnion-api`: cargo sees the api crate as up to date, prints
-  # `Finished` in under a minute, and the API then dies on `migration N was previously applied
-  # but has been modified` — a failure that reads as a database problem and is a build-graph
-  # one. The fix is to make the embedding crate recompile, which is a cache problem rather
-  # than a source one.
-  cargo clean -p omnion-core --target-dir ${CARGO_TARGET_DIR:-target} 2>/dev/null || true
-  cargo build ${CARGO_TARGET_DIR:+--target-dir "$CARGO_TARGET_DIR"} -p omnion-api
+#
+# **The target directory is `$CARGO_TARGET_DIR` when it is set, never a hardcoded
+# `target/debug`.** The box is loaded enough that the parallel writers all point cargo at
+# `/dev/shm/<writer>-target` (a 32 GB tmpfs), and this script used to read the hardcoded path in
+# three places — the staleness check, the `cargo build` and the `pm2 start`. The result was the
+# worst kind of harness bug: `cargo build` compiled the current tree into the tmpfs, the staleness
+# check compared migration timestamps against a *different*, three-hours-older binary in
+# `target/debug`, judged it fresh, skipped the build, and pm2 started that one. The pass then
+# reported a router panic from code that no longer exists in the tree, and "the API did not
+# answer" was the honest summary of a harness testing the wrong build. One variable, used three
+# times, is the whole fix — and the `pm2 restart` branch matters as much as the `pm2 start` one:
+# a restart re-executes the binary path pm2 recorded at *start* time, so a process left over
+# from a pass that ran before the fix keeps panicking on a route that has since been corrected.
+# That is why the process is deleted and started rather than restarted.
+API_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/omnion-api"
+# **Source counts as stale, not just migrations.** The original test compared the binary
+# against `database/migrations/*.sql` only, which catches a new migration and nothing else:
+# a pure code fix leaves the newest migration older than the binary, the check passes, the
+# build is skipped and pm2 starts the previous binary. The pass then measures code that is
+# no longer in the tree and reports defects against it — observed on 2026-10-02 (tick 76):
+# commit 936eae4e (07:36, `fix(ai-eval): decode the run's model key as one column, not a
+# tuple`, which made every model-targeted eval run 500) landed four minutes AFTER the binary
+# was built (07:32), no migration was involved, so the check declared the binary fresh and
+# the pass would have re-measured the exact 500 the commit had just removed. `cargo build`
+# is itself incremental, so including sources costs a mtime walk when nothing changed and
+# a near-no-op compile when something did.
+if [ ! -x "$API_BIN" ] \
+   || [ -n "$(find database/migrations -name '*.sql' -newer "$API_BIN" -print -quit)" ] \
+   || [ -n "$(find crates apps/api -name '*.rs' -newer "$API_BIN" -print -quit 2>/dev/null)" ]; then
+  step "building the API (first pass, or the tree changed since the last build)"
+  # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
+  # compiling at once instead of every pass grabbing all six threads for itself.
+  "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
-# `delete` then `start`, never `restart`. That looks like a pointless extra second of
-# startup and it is the most expensive line in this file.
-#
-# `pm2 restart` **keeps the environment the process was first started with**. This script
-# drops and recreates the QA database a moment earlier, so a process left over from a pass
-# that used a different `QA_DB` still holds the *old* connection string — and after the drop,
-# "that database does not exist" comes back as a restart loop whose log reads `migration 19
-# was previously applied but is missing in the resolved migrations`. That sentence names a
-# migration, so it sends you auditing 41 SQL files that are all perfectly fine.
-#
-# It happened here for real: an earlier attempt left a process pointing at the main writer's
-# `omnion_qa` while every later pass reset `omnion_qa_w10`, and three consecutive passes
-# inherited it. The ports, the CSRF secret and the binary path are inherited the same way, and
-# each of those has changed between passes at least once.
-#
-# The binary pm2 starts must also be `QA_API_BIN`, not the default path: a writer that built
-# out of tree passed a working `QA_API_BIN` through the staleness check and then had pm2 report
-# `Script not found` for a path that was never built.
-#
-# The CSRF guard *refuses* a cookie-authenticated mutation when no secret is configured
-# (REQ-012: refuse, never skip), which is right in production and useless in a QA stack — every
-# create, install and delete in the walkthrough answers 403 and the pass reports a product
-# defect that does not exist. The secret is a throwaway for a disposable database that is
-# dropped on every pass, and it is generated per pass so a half-finished run cannot leave a
-# token a later one still validates.
-pm2 delete "$API_NAME" >/dev/null 2>&1 || true
-OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
+# Delete-then-start, never restart. `pm2 restart` re-executes the path pm2 recorded when the
+# process was first started, so a process left over from an earlier pass keeps running the
+# binary that existed then — which is how this file was fixed, the pass ran, and the API still
+# panicked on a route that had been corrected two hours earlier. The delete below is also what
+# makes main's `OMNION_CSRF_SECRET` argument survive: a restart does NOT re-read the recorded
+# environment, so an env var added to this script after the first pass is silently ignored by
+# every subsequent run, and the write routes answer 403 for a reason the pass cannot see.
+if pm2 describe "$API_NAME" >/dev/null 2>&1; then
+  pm2 delete "$API_NAME" >/dev/null
+fi
+# The CSRF secret is a **throwaway for this disposable stack**, not a credential: the database is
+# dropped and rebuilt at the top of this script and nobody outside this box ever talks to these
+# ports. It is here because its absence is a fail-closed refusal, not a warning — with no secret
+# configured the middleware answers *every* cookie-authenticated POST with 403, so the first-run
+# wizard cannot create the organization, no agent route can resolve a tenant, and one missing
+# environment variable turns the whole pass into hundreds of identical refusals that read like
+# hundreds of defects. The refusal is correct behaviour; an unconfigured QA stack is not.
+OMNION_DATABASE_URL="$(qa_db_url)" \
 OMNION_REDIS_URL="redis://127.0.0.1:6380" \
 OMNION_PORT="$API_PORT" \
 OMNION_ENV=development \
-OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-csrf-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')}" \
-  pm2 start "$QA_API_BIN" --name "$API_NAME" --time >/dev/null
+OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-stack-only-not-a-real-secret}" \
+  pm2 start "$API_BIN" --name "$API_NAME" --time >/dev/null
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
 
 step "admin panel on :$ADMIN_PORT"
 NEXT_ADMIN="$ROOT/apps/admin/node_modules/next/dist/bin/next"
-# Same reasoning as the API: `restart` inherits the environment and the port of the
-# process that was there before, and both have moved between passes.
-pm2 delete "$ADMIN_NAME" >/dev/null 2>&1 || true
-OMNION_API_URL="$API_URL" \
+if pm2 describe "$ADMIN_NAME" >/dev/null 2>&1; then
+  pm2 restart "$ADMIN_NAME" >/dev/null
+else
+  OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_ADMIN" --name "$ADMIN_NAME" --cwd "$ROOT/apps/admin" --time -- dev --port "$ADMIN_PORT" --hostname 127.0.0.1 >/dev/null
-
+fi
 wait_http "http://127.0.0.1:$ADMIN_PORT/login" 150 || { echo "[qa] admin panel did not answer"; pm2 logs "$ADMIN_NAME" --lines 20 --nostream || true; exit 1; }
 
 step "public renderer on :$WEB_PORT"
 NEXT_WEB="$ROOT/apps/web/node_modules/next/dist/bin/next"
-# Same reasoning as the API: `restart` inherits the environment and the port of the
-# process that was there before, and both have moved between passes.
-pm2 delete "$WEB_NAME" >/dev/null 2>&1 || true
-OMNION_API_URL="$API_URL" \
+if pm2 describe "$WEB_NAME" >/dev/null 2>&1; then
+  pm2 restart "$WEB_NAME" >/dev/null
+else
+  OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_WEB" --name "$WEB_NAME" --cwd "$ROOT/apps/web" --time -- dev --port "$WEB_PORT" --hostname 127.0.0.1 >/dev/null
-
+fi
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
-step "browser walkthrough"
-node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT"
+# `QA_ONLY` narrows the pass to named routes and depth passes. The default runs every one of
+# them, which is the right thing for a full acceptance run and the wrong thing for a loop that
+# has just built two screens and needs them proven before the tick ends. It is a filter on the
+# walk, never on the harness around it: the stack, the reset, the vision review and the report
+# all run exactly as they do for a full pass. The array is built unconditionally because
+# `"${QA_ONLY:+--only=$QA_ONLY}"` expands to a single word with a space in the value, which the
+# walkthrough reads as a route name that does not exist.
+QA_ONLY_ARGS=()
+[ -n "${QA_ONLY:-}" ] && QA_ONLY_ARGS=(--only="$QA_ONLY")
 
-step "vision review"
-node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
+step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
+node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}"
+
+
+# The vision review reads the whole shot set and judges it against the product's visual rules.
+# On a scoped pass that set is a fraction of the screens, so its verdicts describe a product
+# state that does not exist — and it is the slowest step in the pass. Skipping it is honest;
+# running it is a report about a partial set.
+if [ -z "${QA_ONLY:-}" ]; then
+  step "vision review"
+  node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
+else
+  step "vision review (skipped: scoped pass, QA_ONLY=$QA_ONLY)"
+fi
 
 step "summary"
 node -e '

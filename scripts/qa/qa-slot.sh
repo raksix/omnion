@@ -45,7 +45,15 @@ reap() {
   for f in "$LOCKDIR"/*; do
     [ -e "$f" ] || continue
     pid="$(basename "$f")"
-    holder="$(cat "${HOLDERDIR}/${pid}" 2>/dev/null || echo '')"
+    # The holder file must yield ONE pid. `run.sh` reads it with `tail -n 1` on the captured
+    # stdout, which is correct; a file holding two pids on one line then fails `kill -0`,
+    # so the place is judged ownerless and reclaimed *while its owner is still running* — and
+    # it is also never reclaimable by its own owner, which is how a queue deadlocks. Taking
+    # the LAST whitespace-separated field makes the test answer the only question it asks
+    # (is that process alive?) whatever the file happens to contain.
+    holder="$(awk '{print $NF}' "${HOLDERDIR}/${pid}" 2>/dev/null || true)"
+    [ -n "${holder:-}" ] || holder="$(cat "${HOLDERDIR}/${pid}" 2>/dev/null || echo '')"
+    holder="$(printf '%s' "${holder}" | awk '{print $NF}')"
     age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
     [ "$age" -gt "$grace" ] || continue
     # No holder file at all, this long after the place appeared, means the pass died between
@@ -60,12 +68,17 @@ reap
 
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
-  # Reap again on every turn, not just once at entry. A pass queued behind another one whose
-  # owner then died holds the place forever otherwise: the place was younger than the grace
-  # period when this script started, so the single entry sweep left it alone and the wait
-  # loop then counted it on every turn without ever asking whether it was still alive. That
-  # is how a crashed pass costs a live one its entire slot wait — this writer's own pass
-  # queued on a place whose owner and holder were both already dead.
+  # Reap INSIDE the loop, not once before it. A place whose holder dies while we are
+  # queued for it is the common case, not the rare one: the pass that owns the place is a
+  # browser pass that can be killed by the box (OOM, a tab crash that takes the process
+  # with it, the loop's own timeout) and its EXIT trap never runs. Reaping once at startup
+  # only cleans up places that were already dead when *this* script started, so a holder
+  # that dies mid-queue is invisible forever — every later pass then prints "waiting for a
+  # QA slot", blocks for the full QA_SLOT_WAIT, and proceeds with a report that never had
+  # a walkthrough in it. Observed on 2026-10-02 (tick 76): a place whose holder died at
+  # 07:53 wedged a pass that had been queued since 07:13 — 49 minutes of the queue for a
+  # holder that was already gone. `count_places` counts files, so an unreclaimed place
+  # reads as full capacity and the queue never drains.
   reap
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then

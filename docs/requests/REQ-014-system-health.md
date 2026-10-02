@@ -1,6 +1,17 @@
 # REQ-014 — System Health
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core + admin UI
+> **Status:** in-progress (slices 1, 2 and 3 shipped: probes + overview, `/health` +
+> `/health/services/{key}` with its own 24 h trend column, `/health/metrics` with named ranges and a
+> server-rendered CSV export, and the incident timeline + threshold policy with
+> `/health/incidents` and `/health/settings`. **Slice 4 is now code-complete.** Its two writers shipped
+> in `a87ee01a`, `c3c22e3f`, `83209cab`: `worker_heartbeats` had a reader and no writer, and
+> `run_and_record` was reached from the route handlers and nowhere else, so samples existed only while
+> somebody watched the panel. Its **events half** shipped in `f57144f9`, `ec56f87d`, `1df104af`,
+> `53273719`: the catalogue now has a `health` area with the five names, `apply_policy` returns what
+> it decided instead of discarding it, and both runners announce it — to organizations that have an
+> endpoint subscribed to `health`, because an event with no organization is delivered to nobody. The
+> `health_history`/`health_incidents`/`health_workers` walks run on live PostgreSQL and pass; the
+> browser pass (`scripts/qa/run.sh`) has still not run on this box) · **Captured:** 2026-09-25 · **Layer:** core + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -92,25 +103,105 @@ Migration: `database/migrations/0014_system_health.sql`, append-only, commented 
 
 Webhook relevance: `health.service.degraded` and `health.service.recovered` are the two an operations endpoint subscribes to; `health.threshold.breached` fires at most once per metric per window so a flapping disk does not flood an endpoint. Audit entries use the `health.*` namespace, written only for manual actions (run checks, settings change, acknowledge, maintenance window).
 
+**Proven against a real receiver** (`05cd11b3`): the fan-out ships per organization that has an *enabled*
+endpoint subscribed to `health`, and the walk creates exactly that — a real organization, a real
+endpoint, a real stop/restart transition — then reads `webhook_deliveries`, not the `events` row. That
+distinction is the whole point: `enqueue_fanout` returns `0` for an event with no organization, so a
+naive `select count(*) from events` assertion would have passed an emitter that recorded five names
+and delivered them to nobody. The walk also asserts the negative both ways — a tenant subscribed to
+`content.published` receives nothing, and with no endpoint at all nothing is recorded.
+
 ### Acceptance criteria
 
-- [ ] `crates/health` exists with a probe registry and one probe per dependency, unit-tested.
-- [ ] `database/migrations/0014_system_health.sql` applies on fresh and populated databases.
-- [ ] `/health` shows all seven services from the request sketch with real states, not constants.
-- [ ] Stopping Redis flips its row to `down` within one interval and restores on recovery.
-- [ ] Worker counts come from heartbeat rows; stopping a worker changes `4/4` to `3/4` and names it.
-- [ ] CPU, memory and disk values match the host within a small tolerance and update on refresh.
-- [ ] Auto-refresh (15 s) visibly updates timestamps and values without a manual reload.
-- [ ] "Run all checks" records a new sample set and reports per-probe failures instead of failing whole.
-- [ ] Service detail lists each probe with latency and message and charts the last 24 h.
-- [ ] A state transition opens an incident; recovery resolves it with a duration.
-- [ ] Acknowledging an incident stores the actor, the note and the timestamp.
-- [ ] A maintenance window suppresses incident creation while the state still shows degraded.
-- [ ] Thresholds save and a breach beyond the critical limit emits `health.threshold.breached` once.
-- [ ] Out-of-range settings (interval 0, heartbeat 0, warn above critical) are refused with messages.
-- [ ] Metric ranges (1 h, 24 h, 7 d) return real aggregates and CSV export matches the range shown.
-- [ ] Sample retention prunes raw samples older than 30 days without touching incidents.
-- [ ] Reads require `health.read`; run-checks and settings require `health.manage` (`403` otherwise).
+- [x] `crates/health` exists with a probe registry and one probe per dependency, unit-tested.
+- [x] `database/migrations/0014_system_health.sql` applies on fresh and populated databases.
+      → shipped as `0188_system_health.sql`: the number is a shared namespace and 0188 is the
+      union high-water across every worktree, not the next free slot on this branch.
+- [x] `/health` shows all seven services from the request sketch with real states, not constants.
+- [x] Stopping Redis flips its row to `down` within one interval and restores on recovery.
+      → **Both legs now run against a real dependency** (`05cd11b3`), which is what the criterion
+        actually asks and what four slices of walks could not reach. The old fixture pointed the
+        probe at `redis://127.0.0.1:1` — a port that was never open — so "restores on recovery"
+        was unreachable *by construction* while the down leg passed honestly. `health_recovery`
+        starts a throwaway `redis-server` on a reserved port of its own, stops it, and starts it
+        again **through the same client handle**: `RedisClient::connection()` caches a
+        `ConnectionManager`, and a cached manager to a server that went away is precisely how a
+        panel says `down` for ever after the server returns. The walk asserts the *stored*
+        samples, the incident that opened, that a steady outage opens no second one, that the
+        recovery resolves **that** incident, and that nothing is left open. Proof: 2 walks,
+        live PostgreSQL and a real server.
+- [x] Worker counts come from heartbeat rows; stopping a worker changes `4/4` to `3/4` and names it.
+      → **re-proved against the writer this slice adds** (`83209cab`). The box was already ticked and
+      the proof was weaker than it looked: `probe_workers` counted rows that the *walk itself* had
+      inserted, and nothing in the platform wrote a heartbeat — so the criterion was proven against a
+        fixture. `one_silent_worker_is_named_and_the_limit_is_the_one_that_was_saved` now drives four
+        workers through `workers::beat`, ages one past a limit it saves at **600** (far enough from
+        the default 120 that a hard-coded constant passes nothing), and asserts `3/4`, the shrinking
+        count, and the worker's *id* in the stale list.
+- [x] CPU, memory and disk values match the host within a small tolerance and update on refresh.
+- [x] Auto-refresh (15 s) visibly updates timestamps and values without a manual reload.
+- [x] "Run all checks" records a new sample set and reports per-probe failures instead of failing whole.
+- [x] Service detail lists each probe with latency and message and charts the last 24 h.
+      → the drill-down shipped in `5690748f` with `runHealthDepth` asserting the screen
+        *rendered* rather than that the URL resolved. **The trend line itself shipped this
+        tick**: `ServiceMetricBody` now carries a `series` and the metric table draws it in a
+        `24 h trend` column, so the screen holds a chart rather than a table of current values
+        with the history on another page. Two details that are the difference between a chart
+        and a decoration: the window is read **once per response** (`SERVICE_TREND_RANGE`), so
+        every row on the page covers the same 24 hours — a per-row `now()` gives the first row a
+        fraction of a second more than the last, and two lines sharing one screen that do not
+        end at the same instant are not comparable; and a row whose series is empty says
+        **"no samples in the last 24 h"** rather than drawing an empty box that reads as a
+        chart that failed to load. `runHealthDepth` now counts the trend elements per metric
+        row and fails a row that renders none of line/point/empty.
+- [x] A state transition opens an incident; recovery resolves it with a duration.
+      → shipped `f572dbde`. An incident opens on a **transition**, decided against the open
+        incident rather than the last sample, so a disk at 91% for six hours is one row with a
+        duration rather than 360 rows whose duration reads as the check interval. Recovery sets
+        `resolved_at = now()` and the duration in SQL, so the stored instant and the number the
+        panel shows come from one clock — a Rust subtraction off a separately-read timestamp is
+        wrong by exactly the gap between the two reads. Proof: `health_incidents` walks
+        (`a_steady_outage_opens_one_incident_and_not_one_per_run`,
+        `recovery_resolves_with_a_duration_the_database_computed`), and the duration is asserted
+        against `resolved_at - started_at` rather than a hand-written constant.
+- [x] Acknowledging an incident stores the actor, the note and the timestamp.
+      → the actor is the **session's** user, never the request body: "acknowledged by" is the
+        only evidence a human looked, and a client-supplied actor id would be a client-supplied
+        claim. The walk re-reads through `incident()` after the write rather than trusting the
+        PATCH's return value, because a value that existed only in the response renders as
+        "not acknowledged" on every later open.
+- [x] A maintenance window suppresses incident creation while the state still shows degraded.
+      → `is_suppressed` answers only "should an incident open". The incident keeps its real
+        `to_state` and the **sample is still written**, which is the leg that distinguishes
+        suppression from skipping the reading — skipping the sample draws a flat line across a
+        planned restart, a chart that lies about the machine. The walk asserts all three: the
+        flag, the state, and the sample row.
+- [x] Thresholds save and a breach beyond the critical limit emits `health.threshold.breached` once.
+      → the ledger stores one row per `(metric, window_start)` and the writer **computes the
+        window once and stores it**, so an emitter that derived it from `now()` at insert time
+        would write one bucket at 10:14:59 and the next at 10:15:01 and the unique index would
+        treat one continuous breach as two events. In-process dedup forgets on restart and
+        re-fires for a disk that has been over the line for an hour. A metric with **no stored
+        pair** never fires: thresholds start empty and the form's numbers are placeholders, so
+        the walk asserts an *unconfigured* metric at 99% is silent.
+- [x] Out-of-range settings (interval 0, heartbeat 0, warn above critical) are refused with messages.
+      → refused with a sentence naming the metric, in `Threshold::new` and in the interval
+        bounds, and refused *again* by the database constraints so a save that bypasses the form
+        still cannot write an invalid policy. Two of those constraints were themselves wrong and
+        the walk found both — see `0191` below.
+- [x] Metric ranges (1 h, 24 h, 7 d) return real aggregates and CSV export matches the range shown.
+      → shipped `8c445f52` + `9e7382b0`. A range is a **name** (`Range::Hour/Day/Week`, keys
+        `1h`/`24h`/`7d`) and `Range::parse` refuses anything else naming what is offered — the
+        clamp-and-answer shape produces a table labelled `7d` holding a day *and* a CSV that
+        matches that table perfectly, so the export criterion would pass while both were wrong.
+        The export and the table are rendered from one `metric_summaries` list, and the file
+        stamps the range into every row, the filename and an `X-Health-Range` header. An empty
+        window has `None` aggregates, not `0` (`avg()` over no rows is `NULL`). Proof: 11 crate
+        unit tests + 8 live-PostgreSQL walks (`health_history`), `tsc` exit 0. The walk asserts
+        the empty case *and* the populated case through the same function, because a read that
+        returned nothing for everybody would pass the empty leg.
+- [x] Sample retention prunes raw samples older than 30 days without touching incidents.
+- [x] Reads require `health.read`; run-checks and settings require `health.manage` (`403` otherwise).
 - [ ] Walkthrough passes with zero high findings.
 
 ### QA plan
@@ -120,9 +211,19 @@ The walkthrough must visit `/health`, `/health/metrics`, `/health/incidents`, `/
 ### Slices
 
 1. **Probes + overview** — schema for samples and settings, probe registry, run loop, `/health` with the seven service rows and the metric cards. Done: stopping a dependency changes the panel and restarting it recovers, all from real probes.
-2. **History + service detail** — sample aggregation, sparklines, ranges, per-service detail and CSV export, retention pruning. Done: 24 h trends render from stored samples and pruning keeps the configured retention.
-3. **Incidents + thresholds** — transition detection, incident store, acknowledge/resolve, threshold policy and breach events, `/health/incidents`. Done: a scripted outage produces one incident with a duration and an acknowledgement that persists.
+2. **History + service detail** — sample aggregation, sparklines, ranges, per-service detail and CSV export, retention pruning. Done: 24 h trends render from stored samples and pruning keeps the configured retention. **Shipped** (`8c445f52`, `9e7382b0`): `crates/health::history` (named `Range`, `MetricSummary`, `RollupDay`, `summaries_to_csv`), `/health/metrics` + `/health/metrics.csv` behind `health.read`, and `/health/metrics` with range selector, sparklines, CSV export, empty state and mobile cards. **The service detail page's own 24 h chart closed this tick**: its metric table now has a `24 h trend` column fed by the series on each row, over a window read once per response so every line on the page ends at the same instant. *Still open in this slice:* only the browser pass — the trend column's rendering is asserted in code and walked, but `scripts/qa/run.sh` has still not run on this box.
+3. **Incidents + thresholds** — transition detection, incident store, acknowledge/resolve, threshold policy and breach events, `/health/incidents`. Done: a scripted outage produces one incident with a duration and an acknowledgement that persists. **Shipped** (`f572dbde`, `0191`): `crates/health::incidents`, the emitter wired into `run_and_record` (so the manual button and the schedule produce the same incidents), `/health/incidents` + `/health/settings`, and the `health_incidents` walks. **The walk found two constraints that were themselves wrong**, which is why it is worth recording rather than just ticking: `0188`'s `health_incidents_resolved_shape` was the *inverse* of its own comment and made every open non-healthy incident unrepresentable, and `0190`'s pair check demanded `warn < crit` unconditionally while `classify` reads a `below` pair with `warn > crit`. Both are fixed in `0191`; see that file for why neither a type checker nor four green gates could see them. *Still open in this slice:* only the browser pass.
 4. **Workers + maintenance + summary** — worker heartbeats, stale detection, maintenance windows, platform summary endpoint feeding the security overview, webhook for degraded/recovered. Done: a killed worker is reported as stale and the summary endpoint reflects the worst current state.
+   **Two of the four shipped this tick** (`a87ee01a`, `c3c22e3f`, `83209cab`): the heartbeat
+   **writer** (`crates/health::workers`) and the **scheduled probe run** (`apps/api::health_runner`),
+   which is what the maintenance windows and the summary endpoint both read to have anything to
+   show. Maintenance windows themselves shipped in slice 3 with `/health/settings`, and
+   `GET /health/summary` is live. *Still open in this slice:* the five `health.*` events the
+   request names (`health.service.degraded`, `health.service.recovered`, `health.threshold.breached`,
+   `health.incident.acknowledged`, `health.checks.completed`). None of them is emitted today — the
+   catalogue has no `health` area at all — so "an operations endpoint subscribes to degraded and
+   recovered" is currently a sentence in a document rather than a subscription somebody can make.
+   That half is a catalogue addition plus emitters, and it is the next slice.
 
 ### Risks / notes
 

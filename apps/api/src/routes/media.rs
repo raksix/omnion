@@ -397,9 +397,21 @@ pub async fn raw_media(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(media_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     let media = media_in_scope(&state, &current, media_id).await?;
-    serve(&state, &media, "private, max-age=300").await
+    let range = range_header(&headers);
+    let conditional = conditional_headers(&headers, &media.checksum, Some(media.created_at));
+    serve(&state, &media, "private, max-age=300", range, conditional).await
+}
+
+/// The caller's `Range` header, if it carries one.
+///
+/// A header that is present but not valid UTF-8 reads as `None` rather than as an error: the
+/// parser would ignore it either way, and refusing the request over an undecodable byte would
+/// make a broken proxy into a broken video.
+pub(crate) fn range_header(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers.get(header::RANGE)?.to_str().ok()
 }
 
 /// The bytes of one file for the panel, through the full file-manager row.
@@ -412,10 +424,13 @@ pub async fn raw_file(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(media_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     let file = crate::routes::media_files::file_in_scope(&state, &current, media_id).await?;
     ensure_servable(&state, &current, &file).await?;
-    serve_file(&state, &file, "private, max-age=300").await
+    let range = range_header(&headers);
+    let conditional = conditional_headers(&headers, &file.checksum, file.updated_at.or(Some(file.created_at)));
+    serve_file(&state, &file, "private, max-age=300", range, conditional).await
 }
 
 /// Remove one file: the object and its row.
@@ -473,6 +488,7 @@ pub async fn delete_media(
 pub async fn public_media(
     State(state): State<AppState>,
     Path(media_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     // The public renderer reads the full row, not the base one, because a file that is
     // quarantined or unscanned must be refused here too: the public path is the one an
@@ -487,7 +503,9 @@ pub async fn public_media(
     // unauthenticated reader must not reach. The two halves are separate functions for this
     // reason, and conflating them is the mistake this comment is here to stop.
     ensure_scan_allows(&state, &file).await?;
-    serve_file(&state, &file, "public, max-age=3600").await
+    let range = range_header(&headers);
+    let conditional = conditional_headers(&headers, &file.checksum, file.updated_at.or(Some(file.created_at)));
+    serve_file(&state, &file, "public, max-age=3600", range, conditional).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -562,15 +580,31 @@ fn multipart_error(error: axum::extract::multipart::MultipartError) -> ApiError 
 }
 
 /// Answer with the bytes of one file, under the serve plan of its content type.
+///
+/// `range` is the caller's `Range` header, already extracted. A `None` header and a header the
+/// parser could not read are the same request as far as this function is concerned, and they get
+/// the same answer — see [`omnion_media::RangePlan`] for why an unreadable range is ignored
+/// rather than refused.
 async fn serve(
     state: &AppState,
     media: &Media,
     cache_control: &'static str,
+    range: Option<&str>,
+    conditional: ConditionalAnswer,
 ) -> Result<Response, ApiError> {
-    let bytes = state.storage().get(&media.storage_key).await?;
+    // Before the body moves: a revalidation that reads the object store and then decides to send
+    // nothing has cost exactly what an unconditional `200` would have.
+    if conditional.verdict == omnion_media::validators::Conditional::NotModified {
+        return not_modified(&conditional);
+    }
     let plan = serve_plan(&media.content_type);
+    let (status, body) = read_window(state, &media.storage_key, range, media.size()).await?;
+    // The range headers are decided *before* the body moves into the response, because they
+    // report the number of bytes that arrived and the body is the only thing that knows it.
+    let ranges = range_header_values(range, media.size(), &body)?;
 
-    let mut response = Response::new(Body::from(bytes));
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, header_value(plan.content_type)?);
     headers.insert(
@@ -582,6 +616,8 @@ async fn serve(
     );
     headers.insert(header::CACHE_CONTROL, header_value(cache_control)?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
+    apply_range_headers(headers, ranges)?;
+    apply_validators(headers, &conditional)?;
     Ok(response)
 }
 
@@ -594,11 +630,20 @@ async fn serve_file(
     state: &AppState,
     media: &omnion_media::MediaFile,
     cache_control: &'static str,
+    range: Option<&str>,
+    conditional: ConditionalAnswer,
 ) -> Result<Response, ApiError> {
-    let bytes = state.storage().get(&media.storage_key).await?;
+    if conditional.verdict == omnion_media::validators::Conditional::NotModified {
+        return not_modified(&conditional);
+    }
     let plan = serve_plan(&media.content_type);
+    let (status, body) = read_window(state, &media.storage_key, range, media.size()).await?;
+    // The range headers are decided *before* the body moves into the response, because they
+    // report the number of bytes that arrived and the body is the only thing that knows it.
+    let ranges = range_header_values(range, media.size(), &body)?;
 
-    let mut response = Response::new(Body::from(bytes));
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, header_value(plan.content_type)?);
     headers.insert(
@@ -610,7 +655,104 @@ async fn serve_file(
     );
     headers.insert(header::CACHE_CONTROL, header_value(cache_control)?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
+    apply_range_headers(headers, ranges)?;
+    apply_validators(headers, &conditional)?;
     Ok(response)
+}
+
+/// Read the bytes a request asks for: the whole object, or the window its `Range` header names.
+///
+/// Three decisions live here and each is a shortcut that produces a plausible wrong answer:
+///
+/// 1. **The window is chosen from the row's length, and a store that disagrees is answered with
+///    what actually came back.** The `media` row records the size at upload; the object may be
+///    shorter (a truncated write, a key rewritten by hand). Slicing to the row's length and
+///    reporting it in `Content-Range` would tell a player it received bytes that never existed.
+/// 2. **A store that cannot satisfy the window yields the whole object, not an error.** A
+///    `416` from the *store* means the object is shorter than the row says — the client did
+///    nothing wrong, so answering `416` to it blames the client for the server's disagreement.
+///    The body is then the whole object, which is what a player can still play.
+/// 3. **A window is only requested when it is worth requesting.** For a small object the whole
+///    read is cheaper than a second round trip, and the branch keeps a one-kilobyte text file on
+///    exactly the code path it used before ranges existed.
+pub(crate) async fn read_window(
+    state: &AppState,
+    storage_key: &str,
+    range: Option<&str>,
+    claimed_total: u64,
+) -> Result<(StatusCode, Vec<u8>), ApiError> {
+    match omnion_media::RangePlan::decide(range, claimed_total) {
+        omnion_media::RangePlan::Whole => {
+            let bytes = state.storage().get(storage_key).await?;
+            Ok((StatusCode::OK, bytes))
+        }
+        omnion_media::RangePlan::Unsatisfiable { .. } => {
+            // Nothing the client named exists, and no body is sent: the `Content-Range` header
+            // on this response is the whole answer, and a player reads the length from it.
+            Ok((StatusCode::RANGE_NOT_SATISFIABLE, Vec::new()))
+        }
+        omnion_media::RangePlan::Partial { window, .. } => {
+            match state
+                .storage()
+                .get_range(storage_key, window.start, window.end)
+                .await
+            {
+                Ok(bytes) if !bytes.is_empty() => Ok((StatusCode::PARTIAL_CONTENT, bytes)),
+                // Decision 2 above: the store refused the window the *row* implied, so the whole
+                // object is the honest answer and the status follows the bytes that arrived.
+                Ok(_) => {
+                    let bytes = state.storage().get(storage_key).await?;
+                    Ok((StatusCode::OK, bytes))
+                }
+                Err(omnion_storage::StorageError::RangeNotSatisfiable { .. }) => {
+                    let bytes = state.storage().get(storage_key).await?;
+                    Ok((StatusCode::OK, bytes))
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+    }
+}
+
+/// Write the three headers a range answer carries.
+///
+/// `Accept-Ranges` goes on **every** response, including the whole-object one: a client that has
+/// to fail a request to discover that ranges work never tries again, and the media player is
+/// exactly the client that most needs the second attempt. `Content-Range` is only written when
+/// bytes were actually windowed, and its total is the number of bytes that really arrived.
+pub(crate) fn range_header_values(
+    range: Option<&str>,
+    claimed_total: u64,
+    served: &[u8],
+) -> Result<Option<String>, ApiError> {
+    let plan = omnion_media::RangePlan::decide(range, claimed_total);
+    // A `200` carries no `Content-Range` even when the client asked for a window and the answer
+    // turned out to be the whole object — a `Content-Range` on a `200` is a lie about a
+    // response that is not a range.
+    match plan.content_range(served.len() as u64) {
+        Some(value) => Ok(Some(value)),
+        None => Ok(None),
+    }
+}
+
+/// Write the headers a range answer carries.
+///
+/// `Accept-Ranges` goes on **every** response, including the whole-object one: a client that has
+/// to fail a request to discover that ranges work never tries again, and the media player is
+/// exactly the client that most needs the second attempt. `Content-Range` is only written when
+/// bytes were actually windowed, and its total is the number of bytes that really arrived.
+pub(crate) fn apply_range_headers(
+    headers: &mut axum::http::HeaderMap,
+    content_range: Option<String>,
+) -> Result<(), ApiError> {
+    headers.insert(
+        header::ACCEPT_RANGES,
+        header_value(omnion_media::RangePlan::ACCEPT_RANGES)?,
+    );
+    if let Some(value) = content_range {
+        headers.insert(header::CONTENT_RANGE, header_value(&value)?);
+    }
+    Ok(())
 }
 
 /// Build one response header value, refusing anything unusable.
@@ -622,6 +764,83 @@ fn header_value(value: &str) -> Result<HeaderValue, ApiError> {
             err.to_string(),
         )
     })
+}
+
+/// Answer a conditional `GET` with `304` when the caller already holds these bytes.
+///
+/// The three media serve paths — the panel's `raw`, the public renderer and a version's `raw` —
+/// all answer from an address that **names the file rather than its contents**, and a replace
+/// changes the bytes behind that address without changing it. So the response has to carry a
+/// validator, and the server has to honour one, or the panel's own `max-age` window is a promise
+/// the bytes behind it can break.
+///
+/// Three decisions, each a shortcut that produces a plausible wrong answer:
+///
+/// 1. **The check happens before the body is read.** Reading first and comparing after is the same
+///    work as not checking at all, which defeats the entire point: a revalidation that still
+///    pulls every byte off the object store saves the *client* nothing an unconditional `200`
+///    would not have saved it.
+/// 2. **A `304` carries no `Content-Length` and no body** — only the validators. Sending `0`
+///    as the length is the detail that makes several clients treat the response as an empty file,
+///    and a `Content-Range` on it is a lie about a response that is not a range.
+/// 3. **The ETag is weak and the validator is the checksum.** `Media::checksum` is the SHA-256 of
+///    the bytes, and `append_version` rewrites it in the same statement that moves
+///    `storage_key`, so it cannot outlive its object. A validator built from `updated_at` would
+///    instead be changed by a rename and unchanged by a replace that happened without a stamp.
+///
+/// `last_modified` is optional because the version row records `created_at` rather than a change
+/// instant; a row with no recorded instant offers no date validator, which is honest rather than
+/// a missing header a client has to guess about.
+pub(crate) fn conditional_headers(
+    headers: &axum::http::HeaderMap,
+    checksum: &str,
+    last_modified: Option<OffsetDateTime>,
+) -> ConditionalAnswer {
+    let etag = omnion_media::validators::weak_etag_of(checksum);
+    let rendered = last_modified.map(omnion_media::validators::imf_fixdate);
+    let get = |name: header::HeaderName| {
+        headers
+            .get(&name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    let verdict = omnion_media::validators::decide(
+        get(header::IF_NONE_MATCH).as_deref(),
+        get(header::IF_MODIFIED_SINCE).as_deref(),
+        &etag,
+        rendered.as_deref(),
+    );
+    ConditionalAnswer { verdict, etag, rendered }
+}
+
+/// What a conditional answer decided, carried with the values a `304` still has to report.
+pub(crate) struct ConditionalAnswer {
+    /// Whether the body is sent or the caller is told it already has it.
+    pub verdict: omnion_media::validators::Conditional,
+    /// The current representation's validator.
+    pub etag: String,
+    /// The current representation's instant, when one was recorded.
+    pub rendered: Option<String>,
+}
+
+/// Write the validators onto a response, whether or not it carries a body.
+pub(crate) fn apply_validators(
+    headers: &mut axum::http::HeaderMap,
+    answer: &ConditionalAnswer,
+) -> Result<(), ApiError> {
+    headers.insert(header::ETAG, header_value(&answer.etag)?);
+    if let Some(last_modified) = &answer.rendered {
+        headers.insert(header::LAST_MODIFIED, header_value(last_modified)?);
+    }
+    Ok(())
+}
+
+/// Build the `304` a revalidated request is answered with.
+pub(crate) fn not_modified(answer: &ConditionalAnswer) -> Result<Response, ApiError> {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NOT_MODIFIED;
+    apply_validators(response.headers_mut(), answer)?;
+    Ok(response)
 }
 
 /// Write an audit row; a privileged action is not reported as successful without one.

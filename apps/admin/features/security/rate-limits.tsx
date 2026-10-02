@@ -333,9 +333,27 @@ export function RateLimitsScreen() {
         <p
           role="alert"
           data-rate-limits-save-error
+          data-rate-limits-save-error-code={saveError.code}
           className="rounded-md border border-danger-soft bg-danger-soft px-3 py-2 text-[12.5px] text-danger"
         >
           {saveError.message}
+          {saveError.isRateLimited ? (
+            <span className="mt-1 block text-muted">
+              The limiter refused this save —{" "}
+              {typeof saveError.details?.scope === "string" ? (
+                <strong className="font-medium">{saveError.details.scope}</strong>
+              ) : (
+                "a scope"
+              )}
+              {saveError.details?.count !== undefined &&
+              saveError.details?.ceiling !== undefined
+                ? `, ${String(saveError.details.count)} of ${String(saveError.details.ceiling)} in the window`
+                : ""}
+              {saveError.retryAfterSeconds
+                ? `. Try again in ${saveError.retryAfterSeconds}s — the panel is on the request path too.`
+                : ""}
+            </span>
+          ) : null}
         </p>
       ) : null}
 

@@ -1,7 +1,8 @@
 //! HTTP representation of core errors.
 
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::header;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use omnion_ai_hub::AiHubError;
 use omnion_audit::AuditError;
@@ -39,6 +40,14 @@ pub struct ApiError {
     code: &'static str,
     message: String,
     details: Option<Value>,
+    /// Seconds the caller should wait, for `Retry-After`.
+    ///
+    /// `None` on every error that is not a refusal with a wait attached, and it is a distinct
+    /// field rather than something dug out of `details` because the header has to be *absent*
+    /// rather than wrong: a `Retry-After: 0` on a 403 would tell a client to retry immediately,
+    /// and a `Retry-After` present on an error that is not a refusal teaches a client to wait on
+    /// things that never needed waiting. One field, set only by the layer that knows the wait.
+    retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -50,7 +59,21 @@ impl ApiError {
             code,
             message: message.into(),
             details: None,
+            retry_after: None,
         }
+    }
+
+    /// Attach a `Retry-After` in seconds.
+    ///
+    /// Zero is refused rather than clamped: "retry immediately" and "I do not know how long" are
+    /// different claims, and a layer that computes a wait knows which one it means. A `0` here
+    /// would be the platform telling every client to come straight back.
+    #[must_use]
+    pub fn with_retry_after(mut self, seconds: i64) -> Self {
+        if seconds > 0 {
+            self.retry_after = Some(seconds as u64);
+        }
+        self
     }
 
     /// Attach the structured explanation of a refusal.
@@ -93,12 +116,14 @@ impl ApiError {
                 code: "dependency_unavailable",
                 message: format!("{dependency}: {message}"),
                 details: None,
+                retry_after: None,
             },
             other => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "internal_error",
                 message: other.to_string(),
                 details: None,
+                retry_after: None,
             },
         }
     }
@@ -483,6 +508,7 @@ impl From<PermissionsError> for ApiError {
                 code: "system_role",
                 message: "platform roles are managed by the platform".to_owned(),
                 details: None,
+                retry_after: None,
             },
             // REQ-006 role depth: the field-level refusals carry the field they belong to, so the
             // matrix screen can point at `inherits_role_id` instead of showing a generic message.
@@ -493,6 +519,7 @@ impl From<PermissionsError> for ApiError {
                     "the role cannot inherit from itself or one of its own descendants (inherits_role_id)"
                         .to_owned(),
                 details: None,
+                retry_after: None,
             },
             PermissionsError::InheritanceDepthExceeded { max } => Self::bad_request(
                 "role_inheritance_depth",
@@ -505,6 +532,7 @@ impl From<PermissionsError> for ApiError {
                     "the role still carries {count} live binding(s); revoke them before deleting it"
                 ),
                 details: None,
+                retry_after: None,
             },
             PermissionsError::VersionConflict { expected, current } => Self {
                 status: StatusCode::CONFLICT,
@@ -513,6 +541,7 @@ impl From<PermissionsError> for ApiError {
                     "the role changed since it was read: expected version {expected}, current version {current}"
                 ),
                 details: None,
+                retry_after: None,
             },
             PermissionsError::InvalidEntries { unknown, duplicates } => {
                 let mut parts: Vec<String> = Vec::new();
@@ -597,6 +626,47 @@ impl From<PermissionsError> for ApiError {
     }
 }
 
+impl From<omnion_backup::BackupError> for ApiError {
+    fn from(error: omnion_backup::BackupError) -> Self {
+        use omnion_backup::BackupError as B;
+        match error {
+            // A missing run or schedule is a 404, and it is a 404 rather than a 403 even
+            // when the row exists in another tenant: a 403 confirms the id is real, and a
+            // backup's existence is itself information about the platform.
+            B::NotFound => Self::new(StatusCode::NOT_FOUND, "backup_not_found", "no such backup"),
+            B::ScheduleNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "backup_schedule_not_found",
+                "no such backup schedule",
+            ),
+            // A refusal is a 409, not a 400: the request was legal and the platform has
+            // moved on. That is the same split the permissions and media modules use, and
+            // the two answer different questions for the caller.
+            B::Rejected(message) => Self::new(StatusCode::CONFLICT, "backup_rejected", message),
+            B::Invalid(message) => Self::bad_request("invalid_backup", message),
+            B::Partial {
+                failed,
+                total,
+                message,
+            } => Self::new(
+                StatusCode::CONFLICT,
+                "backup_partial",
+                format!("{failed} of {total} parts failed: {message}"),
+            ),
+            B::Database(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            B::Database(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
+        }
+    }
+}
+
 impl From<MediaError> for ApiError {
     fn from(error: MediaError) -> Self {
         match error {
@@ -658,6 +728,13 @@ impl From<MediaError> for ApiError {
             MediaError::InvalidFolderName(message) => {
                 Self::bad_request("invalid_folder_name", message)
                     .with_details(serde_json::json!({ "field": "name" }))
+            }
+            // A browser filter that contradicts itself is a `400` with its own code and the
+            // offending field, so the toolbar can put the sentence under the box that produced
+            // it instead of showing "no files match" for a filter nobody typed.
+            MediaError::InvalidFilter { field, reason } => {
+                Self::bad_request("invalid_filter", format!("`{field}`: {reason}"))
+                    .with_details(serde_json::json!({ "field": field }))
             }
             MediaError::FolderCycle { path } => Self::new(
                 StatusCode::CONFLICT,
@@ -773,6 +850,13 @@ impl From<MediaError> for ApiError {
                 Self::bad_request("invalid_retention_setting", reason)
                     .with_details(serde_json::json!({ "field": field }))
             }
+            // Same rule for the custom metadata pairs, with its own code: the pair editor puts
+            // the message under the row that caused it, and `metadata.<key>` means a refusal
+            // about a licence number cannot land under the campaign field beside it.
+            MediaError::InvalidMetadata { field, reason } => {
+                Self::bad_request("invalid_metadata", reason)
+                    .with_details(serde_json::json!({ "field": field }))
+            }
             // A missing policy is a `404`, and the tenancy scope lives *inside* the lookup
             // rather than being applied afterwards — the same lesson `media_grants::delete_one`
             // learned from a walk that got a `403` for another tenant's grant id and thereby
@@ -830,6 +914,17 @@ impl From<StorageError> for ApiError {
                 "storage_error",
                 format!("the object store refused the request (status {status}): {message}"),
             ),
+            // A `409`, not a `503`: nothing is unavailable and retrying will not help, because
+            // the object and the row disagree about its length and only a repair fixes that. A
+            // retryable status here would have a client — or a media player — asking for ever.
+            StorageError::RangeNotSatisfiable { key, requested } => Self::new(
+                StatusCode::CONFLICT,
+                "object_range_not_satisfiable",
+                format!(
+                    "the stored object is shorter than the range that was asked for \
+                     ({requested} of {key:?})"
+                ),
+            ),
         }
     }
 }
@@ -852,41 +947,6 @@ impl From<WorkflowError> for ApiError {
             ),
             WorkflowError::Audit(err) => err.into(),
             WorkflowError::Invalid { code, message } => Self::bad_request(code, message),
-            // The credential taxonomy (REQ-087 slice 2). The statuses are the ones the routes
-            // use too, kept here so a `?` conversion and a `.map_err(map_store)` cannot answer
-            // the same failure two different ways: `credential_in_use` is a `409` because the
-            // resource exists and the conflict is real, and the rest are the caller's `400`.
-            WorkflowError::CredentialInUse { key, workflows } => Self::new(
-                StatusCode::CONFLICT,
-                "credential_in_use",
-                format!("{key:?} is still named by {workflows} workflow(s)"),
-            ),
-            WorkflowError::CredentialSecretWriteOnly { field } => Self::bad_request(
-                "credential_secret_write_only",
-                format!(
-                    "{field:?} is write-only — a secret is accepted once, on the replace-secret \
-                     path, and is never returned"
-                ),
-            ),
-            WorkflowError::CredentialFieldRequired { field } => Self::bad_request(
-                "credential_field_required",
-                format!("{field:?} is required by this credential type"),
-            ),
-            WorkflowError::CredentialTypeUnknown(key) => Self::bad_request(
-                "credential_type_unknown",
-                format!("{key:?} is not a credential type"),
-            ),
-            WorkflowError::CredentialScopeDenied {
-                field,
-                value,
-                allowed,
-            } => Self::bad_request(
-                "credential_scope_denied",
-                format!("{field} {value:?} is not one of {}", allowed.join(", ")),
-            ),
-            WorkflowError::CredentialInvalid(message) => {
-                Self::bad_request("credential_invalid", message)
-            }
         }
     }
 }
@@ -999,6 +1059,13 @@ impl From<AiHubError> for ApiError {
                 "provider_not_found",
                 "no such AI provider",
             ),
+            // A decision id is a bookmark, and a stale one is a 404 rather than an error: the
+            // detail view opens by id and a pruned row is the expected cause.
+            AiHubError::DecisionNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "decision_not_found",
+                "no route decision with that id",
+            ),
             AiHubError::ModelNotFound => Self::new(
                 StatusCode::NOT_FOUND,
                 "model_not_found",
@@ -1019,8 +1086,215 @@ impl From<AiHubError> for ApiError {
                 "provider_disabled",
                 format!("the AI provider \"{name}\" is switched off"),
             ),
+            // Removing the default is a `409` and not a `404`: the row is right there, and what
+            // the caller has to change first is the installation's default, not the id.
+            AiHubError::ProviderIsDefault(name) => Self::new(
+                StatusCode::CONFLICT,
+                "provider_is_default",
+                format!(
+                    "\"{name}\" is the installation default; make another provider the default \
+                     before removing it"
+                ),
+            ),
             AiHubError::InvalidProvider(message) => Self::bad_request("invalid_provider", message),
             AiHubError::InvalidModel(message) => Self::bad_request("invalid_model", message),
+            // An agent and a run are both things the caller *shaped*, so both are 400s with the
+            // message carried through: the limit text ("the goal is 2001 characters; the limit is
+            // 2000") is what the form puts under the field, and replacing it with a generic
+            // sentence would throw away the only part the user can act on.
+            AiHubError::InvalidAgent(message) => Self::bad_request("invalid_agent", message),
+            AiHubError::InvalidRun(message) => Self::bad_request("invalid_run", message),
+            // A workspace refusal is a 400 with the limit text kept: the Workspace tab shows the
+            // message under the path field, and "file too large" without the number is a message
+            // the reader cannot act on. It is deliberately not an `invalid_agent` — the shape
+            // differs and a client that folds them together puts a path error above the name.
+            AiHubError::InvalidFile(message) => Self::bad_request("invalid_file", message),
+            // Skills (REQ-099 slice 3). The three codes map to three different screens, which
+            // is why they are three and not one: `invalid_skill` is a field message under the
+            // skill form, `skill_not_found` is a 404 so a stale key in a URL is a stale bookmark
+            // rather than an error, and `skill_conflict` is a 409 the panel resolves by asking
+            // for another key. `skill_read_only` is a 403 — the row exists, it is just not the
+            // caller's to rewrite, and a 400 would tell them to fix a request that was fine.
+            AiHubError::InvalidSkill(message) => Self::bad_request("invalid_skill", message),
+            AiHubError::SkillNotFound(key) => Self::new(
+                StatusCode::NOT_FOUND,
+                "skill_not_found",
+                format!("no skill `{key}` in this registry"),
+            ),
+            AiHubError::SkillReadOnly(message) => {
+                Self::new(StatusCode::FORBIDDEN, "skill_read_only", message)
+            }
+            AiHubError::SkillConflict(message) => {
+                Self::new(StatusCode::CONFLICT, "skill_conflict", message)
+            }
+            // The tool registry (REQ-100). Same shape as the skills above and for the same
+            // reasons: a limit or a key the panel cannot use is a `400` whose message names the
+            // field, and a tool key that is not in the registry is a `404` so a stale bookmark
+            // reads as a stale bookmark. A *retired* tool is still found on purpose — the detail
+            // screen has to be able to open one and say why it retired.
+            AiHubError::InvalidTool(message) => Self::bad_request("invalid_tool", message),
+            AiHubError::ToolNotFound(key) => Self::new(
+                StatusCode::NOT_FOUND,
+                "tool_not_found",
+                format!("no tool `{key}` in the registry"),
+            ),
+            // AI identities (REQ-100 slice 2). The same three-way split the tools use, and it is
+            // a split rather than a single catch because the three answers mean different things
+            // to the panel: `invalid_identity` lands on a form field, `identity_not_found` is a
+            // deleted row or another tenant's (never confirmable, per the variant's own docs),
+            // and `identity_conflict` is a taken key the operator resolves by choosing another.
+            AiHubError::InvalidIdentity(message) => {
+                Self::bad_request("invalid_identity", message)
+            }
+            AiHubError::IdentityNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "identity_not_found",
+                format!("no identity `{id}` in this organization"),
+            ),
+            AiHubError::IdentityConflict(message) => {
+                Self::new(StatusCode::CONFLICT, "identity_conflict", message)
+            }
+            // MCP clients (REQ-108 slice 1). The same three-way split the identities use, and
+            // the tenancy half matters most here: an MCP client id sits in a URL, and a status
+            // code that distinguishes "exists in another tenant" would make the clients table an
+            // existence oracle over every token prefix in the installation. `invalid_mcp_client`
+            // lands on a form field (the message names which), `mcp_client_not_found` is a
+            // deleted row or a foreign one, and `mcp_client_conflict` is a taken name the
+            // operator resolves by choosing another.
+            AiHubError::InvalidMcpClient(message) => {
+                Self::bad_request("invalid_mcp_client", message)
+            }
+            AiHubError::McpClientNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "mcp_client_not_found",
+                format!("no MCP client `{id}` in this organization"),
+            ),
+            AiHubError::McpClientConflict(message) => {
+                Self::new(StatusCode::CONFLICT, "mcp_client_conflict", message)
+            }
+            AiHubError::McpClientToolConflict(message) => {
+                Self::new(StatusCode::CONFLICT, "mcp_client_tool_conflict", message)
+            }
+            // The data guard (REQ-105). The same four-way split, and for the same reason: the
+            // rule form's bad field is a `400` naming the field, a rule id from another tenant
+            // (or a platform row, for the update path) is a `404` — never a 403, or the rules
+            // screen becomes an existence oracle for the whole installation's detection rules —
+            // a taken key is a `409` the panel resolves by offering another, and the rule
+            // budget is a `422`: nothing in the caller's request is wrong, the *configuration*
+            // is, and the fix is on the rules screen.
+            AiHubError::InvalidGuardRule(message) => {
+                Self::bad_request("invalid_guard_rule", message)
+            }
+            AiHubError::GuardRuleNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "guard_rule_not_found",
+                format!("no guard rule `{id}` in this organization"),
+            ),
+            AiHubError::GuardRuleConflict(message) => {
+                Self::new(StatusCode::CONFLICT, "guard_rule_conflict", message)
+            }
+            AiHubError::InvalidGuardExemption(message) => {
+                Self::bad_request("invalid_guard_exemption", message)
+            }
+            AiHubError::GuardConfiguration(message) => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "guard_configuration",
+                message,
+            ),
+            // A refusal by policy is a `403` and not a `400`: nothing about the payload is
+            // malformed, so sending it again unchanged would be refused again, and the code has
+            // to be exactly `ai_guard_blocked` — the chat surface keys its "this was blocked by
+            // the data guard" banner off that string, and a generic `forbidden` would leave the
+            // user with no idea why their message never reached a model.
+            AiHubError::GuardBlocked {
+                label,
+                rule_key,
+                message,
+            } => Self::new(StatusCode::FORBIDDEN, "ai_guard_blocked", message)
+                .with_details(serde_json::json!({
+                    "label": label,
+                    "rule_key": rule_key,
+                })),
+            // Approvals (REQ-101). The same three-way split, and for the same reason: an
+            // `invalid_approval` is a field on the review or the policy form (a class nobody
+            // has heard of, an expiry of zero, a rejection with no reason), an
+            // `approval_not_found` is a pruned row or **another tenant's** — never a 403,
+            // because an approval id that exists must not be confirmable by its status code,
+            // and the inbox would become an existence oracle for every deletion on record.
+            AiHubError::InvalidApproval(message) => {
+                Self::bad_request("invalid_approval", message)
+            }
+            AiHubError::ApprovalNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "approval_not_found",
+                format!("no approval `{id}` in this organization"),
+            ),
+            // The change-set pair (REQ-101 slice 3). Same shapes as the approval pair and for
+            // the same reason: a set that breaks its own rules is a `400` whose message names
+            // the operation, and a set id that is not in this organization is a `404` — never
+            // a 403, or the editor becomes an existence oracle for every proposal in the
+            // installation.
+            AiHubError::InvalidChangeSet(message) => {
+                Self::bad_request("invalid_change_set", message)
+            }
+            AiHubError::ChangeSetNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "change_set_not_found",
+                format!("no change set `{id}` in this organization"),
+            ),
+            // The air gap (REQ-106 slice 2). A bad reason is a field on the switch form, so it is
+            // a `400`; an allow-list row that is not there is a `404` — never a 403, or the
+            // settings screen becomes an existence oracle over a list whose whole purpose is to
+            // say what counts as internal. The blocked *call* is not here on purpose: it is a
+            // frame inside the chat stream, because the stream has already opened by the time the
+            // walk reaches the provider, and a status code is no longer available there.
+            // The eval trio (REQ-107 slice 1). A suite or case that breaks its own rules is a
+            // `400` naming the field, because every one of those refusals belongs to one input
+            // in the editor; a taken key is a `409`, which is a different shape on purpose —
+            // the editor RESOLVES it by offering another key and keeping the rest of the form,
+            // where a `400` would make the operator guess which field collided. A suite or case
+            // id that is not in this organization is a `404`, never a 403, or the suite screen
+            // becomes an existence oracle over every key in the installation.
+            AiHubError::InvalidEval(message) => Self::bad_request("invalid_eval", message),
+            AiHubError::EvalSuiteNotFound(key) => Self::new(
+                StatusCode::NOT_FOUND,
+                "eval_suite_not_found",
+                format!("no eval suite `{key}` in this organization"),
+            ),
+            AiHubError::EvalCaseNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "eval_case_not_found",
+                format!("no eval case `{id}` in this organization"),
+            ),
+            // A run (REQ-107 slice 2). A `404` for the same tenancy reason as the pair above —
+            // a run id that answered "exists in another tenant" would make the run screen an
+            // existence oracle over every run in the installation. The same code also answers a
+            // second settle of an already-settled run, because the settle's status guard is
+            // what makes a double settle impossible.
+            AiHubError::EvalRunNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "eval_run_not_found",
+                format!("no eval run `{id}` in this organization"),
+            ),
+            AiHubError::EvalSuiteKeyTaken(key) => Self::new(
+                StatusCode::CONFLICT,
+                "eval_suite_key_taken",
+                format!("an eval suite with the key `{key}` already exists in this organization"),
+            ),
+            AiHubError::InvalidAirgap(message) => Self::bad_request("invalid_airgap", message),
+            AiHubError::AirgapHostNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "airgap_host_not_found",
+                format!("`{id}` is not on the internal-host allow-list"),
+            ),
+            // A model that cannot do what the request needs is a `400` and not a `409`: nothing
+            // about the installation is in conflict, the caller asked for a capability this
+            // model does not claim, and the fix is a flag edit or a different model. The code
+            // and the message both name the capability so a client can branch on it.
+            AiHubError::CapabilityUnsupported { model, capability } => Self::bad_request(
+                "capability_unsupported",
+                format!("the model \"{model}\" does not support {capability}"),
+            ),
             AiHubError::InvalidChatRequest(message) => {
                 Self::bad_request("invalid_chat_request", message)
             }
@@ -1069,7 +1343,16 @@ impl IntoResponse for ApiError {
                 details: self.details,
             },
         };
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        // Only ever set when the error carries a wait. Absent is not the same as zero: a client
+        // that sees no `Retry-After` retries on its own schedule, which is the correct behaviour
+        // for every error that is not a refusal with a window behind it.
+        if let Some(seconds) = self.retry_after {
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 

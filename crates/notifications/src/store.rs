@@ -22,7 +22,7 @@ use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::error::{NotificationError, Result};
-use crate::model::{ListQuery, NewNotification, Notification, NotificationPage};
+use crate::model::{DeliveryRow, ListQuery, NewNotification, Notification, NotificationPage};
 use crate::vocabulary::{MAX_PAGE, is_category, is_channel};
 
 const COLUMNS: &str = "id, organization_id, user_id, category, priority, title, body, url, \
@@ -69,7 +69,90 @@ pub async fn record(
     Ok(result.rows_affected() == 1)
 }
 
-/// Record the same notification for several people at once.
+/// Record one notification **and the deliveries its own channel configuration asks for**, and
+/// report what came of each.
+///
+/// **This is the producer side of the whole delivery subsystem, and until this slice existed
+/// nothing in production called it.** `record` writes the `notifications` row; `enqueue` writes
+/// the `notification_deliveries` rows; and the two had no call site that did both. The emit
+/// route recorded rows the runner could never claim (so no e-mail was ever sent, and the drawer
+/// listed no channel at all — "it is in my panel but the e-mail never came" had no row to be a
+/// fact about), and the router did the same for every bus event. Two subsystems, each complete
+/// and each useless alone: a queue with no producer and a producer with no queue. The test
+/// delivery route was the *only* caller, which is why a green suite did not catch it — a suite
+/// that fills the queue itself proves the queue drains, not that anything ever fills it.
+///
+/// **Why the id is returned rather than re-read.** A dedupe that collapses returns no row, so
+/// there is no id to give; a `record` that returned `Option<Uuid>` would make the caller ask
+/// "did I create it, and what is it" as one question, which is the only shape in which the
+/// answer is not two lookups that can disagree. The previous production pattern read the id
+/// back by dedupe key — a lookup by a value the caller chose, which is a guess dressed up as a
+/// query. `None` is the *second* emit of the same fact, and the notification that already
+/// exists already carries its delivery rows.
+///
+/// A caller that wants a different set of channels than the reader's own configuration asks
+/// for — the test delivery route is the one — uses [`record`] and [`delivery::enqueue`]
+/// directly. This function is for the path that must not be able to forget.
+pub async fn record_with_deliveries(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    emitted_by: Option<Uuid>,
+    draft: &NewNotification,
+) -> Result<Option<(Uuid, crate::delivery::EnqueueReport)>> {
+    // **One insert, and that is load-bearing.** An earlier shape of this function called
+    // `record` and *then* repeated the insert with `returning id` to get the id — which writes
+    // **two** `notifications` rows for every draft that carries no `dedupe_key`, because the
+    // `on conflict` clause is partial (`where dedupe_key is not null`) and therefore does
+    // nothing at all for a null key. The reader would have seen every undeduped notification
+    // twice, the badge would have counted both, and the only evidence would have been a count
+    // nobody had a reason to distrust. So the statement below is the *only* write, and its
+    // `returning` is what supplies the id.
+    let validated = draft.clone().build()?;
+    let inserted: Option<Uuid> = sqlx::query_scalar(
+        "insert into notifications \
+         (organization_id, user_id, category, priority, title, body, url, source_type, \
+          source_id, payload, dedupe_key, emitted_by) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+         on conflict (user_id, dedupe_key) where dedupe_key is not null do nothing \
+         returning id",
+    )
+    .bind(organization_id)
+    .bind(validated.user_id)
+    .bind(&validated.category)
+    .bind(&validated.priority)
+    .bind(&validated.title)
+    .bind(&validated.body)
+    .bind(&validated.url)
+    .bind(&validated.source_type)
+    .bind(&validated.source_id)
+    .bind(&validated.payload)
+    .bind(&validated.dedupe_key)
+    .bind(emitted_by)
+    .fetch_optional(pool)
+    .await?;
+
+    // `None` is the *second* emit of the same fact: the partial unique index refused it. The
+    // notification that is already there already carries the delivery rows from the emit that
+    // made it, so there is nothing to add — and re-enqueueing them would be a no-op the caller
+    // would have to learn not to read as "the retry worked".
+    let Some(id) = inserted else {
+        return Ok(None);
+    };
+
+    let allowed =
+        crate::preference_store::allowed_channels(pool, validated.user_id, &validated.category).await?;
+    let disabled = crate::preference_store::disabled_channels(
+        pool,
+        validated.user_id,
+        &validated.category,
+    )
+    .await?;
+
+    let report = crate::delivery::enqueue(pool, id, &allowed, &disabled).await?;
+    Ok(Some((id, report)))
+}
+
+/// Record the same notification for several people at once, deliveries included.
 ///
 /// A module that has to tell forty reviewers that a page is waiting writes one loop over forty
 /// drafts, not forty statements — and the result says how many rows really appeared, so a
@@ -87,6 +170,48 @@ pub async fn record_many(
         }
     }
     Ok(created)
+}
+
+/// Record the same notification for several people, deliveries included, and count the rows.
+///
+/// **The deliveries variant of [`record_many`], and the reason it exists separately is the same
+/// as [`record_with_deliveries`]'s:** a bulk producer that records without enqueueing leaves a
+/// queue nothing ever fills, and the difference is invisible in every number except the drawer.
+///
+/// A deduped recipient counts as `deduped` rather than `created`, and its deliveries are left
+/// exactly as they were: the notification that already exists already carries the delivery rows
+/// from the emit that made it, and re-enqueueing them would only ever be a no-op.
+pub async fn record_many_with_deliveries(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    emitted_by: Option<Uuid>,
+    drafts: &[NewNotification],
+) -> Result<BulkRecord> {
+    let mut report = BulkRecord::default();
+    for draft in drafts {
+        match record_with_deliveries(pool, organization_id, emitted_by, draft).await? {
+            Some((_, enqueued)) => {
+                report.created += 1;
+                report.queued += enqueued.queued;
+                report.skipped += enqueued.skipped;
+            }
+            None => report.deduped += 1,
+        }
+    }
+    Ok(report)
+}
+
+/// What a bulk record produced: the rows, and the deliveries behind them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BulkRecord {
+    /// Notifications that did not exist before this call.
+    pub created: u64,
+    /// Notifications that were already there under the same dedupe key.
+    pub deduped: u64,
+    /// Delivery rows written as `pending`.
+    pub queued: u32,
+    /// Delivery rows written as `skipped`, each with its reason on the row.
+    pub skipped: u32,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -156,6 +281,40 @@ pub async fn summary(pool: &PgPool, user_id: Uuid) -> Result<crate::model::Summa
     })
 }
 
+/// One notification's delivery rows.
+///
+/// **Ordered deterministically, because the drawer is a list and a table's row order is not
+/// one.** Without `order by` Postgres may return the channels in any order it finds cheapest, so
+/// the drawer would re-order itself between two reads of the same row and "which channel is
+/// first" would be a property of the query plan.
+///
+/// **The order is chronological where it can be, and alphabetical where it cannot — and the
+/// second case is the common one, so it is written down rather than implied.** `enqueue` inserts
+/// every channel of one notification inside a single call, and `created_at` defaults to
+/// `now()`, which is one timestamp for the whole statement. So a notification that went out over
+/// three channels has three rows with *identical* `created_at`, and the chronological key ties.
+/// The `channel` tiebreak then decides, which is alphabetical: `email`, then `in_app`, then
+/// `web_push`. That order is arbitrary as a story and stable as a sort, and stability is the
+/// property the drawer needs — the alternative, letting Postgres choose, is a list that reshuffles
+/// on every read.
+///
+/// Attempts made *later* by the runner keep their own timestamps, so a retried channel really
+/// does sort after one that was sent on the first try. The tiebreak only ever governs rows
+/// enqueued together, which by definition were enqueued together.
+pub async fn deliveries(pool: &PgPool, notification_id: Uuid) -> Result<Vec<DeliveryRow>> {
+    let rows = sqlx::query_as::<_, DeliveryRow>(
+        "select channel, status, attempts, max_attempts, response_status, error, sent_at, \
+                next_attempt_at \
+         from notification_deliveries \
+         where notification_id = $1 \
+         order by created_at, channel",
+    )
+    .bind(notification_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// One notification, and only if that person owns it.
 ///
 /// `None` for somebody else's row is the whole point: the detail route turns it into a `404`,
@@ -165,6 +324,32 @@ pub async fn find(pool: &PgPool, user_id: Uuid, id: Uuid) -> Result<Option<Notif
     Ok(sqlx::query_as::<_, Notification>(&query)
         .bind(id)
         .bind(user_id)
+        .fetch_optional(pool)
+        .await?)
+}
+
+/// Read one notification back by the `dedupe_key` it was written with.
+///
+/// **Exists because `record` answers a `bool`, and one caller needs the id.** The emit path
+/// counts rows and never asks which ones; the test-delivery route writes a row and then has
+/// to address the delivery it just queued. Returning the id from `record` would change the
+/// contract every caller depends on for one caller, so the lookup lives here — keyed by a
+/// value the caller itself chose, never by "the most recent row", which would be wrong the
+/// moment two readers pressed the button in the same second.
+///
+/// Scoped to `user_id` for the same reason `find` is: a key is not a capability, and a lookup
+/// that ignored the owner would let a caller read another's notification by guessing a key.
+pub async fn find_by_dedupe_key(
+    pool: &PgPool,
+    user_id: Uuid,
+    dedupe_key: &str,
+) -> Result<Option<Notification>> {
+    let query = format!(
+        "select {COLUMNS} from notifications where user_id = $1 and dedupe_key = $2"
+    );
+    Ok(sqlx::query_as::<_, Notification>(&query)
+        .bind(user_id)
+        .bind(dedupe_key)
         .fetch_optional(pool)
         .await?)
 }

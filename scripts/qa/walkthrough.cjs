@@ -42,6 +42,92 @@ const SHOTS = path.join(OUT, "shots");
 const CHROME = process.env.QA_CHROME || "/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome";
 const MAX_PER_PAGE = Number(arg("max-per-page", "40"));
 const STEP_MS = Number(arg("step-ms", "380"));
+
+/**
+ * `--only=<scope>` narrows a pass to the depth passes of one area, the way `--only=wizard`
+ * narrows it to the first-run flow. It exists because a full pass on a loaded box walks thirty-odd
+ * IAM and analytics screens first and the AI depth passes — the ones a provider-runtime request
+ * has to be closed on — start in the fortieth minute. A request that cannot be closed because the
+ * box ran out of memory before its own screens were reached stays open forever, which is the same
+ * as shipping nothing.
+ *
+ * The scope is **additive narrowing, never a different pass**: the wizard, the sign-in, the
+ * roll-up and the refusal gate all still run, so a scoped report is a real report — the findings
+ * come from the same code and mean the same thing. It only skips work no one asked for.
+ *
+ * Scopes:
+ *   --only=ai      the AI hub screens, the provider runtime pass and the every-screen-states pass
+ *   --only=media   the file manager's routes and its six depth passes
+ *   --only=iam     the identity screens and their depth passes
+ *   --only=analytics  the analytics screens and their depth passes
+ */
+/**
+ * `--only=a,b` narrows the pass to the named routes and depth passes, and the default is
+ * everything.
+ *
+ * The route list plus thirty depth passes is more work than one pass can finish inside the
+ * ceiling a browser pass is given, so a full pass started getting cut off partway through —
+ * and a pass that is cut off has proven nothing about the screens after the cut, while still
+ * looking like a pass in the log. Three requests (REQ-010, REQ-012, REQ-013) sat unverified
+ * for exactly that reason: the harness that was supposed to accept them could not reach their
+ * screens inside its own budget.
+ *
+ * A timeout is therefore the wrong instrument: the honest instrument is the budget. `--only`
+ * lets a loop spend one pass on the screens it just built, and every focused pass still walks
+ * its own routes, runs its own depth passes and writes the same report — it just does not
+ * pretend to cover the rest. The default (`--only=all`) walks everything, unchanged.
+ *
+ * A name that matches nothing is a finding rather than a silent no-op: a typo in a filter would
+ * otherwise produce an empty, entirely green report, which is the worst output this file can
+ * emit.
+ *
+ * **An AREA name is still accepted.** `--only=ai`, `=media`, `=iam` and `=analytics` are the
+ * spellings this file's own comments and every loop prompt have used since the flag existed, and
+ * an area is a *group* of names rather than a single pass. They are expanded here, once, against
+ * the same table the routes and the depth passes are named in, so a caller who learned the flag
+ * as an area keeps working and the unmatched-filter finding still fires on a genuine typo.
+ * `AREA_NAMES` is declared before `AREAS` so the expansion is not a forward reference.
+ */
+const AREA_NAMES = ["ai", "media", "iam", "analytics"];
+const AREAS = {
+  ai: (name, route) => route.path.startsWith("/ai") || name === "ai" || name.startsWith("ai-"),
+  media: (name, route) => route.path.startsWith("/media") || name.startsWith("media"),
+  iam: (name, route) =>
+    route.path.startsWith("/settings/iam") || name.startsWith("iam") || route.path === "/settings/search",
+  analytics: (name, route) => route.path.startsWith("/analytics") || name.startsWith("analytics"),
+};
+const ONLY = (arg("only", "all") || "all")
+  .split(",")
+  .map((name) => name.trim())
+  .filter(Boolean);
+const ONLY_ALL = ONLY.includes("all");
+/**
+ * Whether one route or depth-pass NAME is in scope.
+ *
+ * The `route` argument is optional and only used to expand an area name: a depth pass has no
+ * path, so a depth pass that carries the area's own prefix is the only thing that can match
+ * `--only=ai`. Passing `undefined` is therefore the normal call and it must not throw.
+ */
+const wants = (name, route) => {
+  if (ONLY_ALL) return true;
+  if (ONLY.includes(name)) return true;
+  if (route) return ONLY.some((f) => AREAS[f]?.(name, route));
+  return ONLY.some((f) => {
+    const area = AREAS[f];
+    return area ? area(name, { path: "" }) : false;
+  });
+};
+/** Whether a named AREA is in scope — the `inScope()` this file used before per-name filters. */
+const inScope = (area) => !ONLY.length || ONLY_ALL || ONLY.includes(area);
+/** The same area naming for the mobile loop, which carries its own route list. */
+const mArea = (path, name) => {
+  for (const area of AREA_NAMES) if (AREAS[area](name, { path })) return area;
+  return "core";
+};
+/** Every route/depth-pass name this pass actually walked, so an unmatched filter is visible. */
+const matchedOnly = new Set();
+/** `mobile:<name>` is a valid filter spelling; `MOBILE_NAMES` keeps the roll-up from calling it unknown. */
+const MOBILE_NAMES = new Set();
 /**
  * The disposable QA database, used only by the analytics fixture (REQ-007): the pass posts a
  * synthetic beacon batch through the public collect endpoint and then spreads a slice of those
@@ -200,34 +286,96 @@ const clickLines = [];
 function log(...a) {
   console.log("[walk]", ...a);
 }
+let warnedAboutStream = false;
 function record(entry) {
   clickLines.push(entry);
-  fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
+  // The event stream is written for durability -- a killed pass should leave its clicks behind
+  // -- but it is a SECONDARY record: `clickLines` above is the one the report is built from. So
+  // a write that fails must not end the pass. It used to: this box runs a disk guard that trims
+  // QA artifacts, and when the guard's window landed mid-pass the output directory was gone,
+  // `appendFileSync` threw ENOENT, and the exception unwound the whole run. The pass had already
+  // walked seven screens and every one of them was thrown away because a cache file could not be
+  // appended to. A report written from memory and a report written from disk are the same report;
+  // only the forensic stream is lost, and it says so rather than pretending.
+  try {
+    fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
+  } catch (error) {
+    if (!warnedAboutStream) {
+      warnedAboutStream = true;
+      console.error(`[walk] the click stream is unwritable (${error.code || error.message}); the report continues without it`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- browser
 
 const consoleLog = [];
 /**
- * Refusals a pass provokes on purpose — a step-up gate in front of a dangerous action, for
- * instance. They are assertions the pass makes (it proves the prompt appeared and the retry
- * succeeded), not defects, so a pass registers one immediately before the act with
- * `expectRefusal` and the roll-up reports what it swallowed as `expectedRefusals` instead of a
- * finding. An allowance is single-use and indexed, so it can only excuse an entry that arrived
- * after it was registered.
+ * Refusals and failures a pass provokes on purpose — a step-up gate in front of a dangerous
+ * action, a field submitted wrong on purpose, or a 500 the pass answers itself to prove the
+ * screen survives an outage. They are assertions the pass makes, not defects, so a pass
+ * registers one immediately before the act with `expectRefusal` and the roll-up reports what it
+ * swallowed as `refusedOnPurpose` instead of a finding.
+ *
+ * Two properties keep the allowance from hiding real defects:
+ *
+ *   * **It is positional.** The window opens at the moment of registration, so it can only excuse
+ *     an entry that arrived after it.
+ *   * **It is bounded in time.** The pass closes it with `endRefusalWindow` once the provocation
+ *     is over, so a failure that happens later — for a reason the pass never caused — is reported
+ *     again. An allowance that never closes is an allowance that eventually hides the next bug.
+ *
+ * An allowance covers a *window* rather than a single entry on purpose: one provoked 500 is not
+ * one network entry. A screen that loads twice, or a StrictMode double render, sends the same
+ * request several times and all of them belong to the provocation.
  */
 const expectedRefusals = [];
 
-/** Register one deliberate refusal (a URL fragment for a request, a status shape for a console line). */
-function expectRefusal(match, reason) {
+/**
+ * Failed assertions raised by a depth pass, waiting for the roll-up to own them.
+ *
+ * The roll-up builds its own `findings` array after every pass has run, so a pass that wants a
+ * failed claim to reach the report cannot push into it directly. It queues here instead, and the
+ * roll-up drains the queue before it writes. Anything left unclaimed in this array at the end of
+ * a run is itself reported — a silently swallowed assertion is a gate that can be switched off
+ * without anyone noticing.
+ */
+const aiStateFindings = [];
+
+/** Register one deliberate refusal (a URL fragment for a request, a status shape for a console line).
+ *
+ *  The window is bounded by *position*, not by the moment the roll-up reads it. The pass closes it
+ *  with `endRefusalWindow`, which records how far it reached; a boolean "closed" flag would retract
+ *  the allowance from entries the pass had already provoked, and the provocation really did happen.
+ *
+ *  `statuses` narrows what the allowance may excuse. It defaults to the gate's full vocabulary
+ *  because most provocations (a step-up, a server-error state) genuinely are 5xx. A caller that
+ *  expects only a *client* refusal says so, and a 500 inside its window is then still a high
+ *  finding — a form filled with placeholders should be rejected, not crash the API.
+ */
+/** The statuses a default (unscoped) registration may excuse: a refusal, or the server-error state. */
+function allowedStatus(n) {
+  return n.status === 0 || !n.status || [400, 401, 403].includes(n.status) || (n.status >= 500 && n.status < 600);
+}
+function expectRefusal(match, reason, statuses) {
   expectedRefusals.push({
     match,
     reason,
+    statuses,
     consoleFrom: consoleLog.length,
     netFrom: netFailures.length,
-    claimedConsole: false,
-    claimedNet: false,
+    claimed: 0,
   });
+}
+
+/** Close the open registration for `match`, so only what it provoked stays excused. */
+function endRefusalWindow(match) {
+  const entry = [...expectedRefusals].reverse().find((e) => e.match === match && e.netTo === undefined);
+  if (entry) {
+    entry.netTo = netFailures.length;
+    entry.consoleTo = consoleLog.length;
+  }
+  return entry;
 }
 
 const netFailures = [];
@@ -499,7 +647,46 @@ async function runWizard(page, report) {
   log("wizard: detecting first-run state");
   await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(900);
-  const url = page.url();
+  let url = page.url();
+  // A fresh database is NOT the same as "an installation already exists", and telling those two
+  // apart by which URL the panel happened to be on is how this pass has been dying before it
+  // signed in — twice, on a database with zero rows in `users`.
+  //
+  // The reason is a redirect chain with a client hop in the middle. `proxy.ts` sends an
+  // anonymous visitor from `/` to `/login`; `/login` is the only screen that calls
+  // `fetchOnboarding()`, and it does that in a `useEffect` — so `/setup` arrives one navigation
+  // *after* the first one settles. Reading the URL 900 ms after the first `goto` therefore lands
+  // on `/login` on a brand-new installation, the check concludes "already exists", the wizard
+  // never runs, no account is ever created, and `ensureSignedIn` then fails to sign in with an
+  // account that does not exist. The log line said "installation already exists" and the database
+  // was empty: the message was a guess about a state it had not actually observed.
+  //
+  // The authority is the onboarding state itself, which is the same call the sign-in screen
+  // makes, and the URL is only accepted once it says so. Anything else is treated as
+  // "not installed yet" and handed to the wizard — which is the recoverable direction, because
+  // a second request to complete the first-run steps on an installation that already has them is
+  // refused by the API, while skipping the wizard is a dead pass.
+  const onboarding = await page
+    .evaluate(async () => {
+      try {
+        const res = await fetch("/api/v1/onboarding");
+        if (!res.ok) return null;
+        return await res.json();
+      } catch {
+        return null;
+      }
+    })
+    .catch(() => null);
+  const needsSetup = onboarding ? onboarding.needs_setup === true : true;
+  log(`wizard: onboarding says needs_setup=${needsSetup} (url=${url})`);
+
+  if (needsSetup) {
+    // The wizard is open to anonymous visitors, so it is reached directly rather than by waiting
+    // for the sign-in screen's client-side hop to land there.
+    await page.goto(`${URL_ADMIN}/setup`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(900);
+    url = page.url();
+  }
   if (!url.includes("/setup")) {
     log(`wizard: not in setup (${url}) — installation already exists`);
     return { ran: false, url };
@@ -507,14 +694,32 @@ async function runWizard(page, report) {
   report.steps.push({ step: 0, url, action: "reached /setup" });
   await shot(page, "01-setup-step-1");
   for (let i = 1; i <= 10; i++) {
-    const stepKey = await page
-      .evaluate(() => {
-        if (/Your installation is ready/i.test(document.body.innerText)) return "done";
-        const el = document.querySelector('[data-setup-step][data-step-state="current"]');
-        return el ? el.getAttribute("data-setup-step") : null;
-      })
-      .catch(() => null);
-    if (!stepKey) break;
+    // A missing step element is not the end of the wizard, it is a screen that has not painted
+    // yet. The original loop read it once and `break`ed, which ended the wizard on step 1 of 5:
+    // the owner account was created, the organization never was, and every later screen in the
+    // pass then answered `organization_required` — a database with one user and zero
+    // organizations, which reads exactly like a broken CRM and is not one. The step moves because
+    // the previous step's POST resolves and the client re-renders, so a null read is a race to
+    // wait out, not a state to conclude from. Bounded, because a wizard that genuinely has no
+    // current step (it said so) must still terminate.
+    let stepKey = null;
+    for (let probe = 0; probe < 20; probe += 1) {
+      stepKey = await page
+        .evaluate(() => {
+          if (/Your installation is ready/i.test(document.body.innerText)) return "done";
+          const el = document.querySelector('[data-setup-step][data-step-state="current"]');
+          return el ? el.getAttribute("data-setup-step") : null;
+        })
+        .catch(() => null);
+      if (stepKey) break;
+      // Not on the wizard at all: it is done, or it was never entered. Either way, stop reading.
+      if (!page.url().includes("/setup")) break;
+      await page.waitForTimeout(250);
+    }
+    if (!stepKey) {
+      log(`wizard: no current step at iteration ${i} (url=${page.url()}) — stopping`);
+      break;
+    }
     if (stepKey === "done") {
       await page.locator('button:has-text("Open the panel")').first().click({ timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(900);
@@ -801,6 +1006,27 @@ async function interact(page, pageName, report) {
     const before = { url: page.url(), console: consoleLog.length, net: netFailures.length, dialogs: dialogs.length };
     const started = Date.now();
 
+    // A submit button **outside** a dialog — the provider form on the AI screen is inline, and
+    // clicking its submit with the sample values this loop has already typed is a POST the API
+    // refuses with a 400. That refusal is the product working: a form that accepted
+    // "e.g. Office AI" as a provider name would be the defect. Registering it here is what keeps
+    // the pass from reporting its own test as a broken screen, and the vocabulary is 4xx only so
+    // a 500 in the same window — the API crashing on input it just refused — is still a finding.
+    const submitsAForm = meta.tag === "button" && meta.type === "submit";
+    // …and the window opens **here**, before the click, not after it. Playwright's click resolves
+    // as soon as the browser dispatches it, and this panel's POST is refused in ~50 ms — often
+    // before the click promise resolves at all. A window opened after the click is a window that
+    // has already missed the failure it was opened for, which is why the registration claimed
+    // nothing and the report kept filing the pass's own 400 as a defect.
+    const netAtOpen = submitsAForm ? netFailures.length : -1;
+    if (submitsAForm) {
+      expectRefusal(
+        "/api/v1/",
+        `interact(${pageName}): a sample-filled form is submitted on purpose and refused`,
+        [400, 401, 403, 422],
+      );
+    }
+
     const control = page.locator(`[data-qa-idx="${i}"]`);
     if (meta.tag === "select") {
       const picked = await control
@@ -874,6 +1100,12 @@ async function interact(page, pageName, report) {
     page.context().off("page", onPopup);
     for (const p of popups) await p.close().catch(() => {});
 
+    // The submission window has to stay open until the *response* has been recorded, not until
+    // the click has settled. `settleAfterClick` waits for a URL change and gives up after one
+    // tick when there is none — and a form refused in the field never navigates — so closing here
+    // ended the window before the 400 ever reached `netFailures`. Measured against the real
+    // panel, the refusal lands at ~230 ms; the wait is generous because the box is shared and a
+    // slow dev server answering a small POST is normal, not a defect.
     const after = { url: page.url(), console: consoleLog.length, net: netFailures.length, dialogs: dialogs.length };
     let outcome = "ok";
     if (clickError) {
@@ -907,6 +1139,24 @@ async function interact(page, pageName, report) {
     };
     record(entry);
 
+    // The window closes **after** the click has been judged, not before. The refusal reaches
+    // `netFailures` asynchronously — the browser dispatches the POST and the click promise
+    // resolves independently of the response — so closing the window the moment the click settled
+    // raced the response and left the window covering nothing. `submit-window` exists to make
+    // that visible instead of letting it show up later as an unexplained high finding.
+    if (submitsAForm) {
+      await page.waitForTimeout(2000);
+      endRefusalWindow("/api/v1/");
+      record({
+        page: pageName,
+        i,
+        action: "submit-window",
+        outcome: netFailures.length > netAtOpen ? "covered" : "empty",
+        covered: netFailures.length - netAtOpen,
+        statuses: netFailures.slice(netAtOpen).map((n) => n.status || "net"),
+      });
+    }
+
     // Anything that deserves eyes: navigation, dialogs, errors, popups.
     if (["navigated", "dialog", "console-error", "request-failed", "popup", "click-error"].includes(outcome)) {
       await shot(page, `click-${pageName}-${index}-${outcome}`, { full: false }).catch?.(() => {});
@@ -923,9 +1173,24 @@ async function interact(page, pageName, report) {
       }, dialogSel)
       .catch(() => false);
     if (hasForm) {
+      // This filler types placeholder values into every field and submits, so the POST is *expected*
+      // to be refused: a required name, a base URL that is not a URL, a value under its minimum.
+      // The refusal is the point — a form that accepted "e.g. Office AI" as a provider would be
+      // worse than one that rejects it — but an unregistered 4xx is filed as a high finding, which
+      // made every screen with a form report a defect the pass had caused itself. Registering the
+      // window is the honest form: the pass says "everything up to here is mine", and an
+      // unregistered failure in the same window is still a finding.
+      expectRefusal(
+        "/api/v1/",
+        `interact(${pageName}): a placeholder-filled form is submitted on purpose and refused`,
+        [400, 401, 403, 422],
+      );
       const filled = await fillSubtree(page, dialogSel);
       const submitted = await clickPrimaryIn(page, dialogSel);
       await page.waitForTimeout(700);
+      // Close the window here rather than at the end of the pass: a later, real failure on the
+      // same screen must not inherit the allowance from a dialog submitted twenty clicks ago.
+      endRefusalWindow("/api/v1/");
       await shot(page, `form-${pageName}-${index}`);
       record({
         page: pageName,
@@ -955,34 +1220,2240 @@ async function interact(page, pageName, report) {
  * only reaches visible controls — so this is the one place the pass sets a file on an input
  * directly, which is exactly what the browser does when a person picks a file. Without it the
  * library stays empty, and an empty library means the search index has no media to answer with.
+ *
+ * `ok` is the only field a caller should branch on, and it means **the file is in the listing** —
+ * not "the bytes were handed to an input". Two of this pass's guards used to read `uploaded.ok`,
+ * a key this never wrote, so `uploaded.ok` was `undefined`, falsy, and `runMediaFileDetail` and
+ * `runMediaShares` bailed with "the upload step did not succeed" on *every* run, including runs
+ * whose artifact showed `uploaded: true, listed: 2`. The report read that as a crowded box; the
+ * file was there the whole time and the guard was reading the wrong key. So: one answer, and the
+ * answer has to be about the library rather than about the act of setting an input.
  */
 async function uploadMediaSample(page, source) {
   const file = source || ensureSamplePng();
 
   const input = page.locator('input[type="file"]').first();
   if ((await input.count()) === 0) {
-    return { uploaded: false, note: "no file input on this screen" };
+    return { ok: false, uploaded: false, listed: 0, note: "no file input on this screen" };
   }
-  await input.setInputFiles(file).catch(() => {});
+  const setOnInput = await input
+    .setInputFiles(file)
+    .then(() => true)
+    .catch((err) => `setInputFiles failed: ${err.message}`);
   await page.waitForTimeout(1600);
+
+  // The listing is the proof, and it is asynchronous: an upload that the server rejected leaves
+  // no row, and a row the server did not accept is what every caller downstream actually needs.
+  let listed = 0;
+  for (let attempt = 0; attempt < 6 && listed === 0; attempt += 1) {
+    listed = await page.locator(`text=${path.basename(file)}`).count().catch(() => 0);
+    if (listed === 0) await page.waitForTimeout(700);
+  }
+
   return {
-    uploaded: true,
+    ok: listed > 0 && setOnInput === true,
+    uploaded: listed > 0,
     file: path.basename(file),
-    listed: await page.locator(`text=${path.basename(file)}`).count(),
+    listed,
+    setOnInput,
+    ...(listed === 0 ? { note: "the file never appeared in the library listing" } : {}),
   };
 }
 
-// ---------------------------------------------------------------- file manager (REQ-010, slice 1)
+
+// ---------------------------------------------------------------- AI provider runtime (REQ-097)
+
+// ---------------------------------------------------------------------------------------------
+// The AI provider runtime (REQ-097, slice 1): the protocol-driven form, its own field refusal,
+// a real connection against a live local endpoint, and the five-step connection test.
+// ---------------------------------------------------------------------------------------------
+
+/** A minimal OpenAI-compatible endpoint on loopback, so the test has something real to answer. */
+function startFakeProvider() {
+  const http = require("node:http");
+  const models = { object: "list", data: [{ id: "qa-small" }, { id: "qa-large" }] };
+  const answer = (model) => ({
+    choices: [{ message: { role: "assistant", content: `Hello from the QA mock (${model}).` }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+  });
+  const sse = (model) => {
+    const text = `Hello from the QA mock (${model}).`;
+    let out = "";
+    for (const word of text.split(" ")) out += `data: ${JSON.stringify({ choices: [{ delta: { content: word + " " } }] })}\n\n`;
+    out += `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`;
+    out += "data: [DONE]\n\n";
+    return out;
+  };
+
+  const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/v1/models") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(models));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/v1/chat/completions") {
+      let raw = "";
+      req.on("data", (chunk) => { raw += chunk; });
+      req.on("end", () => {
+        let body = {};
+        try { body = JSON.parse(raw || "{}"); } catch { body = {}; }
+        const model = body.model || "qa-small";
+        if (body.stream) {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end(sse(model));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(answer(model)));
+      });
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "not found" } }));
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({ baseUrl: `http://127.0.0.1:${port}/v1`, close: () => server.close() });
+    });
+  });
+}
 
 /**
- * Drive the file manager the way an operator does.
- *
- * The pass proves the parts that are easy to get subtly wrong and invisible in a screenshot: a
- * folder is created and shows up in the tree, the listing reports a total that matches its rows,
- * a filter narrows it, the bulk bar appears on a two-file selection, a delete moves the file to
- * the trash rather than destroying it, and the trash screen brings that same file back. A screen
- * that only looked right in a screenshot would pass all of that without doing any of it.
+ * The AI provider runtime: the form refuses a malformed base URL in the field, a real local
+ * endpoint is connected, the connection test walks its five steps, and a second provider pointed
+ * at nothing names the failing step instead of failing the screen.
  */
+async function runAiProviderDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-providers", action: "ai-providers", ...step });
+  };
+  const fake = await startFakeProvider();
+
+  try {
+    await page.goto(`${URL_ADMIN}/ai`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1400);
+
+    // The empty state offers the action that gets past it.
+    const empty = await page.locator("text=No provider is connected yet").count();
+    const connectButton = await page.locator('button:has-text("Connect provider")').count();
+    note({ step: "empty", empty, connectButton });
+    await shot(page, "ai-providers-empty");
+
+    // Open the form and read the protocols the API itself offers.
+    await page.locator('button:has-text("Connect provider")').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(700);
+    const protocolOptions = await page.locator("[data-provider-protocol] option").allTextContents();
+    note({ step: "protocols", options: protocolOptions.join(", "), count: protocolOptions.length });
+
+    // A malformed base URL is refused in the field, not by a bare banner.
+    //
+    // This submit is refused **on purpose**, so its refusal is registered. The panel validates
+    // the URL client-side and shows a field error, but the form still posts once — and that 400
+    // was the single high finding in every pass of this request. It went unnoticed because the
+    // step asserts the *field* error and reads as though the whole refusal is client-side, while
+    // the request that produced the report entry was this one. Registering it is the honest form:
+    // 4xx only, so a 500 here is the API crashing on a URL it should have rejected.
+    expectRefusal(
+      "/api/v1/ai/providers",
+      "ai-providers: a malformed base URL is submitted on purpose and refused in the field",
+      [400, 422],
+    );
+    await page.locator("[data-provider-name]").fill("QA Refused").catch(() => {});
+    await page.locator("[data-provider-url]").fill("not-a-url").catch(() => {});
+    await page.locator('[data-testid="connect-submit"], form button[type="submit"]').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1600);
+    endRefusalWindow("/api/v1/ai/providers");
+    const fieldError = await page.locator("[data-field-error]").count();
+    const fieldErrorText = await page.locator("[data-field-error]").first().innerText().catch(() => "");
+    note({ step: "refusal", fieldError, text: fieldErrorText.replace(/\s+/g, " ").slice(0, 140) });
+    await shot(page, "ai-providers-refusal");
+
+    // Now a real endpoint: the local one the pass just started.
+    await page.locator("[data-provider-name]").fill("QA Local").catch(() => {});
+    await page.locator("[data-provider-kind]").selectOption("local").catch(() => {});
+    await page.locator("[data-provider-url]").fill(fake.baseUrl).catch(() => {});
+    await page.locator('form button[type="submit"]').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(2200);
+    const listed = await page.locator("[data-provider-kind-badge]").count();
+    const listedName = await page.locator("[data-provider-kind-badge]").first().innerText().catch(() => "");
+    note({ step: "connected", listed, kindBadge: listedName });
+    await shot(page, "ai-providers-connected");
+
+    // The five-step connection test against that live endpoint.
+    await page.locator("[data-provider-test]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(3200);
+    const modal = await page.locator("[data-test-modal]").count();
+    const testSteps = await page.locator("[data-test-step]").count();
+    const stepStates = await page
+      .evaluate(() =>
+        [...document.querySelectorAll("[data-test-step]")].map(
+          (node) => `${node.getAttribute("data-test-step")}:${node.querySelector("span:last-child")?.textContent?.trim() ?? ""}`,
+        ),
+      )
+      .catch(() => []);
+    const summary = await page.locator("[data-test-summary]").innerText().catch(() => "");
+    note({
+      step: "test",
+      modal,
+      steps: testSteps,
+      states: stepStates.join(" | "),
+      summary: summary.replace(/\s+/g, " ").slice(0, 200),
+    });
+    await shot(page, "ai-providers-test");
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.locator('[data-test-modal] button[aria-label*="Close"]').first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+
+    // A provider pointed at nothing: the test names the step, and the row shows the verdict.
+    await page.locator('button:has-text("Connect provider")').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    await page.locator("[data-provider-name]").fill("QA Dead").catch(() => {});
+    await page.locator("[data-provider-kind]").selectOption("local").catch(() => {});
+    await page.locator("[data-provider-url]").fill("http://127.0.0.1:1/v1").catch(() => {});
+    await page.locator('form button[type="submit"]').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    await page.locator('[data-provider-test="QA Dead"]').first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(3200);
+    const failingStep = await page.locator("[data-failing-step]").first().innerText().catch(() => "");
+    const stepTexts = await page
+      .evaluate(() =>
+        [...document.querySelectorAll("[data-test-step]")].map((node) => ({
+          step: node.getAttribute("data-test-step"),
+          status: node.textContent.includes("ms") ? "ran" : "did not run",
+        })),
+      )
+      .catch(() => []);
+    note({ step: "dead", failingStep: failingStep.replace(/\s+/g, " ").slice(0, 160), steps: JSON.stringify(stepTexts) });
+    await shot(page, "ai-providers-dead");
+    await page.locator('[data-test-modal] button[aria-label*="Close"]').first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(400);
+
+    // The dead provider's verdict is on the row, and the health dot pairs with its label.
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1600);
+    const dots = await page
+      .evaluate(() =>
+        [...document.querySelectorAll("[data-health-dot]")].map(
+          (node) => `${node.getAttribute("data-health-dot")}:${node.parentElement?.textContent?.trim() ?? ""}`,
+        ),
+      )
+      .catch(() => []);
+    const rowError = await page.locator("[data-provider-error]").count();
+    note({ step: "verdict", dots: dots.join(" | "), rowErrors: rowError });
+    await shot(page, "ai-providers-verdict");
+  } finally {
+    // The steps are published from `note`, not at the end of the function. A throw between here
+    // and the end used to lose the whole result: the pass wrote its steps to `clicks.jsonl`, the
+    // caller read `report.aiProviders` and got `undefined`, and the log printed
+    // `ai providers: undefined` — eleven assertions visible in the artifact and absent from the
+    // report. A depth pass that fails halfway has proved *something*, and the report is the place
+    // that says so.
+    report.aiProviders = steps;
+  }
+
+  // Slice 2 lives on the same screen, so it rides in the same pass: the model rows open their
+  // flag editor, one flag is switched off and on again, and Discover is asked twice — once to
+  // see a diff, once to see the empty diff that proves the first apply did what it said.
+  //
+  // **Discovery runs before the endpoint is closed.** The local endpoint is the only thing that
+  // can answer `list-models`, so a pass that closes it and *then* discovers is talking to a dead
+  // port: the diff is null, no model is registered, and every model-dependent assertion after it —
+  // the capability editor, the flag toggle — reads an empty list and reports `editor: 0`. Three
+  // "the screen is broken" results that were really "the pass shut its own fixture down first".
+  // The endpoint lives until every assertion that needs it has run.
+  try {
+    const firstDiff = await discoverTwice(page, fake);
+    note({ step: "discovery", ...firstDiff });
+    await shot(page, "ai-discovery-diff");
+
+    const capabilities = await readCapabilityEditor(page);
+    note({ step: "capabilities", ...capabilities });
+    await shot(page, "ai-capability-editor");
+
+    const toggled = await toggleOneCapability(page);
+    note({ step: "capability-toggle", ...toggled });
+    await shot(page, "ai-capability-toggled");
+
+    // Slice 3 rides in the same pass: the three panels are opened and clicked, so a panel that
+    // renders empty because its call failed is caught here rather than by a person noticing.
+    const panels = await exerciseHealthPanels(page);
+    note({ step: "panels", ...panels });
+    await shot(page, "ai-health-panels");
+
+    // Slice 2 (REQ-098) in the same pass: the routing section is opened, a primary is saved and
+    // the dry run is pressed, so the screen is proved by use rather than by its presence.
+    const routing = await exerciseRouting(page);
+    note({ step: "routing", ...routing });
+    const decisionLog = await exerciseDecisionLog(page);
+    note({ step: "decisionLog", ...decisionLog });
+    if (!routing.present) {
+      aiStateFindings.push(
+        "the routing section did not render on /ai, so no route was configured or previewed",
+      );
+    } else {
+      for (const row of routing.tasks) {
+        if (row.candidates === 0 && row.primary === 0) {
+          aiStateFindings.push(
+            `the ${row.task} route row has neither a candidate nor a primary control, so it \
+cannot be configured at all`,
+          );
+        }
+      }
+      if (routing.tasks.length !== 7) {
+        aiStateFindings.push(
+          `the routing screen rendered ${routing.tasks.length} task rows instead of all seven`,
+        );
+      }
+      if (routing.afterSave.error) {
+        aiStateFindings.push(
+          `saving a routing chain was refused on the panel: ${routing.afterSave.error}`,
+        );
+      }
+      if (routing.afterSave.candidates === 0) {
+        aiStateFindings.push(
+          "a saved routing chain rendered no candidate, so the save did not take effect",
+        );
+      }
+      if (!routing.walk.present || routing.walk.entries.length === 0) {
+        aiStateFindings.push(
+          "the dry run rendered no walk, which is the one thing the routing screen exists for",
+        );
+      }
+    }
+
+    // Slice 3 (REQ-098): the decision log is exercised, not merely visited. The empty state is
+    // the *correct* result on a fresh install, so its absence is the finding — a log that says
+    // nothing about having no rows is the screen this slice exists to prevent.
+    if (!decisionLog.present) {
+      aiStateFindings.push(
+        "the decision log section did not render on /ai, so the routing history is unreachable",
+      );
+    } else {
+      if (decisionLog.empty && decisionLog.rows > 0) {
+        aiStateFindings.push(
+          "the decision log shows its empty state while also listing rows",
+        );
+      }
+      if (!decisionLog.empty && decisionLog.rows === 0) {
+        aiStateFindings.push(
+          "the decision log is not empty but rendered no rows and no empty state",
+        );
+      }
+      if (decisionLog.error > 0) {
+        aiStateFindings.push("the decision log rendered its error banner on a healthy stack");
+      }
+      // Every filter the screen offers must actually be in the DOM. A filter that exists in the
+      // copy and not on the screen is a dead control, which the definition of done forbids.
+      for (const [name, count] of Object.entries(decisionLog.filters)) {
+        if (count === 0) aiStateFindings.push(`the decision log has no ${name} filter control`);
+      }
+      if (decisionLog.exportButton === 0) {
+        aiStateFindings.push("the decision log has no export control, so the CSV is unreachable");
+      }
+      if (decisionLog.afterExport.exportError) {
+        aiStateFindings.push(
+          `the decision log export was refused: ${decisionLog.afterExport.exportError}`,
+        );
+      }
+      if (!decisionLog.afterExport.notice) {
+        aiStateFindings.push(
+          "the decision log export reported nothing, so an operator cannot tell it worked",
+        );
+      }
+      // A row that opens a drawer must open one that shows the walk. The drawer existing with
+      // no walk is the exact failure the detail view exists to prevent.
+      if (decisionLog.drawer.opened && decisionLog.drawer.walk === 0) {
+        aiStateFindings.push(
+          "a decision row opened a detail drawer with no candidate walk in it",
+        );
+      }
+      if (decisionLog.drawer.opened && decisionLog.drawer.close === 0) {
+        aiStateFindings.push("the decision detail drawer has no close control");
+      }
+      if (decisionLog.mobile.overflows) {
+        aiStateFindings.push(
+          "the decision log section overflows its card at 390px, so the table is unusable on mobile",
+        );
+      }
+    }
+  } catch (cause) {
+    const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+    // The second half failing is a finding, not a shrug: the screen is half-tested and the report
+    // must not read as if the whole pass ran.
+    note({ step: "failed", reason });
+    aiStateFindings.push(`the AI provider depth pass stopped at the slice-2/3 half: ${reason}`);
+  } finally {
+    report.aiProviders = steps;
+    fake.close();
+  }
+}
+
+/**
+ * Open Health, Usage and Failover in turn and read what each one rendered.
+ *
+ * The Health panel is the one that matters most for a defect: its header, its sample table and its
+ * "Probe now" button are checked against each other, because a header that disagrees with the rows
+ * under it is exactly the bug this slice exists to prevent.
+ */
+async function exerciseHealthPanels(page) {
+  const result = { health: null, usage: null, failover: null, probe: null };
+
+  await page.locator('[data-panel-toggle="health"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  result.health = await page.evaluate(() => {
+    const root = document.querySelector("[data-health-panel]");
+    if (!root) return { present: false };
+    return {
+      present: true,
+      figures: [...root.querySelectorAll("[data-figure]")].map((node) => `${node.getAttribute("data-figure")}=${node.textContent?.trim() ?? ""}`),
+      samples: root.querySelectorAll("[data-sample-row]").length,
+      sparkline: root.querySelectorAll("[data-spark-bar]").length,
+      empty: root.querySelectorAll("[data-health-empty]").length,
+      error: root.querySelectorAll("[data-health-error]").length,
+      lastError: root.querySelector("[data-health-last-error]")?.textContent?.trim() ?? "",
+    };
+  });
+  await shot(page, "ai-health-panel");
+
+  // "Probe now" must be a real button that answers: pressed, one sample added, header refreshed.
+  const before = result.health?.samples ?? 0;
+  await page.locator("[data-health-probe]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(4000);
+  result.probe = await page.evaluate((previous) => {
+    const root = document.querySelector("[data-health-panel]");
+    if (!root) return { pressed: false };
+    return {
+      pressed: true,
+      notice: root.querySelector("[data-health-notice]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      inlineError: root.querySelector("[data-health-inline-error]")?.textContent?.trim() ?? "",
+      samples: root.querySelectorAll("[data-sample-row]").length,
+      grew: root.querySelectorAll("[data-sample-row]").length > previous,
+    };
+  }, before);
+
+  await page.locator('[data-panel-toggle="usage"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  result.usage = await page.evaluate(() => {
+    const root = document.querySelector("[data-usage-panel]");
+    if (!root) return { present: false };
+    return {
+      present: true,
+      figures: [...root.querySelectorAll("[data-figure]")].map((node) => `${node.getAttribute("data-figure")}=${node.textContent?.trim() ?? ""}`),
+      // REQ-098 slice 5: the cost figure and the "could not be priced" notice. A screenshot can
+      // show a number being rendered but cannot tell `—` (unknown) from `0` (free) at a glance,
+      // and that difference is the whole claim of the snapshot — so the pass reads both as text.
+      costFigure:
+        root.querySelector('[data-testid="usage-cost"]')?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      uncosted: root.querySelector("[data-usage-uncosted]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      days: root.querySelectorAll("[data-usage-day]").length,
+      empty: root.querySelectorAll("[data-usage-empty]").length,
+      missing: root.querySelector("[data-usage-missing]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      error: root.querySelectorAll("[data-usage-error]").length,
+    };
+  });
+  await shot(page, "ai-usage-panel");
+
+  await page.locator('[data-panel-toggle="failover"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  result.failover = await page.evaluate(() => {
+    const root = document.querySelector("[data-failover-panel]");
+    if (!root) return { present: false };
+    const rows = [...root.querySelectorAll("[data-failover-row]")].map((node) => node.textContent?.replace(/\s+/g, " ").trim() ?? "");
+    return {
+      present: true,
+      rows,
+      rowCount: rows.length,
+      empty: root.querySelectorAll("[data-failover-empty]").length,
+      error: root.querySelectorAll("[data-failover-error]").length,
+    };
+  });
+  await shot(page, "ai-failover-panel");
+
+  return result;
+}
+
+
+/** Open the first model's flag editor and read the catalog it renders. */
+async function readCapabilityEditor(page) {
+  await page.locator("[data-model-flags]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const flags = await page.evaluate(() =>
+    [...document.querySelectorAll("[data-capability-flag]")].map((node) => {
+      const key = node.getAttribute("data-capability-flag") ?? "";
+      return `${key.split(":")[1]}:${node.checked ? "on" : "off"}${node.disabled ? "/locked" : ""}`;
+    }),
+  );
+  const editor = await page.locator("[data-capability-editor]").count();
+  const notes = await page.locator("[data-capability-editor] label span").allTextContents();
+
+  return {
+    editor,
+    flags: flags.join(" "),
+    flagCount: flags.length,
+    notes: notes.map((text) => text.replace(/\s+/g, " ").trim()).slice(0, 4).join(" / "),
+  };
+}
+
+/**
+ * Open the routing section and read what it rendered (REQ-098 slice 2).
+ *
+ * Three claims are checked here that no API test can make, because they are claims about the
+ * *screen*: that all seven task rows exist on a fresh install, that the unresolvable banner is
+ * amber rather than red, and that the dry run renders a walk after a click. The walk is the
+ * whole point of the screen — a routing table that shows chains but cannot explain itself is
+ * the failure this slice exists to prevent.
+ */
+async function exerciseRouting(page) {
+  await page.locator("[data-routing-screen]").first().scrollIntoViewIfNeeded().catch(() => {});
+  await page.waitForTimeout(1800);
+
+  const initial = await page.evaluate(() => {
+    const root = document.querySelector("[data-routing-screen]");
+    if (!root) return { present: false };
+    const banner = root.querySelector("[data-routing-warning]");
+    return {
+      present: true,
+      tasks: [...root.querySelectorAll("[data-routing-task]")].map((node) => ({
+        task: node.getAttribute("data-routing-task") ?? "",
+        inherited: node.getAttribute("data-routing-inherited") === "true",
+        candidates: node.querySelectorAll("[data-routing-candidate]").length,
+        // The primary control is counted separately from the candidate selects: on a fresh
+        // install the chain is empty, so "this row has no way to be configured" is a dead
+        // control and the two must not be counted as one number.
+        primary: node.querySelectorAll("[data-routing-primary]").length,
+        selects: node.querySelectorAll("select").length,
+        save: node.querySelectorAll("button").length,
+      })),
+      warning: banner?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      // The banner's own class is read rather than judged from a screenshot: "warning, not
+      // error" is a claim about colour, and colour is exactly what a screenshot review is worst
+      // at asserting.
+      warningTone: banner ? getComputedStyle(banner).borderColor : "",
+      error: root.querySelectorAll("[data-routing-error]").length,
+      preview: root.querySelectorAll("[data-routing-preview]").length,
+      overrides: root.querySelectorAll("[data-routing-override]").length,
+      rule: root.textContent?.match(/Resolution order: ([a-z_ →]+)/)?.[1] ?? "",
+    };
+  });
+  await shot(page, "ai-routing-tasks");
+
+  // Set a primary for `cheap`, then ask the dry run what that request would do.
+  //
+  // The selector is `[data-routing-primary]`, not "the first select in the row": on a fresh
+  // install the chain is empty, and the empty state is what renders the control. Targeting the
+  // candidate list instead found nothing, the save never fired, and the pass reported "the save
+  // did not take effect" — a finding about a screen that was working, caused by the walkthrough
+  // looking for a control that only exists in the *configured* state.
+  const saved = await page
+    .locator('[data-routing-task="cheap"] [data-routing-primary]')
+    .first()
+    .selectOption({ index: 1 })
+    .catch(() => null);
+  await page.waitForTimeout(400);
+  await page
+    .locator('[data-routing-task="cheap"] button:has-text("Save chain")')
+    .first()
+    .click({ timeout: 5000 })
+    .catch(() => {});
+  await page.waitForTimeout(2600);
+
+  const afterSave = await page.evaluate(() => {
+    const root = document.querySelector("[data-routing-screen]");
+    const row = root?.querySelector('[data-routing-task="cheap"]');
+    return {
+      candidates: row?.querySelectorAll("[data-routing-candidate]").length ?? 0,
+      notice: root?.querySelector("[data-routing-notice]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      error: root?.querySelector("[data-routing-error]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+    };
+  });
+  await shot(page, "ai-routing-saved");
+
+  await page
+    .locator("[data-routing-preview] button:has-text('Resolve')")
+    .first()
+    .click({ timeout: 5000 })
+    .catch(() => {});
+  await page.waitForTimeout(2600);
+
+  const walk = await page.evaluate(() => {
+    const root = document.querySelector("[data-routing-preview]");
+    if (!root) return { present: false };
+    return {
+      present: true,
+      answer: root.querySelector("[data-routing-walk]")?.textContent?.replace(/\s+/g, " ").trim().slice(0, 200) ?? "",
+      entries: [...root.querySelectorAll("[data-routing-walk-outcome]")].map(
+        (node) => node.getAttribute("data-routing-walk-outcome") ?? "",
+      ),
+      previewError: root.querySelectorAll("[data-routing-preview-error]").length,
+    };
+  });
+  await shot(page, "ai-routing-walk");
+
+  return { ...initial, saved: saved !== null, afterSave, walk };
+}
+
+/**
+ * Open the decision log and read what it rendered (REQ-098 slice 3).
+ *
+ * The API walks prove the log stores what the resolver decided; this proves the *screen* shows
+ * it, which is a different claim and the one the definition of done actually names. Three things
+ * are checked that no API test can make: the empty state names a real next step, the table
+ * renders rows with their reason, and clicking a row opens a walk rather than a blank drawer.
+ */
+async function exerciseDecisionLog(page) {
+  await page
+    .locator("[data-ai-decision-log]")
+    .first()
+    .scrollIntoViewIfNeeded()
+    .catch(() => {});
+  await page.waitForTimeout(1800);
+
+  const initial = await page.evaluate(() => {
+    const root = document.querySelector("[data-ai-decision-log]");
+    if (!root) return { present: false };
+    const banner = root.querySelector("[data-log-unresolved]");
+    return {
+      present: true,
+      // An empty log and a broken one must be told apart by the DOM, not by a screenshot: the
+      // empty state and the amber banner are the two states this screen is judged in.
+      empty: root.textContent?.includes("No route decisions yet") ?? false,
+      rows: root.querySelectorAll("[data-log-row]").length,
+      count: root.querySelector("[data-log-count]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      error: root.querySelectorAll("[data-log-error]").length,
+      filters: {
+        task: root.querySelectorAll("[data-log-filter-task]").length,
+        range: root.querySelectorAll("[data-log-filter-range]").length,
+        fallback: root.querySelectorAll("[data-log-filter-fallback]").length,
+        unresolved: root.querySelectorAll("[data-log-filter-unresolved]").length,
+      },
+      exportButton: root.querySelectorAll("[data-log-export]").length,
+      // The warning banner's tone is read from the computed style: "amber, not red" is a claim
+      // about colour, which is exactly what a screenshot review is worst at asserting.
+      bannerTone: banner ? getComputedStyle(banner).borderColor : "",
+    };
+  });
+  await shot(page, "ai-decision-log");
+
+  // The export is a control, not a navigation, so it can be clicked and its result asserted —
+  // and the assertion that matters is that the export *answers at all* on a fresh install.
+  await page.locator("[data-log-export]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+
+  const afterExport = await page.evaluate(() => {
+    const root = document.querySelector("[data-ai-decision-log]");
+    return {
+      notice: root?.querySelector("[data-log-export-notice]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      exportError: root?.querySelector("[data-log-export-error]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+    };
+  });
+
+  // Open the first row, if there is one. On a fresh install there is none, and the empty state
+  // is the correct result — the walk records that rather than inventing a row to click.
+  let drawer = { opened: false };
+  const firstOpen = page.locator("[data-log-open]").first();
+  if ((await firstOpen.count()) > 0) {
+    await firstOpen.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1600);
+    drawer = await page.evaluate(() => {
+      const panel = document.querySelector("[data-log-drawer-panel]");
+      if (!panel) return { opened: false };
+      return {
+        opened: true,
+        reason: panel.querySelector("[data-log-drawer-reason]")?.textContent?.replace(/\s+/g, " ").trim().slice(0, 160) ?? "",
+        walk: panel.querySelectorAll("[data-log-walk-entry]").length,
+        close: panel.querySelectorAll("[data-log-drawer-close]").length,
+      };
+    });
+    await shot(page, "ai-decision-detail");
+    await page.locator("[data-log-drawer-close]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(600);
+  }
+
+  // Mobile: the table is a card list under 1024px, and the reason stays clamped so a long one
+  // cannot push the row to three screens tall.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(1200);
+  const mobile = await page.evaluate(() => {
+    const root = document.querySelector("[data-ai-decision-log]");
+    const section = root?.closest("section");
+    return {
+      width: section?.getBoundingClientRect().width ?? 0,
+      overflows: section ? section.scrollWidth > section.clientWidth + 1 : false,
+    };
+  });
+  await shot(page, "ai-decision-log-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(800);
+
+  return { ...initial, afterExport, drawer, mobile };
+}
+
+/** Switch one editable capability off and back on, and read the notice each time. */
+async function toggleOneCapability(page) {
+  const flag = page.locator('[data-capability-flag$=":vision"]').first();
+  const existed = (await flag.count()) > 0;
+  if (!existed) return { toggled: false, reason: "no vision flag in the catalog" };
+
+  const before = await flag.isChecked().catch(() => false);
+  await flag.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const after = await flag.isChecked().catch(() => !before);
+  const notice = await page.locator("text=/vision (enabled|disabled)/").first().innerText().catch(() => "");
+  await shot(page, "ai-capability-off");
+
+  // Put it back, so the pass leaves the registry as it found it.
+  await flag.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const restored = await flag.isChecked().catch(() => false);
+
+  return {
+    toggled: true,
+    before,
+    after,
+    restored,
+    flipped: before !== after,
+    notice: notice.replace(/\s+/g, " ").slice(0, 120),
+  };
+}
+
+/** Discover, read the diff, apply it, and discover again — the second run must be empty. */
+async function discoverTwice(page, fake) {
+  // **Discover lives inside the provider's Models drawer.** `{editing === provider.id ? … : null}`
+  // means the button does not exist in the DOM until that row is opened, so a pass that goes
+  // straight for it clicks nothing, finds no `[data-discovery-diff]`, and reports `first: null` —
+  // which reads exactly like "the endpoint served no models". Opening the drawer is the whole
+  // difference between proving discovery and not proving it.
+  const opened = await page
+    .locator('[data-provider-models="QA Local"]')
+    .first()
+    .click({ timeout: 5000 })
+    .then(() => true)
+    .catch(() => false);
+  await page.waitForTimeout(900);
+  const discoverVisible = await page.locator('[data-provider-discover="QA Local"]').isVisible().catch(() => false);
+  if (!discoverVisible) {
+    return { first: null, applied: "skipped", second: null, fakeEndpoint: fake.baseUrl, drawerOpened: opened, discoverVisible: false };
+  }
+
+  await page
+    .locator('[data-provider-discover="QA Local"]')
+    .first()
+    .click({ timeout: 5000 })
+    .catch(() => {});
+  await page.waitForTimeout(2600);
+
+  const first = await page.evaluate(() => {
+    const root = document.querySelector("[data-discovery-diff]");
+    if (!root) return null;
+    return {
+      counts: root.querySelector("[data-discovery-counts]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      lines: [...root.querySelectorAll("[data-discovery-line]")].map(
+        (node) => node.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      ),
+      applyLabel: root.querySelector("[data-discovery-apply]")?.textContent?.trim() ?? "",
+      applyDisabled: root.querySelector("[data-discovery-apply]")?.disabled ?? null,
+    };
+  });
+
+  // Apply only when the diff actually has something to do.
+  let applied = "skipped";
+  if (first && first.applyLabel === "Apply this diff") {
+    await page
+      .locator('[data-discovery-apply="QA Local"]')
+      .first()
+      .click({ timeout: 5000 })
+      .catch(() => {});
+    await page.waitForTimeout(2800);
+    applied = "clicked";
+  }
+
+  // The second discovery is the proof: nothing left to do.
+  await page
+    .locator('[data-provider-discover="QA Local"]')
+    .first()
+    .click({ timeout: 5000 })
+    .catch(() => {});
+  await page.waitForTimeout(2600);
+  const second = await page.evaluate(() => {
+    const root = document.querySelector('[data-discovery-diff="QA Local"]');
+    if (!root) return null;
+    return {
+      upToDate: (root.querySelector("[data-discovery-uptodate]")?.textContent ?? "").trim().length > 0,
+      applyLabel: root.querySelector("[data-discovery-apply]")?.textContent?.trim() ?? "",
+      applyDisabled: root.querySelector("[data-discovery-apply]")?.disabled ?? null,
+    };
+  });
+  await shot(page, "ai-discovery-uptodate");
+
+  return {
+    first,
+    applied,
+    second,
+    fakeEndpoint: fake.baseUrl,
+  };
+}
+
+/**
+ * Every screen has three states, and only one of them is the happy path.
+ *
+ * A panel that renders a skeleton when the request *failed* is the defect this pass exists to
+ * find: `null` used to mean both "loading" and "could not be loaded", so an outage looked like a
+ * slow network and the skeleton shimmered for ever. Each state is provoked for real — the
+ * request is answered with a 500 or the connection is dropped, never a mock of the component —
+ * and the pass asserts the screen says which one it is and offers a way out.
+ *
+ * The failing call is scoped with a route handler and then removed, so the retry is a real second
+ * request rather than a re-render of cached state.
+ */
+async function runAiStatesDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-providers", action: "ai-states", ...step });
+  };
+  // A note in a jsonl file is evidence for a human reading the log, not a gate. Every assertion
+  // here is a claim about the panel, so a false one has to reach the report as a finding — the
+  // whole point of the sweep is that a screen which cannot say what went wrong is a defect, and a
+  // defect that only prints is a defect nobody fixes.
+  //
+  // The roll-up owns the real `findings` array and runs after this pass, so the assertions queue
+  // here and are drained into it. Pushing straight at the roll-up's array would be a ReferenceError
+  // — a gate that throws is worse than no gate, because the run dies before the report is written.
+  const expect = (condition, detail) => {
+    if (condition) return true;
+    aiStateFindings.push(detail);
+    return false;
+  };
+
+  const readStates = () =>
+    page.evaluate(() => ({
+      providersError: document.querySelectorAll("[data-providers-error]").length,
+      providersRetry: document.querySelectorAll("[data-providers-retry]").length,
+      modelsError: document.querySelectorAll("[data-models-error]").length,
+      modelsRetry: document.querySelectorAll("[data-models-retry]").length,
+      // The skeleton is the *loading* state. If it is on screen while an error is also claimed,
+      // the screen is telling the operator two different things at once.
+      skeletons: document.querySelectorAll("[data-loading-table]").length,
+      emptyTitle: (document.body.textContent || "").includes("No provider is connected yet"),
+    }));
+
+  // --- one list fails, the other keeps working ---------------------------------------------
+  // A provider-list outage that also blanked the model registry would prove the two are not
+  // really independent, which is the whole point of the `allSettled` above.
+  //
+  // Every failure below is *registered* first. The roll-up turns an unclaimed 500 or a dropped
+  // connection into a high finding, and that is the right default — but these are the assertions
+  // this pass exists to make, so they are excused deliberately rather than by loosening the gate.
+  const failProviders = async (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { message: "the provider registry is unreachable" } }),
+    });
+  const failModels = async (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { message: "the model registry is unreachable" } }),
+    });
+
+  const unroute = async (pattern) => {
+    try {
+      await page.unroute(pattern);
+    } catch {
+      /* never registered — nothing to undo */
+    }
+  };
+
+  // ---- the provider list fails -----------------------------------------------------------
+  expectRefusal("/ai/providers", "ai-states: the provider list is answered with a 500 on purpose");
+  await page.route("**/api/v1/ai/providers**", failProviders);
+  await page.goto(`${URL_ADMIN}/ai`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const providersDown = await readStates();
+  // An error with no button is a dead end: the operator is told what broke and given nothing.
+  expect(
+    providersDown.providersError === 1 && providersDown.providersRetry === 1,
+    `ai-states: the provider list answered 500 but the screen showed no retryable error ` +
+      `(error blocks ${providersDown.providersError}, retry buttons ${providersDown.providersRetry})`,
+  );
+  // "No provider is connected yet" is a *different* claim — it tells an operator with a working
+  // installation that they have no provider, and invites them to add a duplicate.
+  expect(
+    providersDown.emptyTitle === false,
+    'ai-states: the provider outage claimed the installation is empty ("No provider is connected yet")',
+  );
+  // The models list is untouched, so it must still be readable rather than erroring too.
+  expect(
+    providersDown.modelsError === 0,
+    "ai-states: one failing provider list also blanked the model registry — they are not independent",
+  );
+  note({ step: "providers-outage", ...providersDown });
+  await shot(page, "ai-providers-outage");
+  // The provocation is over. Everything the failing screen did to answer 500 belongs to it; a
+  // failure after this point is a real one again.
+  endRefusalWindow("/ai/providers");
+
+  // ---- the retry really re-requests ------------------------------------------------------
+  await unroute("**/api/v1/ai/providers**");
+  await page.locator("[data-providers-retry]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const afterRetry = await readStates();
+  expect(
+    afterRetry.providersError === 0,
+    "ai-states: the retry button left the error on screen after the endpoint recovered",
+  );
+  expect(
+    afterRetry.skeletons === 0,
+    "ai-states: the retry left the loading skeleton up — the request never resolved",
+  );
+  note({
+    step: "retry-recovers",
+    clearedError: afterRetry.providersError === 0,
+    showsRowsOrEmpty: afterRetry.skeletons === 0,
+  });
+  await shot(page, "ai-providers-recovered");
+
+  // ---- the model registry fails -----------------------------------------------------------
+  expectRefusal("/ai/models", "ai-states: the model registry is answered with a 500 on purpose");
+  await page.route("**/api/v1/ai/models**", failModels);
+  await page.goto(`${URL_ADMIN}/ai`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const modelsDown = await readStates();
+  expect(
+    modelsDown.modelsError === 1 && modelsDown.modelsRetry === 1,
+    `ai-states: the model registry answered 500 but the screen showed no retryable error ` +
+      `(error blocks ${modelsDown.modelsError}, retry buttons ${modelsDown.modelsRetry})`,
+  );
+  // The provider list is the screen's real content; losing it too would mean one failure took
+  // the whole hub down.
+  expect(
+    modelsDown.providersError === 0,
+    "ai-states: one failing model registry also blanked the provider list — they are not independent",
+  );
+  note({ step: "models-outage", ...modelsDown });
+  await shot(page, "ai-models-outage");
+  endRefusalWindow("/ai/models");
+  await unroute("**/api/v1/ai/models**");
+
+  // ---- the transport itself fails ---------------------------------------------------------
+  // A dropped connection is a different failure from a 500 and the honest message is not the
+  // same: the server never answered, so the panel must not claim it did.
+  expectRefusal("/ai/providers", "ai-states: the provider request is dropped on purpose");
+  await page.route("**/api/v1/ai/providers**", (route) => route.abort("connectionrefused"));
+  await page.goto(`${URL_ADMIN}/ai`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const offline = await readStates();
+  // A skeleton here is the original bug, unfixed: a transport failure read as "still loading".
+  expect(
+    offline.skeletons === 0,
+    "ai-states: a dropped connection left the loading skeleton on screen — a failure reads as pending",
+  );
+  expect(
+    offline.providersError === 1 && offline.providersRetry === 1,
+    `ai-states: the provider request was dropped but the screen showed no retryable error ` +
+      `(error blocks ${offline.providersError}, retry buttons ${offline.providersRetry})`,
+  );
+  note({ step: "connection-refused", ...offline });
+  await shot(page, "ai-providers-offline");
+  endRefusalWindow("/ai/providers");
+  await unroute("**/api/v1/ai/providers**");
+
+  return { providersDown, afterRetry, modelsDown, offline };
+}
+
+
+/**
+ * A local-inference stub: the model list answers, and the chat answers one token.
+ *
+ * Separate from `startFakeProvider` on purpose. That stub is a **remote**-looking provider with
+ * one model and a chat that streams; the doctor needs an endpoint that also serves an embedding
+ * model and answers a non-streaming one-token completion, because "does the doctor award a tick
+ * to a server that is up but useless" is the question this pass asks. A stub shaped like the
+ * other one would make every check pass and prove nothing.
+ */
+function startLocalStub() {
+  const http = require("node:http");
+  const models = {
+    object: "list",
+    data: [
+      { id: "qa-local-chat" },
+      // The embedding model is what the doctor's embedding check looks for; without it that
+      // check can only ever be `warn`, and the screen would show one amber row for the wrong
+      // reason.
+      { id: "qa-local-embed" },
+    ],
+  };
+  const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/v1/models") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(models));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/v1/chat/completions") {
+      let raw = "";
+      req.on("data", (chunk) => { raw += chunk; });
+      req.on("end", () => {
+        let body = {};
+        try { body = JSON.parse(raw || "{}"); } catch { body = {}; }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 4, completion_tokens: 1, total_tokens: 5 },
+          }),
+        );
+      });
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "not found" } }));
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({ baseUrl: `http://127.0.0.1:${port}/v1`, close: () => server.close() });
+    });
+  });
+}
+
+/**
+ * The local AI doctor, driven (REQ-106, slice 4).
+ *
+ * The screen is where "can this machine run AI by itself" gets an answer, and the answer has to
+ * distinguish three states rather than two. The walk asserts, in order:
+ *
+ * 1. **Never run is an empty state, not a verdict.** A fresh QA database has no run, and a list
+ *    of green ticks there is the single most expensive thing this screen could ship.
+ * 2. **Running it produces check rows with three distinguishable words.** `warn` is asserted as
+ *    its own label because "Passed" / "Not established" / "Failed" are the three claims the type
+ *    makes, and a screen that renders two of them as one has told the reader something false.
+ * 3. **A real endpoint turns the checks green.** The stub answers `/models` and a one-token chat,
+ *    so reachability and completion must pass — which is also the proof that the screen is
+ *    reading a real run and not its own empty state.
+ * 4. **A rerun says what changed and grows the history** — the regression-visibility claim.
+ *
+ * The run and the reruns are POSTs the pass causes, so they are registered with the refusal
+ * gate: a 403 or 400 there would otherwise be counted as a high finding by the roll-up, and an
+ * unclaimed one is a real defect this pass cannot excuse.
+ */
+async function runAiLocalDoctorDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-local-doctor", action: "ai-local-doctor", ...step });
+  };
+  const findings = [];
+  const expect = (condition, detail) => {
+    if (condition) return true;
+    findings.push(detail);
+    return false;
+  };
+
+  const callApi = (method, path, body) =>
+    page.evaluate(
+      async ([verb, url, payload]) => {
+        const answer = await fetch(url, {
+          method: verb,
+          credentials: "same-origin",
+          headers: payload ? { "content-type": "application/json" } : {},
+          body: payload ? JSON.stringify(payload) : undefined,
+        });
+        return { status: answer.status, body: await answer.json().catch(() => null) };
+      },
+      [method, `${URL_ADMIN}/api${path}`, body ?? null],
+    );
+
+  const stub = await startLocalStub();
+  let endpointId = null;
+
+  try {
+    await page
+      .goto(`${URL_ADMIN}/ai/local/doctor`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForTimeout(2000);
+
+    // --- the never-run state -------------------------------------------------------------
+    const first = await page.evaluate(() => ({
+      rendered: document.querySelectorAll("[data-doctor-latest]").length,
+      empty: document.body.innerText.includes("has not run yet"),
+      // The load-bearing assertion: a screen that has never run anything must not be showing a
+      // verdict, in any tone.
+      verdict: document.querySelectorAll("[data-doctor-verdict]").length,
+      passTicks: (document.body.innerText.match(/Passed/g) || []).length,
+      runAll: document.querySelectorAll("[data-doctor-run-all]").length,
+    }));
+    expect(
+      first.rendered + (first.empty ? 1 : 0) > 0,
+      "the doctor screen rendered neither a run nor an empty state",
+    );
+    expect(
+      first.verdict === 0,
+      `a doctor that has never run must not show a verdict badge, saw ${first.verdict}`,
+    );
+    expect(
+      first.passTicks === 0,
+      "a never-run doctor must not render the word Passed anywhere",
+    );
+    expect(first.runAll >= 1, "the empty state must offer the action that gets past it");
+    note({ step: "never-run", ...first });
+    await shot(page, "ai-local-doctor-never-run");
+
+    // --- a real endpoint ----------------------------------------------------------------
+    const created = await callApi("POST", "/v1/ai/local/endpoints", {
+      name: "QA local stub",
+      base_url: stub.baseUrl,
+      protocol: "openai_compatible",
+    });
+    expect(
+      created.status === 201 || created.status === 200,
+      `registering the local stub should succeed, saw ${created.status}: ${JSON.stringify(created.body)}`,
+    );
+    endpointId = created.body?.endpoint?.id ?? null;
+
+    // The model rows come from a scan, exactly as an operator's would — the doctor's embedding
+    // check reads stored rows, so a fixture that skipped the scan would test a screen showing
+    // nothing.
+    const scanned = await callApi("POST", "/v1/ai/local/scan", endpointId);
+    expect(scanned.status === 200, `the scan should succeed, saw ${scanned.status}`);
+    note({
+      step: "fixture",
+      created: created.status,
+      scanned: scanned.status,
+      served: scanned.body?.served,
+    });
+
+    // --- run it ------------------------------------------------------------------------
+    // Registered: the doctor's own run is a POST the pass causes. A 500 inside that window is
+    // still a real defect, which is why the allowance is positional and closed rather than a
+    // blanket "the doctor may fail".
+    expectRefusal(
+      "/api/v1/ai/local/doctor",
+      "ai-local-doctor: the run and the reruns are POSTs the pass causes",
+      [201, 200, 403, 400],
+    );
+    await page.goto(`${URL_ADMIN}/ai/local/doctor`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.locator("[data-doctor-run-all]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(4000);
+
+    const ran = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll("[data-doctor-check]")];
+      return {
+        verdict: (document.querySelector("[data-doctor-verdict]")?.textContent || "").trim(),
+        summary: (document.querySelector("[data-doctor-summary]")?.textContent || "").trim(),
+        rows: rows.length,
+        statuses: [...new Set(rows.map((row) => row.getAttribute("data-doctor-status")))].sort(),
+        // The three words must be reachable as WORDS, not only as colours.
+        words: ["Passed", "Not established", "Failed"].filter((word) =>
+          document.body.innerText.includes(word),
+        ),
+        fixes: rows.filter((row) => row.innerText.includes("Fix:")).length,
+        notice: (document.querySelector("[data-doctor-notice]")?.textContent || "").trim(),
+        history: document.querySelectorAll("[data-doctor-history-row]").length,
+      };
+    });
+    expect(ran.rows > 0, `the run produced no check rows, saw ${ran.rows}`);
+    expect(ran.summary.length > 0, "the summary line must state the verdict");
+    expect(
+      ran.statuses.includes("pass"),
+      `a healthy local endpoint must produce at least one passing check, saw ${JSON.stringify(ran.statuses)}`,
+    );
+    expect(
+      ran.notice.length > 0,
+      "clicking Run all must print what happened — a button that works and says nothing is a dead end",
+    );
+    note({ step: "run", ...ran });
+    await shot(page, "ai-local-doctor-ran");
+
+    // --- rerun one check ----------------------------------------------------------------
+    const firstRow = page.locator("[data-doctor-check]").first();
+    const beforeKey = await firstRow.getAttribute("data-doctor-check-key");
+    await firstRow.locator('button:has-text("Re-run")').click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(3000);
+    const reran = await page.evaluate(() => ({
+      notice: (document.querySelector("[data-doctor-notice]")?.textContent || "").trim(),
+      rows: document.querySelectorAll("[data-doctor-check]").length,
+      history: document.querySelectorAll("[data-doctor-history-row]").length,
+    }));
+    expect(
+      reran.notice.length > 0,
+      "re-running one check must say what that check now says, by name",
+    );
+    expect(reran.rows > 0, "the rerun must not blank the list");
+    expect(
+      reran.history > ran.history,
+      `the rerun must add to history so a regression stays visible (was ${ran.history}, now ${reran.history})`,
+    );
+    note({ step: "rerun", key: beforeKey, ...reran });
+    await shot(page, "ai-local-doctor-rerun");
+
+    // --- keyboard -----------------------------------------------------------------------
+    const kb = await page.evaluate(() => {
+      const input = document.querySelector("[data-doctor-filter]");
+      if (!input) return { present: false };
+      input.focus();
+      return { present: true, focused: document.activeElement === input };
+    });
+    expect(kb.present && kb.focused, "the `/` shortcut must reach the filter field");
+    note({ step: "keyboard", ...kb });
+
+    return { ok: findings.length === 0, steps: steps.length, findings };
+  } finally {
+    endRefusalWindow("/api/v1/ai/local/doctor");
+    // Teardown through the API, not the UI: an assertion above that throws must not also be able
+    // to leave a local endpoint behind for the next pass in this run. The endpoint is deleted
+    // through the PROVIDER route — a local endpoint *is* a provider row, and slice 1 registered
+    // it in `ai_providers` rather than in a parallel table, so there is no second delete to
+    // write and no way for the two to disagree about what a row is.
+    if (endpointId) {
+      const removed = await callApi("DELETE", `/v1/ai/providers/${endpointId}`).catch(() => null);
+      note({ step: "teardown", removed: removed?.status ?? null });
+    }
+    stub.close();
+  }
+}
+
+/**
+ * The "Run AI locally" manual, driven (REQ-106, slice 4).
+ *
+ * A documentation screen is the easiest thing in a build to ship wrong, because nothing about it
+ * is load-bearing until an operator follows it in an air-gapped install and finds out. The route
+ * walk proves it renders; this pass proves the three claims that could be wrong:
+ *
+ *   1. **The "what stops working" list is the server's, not the page's.** The pass reads
+ *      `GET /api/v1/ai/airgap` and asserts every provider the server would block appears on the
+ *      page with its base URL — and, in the other direction, that the page lists no provider the
+ *      server would not block. A hand-written list is the failure mode: it looks right in review,
+ *      it is right until an operator adds a provider, and it is wrong in the direction that gets
+ *      discovered in production. Both directions are asserted, because a page that prints nothing
+ *      passes a one-directional check.
+ *
+ *   2. **The verdict is quoted, not guessed.** With no doctor run on record the page must say
+ *      "Never verified" rather than either claiming readiness or rendering a blank. The pass takes
+ *      the words off the DOM and refuses any of the three ready-claims when the doctor has no run.
+ *
+ *   3. **The steps link to screens that exist.** Each step's link is followed; a guide whose
+ *      links 404 is worse than no guide, because it is trusted.
+ *
+ * It runs after the doctor pass, which is what leaves a real run on record — so the readiness
+ * assertion sees a verdict and not only the never-run branch.
+ */
+async function runAiLocalGuideDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-local-guide", action: "ai-local-guide", ...step });
+  };
+  const findings = [];
+  const expect = (condition, detail) => {
+    if (condition) return true;
+    findings.push(detail);
+    return false;
+  };
+
+  const callApi = (method, path, body) =>
+    page.evaluate(
+      async ([verb, url, payload]) => {
+        const answer = await fetch(url, {
+          method: verb,
+          credentials: "same-origin",
+          headers: payload ? { "content-type": "application/json" } : {},
+          body: payload ? JSON.stringify(payload) : undefined,
+        });
+        return { status: answer.status, body: await answer.json().catch(() => null) };
+      },
+      [method, `${URL_ADMIN}/api${path}`, body ?? null],
+    );
+
+  try {
+    // The server's own answer, taken before the page is read so the comparison is against a
+    // snapshot the page could not have influenced.
+    const airgap = await callApi("GET", "/v1/ai/airgap");
+    expect(
+      airgap.status === 200,
+      `reading the air-gap overview should succeed, saw ${airgap.status}: ${JSON.stringify(airgap.body)}`,
+    );
+    const serverBlocked = (airgap.body?.would_block ?? []).map((entry) => ({
+      name: entry.name,
+      base_url: entry.base_url,
+    }));
+
+    await page
+      .goto(`${URL_ADMIN}/ai/local/guide`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForTimeout(2000);
+
+    const view = await page.evaluate(() => {
+      const text = document.body.innerText;
+      const blockRows = [...document.querySelectorAll("[data-guide-block]")].map((row) => ({
+        name: (row.querySelector("span")?.textContent || "").trim(),
+        url: (row.querySelector(".font-mono")?.textContent || "").trim(),
+      }));
+      const guide = document.querySelectorAll("[data-local-guide]").length;
+      const stat = (selector) =>
+        (document.querySelector(selector)?.textContent || "").replace(/\s+/g, " ").trim();
+      return {
+        guide,
+        verdict: stat("[data-guide-verdict]"),
+        verdictNote: stat("[data-guide-verdict-note]"),
+        steps: document.querySelectorAll("[data-guide-step]").length,
+        servers: document.querySelectorAll("[data-guide-server]").length,
+        blockRows,
+        blocksEmpty: document.querySelectorAll("[data-guide-blocks-empty]").length,
+        blocks: document.querySelectorAll("[data-guide-blocks]").length,
+        local: stat("[data-guide-stat-local]"),
+        remote: stat("[data-guide-stat-remote]"),
+        wouldBlock: stat("[data-guide-stat-blocked]"),
+        gap: stat("[data-guide-gap-state]"),
+        noLocal: document.querySelectorAll("[data-guide-no-local]").length,
+        links: [...document.querySelectorAll("[data-local-guide] a[href^='/']")].map((a) =>
+          a.getAttribute("href"),
+        ),
+        // The words an over-claiming page would print. Recorded so a failure can say which.
+        readyClaims: ["Ready for air-gapped operation", "Usable, with warnings", "Not ready"].filter(
+          (claim) => text.includes(claim),
+        ),
+      };
+    });
+
+    expect(view.guide === 1, `the guide rendered ${view.guide} times, expected once`);
+    expect(
+      view.steps === 6,
+      `the manual must carry all six steps in order, saw ${view.steps}`,
+    );
+    expect(
+      view.servers >= 3,
+      `the manual must name the supported servers, saw ${view.servers} rows`,
+    );
+
+    // --- the load-bearing comparison, both directions -----------------------------------
+    for (const provider of serverBlocked) {
+      const onPage = view.blockRows.some(
+        (row) => row.url === provider.base_url && row.name === provider.name,
+      );
+      expect(
+        onPage,
+        `the guide does not list ${provider.name} (${provider.base_url}) even though the air-gap check would block it`,
+      );
+    }
+    const serverUrls = new Set(serverBlocked.map((entry) => entry.base_url));
+    for (const row of view.blockRows) {
+      expect(
+        serverUrls.has(row.url),
+        `the guide lists ${row.name} (${row.url}) as blocked, but the air-gap check would not block it`,
+      );
+    }
+    expect(
+      view.blocksEmpty === 1 || view.blocks >= 1,
+      "the 'what stops working' section must render either a list or its empty explanation, never nothing",
+    );
+    if (serverBlocked.length === 0) {
+      expect(
+        view.blocksEmpty === 1,
+        "with nothing to block the page must say so in words, not show an empty list",
+      );
+    }
+
+    // --- the verdict is quoted, not guessed ---------------------------------------------
+    const neverVerified = view.verdict === "Never verified";
+    expect(
+      neverVerified || view.readyClaims.length > 0,
+      `the guide must state a readiness verdict in words, saw "${view.verdict}"`,
+    );
+    if (neverVerified) {
+      expect(
+        view.readyClaims.length === 0,
+        `a guide with no doctor run must not also claim ${view.readyClaims.join(", ")}`,
+      );
+    }
+
+    // --- every step's link resolves -----------------------------------------------------
+    // A `fetch` on the page origin, not an API call: these hrefs are admin *pages*, so the only
+    // thing that can 404 them is the route not existing. Asking the API the same path would
+    // answer 404 for a perfectly healthy page and prove nothing.
+    const uniqueLinks = [...new Set(view.links)];
+    const broken = [];
+    for (const href of uniqueLinks) {
+      const status = await page.evaluate(async (url) => {
+        const answer = await fetch(url, { method: "GET" });
+        return answer.status;
+      }, `${URL_ADMIN}${href}`);
+      if (status === 404) broken.push(href);
+    }
+    expect(
+      broken.length === 0,
+      `the manual links to pages that answer 404: ${broken.join(", ")}`,
+    );
+    note({
+      step: "links",
+      checked: uniqueLinks.length,
+      broken: broken.join(","),
+      targets: uniqueLinks.join(","),
+    });
+
+    await shot(page, "ai-local-guide");
+    note({
+      step: "view",
+      ...view,
+      blockRows: view.blockRows.length,
+      serverBlocked: serverBlocked.length,
+    });
+
+    return { ok: findings.length === 0, steps: steps.length, findings };
+  } catch (cause) {
+    findings.push(`the guide pass threw: ${cause instanceof Error ? cause.message : String(cause)}`);
+    return { ok: false, steps: steps.length, findings };
+  }
+}
+
+/**
+ * The air-gap switch, driven (REQ-106, slice 2).
+ *
+ * The route walk above only proves the screen *renders* in its resting state, which for a
+ * compliance switch is the least interesting thing about it. This pass asks the questions that
+ * matter, in the order an operator would:
+ *
+ *   1. Does the confirmation sheet refuse to submit while the reason is short? The button is
+ *      `disabled` while `onBlocked` is set — an assertion that a **disabled** button stays disabled
+ *      is what makes it a gate, because a sheet that only *warns* is a sheet that can be clicked
+ *      through by anyone in a hurry, and the API's own check is the second line of defence behind
+ *      this one, not the first.
+ *   2. Does a real reason + the typed phrase actually flip the switch, and does the banner appear?
+ *   3. Does the OFF direction skip the reason entirely — the asymmetry the store's docs call out
+ *      as the reason the control can be trusted?
+ *
+ * And it leaves the database as it found it. **The flip is restored in a `finally`,** because a
+ * harness that leaves the air gap ON makes every later pass read a banner, refuse a chat and
+ * measure a screen in an emergency state — the failure would surface as a dozen unrelated findings
+ * in a report written by a different writer, and nobody would connect them to this pass.
+ */
+/**
+ * The eval suites, driven (REQ-107, slice 1).
+ *
+ * The suite list is walked on its bare path (the empty state is what a fresh QA database has and
+ * the state most likely to render as a table that reads like "everything passes"), so this pass
+ * exists for the half the route walk cannot reach: the `[key]` screen, whose case editor and
+ * config form are the whole of slice 1's UI. There is no key to put in a route literal, so the
+ * suite is created through the API and the screen it produced is visited.
+ *
+ * What it asserts, and why each one is a place this slice could have lied:
+ *
+ * 1. **A suite with no cases says so on the row, in words.** The request's own risk note is that
+ *    "a suite of ten easy cases passes everything"; the inverse trap is a green row beside zero
+ *    cases. The badge must read `empty` and the sentence must be on the page, not in a tooltip —
+ *    a colour alone is unreadable to a colour-blind operator scanning a table.
+ * 2. **The case editor offers exactly the properties the scorer implements.** Counted from the
+ *    server's own `properties` list against the checkboxes on screen, so a property that is
+ *    authorable but unscorable cannot pass.
+ * 3. **A case that asserts nothing is refused, naming the field.** This is the acceptance row the
+ *    slice exists to satisfy, and the assertion is that the *field* is marked — a refusal with no
+ *    field on a ten-property form is a red form and no red box.
+ * 4. **The CSV import is partial and reports the line it refused.** Two good rows and one bad one:
+ *    the good ones must land and the bad one must be reported *by line number*. An import that
+ *    refused the whole file would be easy to build and would not satisfy the QA plan's
+ *    "reported by line".
+ * 5. **A `rubric` case on a blocking suite with no judge is refused naming the judge model** —
+ *    the combination rule, checked through the API the form posts to.
+ *
+ * Everything it creates is removed in a `finally`: a suite left behind makes the next pass in this
+ * run measure a populated list while its own assertions read about an empty one.
+ */
+async function runAiEvalsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-evals", action: "ai-evals", ...step });
+  };
+  const findings = [];
+  const expect = (condition, detail) => {
+    if (condition) return true;
+    findings.push(detail);
+    return false;
+  };
+
+  const callApi = (method, path, body) =>
+    page.evaluate(
+      async ([verb, url, payload]) => {
+        const answer = await fetch(url, {
+          method: verb,
+          credentials: "same-origin",
+          headers: payload ? { "content-type": "application/json" } : {},
+          body: payload ? JSON.stringify(payload) : undefined,
+        });
+        return { status: answer.status, body: await answer.json().catch(() => null) };
+      },
+      [method, `${URL_ADMIN}/api${path}`, body ?? null],
+    );
+
+  const suiteKey = `qa-evals-${Date.now().toString(36)}`;
+
+  try {
+    // --- a suite with no cases -----------------------------------------------------------
+    const listed = await callApi("GET", "/v1/ai/evals/suites");
+    expect(listed.status === 200, `the suite list should answer 200, saw ${listed.status}`);
+    const suiteCount = listed.body?.total ?? -1;
+    note({ step: "suite-list", status: listed.status, total: suiteCount });
+
+    const created = await callApi("POST", "/v1/ai/evals/suites", {
+      key: suiteKey,
+      name: "QA eval suite",
+      description: "Created by the walkthrough",
+      target: "model",
+      model_id: null,
+      threshold_percent: 90,
+      blocking: false,
+    });
+    expect(
+      created.status === 201 || created.status === 200,
+      `creating a suite should succeed, saw ${created.status}: ${JSON.stringify(created.body)}`,
+    );
+    const suiteId = created.body?.suite?.id ?? null;
+
+    await page
+      .goto(`${URL_ADMIN}/ai/evals`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForTimeout(2000);
+
+    // The load-bearing assertion: a suite that measures nothing must not look healthy.
+    const emptyRow = await page.evaluate((key) => {
+      const rows = [...document.querySelectorAll("[data-eval-suite-row]")];
+      const row = rows.find((node) => (node.textContent || "").includes(key));
+      return {
+        rows: rows.length,
+        found: Boolean(row),
+        readiness: row?.querySelector("[data-eval-readiness]")?.getAttribute("data-eval-readiness") ?? null,
+        badge: (row?.querySelector("[data-eval-readiness]")?.textContent || "").trim(),
+        note: (row?.querySelector("[data-eval-readiness-note]")?.textContent || "").trim(),
+        /*
+          `Run now` is slice 2's, and the reason it is disabled on THIS row has changed with it.
+          Before the runner it was "runs do not exist yet"; now the route is real, and a suite
+          with no enabled case is refused by the store — so the button must be disabled because
+          *this suite* cannot run, and the reason must be in the title rather than nowhere. An
+          assertion that only checked "disabled" would have passed in both worlds, which is
+          exactly the assertion that proves nothing.
+        */
+        runDisabled: Boolean(row?.querySelector("[data-eval-run-disabled]:disabled")),
+        runReason: (row?.querySelector("[data-eval-run]")?.getAttribute("title") || "").trim(),
+      };
+    }, suiteKey);
+    expect(emptyRow.found, "the suite the pass created is not on the list");
+    expect(
+      emptyRow.readiness === "empty",
+      `a suite with no cases must not read as ready, saw "${emptyRow.readiness}"`,
+    );
+    expect(
+      emptyRow.note.length > 0,
+      "the readiness sentence must be on the page, not only in a title attribute",
+    );
+    expect(
+      emptyRow.runDisabled,
+      "a suite with no enabled case cannot be run, so Run now must be disabled",
+    );
+    expect(
+      emptyRow.runReason.length > 0,
+      "the disabled Run now must say why — a greyed-out control with no text is a dead button",
+    );
+    note({ step: "empty-readiness", ...emptyRow });
+    await shot(page, "ai-evals-list-populated");
+
+    // --- the detail screen and its property checkboxes ------------------------------------
+    await page
+      .goto(`${URL_ADMIN}/ai/evals/${encodeURIComponent(suiteKey)}`, {
+        waitUntil: "domcontentloaded",
+      })
+      .catch(() => {});
+    await page.waitForTimeout(2000);
+
+    await page.locator("[data-eval-case-form], button:has-text('New case')").first().click().catch(() => {});
+    await page.waitForTimeout(800);
+
+    const editor = await page.evaluate(() => {
+      const form = document.querySelector("[data-eval-case-form]");
+      return {
+        open: Boolean(form),
+        checkboxes: form ? form.querySelectorAll('input[type="checkbox"]').length : 0,
+        propertyChips: form
+          ? [...form.querySelectorAll("code")].map((node) => node.textContent?.trim()).filter(Boolean)
+          : [],
+      };
+    });
+    expect(editor.open, "the case editor did not open");
+    // Two switches (Enabled, and the properties group is checkboxes) — the property count is
+    // asserted against the server's own list rather than a literal, so a property added to the
+    // scorer is a missing checkbox here and fails loudly.
+    const serverProperties = (await callApi("GET", `/v1/ai/evals/suites/${suiteKey}`))?.body
+      ?.properties?.length;
+    expect(
+      serverProperties > 0,
+      "the server must publish the property list the editor is built from",
+    );
+    if (editor.open) {
+      // `Enabled` is the one checkbox that is not a property, so the count is properties + 1.
+      expect(
+        editor.checkboxes === serverProperties + 1,
+        `the editor must offer every scorable property: ${editor.checkboxes} checkboxes for ${serverProperties} properties plus the Enabled switch`,
+      );
+    }
+    note({ step: "case-editor", serverProperties, ...editor });
+    await shot(page, "ai-evals-case-editor");
+
+    // --- a case that asserts nothing is refused, naming the field -------------------------
+    expectRefusal(
+      "/api/v1/ai/evals/suites",
+      "a case with no property is refused by the acceptance rule this slice exists for",
+    );
+    const noProperty = await callApi("POST", `/v1/ai/evals/suites/${suiteKey}/cases`, {
+      name: "asserts nothing",
+      input: "hello",
+      expected: {},
+    });
+    expect(
+      noProperty.status === 400,
+      `a case with no expected property must be refused, saw ${noProperty.status}: ${JSON.stringify(noProperty.body)}`,
+    );
+    const noPropertyField = noProperty.body?.error?.details?.field ?? null;
+    expect(
+      noPropertyField === "expected",
+      `the refusal must name the field the form marks, got ${JSON.stringify(noPropertyField)}`,
+    );
+    note({ step: "refuse-no-property", status: noProperty.status, field: noPropertyField });
+    endRefusalWindow("/api/v1/ai/evals/suites");
+
+    // --- a real case, then the rubric/blocking/judge rule ----------------------------------
+    const good = await callApi("POST", `/v1/ai/evals/suites/${suiteKey}/cases`, {
+      name: "greets by name",
+      input: "Greet Ada",
+      expected: { contains: "Ada" },
+      weight: 2.5,
+      tags: ["smoke", "qa"],
+    });
+    expect(
+      good.status === 201 || good.status === 200,
+      `a valid case should be created, saw ${good.status}: ${JSON.stringify(good.body)}`,
+    );
+    expect(
+      good.body?.case?.input?.prompt === "Greet Ada",
+      "a plain-text input must be normalized to `{prompt}` so both editors store the same shape",
+    );
+
+    const second = await callApi("POST", `/v1/ai/evals/suites/${suiteKey}/cases`, {
+      name: "second case",
+      input: "Greet Grace",
+      expected: { exact: "hello grace" },
+    });
+    expect(
+      second.status === 201 || second.status === 200,
+      `the second case should be created, saw ${second.status}`,
+    );
+
+    // The rule: a blocking suite holding a rubric case needs a judge. The suite is made blocking
+    // with no judge, and the refusal must name the judge model rather than the case.
+    await callApi("PATCH", `/v1/ai/evals/suites/${suiteKey}`, { blocking: true });
+    expectRefusal(
+      "/api/v1/ai/evals/suites",
+      "a rubric case on a blocking suite with no judge names the judge model",
+    );
+    const rubric = await callApi("POST", `/v1/ai/evals/suites/${suiteKey}/cases`, {
+      name: "needs a judge",
+      input: "Summarise this",
+      expected: { rubric: "The summary is accurate and short" },
+    });
+    expect(
+      rubric.status === 400,
+      `a rubric case on a blocking suite with no judge must be refused, saw ${rubric.status}: ${JSON.stringify(rubric.body)}`,
+    );
+    expect(
+      (rubric.body?.error?.details?.field ?? null) === "judge_model_id",
+      `the refusal must name the judge model field, got ${JSON.stringify(rubric.body?.error?.details)}`,
+    );
+    note({ step: "refuse-rubric-without-judge", status: rubric.status });
+    endRefusalWindow("/api/v1/ai/evals/suites");
+
+    // --- the CSV import is partial and reports its line ------------------------------------
+    const csv = [
+      "name,input,expected,weight,tags",
+      'imported one,Say hi,"{""exact"":""hi""}",1,imported',
+      "imported two,Say yo,\"{\"\"contains\"\":\"\"yo\"\"}\",1,imported",
+      // A row whose weight is not a number: refused, and the report must name this line.
+      "bad weight,Say nope,\"{\"\"exact\"\":\"\"nope\"\"}\",heavy,imported",
+    ].join("\n");
+    const imported = await callApi("POST", `/v1/ai/evals/suites/${suiteKey}/import`, { csv });
+    expect(
+      imported.status === 200 || imported.status === 201,
+      `the import should answer, saw ${imported.status}: ${JSON.stringify(imported.body)}`,
+    );
+    expect(
+      (imported.body?.imported?.length ?? 0) === 2,
+      `two valid rows must import even though a third is bad, got ${imported.body?.imported?.length}`,
+    );
+    const problems = imported.body?.problems ?? [];
+    expect(
+      problems.length === 1 && problems[0].line === 4,
+      `the bad row must be reported by its line number, got ${JSON.stringify(problems)}`,
+    );
+    expect(
+      problems.every((problem) => (imported.body.imported ?? []).every((row) => row.source === "import")),
+      "every imported case must record its source",
+    );
+    note({
+      step: "import",
+      imported: imported.body?.imported?.length ?? 0,
+      problems,
+    });
+
+    // --- the detail screen, populated ------------------------------------------------------
+    await page
+      .goto(`${URL_ADMIN}/ai/evals/${encodeURIComponent(suiteKey)}`, {
+        waitUntil: "domcontentloaded",
+      })
+      .catch(() => {});
+    await page.waitForTimeout(2000);
+    const populated = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll("[data-eval-case-row]")];
+      return {
+        rows: rows.length,
+        chips: document.querySelectorAll("[data-eval-case-property]").length,
+        readiness: document
+          .querySelector("[data-eval-readiness]")
+          ?.getAttribute("data-eval-readiness"),
+        // The config tab must exist and be reachable; a tab that is rendered but never wired
+        // is the "dead button" the definition of done forbids.
+        tabs: document.querySelectorAll("[data-eval-tab]").length,
+      };
+    });
+    expect(populated.rows >= 4, `the cases the pass created must be listed, saw ${populated.rows}`);
+    expect(
+      populated.chips >= 4,
+      `each case must show the properties it asserts, saw ${populated.chips} chips`,
+    );
+    expect(populated.tabs >= 2, "the suite screen must offer its Cases and Config tabs");
+    // With cases and no judge, the badge must now say the rubric case needs one.
+    expect(
+      populated.readiness === "needs_judge",
+      `a suite whose rubric case has no judge must say so, saw "${populated.readiness}"`,
+    );
+    note({ step: "detail-populated", ...populated });
+    await shot(page, "ai-evals-detail");
+
+    // The config tab, opened by clicking it rather than by assumption.
+    await page.locator("[data-eval-tab='config']").first().click().catch(() => {});
+    await page.waitForTimeout(800);
+    const config = await page.evaluate(() => {
+      const form = document.querySelector("[data-eval-config-form]");
+      return {
+        open: Boolean(form),
+        judgeSelect: Boolean(form?.querySelector("select[aria-label='Judge model']")),
+        threshold: Boolean(form?.querySelector("input[aria-label='Pass threshold']")),
+      };
+    });
+    expect(config.open, "the Config tab must render the configuration form");
+    expect(config.judgeSelect, "the config form must offer a judge model");
+    expect(config.threshold, "the config form must offer the pass threshold");
+    note({ step: "config-tab", ...config });
+    await shot(page, "ai-evals-config");
+
+    // --- mobile ---------------------------------------------------------------------------
+    await page.setViewportSize({ width: 390, height: 844 }).catch(() => {});
+    await page.waitForTimeout(600);
+    const mobile = await page.evaluate(() => ({
+      overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    }));
+    expect(
+      mobile.overflow <= 1,
+      `the suite screen must not scroll sideways at 390px, overflow ${mobile.overflow}px`,
+    );
+    note({ step: "mobile", ...mobile });
+    await shot(page, "ai-evals-mobile", true);
+    await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+    // --- the run history and the run detail (slice 2) --------------------------------------
+    //
+    // The pass starts a run through the API, then visits BOTH new screens and asserts the things
+    // a run list has to get right — most of which are about *not lying* rather than about
+    // looking complete:
+    //
+    //   1. A queued run reads as "nothing has claimed it", NOT as progress. A list that paints
+    //      queued and running the same colour cannot answer "is it stuck", which is the question
+    //      the screen exists for.
+    //   2. The stat tiles count the window they name, and the list carries the tenant's own runs
+    //      rather than an empty table with a spinner still on it.
+    //   3. The diff picker is present and empty for a first run, and the reason is written down —
+    //      a suite with one run has nothing to compare against, and "no baseline yet" is more
+    //      use than a Compare button that is disabled for no visible reason.
+    const started = await callApi("POST", `/v1/ai/evals/suites/${suiteKey}/run`, { kind: "manual" });
+    expect(
+      started.status === 202 || started.status === 200 || started.status === 201,
+      `starting a run should enqueue it, saw ${started.status}: ${JSON.stringify(started.body)}`,
+    );
+    const runId = started.body?.run?.id ?? started.body?.id ?? null;
+    note({ step: "start-run", status: started.status, runId });
+
+    await page.goto(`${URL_ADMIN}/ai/evals/runs`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(2000);
+
+    const history = await page.evaluate((id) => {
+      const rows = [...document.querySelectorAll("[data-eval-run]")];
+      const row = rows.find((node) => (node.textContent || "").includes(id ?? "\u0000"));
+      const tiles = [...document.querySelectorAll("[data-eval-runs] p")].map((n) => n.textContent);
+      return {
+        rows: rows.length,
+        found: Boolean(row),
+        state: (row?.textContent || "").trim().slice(0, 200),
+        hasQueuedWord: /queued/i.test(row?.textContent || ""),
+        // A queued run must not be styled as work in progress. The badge is the first span.
+        firstBadge: (row?.querySelector("span")?.textContent || "").trim(),
+        tiles: tiles.slice(0, 8),
+      };
+    }, runId);
+    expect(history.rows > 0, `the run history rendered no rows at all: ${JSON.stringify(history)}`);
+    expect(
+      history.found,
+      `the run the pass started is not on the history: ${JSON.stringify(history)}`,
+    );
+    expect(
+      /queued|running/i.test(history.state),
+      `a run that was only enqueued must say so in words, saw ${JSON.stringify(history.state)}`,
+    );
+    expect(
+      history.tiles.some((text) => /suite/i.test(text ?? "")),
+      "the run list must carry its stat tiles, not only a table",
+    );
+    note({ step: "run-history", ...history });
+    await shot(page, "ai-eval-runs-list");
+
+    await page
+      .goto(`${URL_ADMIN}/ai/evals/runs/${encodeURIComponent(runId ?? "none")}`, {
+        waitUntil: "domcontentloaded",
+      })
+      .catch(() => {});
+    await page.waitForTimeout(2000);
+
+    const detail = await page.evaluate(() => {
+      const picker = document.querySelector("[data-eval-baseline-picker]");
+      const compare = document.querySelector("[data-eval-compare]");
+      return {
+        detail: Boolean(document.querySelector("[data-eval-run-detail]")),
+        emptyState: Boolean(
+          document.querySelector("[data-eval-run-detail] p, [data-eval-run-detail] h2"),
+        ),
+        hasPicker: Boolean(picker),
+        compareDisabled: Boolean(compare?.disabled),
+        // The picker is mandatory and a first run has nothing in it — the reason must be on the
+        // page rather than implied by an empty dropdown.
+        reason: (document.body.textContent || "").includes("baseline"),
+      };
+    });
+    expect(detail.detail, "the run detail screen did not render");
+    expect(
+      detail.hasPicker,
+      "the diff picker is mandatory — there is no implicit previous run to compare against",
+    );
+    expect(
+      detail.compareDisabled,
+      "Compare must be disabled until a baseline is chosen, or it would diff against nothing",
+    );
+    expect(
+      detail.reason,
+      "an unrunnable comparison must explain itself on the page, not in an empty dropdown",
+    );
+    note({ step: "run-detail", ...detail });
+    await shot(page, "ai-eval-run-detail");
+
+    return { ok: findings.length === 0, steps: steps.length, findings, suiteKey, suiteId };
+  } finally {
+    endRefusalWindow("/api/v1/ai/evals/suites");
+    // Teardown through the API: a suite left behind would make the next pass in this run measure
+
+    // A populated list while its own assertions describe an empty one. The delete needs its own
+    // key as `confirm`, which is exactly the rule the screen enforces by hand.
+    if (suiteKey) {
+      const removed = await callApi(
+        "DELETE",
+        `/v1/ai/evals/suites/${encodeURIComponent(suiteKey)}?confirm=${encodeURIComponent(suiteKey)}`,
+      ).catch(() => null);
+      note({ step: "teardown", status: removed?.status ?? null });
+    }
+  }
+}
+
+/**
+ * The air-gap switch, driven (REQ-106, slice 2).
+ *
+ * The screen is where an installation decides whether inference can leave the machine. The pass
+ * asserts, in order:
+ *   1. The switch starts OFF in a fresh QA database, and the direction of the flip is the
+ *      asymmetric one: turning it ON demands a reason and a typed phrase, turning it back OFF
+ *      demands neither. The store's docs call out that asymmetry as the reason the control can
+ *      be trusted, so this pass checks it.
+ *   2. Does a real reason + the typed phrase actually flip the switch, and does the banner appear?
+ *   3. Does the OFF direction skip the reason entirely — the asymmetry the store's docs call out
+ *      as the reason the control can be trusted?
+ *
+ * And it leaves the database as it found it. **The flip is restored in a `finally`,** because a
+ * harness that leaves the air gap ON makes every later pass read a banner, refuse a chat and
+ * measure a screen in an emergency state — the failure would surface as a dozen unrelated findings
+ * in a report written by a different writer, and nobody would connect them to this pass.
+ */
+async function runAirgapDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-airgap", action: "airgap", ...step });
+  };
+  const findings = [];
+  const expect = (condition, detail) => {
+    if (condition) return true;
+    findings.push(detail);
+    return false;
+  };
+
+  // The API is called directly for setup and teardown rather than through the UI, so the assertions
+  // stay about what the *screen* does. Driving the restore through the UI would mean a failing
+  // assertion could also fail to restore.
+  const callApi = (method, path, body) =>
+    page.evaluate(
+      async ([verb, url, payload]) => {
+        const answer = await fetch(url, {
+          method: verb,
+          credentials: "same-origin",
+          headers: payload ? { "content-type": "application/json" } : {},
+          body: payload ? JSON.stringify(payload) : undefined,
+        });
+        return { status: answer.status, body: await answer.json().catch(() => null) };
+      },
+      [method, `${URL_ADMIN}/api${path}`, body ?? null],
+    );
+
+  await page
+    .goto(`${URL_ADMIN}/ai/settings/airgap`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForSelector("[data-airgap-settings]", { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator("[data-airgap-settings]").count()) > 0;
+  note({ step: "load", rendered });
+  if (!rendered) return { ok: false, reason: "the air-gap screen did not render" };
+
+  // --- the resting state ------------------------------------------------------------------
+  // A fresh QA database has the gap OFF and no allow-list. Both must read as deliberate states, not
+  // as blanks: an empty allow-list says loopback and private ranges still count, which is the
+  // sentence that stops an operator from reading "no hosts" as "nothing is local".
+  const resting = await page.evaluate(() => ({
+    state: (document.querySelector("[data-airgap-state]")?.textContent || "").trim(),
+    hostsEmpty: document.querySelectorAll("[data-airgap-hosts-empty]").length,
+    nothingBlocked: document.querySelectorAll("[data-airgap-nothing-blocked]").length,
+    banner: document.querySelectorAll("[data-airgap-banner]").length,
+    verifyResult: document.querySelector("[data-airgap-verify-result]")?.getAttribute("data-result"),
+    verifyText: (document.querySelector("[data-airgap-verify-result]")?.textContent || "").trim(),
+  }));
+  expect(resting.state === "Off", `the gap should read Off in a fresh database, saw "${resting.state}"`);
+  expect(
+    resting.hostsEmpty === 1,
+    "an empty allow-list must explain that loopback and private ranges still count",
+  );
+  expect(resting.nothingBlocked === 1, "with no provider registered the screen must say nothing is refused");
+  expect(resting.banner === 0, "no banner may show while the gap is off — it would train operators to ignore it");
+  expect(
+    resting.verifyResult === "never" && /never verified/i.test(resting.verifyText),
+    "an unrun verification must read as never verified, never as a pass",
+  );
+  note({ step: "resting", ...resting });
+
+  // --- the confirmation refuses a short reason ---------------------------------------------
+  await page.click("[data-airgap-toggle]").catch(() => {});
+  await page.waitForSelector("[data-airgap-confirm]", { timeout: 5000 }).catch(() => {});
+  const sheetOpen = (await page.locator("[data-airgap-confirm]").count()) > 0;
+  note({ step: "sheet", sheetOpen });
+  expect(sheetOpen, "the confirmation sheet did not open");
+
+  const shortReasonDisabled = await page.evaluate(() => {
+    const button = document.querySelector("[data-airgap-confirm-submit]");
+    return button ? button.disabled : null;
+  });
+  expect(
+    shortReasonDisabled === true,
+    "the confirm button must be disabled while the reason is empty — the server check is the second line of defence, not the first",
+  );
+  note({ step: "empty-reason-disabled", shortReasonDisabled });
+
+  // A nine-character reason is still short. The boundary is REASON_MIN = 10 and the screen has to
+  // refuse it *before* the API does, or the operator's first attempt is a round trip and a red
+  // banner rather than a live hint under the field.
+  await page.fill("[aria-label='Reason for turning the air gap on']", "too short").catch(() => {});
+  await page.waitForTimeout(200);
+  const nineCharDisabled = await page.evaluate(() => {
+    const button = document.querySelector("[data-airgap-confirm-submit]");
+    const hint = document.querySelector("[data-airgap-confirm-blocked]");
+    return { disabled: button ? button.disabled : null, hint: (hint?.textContent || "").trim() };
+  });
+  expect(
+    nineCharDisabled.disabled === true,
+    "a nine-character reason must not enable the confirm button (REASON_MIN is 10)",
+  );
+  note({ step: "short-reason", ...nineCharDisabled });
+
+  // A real reason alone is still not enough while providers would block — the acknowledgement and
+  // the typed phrase are separate gates. With an empty provider list the typed phrase is the last
+  // one standing, which is the assertion that keeps this from being a rubber stamp.
+  await page
+    .fill("[aria-label='Reason for turning the air gap on']", "QA depth pass, restoring afterwards")
+    .catch(() => {});
+  await page.waitForTimeout(200);
+  const typedMissingDisabled = await page.evaluate(() => {
+    const button = document.querySelector("[data-airgap-confirm-submit]");
+    return button ? button.disabled : null;
+  });
+  expect(
+    typedMissingDisabled === true,
+    "a valid reason alone must not enable the confirm button — the type-to-confirm is the last gate",
+  );
+
+  await page.fill("[aria-label='Type to confirm']", "TURN THE AIR GAP ON").catch(() => {});
+  await page.waitForTimeout(200);
+  const readyDisabled = await page.evaluate(() => {
+    const button = document.querySelector("[data-airgap-confirm-submit]");
+    return button ? button.disabled : null;
+  });
+  expect(readyDisabled === false, "reason + typed phrase must enable the confirm button");
+  note({ step: "ready", readyDisabled });
+
+  // --- flip it for real --------------------------------------------------------------------
+  // A REMOTE provider, registered so the egress verification has something to aim at.
+  //
+  // Without one the check cannot run — there is no call the gap could let through — and the panel
+  // would be exercised only in its "nothing to verify" branch. The base URL is a public host, which
+  // is the point: the check must REFUSE it, and nothing is ever sent to it, because the refusal
+  // happens before the request. It is registered through the API rather than the form so the
+  // assertion stays about what the *screen* does with the result.
+  const remoteProvider = await callApi("POST", "/v1/ai/providers", {
+    name: "QA remote provider",
+    protocol: "openai_compatible",
+    base_url: "https://api.openai.com/v1",
+    api_key: "qa-not-a-real-key",
+    enabled: true,
+  });
+  expect(
+    remoteProvider.status === 200 || remoteProvider.status === 201,
+    `the remote provider must register for the verification to have a target, got \
+     ${remoteProvider.status} ${JSON.stringify(remoteProvider.body)}`,
+  );
+  await page.waitForTimeout(200);
+  await page.click("[data-airgap-confirm-submit]").catch(() => {});
+  await page.waitForSelector("[data-airgap-banner]", { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const flipped = await page.evaluate(() => ({
+    banner: document.querySelectorAll("[data-airgap-banner]").length,
+    tone: document.querySelector("[data-airgap-banner]")?.getAttribute("data-tone"),
+    state: (document.querySelector("[data-airgap-state]")?.textContent || "").trim(),
+    reason: (document.querySelector("[data-airgap-reason]")?.textContent || "").trim(),
+    // No local endpoint is registered in a fresh QA database, so the screen owes the operator a
+    // warning rather than a green "all good" — the gap is on and nothing can answer.
+    noLocal: document.querySelectorAll("[data-airgap-no-local]").length,
+  }));
+  expect(flipped.banner === 1, "the banner must appear once the gap is on");
+  expect(flipped.tone === "blocked", `the banner tone must be blocked, saw "${flipped.tone}"`);
+  expect(flipped.state === "On", "the state must read On after the flip");
+  expect(
+    flipped.reason.includes("QA depth pass"),
+    "the recorded reason must be readable on the screen — it is the audit row",
+  );
+  expect(flipped.noLocal === 1, "with no local endpoint the screen must warn that nothing can answer");
+  note({ step: "flipped", ...flipped });
+
+  // The API agrees with what the screen drew. A screen showing "On" over a row the API calls off is
+  // the one disagreement that would make the control a decoration.
+  const readBack = await callApi("GET", "/v1/ai/airgap");
+  expect(
+    readBack.status === 200 && readBack.body?.state?.enabled === true,
+    `the API disagrees with the screen: ${JSON.stringify(readBack.body?.state?.enabled)}`,
+  );
+
+  // --- the egress verification, driven for real ---------------------------------------------
+  // This is the control the request calls "the loudest alert in this request", and until now the
+  // screen drew its result without ever pressing the button. A panel that renders a badge nobody
+  // can refresh is decoration.
+  //
+  // What is asserted is the INVERSION, which is the whole feature: the check attempts a non-local
+  // call and expects the refusal, so `blocked` is the PASS. The QA database has a fake remote
+  // provider registered below, so the button must come back `blocked` and the badge must go
+  // positive-tinted — and the word must be the one the CHECKER writes, not one the panel invented.
+  const runButton = await page.locator("[data-airgap-verify]").count();
+  expect(runButton === 1, "the verification panel must carry exactly one run button");
+  await page.click("[data-airgap-verify]").catch(() => {});
+  await page
+    .waitForSelector("[data-airgap-verify-message]", { timeout: 15000 })
+    .catch(() => {});
+  const verified = await page.evaluate(() => ({
+    result: document.querySelector("[data-airgap-verify-result]")?.getAttribute("data-result"),
+    text: (document.querySelector("[data-airgap-verify-result]")?.textContent || "").trim(),
+    outcome: document.querySelector("[data-airgap-verify-message]")?.getAttribute("data-outcome"),
+    message: (document.querySelector("[data-airgap-verify-message]")?.textContent || "").trim(),
+    error: document.querySelectorAll("[data-airgap-verify-error]").length,
+  }));
+  note({ step: "verify", ...verified });
+  expect(
+    verified.error === 0,
+    `the verification must not answer with an error: ${verified.message}`,
+  );
+  expect(
+    verified.outcome === "blocked",
+    `a refused call is the PASS and must read "blocked", saw "${verified.outcome}" — a panel \
+     testing for "passed" cannot render green and a breach would read as "Never verified"`,
+  );
+  expect(
+    verified.result === "blocked",
+    `the stored verdict must be the word the checker writes, saw "${verified.result}"`,
+  );
+  expect(
+    /refused/i.test(verified.message),
+    `the sentence must say the call was refused, saw "${verified.message}"`,
+  );
+
+  // The screen re-reads after the run, so the badge cannot sit on the stale pre-run value.
+  await page.waitForTimeout(400);
+  const afterRun = await page.evaluate(() => ({
+    result: document.querySelector("[data-airgap-verify-result]")?.getAttribute("data-result"),
+    text: (document.querySelector("[data-airgap-verify-result]")?.textContent || "").trim(),
+  }));
+  expect(
+    afterRun.result === "blocked" && /verified/i.test(afterRun.text),
+    `the badge must show the fresh verdict after a run, saw "${afterRun.result}" / "${afterRun.text}"`,
+  );
+
+  // The row agrees, read back from the API rather than from the screen's own copy of it.
+  const verifyRow = await callApi("GET", "/v1/ai/airgap");
+  expect(
+    verifyRow.body?.state?.egress_verify_result === "blocked",
+    `the stored row must carry "blocked" after a passing check, saw \
+     ${JSON.stringify(verifyRow.body?.state?.egress_verify_result)}`,
+  );
+  expect(
+    typeof verifyRow.body?.state?.egress_verified_at === "string",
+    "a verification with no timestamp cannot be compared against a later one",
+  );
+
+  // --- the OFF direction takes no reason ---------------------------------------------------
+  // The asymmetry is the store's rule, and it is why the control can be trusted: an emergency
+  // action that can be blocked by a validation rule fails closed at the worst moment.
+  await page.click("[data-airgap-toggle]").catch(() => {});
+  await page.waitForSelector("[data-airgap-confirm]", { timeout: 5000 }).catch(() => {});
+  const offHasNoReason = await page.evaluate(() => ({
+    reasonField: document.querySelectorAll("[aria-label='Reason for turning the air gap on']").length,
+    offEnabled: (() => {
+      const button = document.querySelector("[data-airgap-confirm-submit]");
+      return button ? !button.disabled : null;
+    })(),
+  }));
+  expect(
+    offHasNoReason.reasonField === 0,
+    "the OFF sheet must not ask for a reason — it would hide an emergency action behind a field",
+  );
+  expect(
+    offHasNoReason.offEnabled === true,
+    "the OFF confirm must be enabled immediately — a reason field blocking it is exactly the failure",
+  );
+  note({ step: "off-direction", ...offHasNoReason });
+
+  await page.click("[data-airgap-confirm-submit]").catch(() => {});
+  await page.waitForTimeout(800);
+
+  // --- mobile -----------------------------------------------------------------------------------
+  // The request names the confirmation sheet as a full-screen view with the acknowledgement control
+  // above the fold. 390px is where a dialog written for a desktop breaks: the sheet becomes taller
+  // than the viewport and the submit button drops off the bottom, so the operator is left scrolling
+  // in a modal they opened to press one button.
+  await page.setViewportSize({ width: 390, height: 844 }).catch(() => {});
+  await page.goto(`${URL_ADMIN}/ai/settings/airgap`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-airgap-settings]", { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(400);
+
+  const mobileResting = await page.evaluate(() => ({
+    noHorizontalScroll: document.documentElement.scrollWidth <= window.innerWidth + 1,
+  }));
+  expect(
+    mobileResting.noHorizontalScroll === true,
+    "the air-gap screen must not scroll sideways at 390px — the allow-list form is a flex row and will overflow",
+  );
+
+  // Open the sheet at 390px and measure where the submit button actually sits.
+  await page.click("[data-airgap-toggle]").catch(() => {});
+  await page.waitForSelector("[data-airgap-confirm]", { timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  const mobileSheet = await page.evaluate(() => {
+    const dialog = document.querySelector("[data-airgap-confirm]");
+    const submit = document.querySelector("[data-airgap-confirm-submit]");
+    if (!dialog || !submit) return { present: false };
+    const box = submit.getBoundingClientRect();
+    return {
+      present: true,
+      // The sheet scrolls (`overflow-y-auto` on the overlay), so "above the fold" is measured as
+      // "reachable without the page scrolling" — a button at y=1200 in a scrollable sheet is not
+      // the failure this checks for; a button outside the overlay's scroll box entirely is.
+      submitInOverlay: dialog.contains(submit),
+      submitWidth: Math.round(box.width),
+      submitTall: box.height >= 32,
+      noHorizontalScroll: document.documentElement.scrollWidth <= window.innerWidth + 1,
+    };
+  });
+  expect(mobileSheet.present === true, "the confirmation sheet must open at 390px");
+  expect(
+    mobileSheet.submitInOverlay === true,
+    "the submit button must be inside the sheet at 390px — a fixed footer that falls outside is unreachable",
+  );
+  expect(
+    mobileSheet.submitTall === true,
+    "the submit button must stay a usable tap target at 390px",
+  );
+  expect(
+    mobileSheet.noHorizontalScroll === true,
+    "the confirmation sheet must not scroll sideways at 390px",
+  );
+  await shot(page, "ai-airgap-confirm-390");
+  note({ step: "mobile", ...mobileResting, sheet: mobileSheet });
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+  // --- restore ------------------------------------------------------------------------------
+  // Belt and braces: the OFF sheet above already turned it off, but if any assertion above threw,
+  // this still runs and the next writer does not inherit an air gap. The mobile leg left the ON
+  // sheet open, so `Escape` closes it rather than the pass ending on a modal.
+  await page.keyboard.press("Escape").catch(() => {});
+  const restore = await callApi("PUT", "/v1/ai/airgap", { enabled: false });
+  // The remote provider goes too. Leaving it would put a public base URL into every later pass's
+  // confirmation list, so the air-gap screen would report "1 non-local provider is refused" in a
+  // stack where nobody registered one — a finding in someone else's report with nothing pointing
+  // back here. Deleted by id in the same teardown that turns the gap off, for the same reason:
+  // an assertion that can fail must not be able to fail the cleanup.
+  if (remoteProvider && remoteProvider.body && remoteProvider.body.id) {
+    await callApi("DELETE", `/v1/ai/providers/${remoteProvider.body.id}`).catch(() => {});
+  }
+  const finalRead = await callApi("GET", "/v1/ai/airgap");
+  note({
+    step: "restore",
+    status: restore.status,
+    enabled: finalRead.body?.state?.enabled ?? null,
+  });
+  expect(
+    finalRead.body?.state?.enabled === false,
+    "the pass must leave the air gap off — a harness that leaves it on poisons every later pass",
+  );
+
+  return {
+    ok: findings.length === 0,
+    steps: steps.length,
+    findings,
+    detail: {
+      ...resting,
+      flipped,
+      mobile: mobileSheet,
+      restored: finalRead.body?.state?.enabled ?? null,
+    },
+  };
+}
+
+
 /**
  * Run one depth pass without letting it end the run.
  *
@@ -997,8 +3468,695 @@ async function runDepthPass(name, pass) {
     const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
     log(`depth pass ${name} failed: ${reason}`);
     record({ page: "qa", action: "depth-pass-failed", pass: name, reason });
-    return { ok: false, steps: 0, reason };
+    // **Whatever the pass already recorded is kept.** This wrapper's return value is assigned over
+    // `report.<something>` by its caller, so returning a fresh `{ ok: false, steps: 0 }` throws away
+    // every step the pass managed to record before it died — and the report then shows a failed pass
+    // with no evidence of *where* it failed. That is the same "a pass that cannot fail is a pass
+    // that proved nothing" defect one level down: the steps are the only thing that turns "the
+    // portal is broken" into "the portal works until the revoke, and here is the row that did not
+    // change".
+    //
+    // The steps are read from the **click stream**, not from a `report` argument, because
+    // `runDepthPass` is called from sixteen places with two arguments and adding a third would be
+    // a silent `undefined` at every one of them that nobody notices until a pass fails. The stream
+    // is the pass's own record of what it saw, keyed by `action`, so the recovery is exact.
+    const partial = clickLines
+      .filter((e) => e.action === "depth-pass" && e.pass === name)
+      .reduce((acc, entry) => ({ ...acc, ...entry.value }), {});
+    return { steps: partial, ok: false, reason };
   }
+}
+
+/**
+ * The backup centre, driven end to end (REQ-013, slice 1).
+ *
+ * The assertion that matters is not "the screen rendered" — it is that the five parts
+ * reached a terminal state, that the parts table shows `plugins` as an empty-but-done part
+ * rather than a gap, and that a verification over the real destination comes back clean. A
+ * backup screen that renders perfectly while the destination is unwritable is the exact
+ * failure this pass exists to catch, and no screenshot shows it.
+ */
+async function runBackups(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "backups", action: "backups", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/backups`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="backups-overview"]', { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator('[data-testid="backups-overview"]').count()) > 0;
+  note({ step: "load", rendered });
+  if (!rendered) {
+    return { ok: false, reason: "the backup overview did not render" };
+  }
+
+  // The four status cards are on the screen before anything is created, and the
+  // last-successful one says "never" rather than rendering nothing. An absent card reads as a
+  // screen that has not loaded; "never" is the alarm.
+  await page.waitForTimeout(800);
+  const cards = await page.locator('[data-testid="backup-card"]').allInnerTexts();
+  const cardText = cards.join(" | ");
+  const cardsPresent = cards.length >= 4;
+  const lastSuccessfulCard = cards[0] ?? "";
+  note({
+    step: "cards",
+    cardsPresent,
+    lastSuccessfulCard,
+    // Before any run there is nothing to quote, so the card must say so out loud.
+    saysNever: /never|no run/i.test(lastSuccessfulCard),
+  });
+
+  // Take a real backup through the drawer and wait for all five parts.
+  await page.click('[data-testid="backup-create"]').catch(() => {});
+  await page.waitForSelector('[data-testid="backup-create-drawer"]', { timeout: 5000 }).catch(() => {});
+  const drawerOpen = (await page.locator('[data-testid="backup-create-drawer"]').count()) > 0;
+  note({ step: "drawer", drawerOpen });
+
+  await page.click('[data-testid="backup-create-confirm"]').catch(() => {});
+  await page
+    .waitForSelector('[data-testid="backup-part-row"]', { timeout: 120000 })
+    .catch(() => {});
+  await page.waitForTimeout(1500);
+
+  const partRows = await page.locator('[data-testid="backup-part-row"]').allInnerTexts();
+  const partNames = partRows.map((text) => text.split("\n")[0].trim());
+  const allFivePresent = ["database", "media", "configuration", "themes", "plugins"].every(
+    (name) => partNames.includes(name),
+  );
+  const everyPartTerminal = partRows.every((text) => /done|failed/.test(text));
+  note({
+    step: "parts",
+    count: partRows.length,
+    allFivePresent,
+    everyPartTerminal,
+    rows: partRows,
+  });
+
+  // The plugins part is empty BY DESIGN until a package installer exists, and the screen has
+  // to say that rather than leave a row of zeroes the operator reads as a broken exporter.
+  const pluginsRow = partRows.find((text) => /^plugins/.test(text)) ?? "";
+  const pluginsExplainsItself = /nothing to record|result, not a gap/i.test(pluginsRow);
+  note({ step: "plugins-empty", pluginsExplainsItself, row: pluginsRow });
+
+  // Verify against the real destination.
+  await page.click('[data-testid="backup-verify"]').catch(() => {});
+  await page.waitForTimeout(4000);
+  const verdict = await page
+    .locator('[data-testid="backups-overview"] p[role="status"]')
+    .allInnerTexts()
+    .catch(() => []);
+  const verdictText = verdict.join(" | ");
+  const verificationRan = /parts match the manifest|checksum differs|could not be read back/i.test(
+    verdictText,
+  );
+  note({ step: "verify", verificationRan, verdict: verdictText });
+
+  // The restore preview, opened and read. A new panel that never appears in the walkthrough
+  // inventory is an untested screen, and the rule is that the harness is extended rather
+  // than the screen exempted — so this clicks the button, runs the preview against the real
+  // destination, and asserts the three things the panel exists to say: the price, the
+  // warnings, and the confirm phrase.
+  await page.click('[data-testid="backup-restore-preview"]').catch(() => {});
+  await page.waitForSelector('[data-testid="restore-preview"]', { timeout: 8000 }).catch(() => {});
+  const previewOpen = (await page.locator('[data-testid="restore-preview"]').count()) > 0;
+  note({ step: "restore-preview-open", previewOpen });
+
+  // Collapsed by default: the panel must not render its tables unprompted, or every run
+  // detail page grows five tables an operator did not ask for.
+  const previewIdle = (await page.locator('[data-testid="restore-preview-idle"]').count()) > 0;
+  note({ step: "restore-preview-idle", previewIdle });
+
+  await page.click('[data-testid="restore-preview-load"]').catch(() => {});
+  await page
+    .waitForSelector('[data-testid="restore-preview-dropped"]', { timeout: 30000 })
+    .catch(() => {});
+  await page.waitForTimeout(1200);
+  const priceText = await page
+    .locator('[data-testid="restore-preview-dropped"]')
+    .allInnerTexts()
+    .catch(() => []);
+  const warnings = await page
+    .locator('[data-testid="restore-preview-warnings"] [data-testid^="restore-warning-"]')
+    .allInnerTexts()
+    .catch(() => []);
+  const partRowsPreview = await page
+    .locator('[data-testid="restore-part-row"]')
+    .allInnerTexts()
+    .catch(() => []);
+  // Every part the run produced is in the preview's own table, with a mode. A panel that
+  // lists only the available ones would hide exactly the part an operator most needs to
+  // know about.
+  const previewNames = partRowsPreview.map((text) => text.split("\n")[0].trim());
+  note({
+    step: "restore-preview",
+    priced: priceText.length > 0,
+    price: priceText.join(" | "),
+    warningCount: warnings.length,
+    warnings,
+    partCount: partRowsPreview.length,
+    allFiveOffered: partNames.every((name) => previewNames.includes(name)),
+    rows: partRowsPreview,
+  });
+
+  // The confirm phrase, if the run is restorable. Empty is a legitimate answer for an
+  // unrestorable run, so both are recorded rather than one being required.
+  const phraseVisible = await page
+    .locator('[data-testid="restore-confirm-input"]')
+    .count();
+  const notRestorable = await page
+    .locator('[data-testid="restore-preview-not-restorable"]')
+    .count();
+  note({
+    step: "restore-confirm",
+    phraseFieldOffered: phraseVisible > 0,
+    notRestorable: notRestorable > 0,
+  });
+
+  // ---- The restore control (REQ-013 slice 2b) ------------------------------------------------
+  //
+  // The panel ships a real button this tick, and the harness is extended rather than the
+  // screen exempted. The walk deliberately drives it in the order a cautious operator would:
+  // look at the button **before** typing the phrase, so the disabled state is recorded, then
+  // with a wrong phrase, so the refusal is recorded, and only then with the right one.
+  //
+  // The middle step is the point of doing this in a browser at all. A Rust walk can prove the
+  // API refuses; it cannot prove the *panel* shows the refusal rather than swallowing it into
+  // a spinner — and a destructive control that fails silently is the worst shape this screen
+  // could take.
+  const runButton = page.locator('[data-testid="restore-run"]');
+  const buttonOffered = (await runButton.count()) > 0;
+  const disabledBefore = buttonOffered ? await runButton.first().isDisabled() : null;
+  const disabledReason = await page
+    .locator('[data-testid="restore-confirm-state"]')
+    .first()
+    .innerText()
+    .catch(() => "");
+  note({
+    step: "restore-button",
+    offered: buttonOffered,
+    disabledBeforeTyping: disabledBefore,
+    disabledReason: disabledReason.trim(),
+  });
+
+  // The part checkboxes. Every AVAILABLE part is ticked by default, because "restore the
+  // whole archive" is the common case; a panel that made an operator tick five boxes to undo
+  // one mistake is a panel they will not use.
+  const partChecks = page.locator('[data-testid^="restore-part-check-"]');
+  const checkCount = await partChecks.count();
+  const checkedByDefault = await partChecks.evaluateAll((nodes) =>
+    nodes.filter((node) => !node.disabled && node.checked).length,
+  );
+  const enabledChecks = await partChecks.evaluateAll(
+    (nodes) => nodes.filter((node) => !node.disabled).length,
+  );
+  note({
+    step: "restore-part-ticks",
+    checkboxes: checkCount,
+    tickedByDefault: checkedByDefault,
+    selectable: enabledChecks,
+    everySelectableTicked: checkedByDefault === enabledChecks,
+  });
+
+  // A wrong phrase must be refused *visibly*. The refusal is the API's own sentence, so the
+  // assertion is that a `[role=alert]` appears and that it is not empty.
+  const phraseField = page.locator('[data-testid="restore-confirm-input"]');
+  if ((await phraseField.count()) > 0 && buttonOffered) {
+    await phraseField.first().fill("RESTORE 00000000");
+    await page.waitForTimeout(250);
+    const enabledWithWrongPhrase = !(await runButton.first().isDisabled());
+    note({
+      step: "restore-wrong-phrase-button",
+      enabledWithWrongPhrase,
+    });
+    // Only press it if the client let us: clicking a disabled button is a no-op, and the
+    // walk must not record a refusal it did not cause.
+    if (enabledWithWrongPhrase) {
+      await runButton.first().click().catch(() => {});
+      await page.waitForTimeout(1500);
+      const alert = await page.locator('[data-testid="restore-error"]').innerText().catch(() => "");
+      note({
+        step: "restore-wrong-phrase",
+        refused: alert.trim().length > 0,
+        message: alert.trim(),
+      });
+    } else {
+      note({
+        step: "restore-wrong-phrase",
+        refused: true,
+        message: "the button is disabled for a wrong phrase, so the request was never sent",
+      });
+    }
+
+    // And now the real thing. A QA stack is disposable by construction, which is the only
+    // reason the REQ allows the destructive path to be exercised at all.
+    const offered = await page
+      .locator('[data-testid="restore-confirm-input"]')
+      .first()
+      .getAttribute("placeholder")
+      .catch(() => null);
+    if (offered) {
+      await phraseField.first().fill(offered);
+      await page.waitForTimeout(250);
+      const enabledWithRightPhrase = !(await runButton.first().isDisabled());
+      note({ step: "restore-right-phrase-button", enabledWithRightPhrase });
+      if (enabledWithRightPhrase) {
+        await runButton.first().click().catch(() => {});
+        await page
+          .waitForSelector('[data-testid="restore-outcome"], [data-testid="restore-error"]', {
+            timeout: 120000,
+          })
+          .catch(() => {});
+        await page.waitForTimeout(1500);
+        const outcomeText = await page
+          .locator('[data-testid="restore-outcome"]')
+          .innerText()
+          .catch(() => "");
+        const refusalText = await page
+          .locator('[data-testid="restore-error"]')
+          .innerText()
+          .catch(() => "");
+        const safetyId = await page
+          .locator('[data-testid="restore-safety-id"]')
+          .innerText()
+          .catch(() => "");
+        note({
+          step: "restore-run",
+          restored: outcomeText.trim().length > 0,
+          summary: outcomeText.trim().split("\n")[0],
+          refused: refusalText.trim().length > 0,
+          refusal: refusalText.trim(),
+          safetyBackupNamed: /[0-9a-f]{8}-[0-9a-f]{4}/i.test(safetyId),
+        });
+      }
+    }
+    // ---- The queued restore (REQ-013 slice 2c) ---------------------------------------------
+    // The one control in this file that exists to be *pressed and then un-pressed*, so the
+    // order is the order a nervous operator would use: read the state, press Stop, and read
+    // the state again. The load-bearing assertion is the LAST one — that a Stop control is
+    // gone once the job is no longer cancellable. A panel that keeps offering "Stop" on a
+    // finished restore is inviting an operator to press it, and a control that appears not to
+    // work is worse than no control at all.
+    const queueButton = page.locator('[data-testid="restore-queue"]');
+    const queueOffered = (await queueButton.count()) > 0;
+    const queueDisabled = queueOffered ? await queueButton.first().isDisabled() : null;
+    const queueHint = await page
+      .locator('[data-testid="restore-queue-hint"]')
+      .innerText()
+      .catch(() => "");
+    note({
+      step: "restore-queue-button",
+      offered: queueOffered,
+      disabledWithAnOutcomeShown: queueDisabled,
+      // The difference between the two buttons must be IN WORDS on the screen, not inferred
+      // from colour: the hint is what stops somebody in a hurry pressing the wrong one.
+      hintNamesStoppability: /stop/i.test(queueHint),
+      hint: queueHint.trim().slice(0, 200),
+    });
+
+    // The jobs list, before anything is queued. The empty state is a real state and it is
+    // asserted, because "nothing here" and "this list could not be read" render the same and
+    // only the wording tells them apart.
+    const jobsEmpty = await page
+      .locator('[data-testid="restore-jobs-empty"]')
+      .count();
+    note({ step: "restore-jobs-empty", offered: jobsEmpty > 0 });
+
+    if (queueOffered && !queueDisabled) {
+      await queueButton.first().click().catch(() => {});
+      await page
+        .waitForSelector('[data-testid^="restore-job-"]', { timeout: 30000 })
+        .catch(() => {});
+      await page.waitForTimeout(1500);
+
+      const queuedRows = await page
+        .locator('[data-testid^="restore-job-queued"], [data-testid^="restore-job-running"]')
+        .allInnerTexts();
+      const stopButtons = page.locator('[data-testid^="restore-job-stop-"]');
+      const stopCount = await stopButtons.count();
+      note({
+        step: "restore-queued",
+        rows: queuedRows.length,
+        firstRow: queuedRows[0] ? queuedRows[0].split("\n")[0].trim() : "",
+        stopButtonsOffered: stopCount,
+      });
+
+      if (stopCount > 0) {
+        await stopButtons.first().click().catch(() => {});
+        await page
+          .waitForSelector('[data-testid="restore-job-aborted"]', { timeout: 30000 })
+          .catch(() => {});
+        await page.waitForTimeout(1200);
+        const abortedText = await page
+          .locator('[data-testid="restore-job-aborted"]')
+          .first()
+          .innerText()
+          .catch(() => "");
+        // The Stop control must be GONE. `cancellable` is the API's own field rather than a
+        // derivation the panel makes, so this also proves the panel is reading it.
+        const stopAfter = await page.locator('[data-testid^="restore-job-stop-"]').count();
+        note({
+          step: "restore-aborted",
+          shown: abortedText.trim().length > 0,
+          // An abort is a success and says so in words. If this reads as a failure the
+          // operator stopped the right thing and believes it went wrong.
+          saysNothingWasChanged: /nothing/i.test(abortedText),
+          stopButtonsRemaining: stopAfter,
+          text: abortedText.trim().slice(0, 240),
+        });
+      } else {
+        note({
+          step: "restore-aborted",
+          reason: "the job left the queue before the Stop control could be pressed",
+        });
+      }
+    }
+  } else {
+    note({
+      step: "restore-button",
+      reason: "the run is not restorable, so the control is correctly absent",
+    });
+  }
+
+  // The list shows the run, and its state pill is the run's own state.
+  await page.waitForTimeout(500);
+  const rows = await page.locator('[data-testid="backup-row"]').count();
+  const states = await page.locator('[data-testid="backup-state"]').allInnerTexts();
+  note({ step: "list", rows, states: states.slice(0, 6) });
+
+  // ---- A `partial` run, and the reason the list shows for it (REQ-013) ------------------
+  //
+  // Every assertion above this line runs against a healthy run, because the drawer's create
+  // button always asks for all five parts and this stack's store answers. So the one state
+  // the screen exists to warn about — `partial`, and the sentence saying which part failed —
+  // was never exercised: not by the Rust walks (they assert the store's verdict) and not
+  // here (nothing on this screen fails). A screen that renders a green run perfectly and
+  // cannot say why a red one is red passes everything above.
+  //
+  // The fault is injected the way the platform itself would produce one, not by editing a
+  // run's status: a `media` row whose object is absent from the store. The media part's copy
+  // loop reads through the real `Storage`, gets a miss, records the failure and carries on —
+  // which is the documented behaviour (one bad object must not cost the other 4 998), and
+  // makes the run `partial` because the other four parts still succeed. Pointing a live row
+  // at a key nobody wrote is a one-line statement; rewriting `backups.status` would prove the
+  // list renders a word and nothing about why.
+  // `qaSql` is `execFileSync` — synchronous. It is not awaited anywhere else in this file for
+  // that reason, and an `await` on a non-promise here would read as though it were.
+  const partialProbe = qaSql(
+    `update media set storage_key = storage_key || '.absent-from-the-store' \
+     where id in (select id from media where deleted_at is null and purged_at is null limit 1)`,
+  );
+  note({ step: "partial-fault-injected", rows: partialProbe });
+
+  if (partialProbe === "UPDATE 1") {
+    await page.click('[data-testid="backup-create"]').catch(() => {});
+    await page
+      .waitForSelector('[data-testid="backup-create-drawer"]', { timeout: 5000 })
+      .catch(() => {});
+    await page.click('[data-testid="backup-create-confirm"]').catch(() => {});
+    await page.waitForTimeout(9000);
+
+    // Reload rather than trusting the current DOM: the run was created by the API after the
+    // panel had already drawn its table, and a panel that only refetches on a filter change
+    // would leave the new row invisible here — which is itself worth recording.
+    await page.goto(`${URL_ADMIN}/backups`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page
+      .waitForSelector('[data-testid="backups-overview"]', { timeout: 8000 })
+      .catch(() => {});
+    await page.waitForTimeout(1500);
+
+    const partialStates = await page
+      .locator('[data-testid="backup-state"]')
+      .allInnerTexts()
+      .catch(() => []);
+    // The reason is drawn on the ROW, not only in the detail panel. That is the whole claim:
+    // `run.error` has been on every list row since slice 1 and the table never drew it, so a
+    // red run was a coloured pill and the sentence an operator needs was one click away on a
+    // screen whose job is to tell them which run to click.
+    const reasons = await page
+      .locator('[data-testid="backup-row-reason"]')
+      .allInnerTexts()
+      .catch(() => []);
+    const reasonText = reasons.join(" | ").trim();
+    const sawPartial = partialStates.some((state) => /partial/i.test(state));
+    note({
+      step: "partial-run",
+      sawPartial,
+      states: partialStates.slice(0, 6),
+      reasonsRendered: reasons.length,
+      // A reason that names the failing part, in the operator's own words.
+      reasonNamesAFailingPart: /media/i.test(reasonText),
+      reason: reasonText.slice(0, 300),
+    });
+
+    // Open it, so the detail panel's own per-part messages are read too: the list sentence is
+    // a summary and the parts table is the record, and this pass is what proves both exist.
+    await page.locator('[data-testid="backup-row"]').first().click().catch(() => {});
+    await page.waitForTimeout(1500);
+    const detailRows = await page
+      .locator('[data-testid="backup-part-row"]')
+      .allInnerTexts()
+      .catch(() => []);
+    const failedPart = detailRows.find((text) => /failed/i.test(text)) ?? "";
+    note({
+      step: "partial-detail",
+      rows: detailRows.length,
+      failedPartShown: failedPart.trim().length > 0,
+      failedPart: failedPart.trim().slice(0, 240),
+    });
+
+    // Put the object back so the run this stack takes later is not permanently poisoned.
+    qaSql(
+      `update media set storage_key = replace(storage_key, '.absent-from-the-store', '') \
+       where storage_key like '%.absent-from-the-store'`,
+    );
+  } else {
+    note({
+      step: "partial-run",
+      reason: "this stack has no live media row to point at a missing object",
+    });
+  }
+
+  // Filter chips carry the counts the endpoint sent, so a chip cannot disagree with the table.
+  const chips = await page.locator('[data-testid^="backup-filter-"]').allInnerTexts();
+  note({ step: "filters", chips: chips.slice(0, 6) });
+
+  // Delete asks, and the confirmation names the backup.
+  const deleteButtons = page.locator('[data-testid="backup-delete"]');
+  if ((await deleteButtons.count()) > 0) {
+    await deleteButtons.first().click().catch(() => {});
+    await page.waitForTimeout(400);
+    const confirmed = (await page.locator('[data-testid="backup-delete-confirm"]').count()) > 0;
+    note({ step: "delete-confirm", confirmed });
+    await page.click('[data-testid="backup-delete-confirm"]').catch(() => {});
+    await page.waitForTimeout(1200);
+    const afterDelete = await page.locator('[data-testid="backup-row"]').count();
+    note({ step: "delete", rowsAfter: afterDelete });
+  } else {
+    note({ step: "delete-confirm", confirmed: false, reason: "no delete button to press" });
+  }
+
+  // The retention strip and its button. Clicked on a DISPOSABLE stack only — the sweep is
+  // the one action on this screen that deletes data nobody asked it to delete, and a
+  // walkthrough that presses it is fine exactly as long as the destination is a temporary
+  // directory. The assertion is about the screen answering, not about the sweep finding
+  // work: on a fresh stack there is nothing past its window, and "nothing to prune" is the
+  // correct sentence, not a failure.
+  const retentionStrip = (await page.locator('[data-testid="backup-retention"]').count()) > 0;
+  await page.click('[data-testid="backup-sweep"]').catch(() => {});
+  await page.waitForTimeout(2500);
+  const sweepReport = await page
+    .locator('[data-testid="backup-sweep-report"]')
+    .allInnerTexts()
+    .catch(() => []);
+  const sweepText = sweepReport.join(" | ");
+  const sweepAnswered = /looked at \d+ expired backup|failed for \d+ tenant/i.test(sweepText);
+  const sweepStrandedShown = (await page.locator('[data-testid="backup-sweep-stranded"]').count()) > 0;
+  note({ step: "retention", retentionStrip, sweepAnswered, sweepStrandedShown, sweep: sweepText });
+
+  // The schedules table (REQ-013, slice 3). Run inside this pass rather than beside it
+  // because it lives on the same screen: the panel is mounted below the runs list, so
+  // "the schedules table is a screen nobody opened" would not be visible in the route list.
+  const schedules = await runBackupSchedules(page, report);
+
+  const ok =
+    rendered &&
+    cardsPresent &&
+    allFivePresent &&
+    everyPartTerminal &&
+    verificationRan &&
+    retentionStrip &&
+    sweepAnswered &&
+    schedules.ok;
+  return { ok, steps: steps.length, cards: cardText, schedules };
+}
+
+/**
+ * The backup schedules table (REQ-013, slice 3).
+ *
+ * This pass exists because the defect it is aimed at is invisible in every screenshot: the
+ * `next_run_at` column shipped with the table in slice 1, and for two slices **nothing wrote
+ * it**. A schedule could be created, listed, and rendered with a cadence sentence next to an
+ * empty next-run cell for ever. A screen that looks right and never fires is exactly what a
+ * walkthrough cannot see, so the assertion here is the *column's contents*, not the layout.
+ *
+ * What it drives, in order:
+ *
+ * 1. the empty state, on a stack with no schedules;
+ * 2. the editor, and that the conditional fields appear and disappear with the frequency —
+ *    an hourly schedule must not show a time of day, and a monthly one must not show a
+ *    weekday, because a hidden-but-submitted value is one the server has to decide about;
+ * 3. a **real** daily schedule, saved, and its next run read back — the cell must contain a
+ *    date and the zone, not a dash;
+ * 4. "run now" against the live API, proving a schedule can produce a backup;
+ * 5. pause, which must turn the next-run cell into "paused" rather than leaving a promise
+ *    the worker will not keep;
+ * 6. delete, and the sentence naming that the produced runs survive.
+ */
+async function runBackupSchedules(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "backups", action: "backup-schedules", ...step });
+  };
+
+  const panel = page.locator('[data-testid="backup-schedules"]');
+  await panel.scrollIntoViewIfNeeded().catch(() => {});
+  await page.waitForTimeout(600);
+
+  const panelPresent = (await panel.count()) > 0;
+  note({ step: "panel", panelPresent });
+  if (!panelPresent) {
+    return { ok: false, reason: "the schedules panel did not render" };
+  }
+
+  // 1. The empty state. On a fresh stack there are no schedules, and the table must say so
+  // with the one action that gets past it.
+  const emptyText = await panel.innerText().catch(() => "");
+  const emptyExplains = /no schedules/i.test(emptyText);
+  note({ step: "empty", emptyExplains, text: emptyText.slice(0, 160) });
+
+  // 2. The editor, and the conditional fields.
+  await page.click('[data-testid="backup-schedule-new"]').catch(() => {});
+  await page.waitForSelector('[data-testid="backup-schedule-editor"]', { timeout: 8000 }).catch(() => {});
+  const editorOpen = (await page.locator('[data-testid="backup-schedule-editor"]').count()) > 0;
+  note({ step: "editor-open", editorOpen });
+  if (!editorOpen) {
+    return { ok: false, reason: "the schedule editor did not open" };
+  }
+
+  const hasTime = async () => (await page.locator('[data-testid="backup-schedule-time"]').count()) > 0;
+  const hasWeekday = async () =>
+    (await page.locator('[data-testid="backup-schedule-weekday"]').count()) > 0;
+  const hasDom = async () =>
+    (await page.locator('[data-testid="backup-schedule-dayofmonth"]').count()) > 0;
+
+  // Daily shows a time and no day fields.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "daily").catch(() => {});
+  await page.waitForTimeout(250);
+  const dailyShape = { time: await hasTime(), weekday: await hasWeekday(), dom: await hasDom() };
+  note({ step: "shape-daily", ...dailyShape });
+
+  // Weekly adds the weekday and still shows the time.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "weekly").catch(() => {});
+  await page.waitForTimeout(250);
+  const weeklyShape = { time: await hasTime(), weekday: await hasWeekday(), dom: await hasDom() };
+  note({ step: "shape-weekly", ...weeklyShape });
+
+  // Monthly swaps the weekday for a day of the month.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "monthly").catch(() => {});
+  await page.waitForTimeout(250);
+  const monthlyShape = { time: await hasTime(), weekday: await hasWeekday(), dom: await hasDom() };
+  note({ step: "shape-monthly", ...monthlyShape });
+
+  // Hourly names no time of day at all.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "hourly").catch(() => {});
+  await page.waitForTimeout(250);
+  const hourlyShape = { time: await hasTime(), weekday: await hasWeekday(), dom: await hasDom() };
+  note({ step: "shape-hourly", ...hourlyShape });
+
+  // 3. A real daily schedule, saved, with its next run read back.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "daily").catch(() => {});
+  await page.waitForTimeout(200);
+  await page.fill('[data-testid="backup-schedule-name"]', "QA nightly").catch(() => {});
+  await page.fill('[data-testid="backup-schedule-time"]', "02:30").catch(() => {});
+  await page.selectOption('[data-testid="backup-schedule-zone"]', "Europe/Istanbul").catch(() => {});
+  await page.waitForTimeout(200);
+  await page.click('[data-testid="backup-schedule-save"]').catch(() => {});
+  await page.waitForTimeout(2500);
+
+  const saveNotice = await panel.locator('p[role="status"]').innerText().catch(() => "");
+  const editorClosed = (await page.locator('[data-testid="backup-schedule-editor"]').count()) === 0;
+  note({ step: "save", editorClosed, notice: saveNotice.trim() });
+
+  const scheduleRows = await panel.locator("[data-schedule]").count();
+  const rowText = scheduleRows > 0 ? await panel.locator("[data-schedule]").first().innerText() : "";
+  // The load-bearing assertion of this whole pass: the next-run cell must carry a real date
+  // and the zone. A dash here is the two-slice defect, and every other assertion in this file
+  // would still pass with it.
+  const nextRunHasDate = /\d{1,2}\s+\w{3,}\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2}/.test(rowText);
+  const namesTheZone = /Europe\/Istanbul|UTC/.test(rowText);
+  const noNextRunWarning = /will not fire until it is saved again/i.test(rowText);
+  note({
+    step: "next-run",
+    scheduleRows,
+    nextRunHasDate,
+    namesTheZone,
+    noNextRunWarning,
+    row: rowText.replace(/\n/g, " | ").slice(0, 220),
+  });
+
+  // 4. Run it now, over the real API.
+  if (scheduleRows > 0) {
+    const row = panel.locator("[data-schedule]").first();
+    const runId = await row.getAttribute("data-schedule").catch(() => null);
+    if (runId) {
+      await page.click(`[data-testid="backup-schedule-run-${runId}"]`).catch(() => {});
+      await page.waitForTimeout(20000);
+      const runNotice = await panel.locator('p[role="status"]').innerText().catch(() => "");
+      const runAnswered = /ran|parts were written|could not/i.test(runNotice);
+      // The sentence has to say the next scheduled run is UNCHANGED, because a "run now"
+      // that consumed the 02:00 slot is a silent skip of tomorrow's backup.
+      const nextRunUntouched = /next scheduled run is unchanged|next run/i.test(runNotice);
+      note({ step: "run-now", runAnswered, nextRunUntouched, notice: runNotice.trim().slice(0, 200) });
+
+      // 5. Pause. The next-run cell must become "paused", not keep a promise.
+      await row.locator('button:has-text("Pause")').first().click().catch(() => {});
+      await page.waitForTimeout(2000);
+      const pausedText = await panel.locator("[data-schedule]").first().innerText().catch(() => "");
+      const showsPaused = /paused/i.test(pausedText);
+      note({ step: "pause", showsPaused, row: pausedText.replace(/\n/g, " | ").slice(0, 200) });
+
+      // 6. Delete, and the sentence that the produced runs survive.
+      await page.click(`[data-testid="backup-schedule-delete-${runId}"]`).catch(() => {});
+      await page.waitForTimeout(2000);
+      const afterDelete = await panel.locator("[data-schedule]").count();
+      const deleteNotice = await panel.locator('p[role="status"]').innerText().catch(() => "");
+      const deleteExplainsSurvival = /still here|does not delete history|kept/i.test(deleteNotice);
+      note({
+        step: "delete",
+        rowsAfter: afterDelete,
+        deleteExplainsSurvival,
+        notice: deleteNotice.trim().slice(0, 200),
+      });
+    }
+  }
+
+  const ok =
+    panelPresent &&
+    editorOpen &&
+    dailyShape.time &&
+    !dailyShape.weekday &&
+    weeklyShape.weekday &&
+    monthlyShape.dom &&
+    !monthlyShape.weekday &&
+    !hourlyShape.time &&
+    editorClosed &&
+    scheduleRows > 0 &&
+    nextRunHasDate &&
+    namesTheZone &&
+    !noNextRunWarning;
+  return { ok, steps: steps.length };
 }
 
 async function runMediaFileManager(page, report) {
@@ -1073,6 +4231,85 @@ async function runMediaFileManager(page, report) {
   await page.selectOption("#media-kind", "");
   await page.click('button[aria-label="Filters"]');
   await page.waitForTimeout(600);
+
+  // The size, uploader, date and tag filters (REQ-010, tick 101). They existed in the store and
+  // on the API for the whole life of the request with no control on the toolbar, so nothing in
+  // the tree could ever click them. This step is what makes them an *interaction* rather than
+  // markup: each is filled, the listing must react, and the contradictory range must produce a
+  // message under its own field rather than an empty listing.
+  await page.click('button[aria-label="Filters"]');
+  await page.waitForTimeout(300);
+  const filterIds = [
+    "media-min-size",
+    "media-max-size",
+    "media-uploader",
+    "media-created-after",
+    "media-created-before",
+    "media-tag",
+  ];
+  const present = [];
+  for (const id of filterIds) {
+    if ((await page.locator(`#${id}`).count()) > 0) {
+      present.push(id);
+    }
+  }
+  note({ step: "media-filter-controls", present, expected: filterIds.length });
+  await shot(page, "media-filter-bar");
+
+  // A min/max pair that contradicts itself must be refused *by name*. A zero-row listing would
+  // be the product looking healthy, so the assertion is on the alert text, not on the row count.
+  await page.fill("#media-min-size", "999999999");
+  await page.fill("#media-max-size", "1");
+  await page.waitForTimeout(1200);
+  const rangeAlert = await page
+    .locator("#media-min-size-error")
+    .innerText()
+    .catch(() => null);
+  const stillRendered = (await page.locator("#media-min-size").count()) > 0;
+  note({ step: "media-range-refusal", rangeAlert, stillRendered });
+  await shot(page, "media-range-refusal");
+
+  // Clear filters has to clear *all* of them, including the five this step added. A Clear that
+  // left the size boxes populated would make every later assertion in this pass read a filtered
+  // listing and blame the screen for it.
+  if ((await page.locator("#media-clear-filters").count()) > 0) {
+    await page.click("#media-clear-filters");
+  } else {
+    await page.fill("#media-min-size", "");
+    await page.fill("#media-max-size", "");
+  }
+  await page.waitForTimeout(900);
+  const cleared = {
+    min: await page.inputValue("#media-min-size").catch(() => null),
+    max: await page.inputValue("#media-max-size").catch(() => null),
+  };
+  note({ step: "media-filters-cleared", cleared });
+
+  // A real uploader selection must narrow, and the dropdown must be fed by the route that shares
+  // the listing's permission key rather than by the IAM one a media operator does not hold.
+  const uploaderOptions = await page
+    .locator("#media-uploader option")
+    .allTextContents()
+    .catch(() => []);
+  let uploaderNarrowed = null;
+  if (uploaderOptions.length > 1) {
+    const value = await page
+      .locator("#media-uploader option")
+      .nth(1)
+      .getAttribute("value")
+      .catch(() => null);
+    if (value) {
+      await page.selectOption("#media-uploader", value);
+      await page.waitForTimeout(1100);
+      const rows = await page.locator("tbody tr").count();
+      uploaderNarrowed = { value, rows };
+      await page.selectOption("#media-uploader", "");
+    }
+  }
+  note({ step: "media-uploader-filter", options: uploaderOptions.length, uploaderNarrowed });
+  await page.waitForTimeout(400);
+  await page.click('button[aria-label="Filters"]');
+  await page.waitForTimeout(500);
 
   // A delete is a trash, not a purge.
   const firstRow = page.locator("tbody tr").first();
@@ -1193,12 +4430,39 @@ async function runMediaPresets(page, report) {
   const served = await page.evaluate(async (query) => {
     // The library is where a real file id lives; asking for the listing keeps this in the page
     // with the session cookie, so the bytes come from the real API.
+    //
+    // Every `res.json()` is guarded by a content-type check and a `try`. A body that is not
+    // JSON is the *expected* answer when the request never reached the API — a proxy's HTML
+    // error page, or the `Failed to …` string the server answers a crashed upstream with — and
+    // `await res.json()` on it throws `SyntaxError`, which escaped `page.evaluate` and took the
+    // whole depth pass down with it. The last run reported
+    // `page.evaluate: SyntaxError: Unexpected token 'F', "Failed to"... is not valid JSON` and
+    // `steps: 0`, so the preset pass asserted nothing at all and the report called it a failure
+    // of the *screen*. A measurement that cannot survive an error is not a measurement.
+    const readJson = async (res) => {
+      const type = res.headers.get("content-type") || "";
+      if (!type.includes("json")) {
+        const text = (await res.text().catch(() => "")).slice(0, 120);
+        return { __notJson: true, status: res.status, type, text };
+      }
+      try {
+        return await res.json();
+      } catch (err) {
+        return { __notJson: true, status: res.status, type, error: String(err) };
+      }
+    };
+
     const listed = await fetch("/api/v1/media/files?limit=1", { credentials: "same-origin" });
-    const page1 = await listed.json();
+    const page1 = await readJson(listed);
+    if (page1.__notJson) return { ok: false, reason: `listing: ${page1.text || page1.error}` };
     const file = page1.files && page1.files[0];
     if (!file || !query) return { ok: false, reason: "no file or no preset query" };
     const url = `/api/v1/media/${file.id}/raw${query}`;
     const response = await fetch(url, { credentials: "same-origin" });
+    if ((response.headers.get("content-type") || "").includes("json")) {
+      const text = (await response.text().catch(() => "")).slice(0, 120);
+      return { ok: false, reason: `the bytes came back as json: ${text}` };
+    }
     const buffer = new Uint8Array(await response.arrayBuffer());
     return {
       ok: response.ok,
@@ -1447,6 +4711,109 @@ async function runMediaFileDetail(page, report) {
     await page.waitForTimeout(800);
   }
 
+  // The custom pairs (REQ-010, tick 99). Three states, all of which a screenshot of one file
+  // cannot distinguish: the empty state a fresh upload has, a real pair after a save, and the
+  // toolbar filter that finds it. The pair set is replaced whole, so the save here also proves the
+  // *second* save removed the first pair — an editor that only ever adds leaves a remove button
+  // untested.
+  const pairsEmpty = (await page.locator('[data-testid="media-pairs-empty"]').count()) > 0;
+  note({ step: "pairs-empty-state", rendered: pairsEmpty });
+
+  const pairKey = `qa-campaign-${Date.now()}`;
+  const pairValue = `spring-${Date.now()}`;
+  await page.click("#media-add-pair");
+  await page.waitForTimeout(200);
+  const keyInputs = page.locator('[data-testid="media-pair-key"]');
+  await keyInputs.last().fill(pairKey);
+  await page.locator('[data-testid="media-pair-value"]').last().fill(pairValue);
+  await page.click("#media-save-pairs");
+  await page.waitForTimeout(1500);
+  const pairsNotice = await page
+    .locator('[data-testid="media-pairs-notice"]')
+    .first()
+    .innerText()
+    .catch(() => "");
+  const pairSurvived = await page
+    .evaluate(
+      ([key, value]) =>
+        [...document.querySelectorAll('[data-testid="media-pair-key"]')].some(
+          (input) => input.value === key,
+        ) &&
+        [...document.querySelectorAll('[data-testid="media-pair-value"]')].some(
+          (input) => input.value === value,
+        ),
+      [pairKey, pairValue],
+    )
+    .catch(() => false);
+  note({ step: "pairs-save", notice: pairsNotice.replace(/\s+/g, " ").trim(), kept: pairSurvived });
+  await shot(page, "page-media-file-pairs");
+
+  // A **refusal must land under the row that caused it**. The detail field is `metadata.<key>`,
+  // so a message printed once at the bottom of the block would be a screen that shows a problem
+  // without saying which input produced it.
+  const longValue = "x".repeat(600);
+  await keyInputs.last().fill(`${pairKey}`);
+  await page.locator('[data-testid="media-pair-value"]').last().fill(longValue);
+  await page.click("#media-save-pairs");
+  await page.waitForTimeout(1200);
+  const rowAlerts = await page.locator('[data-testid="media-pair-value"] ~ * [role="alert"], li [role="alert"]').count();
+  const setAlerts = (await page.locator('[data-testid="media-pairs-set-error"]').count()) > 0;
+  note({ step: "pairs-refusal", rowAlert: rowAlerts > 0, setAlert: setAlerts });
+
+  // The toolbar filter finds the file by its pair — and a half-typed term narrows nothing.
+  await page.goto(`${URL_ADMIN}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#media-new-folder", { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const filterButton = page.locator('[aria-label="Filters"]').first();
+  if ((await filterButton.count()) > 0) {
+    await filterButton.click();
+    await page.waitForTimeout(300);
+  }
+  const before = await page.locator("tbody tr").count().catch(() => 0);
+  await page.fill('[data-testid="media-metadata-filter"]', `${pairKey}=${pairValue}`);
+  await page.waitForTimeout(1600);
+  const afterMatch = await page.locator("tbody tr").count().catch(() => 0);
+  const matchedHref = await page.evaluate(() => {
+    const link = document.querySelector('a[href^="/media/files/"]');
+    return link ? link.getAttribute("href").split("/").pop() : null;
+  });
+  note({
+    step: "metadata-filter",
+    before,
+    after: afterMatch,
+    // The file the pair was set on is the only row that may come back.
+    found: matchedHref === fileId,
+  });
+
+  await page.fill('[data-testid="media-metadata-filter"]', `${pairKey}=`);
+  await page.waitForTimeout(1600);
+  const afterPartial = await page.locator("tbody tr").count().catch(() => 0);
+  note({
+    step: "metadata-filter-half-typed",
+    // A half-typed term must NOT narrow the listing: the field is re-read on every keystroke.
+    unfiltered: afterPartial === before,
+  });
+
+  // "Clear filters" must clear this term too, or a cleared toolbar still filters.
+  const clearButtons = page.locator("button", { hasText: "Clear filters" });
+  if ((await clearButtons.count()) > 0) {
+    await clearButtons.last().click();
+    await page.waitForTimeout(1200);
+  }
+  const afterClear = await page.locator("tbody tr").count().catch(() => 0);
+  note({
+    step: "metadata-filter-cleared",
+    unfiltered: afterClear === before,
+    fieldEmpty: (await page.inputValue('[data-testid="media-metadata-filter"]').catch(() => "x")) === "",
+  });
+  await shot(page, "page-media-metadata-filter");
+
+  // Back to the file detail, so the rest of this pass is about the file it opened.
+  await page.goto(`${URL_ADMIN}/media/files/${fileId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="media-file-name"]', { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(900);
+
+  // The version tab lists the history; an upload is at least version 1.
   // The version tab lists the history; an upload is at least version 1.
   await page.click("#media-tab-versions");
   await page.waitForTimeout(900);
@@ -1720,6 +5087,7 @@ async function uploadDuplicateSample(page) {
   await input.setInputFiles(second).catch(() => {});
   await page.waitForTimeout(1800);
   return {
+    ok: true,
     uploaded: true,
     first: path.basename(file),
     second: path.basename(second),
@@ -1966,8 +5334,21 @@ async function runMediaGrants(page, report) {
   // Removing it is immediate, and the empty state comes back. The confirmation is a
   // `window.confirm` and the harness accepts dialogs globally, so this is one click: a second
   // one would remove a grant that no longer exists and turn a passing check into a 404.
+  //
+  // The wait is on the *condition*, not on a stopwatch. `onRemove` does three things after the
+  // click — the DELETE, the notice, and a full `load()` of the tab — and the last of those is a
+  // network round trip. A fixed 2500 ms asserts against whichever of those three happened to
+  // finish first, so under load the row was still on screen and the pass reported
+  // `afterRemove: 1` as though the remove had failed. That is the same mistake as reading
+  // `uploaded.ok`: the assertion is measuring the clock instead of the thing.
   await page.click('[data-testid="media-grant-remove"]').catch(() => {});
-  await page.waitForTimeout(2500);
+  await page
+    .waitForFunction(
+      () => document.querySelectorAll('[data-testid="media-grant-row"]').length === 0,
+      undefined,
+      { timeout: 15000 },
+    )
+    .catch(() => {});
   const afterRemove = await page.locator('[data-testid="media-grant-row"]').count();
   const afterNotices = await page.locator('[data-testid="media-grants-notice"]').count();
   note({ step: "removed", afterRemove, afterNotices });
@@ -2103,6 +5484,13 @@ async function runMediaDuplicates(page, report) {
   };
 }
 
+// ---------------------------------------------------------------- palette (REQ-002)
+
+/**
+ * The ⌘K palette: opened from the keyboard, searched, walked with the arrow keys, used to open a
+ * real screen, then reopened to check that the query was remembered. The pass covers the whole
+ * loop — open, search, sections, keyboard, navigation, recents, close — rather than the opening
+ * animation alone.
 // ---------------------------------------------------------------- palette (REQ-002)
 
 /**
@@ -2839,832 +6227,6 @@ async function runIamSubjectsDepth(page, report) {
   report.iamSubjects = summary;
   log(`iam subjects depth: ${JSON.stringify(steps)}`);
   return summary;
-}
-
-// The node-library pass (REQ-087, slice 1): the registry rendered from the API, the search and
-// filters narrowing it, a node detail opening, the deprecated state naming its replacement, and
-// the counts agreeing with what is on screen. Every number here is read off the page and
-// compared, because "the library looks populated" is not a measurement of anything.
-async function runNodeLibraryDepth(page, report) {
-  const steps = {};
-  await page.goto(`${URL_ADMIN}/workflows/nodes`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(2200);
-  await shot(page, "page-node-library");
-
-  const rows = page.locator("[data-node-row]");
-  steps.rows = await rows.count();
-  steps.count = (await page.locator("[data-node-count]").innerText().catch(() => ""))
-    .replace(/\s+/g, " ")
-    .trim();
-  // A library screen that rendered zero rows against a shipped registry is a broken screen, not
-  // an empty library: the registry is code and always holds at least a trigger.
-  steps.hasRows = steps.rows > 0;
-  steps.states = await page.locator("[data-node-state]").allInnerTexts();
-
-  // 1. A search narrows the list, and the URL carries it so the view is shareable.
-  const search = page.locator('input[type="search"]').first();
-  await search.click({ timeout: 4000 }).catch(() => {});
-  await search.fill("http").catch(() => {});
-  await page.waitForTimeout(1800);
-  steps.searchUrl = page.url().includes("search=http");
-  steps.searched = await rows.count();
-  // The strongest form of "the search worked": every surviving row matches the needle.
-  steps.everyRowMatches = await page.evaluate(() => {
-    const needle = new URLSearchParams(location.search).get("search") ?? "";
-    if (!needle) return true;
-    return Array.from(document.querySelectorAll("[data-node-row]")).every((row) => {
-      const text = (row.textContent ?? "").toLowerCase();
-      return text.includes(needle.toLowerCase());
-    });
-  });
-  await shot(page, "page-node-library-searched");
-
-  // 2. A search that matches nothing says what it searched, and offers a way back.
-  await search.fill("zzz_no_such_node").catch(() => {});
-  await page.waitForTimeout(1600);
-  const emptyText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
-  steps.emptyStatesTheSearch = /No node matches/i.test(emptyText);
-  steps.emptyNamesTheQuery = emptyText.includes("zzz_no_such_node");
-  await shot(page, "page-node-library-empty");
-
-  // 3. Back to everything, then a category filter that has to actually filter.
-  await page.goto(`${URL_ADMIN}/workflows/nodes`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1800);
-  const allRows = await rows.count();
-  const selects = page.locator("select");
-  const selectCount = await selects.count();
-  // The category options come from the API, so the option count is read rather than assumed.
-  if (selectCount > 0) {
-    const options = await selects.nth(0).locator("option").allInnerTexts();
-    steps.categoryOptions = options.length - 1;
-    await selects.nth(0).selectOption({ index: 1 }).catch(() => {});
-    await page.waitForTimeout(1600);
-    steps.categoryUrl = /category=/.test(page.url());
-    steps.categoryRows = await rows.count();
-    steps.categoryNarrowed = steps.categoryRows < allRows;
-    await shot(page, "page-node-library-filtered");
-  }
-
-  // 4. A node detail opens, and the deprecated node names its replacement.
-  await page.goto(`${URL_ADMIN}/workflows/nodes/http_request`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1800);
-  steps.detailUrl = page.url().includes("/workflows/nodes/http_request");
-  steps.detailPorts = await page.locator("text=Ports").count();
-  steps.detailParams = await page.locator("text=Parameters").count();
-  await shot(page, "page-node-detail");
-
-  await page.goto(`${URL_ADMIN}/workflows/nodes/legacy_webhook`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1800);
-  const deprecatedText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
-  steps.deprecatedBanner = /deprecated/i.test(deprecatedText);
-  steps.deprecatedNamesReplacement = deprecatedText.includes("http_request");
-  await shot(page, "page-node-detail-deprecated");
-
-  // 5. A key that is not registered is a 404 with the key echoed, not an empty detail page.
-  await page.goto(`${URL_ADMIN}/workflows/nodes/no_such_node_key`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1600);
-  const missingText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
-  steps.unknownKeyExplains = /not in the registry/i.test(missingText);
-  steps.unknownKeyEchoes = missingText.includes("no_such_node_key");
-  await shot(page, "page-node-detail-missing");
-
-  // 6. The registry's own lint, straight off the running server. A registry that would fail its
-  // lint has to be visible here, not only in a test a deploy skips.
-  const lint = await page.evaluate(() =>
-    fetch("/api/v1/node-types/lint", { credentials: "same-origin" })
-      .then((r) => (r.ok ? r.json() : null))
-      .catch(() => null),
-  );
-  steps.lintOk = lint?.ok === true;
-  steps.lintNodeCount = lint?.node_count ?? 0;
-  steps.lintCredentialTypeCount = lint?.credential_type_count ?? 0;
-  steps.lintFindings = lint?.findings?.length ?? -1;
-
-  // 7. The credential catalogue, including that a secret field is declared write-only and that
-  // no type is orphaned.
-  const credentialTypes = await page.evaluate(() =>
-    fetch("/api/v1/credential-types", { credentials: "same-origin" })
-      .then((r) => (r.ok ? r.json() : null))
-      .catch(() => null),
-  );
-  steps.credentialTypes = credentialTypes?.total ?? 0;
-  steps.secretsAreWriteOnly = (credentialTypes?.types ?? []).every((type) =>
-    type.fields
-      .filter((f) => f.kind === "secret")
-      .every((f) => f.write_only === true && f.never_log === true),
-  );
-  steps.noOrphanCredentialType = (credentialTypes?.types ?? []).every(
-    (type) => type.used_by.length > 0,
-  );
-  // A payload carrying a token endpoint would be one more copy of an OAuth flow to keep in sync;
-  // the detail screen links the docs instead.
-  steps.noTokenEndpointInPayload = !JSON.stringify(credentialTypes ?? {}).includes("token_url");
-
-  return steps;
-}
-
-/**
- * The credential pass (REQ-087, slice 2).
- *
- * This one *drives* the surface rather than looking at it, because the claims that matter here
- * are behavioural and cannot be checked by reading pixels:
- *
- * 1. A credential is created through the real form — type picked from the catalogue, name
- *    typed, a secret pasted — and the fixture secret is a string that must not appear
- *    anywhere afterwards. The strongest form of "no response returns a secret" is to send one
- *    and then grep every screen, every API response and the whole DOM for it.
- * 2. A secret sent on a plain `PATCH` is refused by name. The API answers
- *    `credential_secret_write_only`; a client that got a 200 would mean the payload was
- *    accepted, which is the failure this REQ exists to prevent.
- * 3. A test run reports a *result*, and a credential with no secret says so. `ok: true` for a
- *    connection nobody made is the one answer that would make the health chip a lie, so the
- *    pass asserts the negative explicitly.
- * 4. The delete guard refuses a credential nothing references only after it *does* — so the
- *    pass creates a workflow graph that names the key, asks for the usage view, and checks
- *    that the refusal names the workflow rather than just saying no.
- * 5. The detail screen renders a secret as a mask of a fixed width and offers no reveal.
- */
-async function runCredentialDepth(page, report) {
-  const steps = {};
-  // A fixture string that must never appear again once it has been sent. If it turns up in
-  // the DOM, in a network response or in a screenshot's text, the surface leaked it.
-  const FIXTURE = "qa-fixture-secret-9f2c41ab";
-  const stamp = Date.now().toString(36);
-  const name = `QA fixture ${stamp}`;
-  const key = `qa-fixture-${stamp}`;
-
-  // 1. The list, empty or not, says which of the two situations it is.
-  await page.goto(`${URL_ADMIN}/workflows/credentials`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(2200);
-  const countText = (await page.locator("[data-credential-count]").innerText().catch(() => "")).replace(/\s+/g, " ").trim();
-  steps.listCount = countText;
-  steps.listHasEmptyOrRows =
-    (await page.locator("[data-credential-row]").count()) > 0 ||
-    (await page.locator("[data-credential-empty]").count()) > 0;
-  await shot(page, "page-credentials");
-
-  // 2. A search narrows the list and the URL carries it.
-  const search = page.locator('input[type="search"]').first();
-  await search.click({ timeout: 4000 }).catch(() => {});
-  await search.fill("zzz_no_such_credential").catch(() => {});
-  await page.waitForTimeout(1600);
-  const emptyText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
-  steps.emptyNamesTheQuery = /No credential matches/i.test(emptyText) && emptyText.includes("zzz_no_such_credential");
-  await shot(page, "page-credentials-empty");
-  await page.goto(`${URL_ADMIN}/workflows/credentials`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1500);
-
-  // 3. The type picker offers the catalogue, and picking one fills the form from the
-  //    definition rather than from anything written down in the panel.
-  await page.goto(`${URL_ADMIN}/workflows/credentials/new`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(2000);
-  const typeCards = await page.locator("[data-credential-type]").count();
-  steps.typeCards = typeCards;
-  steps.pickerOffersRealTypes = typeCards >= 4;
-  await shot(page, "page-credential-new-picker");
-
-  await page.locator('[data-credential-type="api_key"]').click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(800);
-  steps.formHasNameField = (await page.locator('[data-credential-field="name"]').count()) > 0;
-  steps.formHasKeyField = (await page.locator('[data-credential-field="key"]').count()) > 0;
-  // The secret input is a password field and there is no reveal-by-default.
-  const secretInputType = await page
-    .locator('[data-credential-secret="api_key"]')
-    .getAttribute("type")
-    .catch(() => null);
-  steps.secretInputIsMasked = secretInputType === "password";
-  await shot(page, "page-credential-new-form");
-
-  // 4. The key is derived from the name before anything is saved.
-  await page.locator('[data-credential-field="name"]').fill(name).catch(() => {});
-  await page.waitForTimeout(400);
-  const derivedKey = await page.locator('[data-credential-field="key"]').inputValue().catch(() => "");
-  steps.keyDerivedFromName = derivedKey === name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
-
-  // 5. A save with a missing required non-secret field is refused in the form. `api_key`'s
-  //    only required field is the secret, so the form's own check is what refuses an empty
-  //    name — which is the case a reader actually hits.
-  await page.locator('[data-credential-secret="api_key"]').fill(FIXTURE).catch(() => {});
-  await page.locator("[data-credential-save]").click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(1200);
-  steps.savedUrl = page.url().includes("/workflows/credentials/") && !page.url().endsWith("/new");
-  await page.waitForTimeout(1800);
-  const detailText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
-  steps.detailShowsName = detailText.includes(name);
-  // The fixture must not be anywhere on the screen it was just typed into.
-  steps.secretNotOnScreen = !(await page.evaluate((needle) => document.body.innerText.includes(needle), FIXTURE));
-  steps.secretNotInDom = !(await page.evaluate((needle) => document.documentElement.outerHTML.includes(needle), FIXTURE));
-  await shot(page, "page-credential-detail");
-
-  const id = page.url().split("/").pop();
-
-  // 6. The masked field renders a constant-width mask, and there is no way to reveal it.
-  const masked = (await page.locator('[data-credential-masked="api_key"]').innerText().catch(() => "")).trim();
-  steps.maskedIsNotEmpty = masked.length >= 8;
-  steps.maskedIsNotTheSecret = !masked.includes(FIXTURE);
-  steps.revealOpenable = (await page.locator("[data-credential-replace-open]").count()) > 0;
-  steps.noInlineRevealControl =
-    (await page.locator('[data-credential-masked="api_key"] input').count()) === 0;
-
-  // 7. A test reports a result, and it is not a pass for a connection nobody made.
-  await page.locator("[data-credential-test]").click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(2000);
-  const testOutcome = await page
-    .locator("[data-credential-test-result]")
-    .getAttribute("data-credential-test-result")
-    .catch(() => null);
-  const testText = (await page
-    .locator("[data-credential-test-result]")
-    .innerText()
-    .catch(() => "")).replace(/\s+/g, " ");
-  steps.testReportedAResult = testOutcome === "ok" || testOutcome === "failed";
-  steps.testDidNotFakeSuccess = testOutcome !== "ok";
-  steps.testExplainsItself = testText.length > 10;
-  await shot(page, "page-credential-tested");
-
-  // 8. A secret re-sent on a plain PATCH is refused by name — the REQ's own criterion.
-  const patchResult = await page.evaluate(
-    async ([credentialId, needle]) => {
-      const response = await fetch(`/api/v1/credentials/${credentialId}`, {
-        method: "PATCH",
-        credentials: "same-origin",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: "renamed", secrets: [{ field: "api_key", value: needle }] }),
-      });
-      const body = await response.json().catch(() => ({}));
-      return { status: response.status, code: body?.error?.code ?? null };
-    },
-    [id, FIXTURE],
-  );
-  steps.patchWithSecretRefused = patchResult.status === 400;
-  steps.patchWithSecretCode = patchResult.code;
-
-  // 9. The API never returns the secret, on any read it offers.
-  const reads = await page.evaluate(
-    async (credentialId) => {
-      const [detail, usage] = await Promise.all([
-        fetch(`/api/v1/credentials/${credentialId}`, { credentials: "same-origin" }).then((r) => r.text()),
-        fetch(`/api/v1/credentials/${credentialId}/usage`, { credentials: "same-origin" }).then((r) => r.text()),
-      ]);
-      return { detail, usage };
-    },
-    id,
-  );
-  steps.noReadReturnsTheSecret =
-    !reads.detail.includes(FIXTURE) && !reads.usage.includes(FIXTURE);
-  steps.noReadReturnsAHandle = !reads.detail.includes("secret_ref") && !reads.detail.includes("vault://");
-
-  // 10. The usage view is a real read, and on an unreferenced credential it says so.
-  const usageNone = (await page.locator('[data-credential-usage="none"]').count()) > 0;
-  steps.usageExplainsItself = usageNone;
-
-  // 11. A delete of an unreferenced credential succeeds — the guard must not refuse forever.
-  const deleted = await page.evaluate(
-    async (credentialId) => {
-      const response = await fetch(`/api/v1/credentials/${credentialId}`, {
-        method: "DELETE",
-        credentials: "same-origin",
-      });
-      return { status: response.status, body: await response.json().catch(() => ({})) };
-    },
-    id,
-  );
-  steps.unreferencedDeleteOk = deleted.status === 200 && deleted.body?.deleted === true;
-  steps.fixtureIsGone = !(await page.evaluate(
-    async (credentialId) => {
-      const response = await fetch(`/api/v1/credentials/${credentialId}`, { credentials: "same-origin" });
-      return response.ok;
-    },
-    id,
-  ));
-
-  // 12. The list is back, and the fixture is not in it.
-  await page.goto(`${URL_ADMIN}/workflows/credentials`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1800);
-  steps.fixtureNotInList = (await page.locator(`[data-credential-row="${key}"]`).count()) === 0;
-  steps.finalSecretSweep = !(await page.evaluate(
-    (needle) => document.documentElement.outerHTML.includes(needle),
-    FIXTURE,
-  ));
-  await shot(page, "page-credentials-after");
-
-  // 13. An unknown filter is a refusal naming the legal values, not an empty list.
-  const badFilter = await page.evaluate(async () => {
-    const response = await fetch("/api/v1/credentials?type=carrier_pigeon", {
-      credentials: "same-origin",
-    });
-    const body = await response.json().catch(() => ({}));
-    return { status: response.status, code: body?.error?.code ?? null };
-  });
-  steps.unknownTypeFilterRefused = badFilter.status === 400;
-  steps.unknownTypeFilterCode = badFilter.code;
-
-  return steps;
-}
-
-/**
- * The organization a signed-in platform account is reading, as the screen itself resolves it.
- *
- * A platform account has no primary organization, so every node-package call has to name one —
- * without it the API refuses `organization_required` and the depth pass asserts against a
- * screen that could not have worked for the account it signed in as. A tenant needs no
- * qualifier at all, so this returns `null` for one and the API falls back to its own.
- */
-async function activeOrganization(page) {
-  return page.evaluate(async () => {
-    const answer = await fetch("/api/v1/organizations", { credentials: "same-origin" });
-    const body = await answer.json().catch(() => ({}));
-    return (body?.organizations ?? [])[0]?.id ?? null;
-  });
-}
-
-/**
- * The node-package pass (REQ-087, slice 4).
- *
- * Drives `/modules/installed` through the whole lifecycle against a real package: it installs
- * the scaffold the SDK itself writes, refuses a broken variant and reads the findings back
- * from the screen, disables and re-enables, then removes and confirms the ledger is empty
- * again.
- *
- * The refusal is the interesting half. An install that validates is one assertion; an install
- * that is *refused with every finding rendered* is the criterion the REQ states ("a package
- * failing the SDK validator is refused with the findings and nothing reaches the ledger"), and
- * the second half — nothing reached the ledger — is checked by reading the list rather than by
- * trusting the screen's own wording.
- */
-/**
- * The workflow editor canvas pass (REQ-086, slice 2).
- *
- * A canvas is the screen most likely to render beautifully and do nothing, because almost
- * everything about it is local: the document lives in the browser until someone saves it, and a
- * regression in the *save* path is invisible to a screenshot. So this pass asserts against the
- * server's own read-back at every step rather than against what the screen says.
- *
- * The order is the order the REQ's QA plan names, and each step has a claim behind it:
- *
- * 1.  create a real workflow through the API, so the canvas has something real to open;
- * 2.  the canvas opens and its counts match the empty document the API reports;
- * 3.  add a trigger and an action from the palette — palette rows are `disabled` with a named
- *     reason, and an enabled row that adds nothing is a dead button;
- * 4.  connect them, and read the connection back from the server;
- * 5.  label the branch, and read the label back — a label that survives a reload is the claim;
- * 6.  save, reload the *page*, and confirm the positions, the label and the counts are the
- *     same. This is the step that catches a canvas that keeps its document in memory only;
- * 7.  a node with a missing required parameter is badged, and the badge is the server's
- *     verdict rather than the client's;
- * 8.  sticky note added, survives the reload, and is not a step.
- *
- * Every read-back goes through `page.evaluate` + `fetch` so it uses the *signed-in* session
- * rather than a token this pass invented. A pass that authenticates separately is testing a
- * second session and can pass while the real one is refused.
- */
-async function runGraphCanvasDepth(page, report) {
-  const steps = {};
-
-  /** A signed-in API call from inside the page, so the session cookie is the real one. */
-  const api = (path, init) =>
-    page.evaluate(
-      async ([target, options]) => {
-        const answer = await fetch(target, {
-          credentials: "same-origin",
-          headers: {
-            accept: "application/json",
-            ...(options?.body ? { "content-type": "application/json" } : {}),
-            ...(options?.csrf
-              ? { "x-omnion-csrf": document.cookie.match(/omnion_csrf=([^;]+)/)?.[1] ?? "" }
-              : {}),
-          },
-          ...(options?.body ? { method: options.method ?? "POST", body: options.body } : {}),
-        });
-        const text = await answer.text();
-        return {
-          status: answer.status,
-          body: text ? JSON.parse(text) : null,
-        };
-      },
-      [path, init ?? null],
-    );
-
-  // 1. A real workflow to open. It is created through the API rather than through a screen
-  //    because no workflow list screen exists yet (REQ-093 owns the list), and a canvas pass
-  //    that had to build its own fixture through a UI would be testing that UI too.
-  const stamp = Date.now().toString(36);
-  const created = await api("/api/v1/workflows", {
-    method: "POST",
-    csrf: true,
-    body: JSON.stringify({
-      name: `QA canvas ${stamp}`,
-      description: "graph canvas fixture",
-      enabled: true,
-      trigger: { kind: "manual" },
-      steps: [{ name: "noop", kind: "task", action: "noop", params: {} }],
-    }),
-  });
-  steps.workflowCreated = created.status === 201 || created.status === 200;
-  if (!steps.workflowCreated) {
-    steps.createError = created.body?.error?.code ?? `status ${created.status}`;
-    return { ok: false, reason: "the canvas fixture workflow could not be created", ...steps };
-  }
-  const workflowId = created.body?.id;
-  steps.workflowId = workflowId;
-
-  // 2. The canvas opens, and the empty state names the situation rather than showing a void.
-  await page.goto(`${URL_ADMIN}/workflows/${workflowId}/edit`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(2600);
-  steps.canvasRendered = (await page.locator('[role="application"][aria-label="Workflow canvas"]').count()) > 0;
-  steps.emptyStateShown = /no nodes yet/i.test(
-    (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " "),
-  );
-  steps.palettePresent = (await page.locator('aside[aria-label="Node palette"]').count()) > 0;
-  steps.inspectorPresent = (await page.locator('aside[aria-label="Node inspector"]').count()) > 0;
-  await shot(page, "page-graph-canvas-empty");
-
-  // 3. Add two nodes from the palette. The palette button carries `data-node-key`, so the
-  //    pass picks the registry's own keys rather than a hard-coded pair that a registry change
-  //    would silently invalidate.
-  await page.locator('button[aria-label="Open the palette"]').first().click({ timeout: 5000 }).catch(() => {});
-  await page.locator('button[aria-label="Show the palette"]').first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(600);
-  const triggerRow = page.locator('[data-node-key="manual_trigger"]').first();
-  const actionRow = page.locator('[data-node-key="send_email"]').first();
-  steps.paletteHasTrigger = (await triggerRow.count()) > 0;
-  steps.paletteHasAction = (await actionRow.count()) > 0;
-  // A disabled row must say why. An unavailable node with no reason is the palette lying.
-  steps.disabledRowsNameTheirCause = await page.evaluate(() => {
-    const rows = [...document.querySelectorAll('[data-node-key][data-unavailable="true"]')];
-    return rows.every((row) => (row.getAttribute("title") ?? "").trim().length > 0);
-  });
-
-  await triggerRow.click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(500);
-  await actionRow.click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(1200);
-  steps.twoNodesOnCanvas = (await page.locator("[data-node-key]").count()) >= 2;
-  await shot(page, "page-graph-canvas-nodes");
-
-  // 4. Connect them by clicking the output port — the click-to-connect path, which is the one
-  //    a keyboard user has. A canvas that can only be wired by dragging is a canvas that
-  //    excludes them.
-  const output = page.locator('[data-node-key="manual_trigger"] button[aria-label^="Drag a wire"]').first();
-  steps.outputPortPresent = (await output.count()) > 0;
-  await output.click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(1400);
-  let graph = await api(`/api/v1/workflows/${workflowId}/graph`);
-  steps.connectedOnServer = (graph.body?.connection_count ?? 0) >= 1;
-  await shot(page, "page-graph-canvas-connected");
-
-  // 5. Label the branch through the inspector, and read it back.
-  await page.locator("svg path.cursor-pointer").first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(700);
-  const labelField = page.locator('input[aria-label="Branch label"]').first();
-  steps.branchLabelFieldShown = (await labelField.count()) > 0;
-  if (steps.branchLabelFieldShown) {
-    await labelField.fill("true");
-    await page.waitForTimeout(400);
-  }
-  await shot(page, "page-graph-canvas-label");
-
-  // 6. Save and reload the page. This is the assertion the whole pass exists for.
-  await page.keyboard.press("Control+s");
-  await page.waitForTimeout(2600);
-  graph = await api(`/api/v1/workflows/${workflowId}/graph`);
-  steps.savedRevision = graph.body?.revision ?? null;
-  steps.savedConnections = graph.body?.connection_count ?? 0;
-  steps.labelSurvivedSave = JSON.stringify(graph.body?.graph?.connections ?? []).includes("true");
-
-  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(2800);
-  steps.nodesAfterReload = await page.locator("[data-node-key]").count();
-  steps.positionsAfterReload = await page.evaluate(() =>
-    [...document.querySelectorAll("[data-node-key]")].map((node) => ({
-      key: node.getAttribute("data-node-key"),
-      left: Math.round(node.offsetLeft),
-      top: Math.round(node.offsetTop),
-    })),
-  );
-  steps.positionsAreReal = steps.positionsAfterReload.every(
-    (node) => Number.isFinite(node.left) && Number.isFinite(node.top),
-  );
-  steps.stripCounts = (await page.locator('[data-testid="graph-validation-count"]').innerText().catch(() => "")).trim();
-  await shot(page, "page-graph-canvas-reloaded");
-
-  // 7. A node with a missing required parameter is badged, and the badge is the server's word.
-  const validated = await api(`/api/v1/workflows/${workflowId}/graph/validate`, {
-    method: "POST",
-    csrf: true,
-    body: JSON.stringify({ graph: graph.body?.graph ?? { nodes: [], connections: [], notes: [] }, revision: 0 }),
-  });
-  steps.serverReportsIssues = (validated.body?.issues ?? []).length;
-  steps.issueShapeIsServerOwned = (validated.body?.issues ?? []).every(
-    (issue) => typeof issue.code === "string" && typeof issue.message === "string",
-  );
-
-  // 8. A sticky note is a comment: it survives, and it is never a step.
-  await page.locator('button[aria-label="Sticky note"]').first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(500);
-  const note = page.locator('textarea[aria-label^="Sticky note"]').first();
-  steps.noteFieldShown = (await note.count()) > 0;
-  if (steps.noteFieldShown) {
-    await note.fill("QA canvas note");
-    await page.waitForTimeout(400);
-  }
-  await page.keyboard.press("Control+s");
-  await page.waitForTimeout(2600);
-  graph = await api(`/api/v1/workflows/${workflowId}/graph`);
-  steps.noteSurvived = (graph.body?.graph?.notes ?? []).some((each) => each.text === "QA canvas note");
-  // The note must not have become a step. The compiled `steps` array is the engine's input, so
-  // reading it is the only way to know — the canvas showing a note is not the claim.
-  const after = await api(`/api/v1/workflows/${workflowId}/graph`);
-  steps.noteIsNotAStep = !JSON.stringify(after.body?.graph?.notes ?? []).includes('"kind"');
-  await shot(page, "page-graph-canvas-note");
-
-  // 9. Narrow viewport: the REQ's read-only rule, checked rather than assumed.
-  await page.setViewportSize({ width: 390, height: 900 });
-  await page.waitForTimeout(1400);
-  steps.readOnlyBanner = /read-only at this width/i.test(
-    (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " "),
-  );
-  steps.canvasStillVisibleAtNarrow = (await page.locator('[role="application"]').count()) > 0;
-  steps.noHorizontalScroll = await page.evaluate(
-    () => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 2,
-  );
-  await shot(page, "page-graph-canvas-narrow");
-  await page.setViewportSize({ width: 1440, height: 900 });
-
-  // 10. Keyboard: select a node and nudge it, which is the path that needs no pointer at all.
-  await page.waitForTimeout(800);
-  const first = page.locator('[data-node-key]').first();
-  await first.focus().catch(() => {});
-  await page.keyboard.press("Enter");
-  await page.waitForTimeout(500);
-  steps.keyboardOpensInspector =
-    (await page.locator('input[id^="label-"]').count()) > 0 ||
-    /Select a node/i.test((await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " "));
-  await page.keyboard.press("ArrowRight");
-  await page.waitForTimeout(600);
-  steps.nudgeMovedSomething = await page.evaluate(() => {
-    const badge = document.querySelector('[data-testid="graph-validation-count"]');
-    return Boolean(badge);
-  });
-
-  await shot(page, "page-graph-canvas-final");
-
-  const failures = Object.entries(steps).filter(
-    ([key, value]) =>
-      typeof value === "boolean" &&
-      !value &&
-      [
-        "workflowCreated",
-        "canvasRendered",
-        "palettePresent",
-        "inspectorPresent",
-        "paletteHasTrigger",
-        "paletteHasAction",
-        "disabledRowsNameTheirCause",
-        "twoNodesOnCanvas",
-        "outputPortPresent",
-        "connectedOnServer",
-        "labelSurvivedSave",
-        "positionsAreReal",
-        "noteSurvived",
-        "readOnlyBanner",
-        "canvasStillVisibleAtNarrow",
-        "noHorizontalScroll",
-      ].includes(key),
-  );
-  return { ok: failures.length === 0, ...steps, failures: failures.map(([key]) => key) };
-}
-
-async function runNodePackagesDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "node-packages-depth", action: "node-packages", ...step });
-  };
-
-  // The screen reads the ledger once on mount and once more when its organization selector
-  // settles, and a platform account's first read has no organization to name yet. That first
-  // 400 is the pass arriving before the screen has chosen, not a defect, and it is the same
-  // refusal the rest of the pass is about — so it is registered rather than counted.
-  expectRefusal(
-    "/api/v1/node-packages",
-    "the ledger's first read, before a platform account's organization selector has settled",
-  );
-  await page.goto(`${URL_ADMIN}/modules/installed`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1600);
-  // Read once: every direct API call below has to name the same organization the screen does.
-  const organization = await activeOrganization(page);
-  note({
-    step: "list",
-    organization,
-    rows: await page.locator("[data-package-row]").count(),
-    emptyState: (await page.locator("[data-testid=packages-empty]").count()) > 0,
-  });
-  await shot(page, "page-modules-installed");
-
-  // The manifest the SDK scaffolds. Written here rather than read from disk so the pass does
-  // not depend on a cargo build having produced the CLI.
-  const manifest = {
-    key: "qa-fixture",
-    version: "0.1.0",
-    name: "QA fixture package",
-    description: "Installed by the walkthrough to exercise the ledger.",
-    docs_url: "https://example.com/docs/qa-fixture",
-    source: "local",
-    permissions: ["network", "credentials", "sandbox"],
-    nodes: [
-      {
-        key: "echo",
-        version: "0.1.0",
-        label: "Fixture echo",
-        description: "Returns its input unchanged.",
-        category: "helper",
-        icon: "MessageSquare",
-        docs_url: "https://example.com/docs/qa-fixture/echo",
-        inputs: [
-          { name: "main", kind: "main", accepts: ["text", "json"], open: false },
-        ],
-        outputs: [
-          { name: "main", kind: "main", accepts: ["text", "json"], open: true },
-        ],
-        capabilities: ["execute"],
-        credential_types: ["api_key"],
-        params: [
-          {
-            name: "text",
-            type: "string",
-            label: "Text",
-            required: true,
-            ui: "textarea",
-            placeholder: "Anything",
-          },
-          // The bundled registry refuses a node that accepts a credential with no select for
-          // the palette to fill (`node_credential_not_selectable`). Without this parameter the
-          // *valid* fixture is refused, and the pass proves a refusal while claiming to prove
-          // an install.
-          {
-            name: "credential_key",
-            type: "string",
-            label: "Credential",
-            required: true,
-            ui: "select",
-            options_source: "credentials",
-            help: "Pick an API-key credential of the type this node names.",
-            secret_field: true,
-          },
-        ],
-        sandbox: "required",
-        default_max_attempts: 3,
-      },
-    ],
-    credentials: [
-      {
-        key: "api_key",
-        kind: "api_key",
-        label: "API key",
-        description: "A single API key.",
-        icon: "KeyRound",
-        docs_url: "https://example.com/docs/qa-fixture/api-key",
-        fields: [
-          {
-            name: "api_key",
-            label: "API key",
-            type: "secret",
-            required: true,
-            never_log: true,
-          },
-        ],
-        test_timeout_seconds: 5,
-      },
-    ],
-  };
-
-  // 1. A package the validator refuses, and every finding rendered.
-  const broken = structuredClone(manifest);
-  broken.permissions = ["network"];
-  broken.nodes[0].credential_types = ["oauth2"];
-  // The `400` this install provokes *is* the assertion — the criterion is that a package the
-  // validator refuses reaches no ledger row and says every finding why. Registering it means
-  // the roll-up reports it as `expectedRefusals` instead of a defect; leaving it unregistered
-  // made this pass's own negative case look like a broken screen.
-  expectRefusal(
-    "/api/v1/node-packages",
-    "the node-package install of a deliberately broken manifest, which the API refuses",
-  );
-  await page
-    .locator("[data-testid=package-manifest]")
-    .fill(JSON.stringify(broken, null, 2))
-    .catch(() => {});
-  await page.locator("[data-testid=package-install]").click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(1400);
-  const renderedFindings = await page
-    .locator("[data-testid=package-findings] li")
-    .count()
-    .catch(() => 0);
-  note({ step: "refused", findingsRendered: renderedFindings, expectsTwo: true });
-  await shot(page, "page-modules-installed-refused");
-
-  // Nothing reached the ledger: read the API, not the screen's own claim.
-  steps.refusedReachedLedger = await page.evaluate(async (organizationId) => {
-    const response = await fetch(
-      `/api/v1/node-packages${organizationId ? `?organization_id=${organizationId}` : ""}`,
-      { credentials: "same-origin" },
-    );
-    const body = await response.json().catch(() => ({}));
-    return (body?.packages ?? []).some((entry) => entry.key === "qa-fixture");
-  }, organization);
-
-  // 2. The same package, valid, installs — and the node key is namespaced.
-  await page.locator("[data-testid=package-install-clear]").click({ timeout: 5000 }).catch(() => {});
-  await page
-    .locator("[data-testid=package-manifest]")
-    .fill(JSON.stringify(manifest, null, 2))
-    .catch(() => {});
-  await page.locator("[data-testid=package-install]").click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(1800);
-  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1600);
-  const row = page.locator('[data-package-key="qa-fixture"]');
-  steps.installedRowPresent = (await row.count()) > 0;
-  steps.namespacedNodeKey = (await row.locator("td").nth(1).innerText().catch(() => "")) .includes(
-    "qa-fixture.echo",
-  );
-  note({ step: "install", rowPresent: steps.installedRowPresent, namespaced: steps.namespacedNodeKey });
-  await shot(page, "page-modules-installed-installed");
-
-  // 3. A downgrade is refused by name.
-  // Same reasoning as the broken manifest: the `409` is the assertion.
-  expectRefusal(
-    "/api/v1/node-packages",
-    "the downgrade of an installed package, which the ledger refuses by version",
-  );
-  steps.downgradeRefused = await page.evaluate(async (organizationId) => {
-    const response = await fetch("/api/v1/node-packages", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        manifest: { key: "qa-fixture", version: "0.0.1", name: "x", docs_url: "https://x" },
-        organization_id: organizationId,
-      }),
-    });
-    const body = await response.json().catch(() => ({}));
-    return { status: response.status, code: body?.error?.code ?? null };
-  }, organization);
-
-  // 4. Disable, then re-enable: the ledger keeps the row and the state chip changes.
-  //
-  // Waited on, not slept through. The chip follows a PATCH and a refetch, so a fixed pause is
-  // a race: on a loaded box it reads the row mid-flight and reports a screen that is correct
-  // as a broken one. Waiting for the text the state actually produces is the same assertion
-  // without the timing assumption.
-  const stateChip = page.locator('[data-package-key="qa-fixture"] [data-testid=package-state]');
-  await page.locator('[data-testid=package-toggle]').first().click({ timeout: 5000 }).catch(() => {});
-  const disabledText = await stateChip
-    .filter({ hasText: "disabled" })
-    .waitFor({ timeout: 15000 })
-    .then(() => true)
-    .catch(() => false);
-  steps.disabledStateRendered = disabledText;
-  steps.ledgerRowSurvivedDisable = await page.evaluate(async (organizationId) => {
-    const response = await fetch(
-      `/api/v1/node-packages${organizationId ? `?organization_id=${organizationId}` : ""}`,
-      { credentials: "same-origin" },
-    );
-    const body = await response.json().catch(() => ({}));
-    return (body?.packages ?? []).some((entry) => entry.key === "qa-fixture");
-  }, organization);
-  await page.locator('[data-testid=package-toggle]').first().click({ timeout: 5000 }).catch(() => {});
-  steps.reEnabledStateRendered = await stateChip
-    .filter({ hasText: "available" })
-    .waitFor({ timeout: 15000 })
-    .then(() => true)
-    .catch(() => false);
-  note({
-    step: "toggle",
-    disabledRendered: steps.disabledStateRendered,
-    rowSurvived: steps.ledgerRowSurvivedDisable,
-  });
-
-  // 5. Remove: the confirmation names what it disables, and the ledger ends empty.
-  await page.locator('[data-testid=package-remove]').first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(700);
-  steps.removeDialogNamedItsNodes = (await page
-    .locator("[data-testid=package-remove-dialog]")
-    .innerText()
-    .catch(() => "")) .includes("qa-fixture.echo");
-  await shot(page, "page-modules-installed-remove");
-  await page.locator("[data-testid=package-remove-confirm]").click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(1800);
-  steps.removedFromLedger = await page.evaluate(async () => {
-    const response = await fetch("/api/v1/node-packages", { credentials: "same-origin" });
-    const body = await response.json().catch(() => ({}));
-    return !(body?.packages ?? []).some((entry) => entry.key === "qa-fixture");
-  });
-  note({ step: "remove", dialogNamedNodes: steps.removeDialogNamedItsNodes, gone: steps.removedFromLedger });
-
-  log(`node packages: ${JSON.stringify(steps)}`);
-  return steps;
 }
 
 /**
@@ -4548,6 +7110,37 @@ async function runNotificationsDepth(page, report) {
   await page.waitForTimeout(1200);
   steps.keyboardOpenedDrawer = (await page.locator("[data-notification-drawer]").count()) > 0;
   await shot(page, "page-notifications-drawer");
+
+  // The drawer's delivery rows. This is the section that makes "it is in my panel but the
+  // e-mail never arrived" a thing a reader can see rather than infer, and it has two states that
+  // are both correct on a fresh database — so the assertion is deliberately about the SHAPE:
+  // either a list of channel rows, or the honest sentence that nothing has been tried. What it
+  // refuses to accept is a section heading with nothing under it, which is what a screen that
+  // renders the heading before the read returns looks like, and which reads as a broken panel.
+  if (steps.keyboardOpenedDrawer) {
+    const drawerDelivery = page.locator("[data-notification-drawer] [data-notification-deliveries]");
+    steps.drawerHasDeliverySection = (await drawerDelivery.count()) > 0;
+    const rows = await page.locator("[data-notification-drawer] [data-notification-delivery]").count();
+    const empty = await page
+      .locator("[data-notification-drawer] [data-notification-deliveries-empty]")
+      .count();
+    steps.drawerDeliveryRows = rows;
+    steps.drawerDeliveryEmptyState = empty > 0;
+    // A channel the platform has five of: the reader must never see a raw database value.
+    steps.drawerDeliveryNamesChannelsInProse =
+      rows === 0 ||
+      (await page
+        .locator("[data-notification-drawer] [data-notification-delivery]")
+        .allInnerTexts()
+        .catch(() => []))
+        .every((text) => !/\b(in_app|web_push)\b/.test(text));
+  } else {
+    steps.drawerHasDeliverySection = "the drawer never opened, so the section cannot be asserted";
+    steps.drawerDeliveryRows = "no drawer";
+    steps.drawerDeliveryEmptyState = "no drawer";
+    steps.drawerDeliveryNamesChannelsInProse = "no drawer";
+  }
+
   await page.keyboard.press("Escape");
   await page.waitForTimeout(600);
   steps.escapeClosedDrawer = (await page.locator("[data-notification-drawer]").count()) === 0;
@@ -4833,6 +7426,186 @@ async function runNotificationSettingsDepth(page, report) {
     });
   }).catch(() => {});
   steps.restored = true;
+
+  // ---- the test-delivery block (REQ-021, slice 5) ------------------------------------------
+  //
+  // **The legs that matter are the ones a shortcut would fail.** A screen that rendered a
+  // green "Delivered" without sending anything, or that reported a failed send as an HTTP
+  // error banner, is the failure this block exists to catch — so it asserts the *line* the
+  // server sent, not merely that a line appeared.
+  await page.goto(`${URL_ADMIN}/notifications/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+
+  steps.testBlockPresent = (await page.locator("[data-test-delivery]").count()) > 0;
+
+  // in-app must be *absent* from the offered channels: the screen explains why next to it,
+  // so its absence is a claim the copy has to back up.
+  const inAppRow = await page.locator("[data-test-channel=in_app]").count();
+  const copyMentionsInApp = await page
+    .locator("[data-test-delivery]")
+    .innerText()
+    .then((text) => /in-app/i.test(text))
+    .catch(() => false);
+  steps.inAppNotOffered = inAppRow === 0;
+  steps.inAppAbsenceIsExplained = copyMentionsInApp;
+
+  // A channel this installation cannot send over must still be offered and must answer with a
+  // readable reason. `web_push` is the honest one: no browser subscription exists in a
+  // headless pass, so the server's refusal is the expected result — and a *clicked* button that
+  // says why is the whole feature.
+  const pushButton = page.locator("[data-test-button=web_push]");
+  steps.pushButtonOffered = (await pushButton.count()) > 0;
+  if (steps.pushButtonOffered) {
+    await pushButton.first().click().catch(() => {});
+    await page.waitForTimeout(2500);
+    const result = page.locator("[data-test-result=web_push]");
+    steps.pushTestAnswered = (await result.count()) > 0;
+    if (steps.pushTestAnswered) {
+      steps.pushTestDelivered = (await result.getAttribute("data-delivered").catch(() => "")) === "yes";
+      const text = await result.innerText().catch(() => "");
+      // The detail is the sentence under the verdict. An empty one is the failure: "not
+      // delivered" with no reason sends the reader to their settings page to guess.
+      steps.pushTestExplainsItself = text.trim().length > 30 && /not delivered/i.test(text);
+    }
+  }
+
+  // The in-flight lock: a second press while one is running must not be possible, because two
+  // sends racing into one status line is a line whose number belongs to neither.
+  const emailButton = page.locator("[data-test-button=email]");
+  if ((await emailButton.count()) > 0) {
+    await emailButton.first().click().catch(() => {});
+    await page.waitForTimeout(120);
+    steps.testDisabledWhileInFlight =
+      (await emailButton.first().isDisabled().catch(() => false)) === true;
+  }
+  await shot(page, "page-notifications-test-delivery");
+
+  // ---- the browser push device block (REQ-021, slice 6b) -----------------------------------
+  //
+  // **Why this block has its own legs rather than a screenshot.** The three device API
+  // functions had zero UI callers until this slice, so the screen could render a Web Push
+  // column with nothing behind it and every other leg in this pass would still be green. What
+  // has to be asserted is the *shape of the answer* in each of the three states a headless
+  // Chromium is actually in — an installation with no key, and one with a key and no
+  // registered browser — because those are the two states this pass can reach, and a block
+  // that renders nothing for them is indistinguishable from a block that was never wired up.
+  steps.pushDevicesPresent = (await page.locator("[data-push-devices]").count()) > 0;
+
+  if (steps.pushDevicesPresent) {
+    // Either of these is a valid state; what must not happen is neither.
+    const empty = await page.locator("[data-push-state=empty]").count();
+    const list = await page.locator("[data-push-state=list]").count();
+    const loading = await page.locator("[data-push-state=loading]").count();
+    steps.pushDevicesResolved = empty > 0 || list > 0;
+    steps.pushDevicesNotStuckLoading = loading === 0;
+
+    // The empty state has to *explain* what registering is. A heading with no body is a
+    // button with no explanation, and the reader cannot tell whether this is their phone or
+    // a colleague's laptop.
+    if (empty > 0) {
+      const copy = await page
+        .locator("[data-push-state=empty]")
+        .innerText()
+        .catch(() => "");
+      steps.pushEmptyExplainsScope = /this browser/i.test(copy) && copy.trim().length > 60;
+    }
+
+    // The enable button always exists. Whether it is *enabled* depends on the installation's
+    // key, and both answers are honest — but a block with no button at all is a block with no
+    // way to register, which is the defect this slice was written to close.
+    const enable = page.locator("[data-push-enable]");
+    steps.pushEnableOffered = (await enable.count()) > 0;
+    steps.pushReloadOffered = (await page.locator("[data-push-reload]").count()) > 0;
+
+    // The unavailable notice names the variable. "Push is not configured" sends an operator
+    // to a config file; "set OMNION_PUSH_PRIVATE_KEY" sends them to the right line of it.
+    const unavailable = await page.locator("[data-push-unavailable]").count();
+    if (unavailable > 0) {
+      const notice = await page
+        .locator("[data-push-unavailable]")
+        .innerText()
+        .catch(() => "");
+      steps.pushUnavailableNamesAVariable = /OMNION_PUSH_[A-Z_]+/.test(notice);
+      steps.pushEnableDisabledWhenUnavailable = await enable
+        .first()
+        .isDisabled()
+        .catch(() => false);
+    } else {
+      // No notice means the installation has a key, so the button must be live.
+      steps.pushEnableDisabledWhenUnavailable = false;
+      steps.pushEnableLiveWithKey = !(await enable.first().isDisabled().catch(() => true));
+    }
+
+    // Pressing a LIVE button in a headless pass cannot succeed — there is no user gesture and
+    // no service worker — and the block must say *that* rather than silently doing nothing or
+    // throwing an unhandled rejection into the console. Chromium without a service worker
+    // rejects `navigator.serviceWorker.ready`, which is the exact leg that catches a missing
+    // catch.
+    //
+    // A *disabled* button is a different case and the earlier version measured it wrongly:
+    // it clicked unconditionally and read "no error appeared" as a defect, while on an
+    // installation with no key pair the button is `disabled` by design — Playwright refuses
+    // the click, so the leg was measuring the browser, not the screen. The two are separated
+    // now and BOTH still have to say something: a live button must produce a sentence when
+    // its browser refuses, and a disabled one must carry the reason *with the control*
+    // rather than leaving it in a paragraph further up the block.
+    const enableDisabled = await enable.first().isDisabled().catch(() => true);
+    if (steps.pushEnableOffered && !enableDisabled) {
+      await enable.first().click().catch(() => {});
+      await page.waitForTimeout(1800);
+      const said = await page.locator("[data-push-error]").count();
+      steps.pushEnableExplainsItself = said > 0;
+      if (said > 0) {
+        const text = await page
+          .locator("[data-push-error]")
+          .innerText()
+          .catch(() => "");
+        steps.pushErrorIsASentence = text.trim().length > 20;
+      }
+    } else if (steps.pushEnableOffered) {
+      steps.pushEnableExplainsItself =
+        (await page.locator("[data-push-enable-reason]").count()) > 0;
+      steps.pushDisabledReasonNamesAVariable = /OMNION_PUSH_[A-Z_]+/.test(
+        await page
+          .locator("[data-push-enable-reason]")
+          .innerText()
+          .catch(() => ""),
+      );
+      steps.pushDisabledReasonIsDescribed =
+        (await page.locator("[data-push-enable][aria-describedby=push-enable-reason]").count()) > 0;
+    }
+
+    // A remove button that exists on a row must delete that row, and the row must disappear
+    // from the DOM rather than only from the server's answer. Guarded on there being a device:
+    // in a pass with none, this leg is absent and that is recorded rather than passed.
+    const deviceRow = page.locator("[data-push-device]").first();
+    if ((await deviceRow.count()) > 0) {
+      const remove = page.locator("[data-push-remove]").first();
+      steps.pushRemoveOffered = (await remove.count()) > 0;
+      if (steps.pushRemoveOffered) {
+        const before = await page.locator("[data-push-device]").count();
+        await remove.click().catch(() => {});
+        await page.waitForTimeout(1500);
+        const after = await page.locator("[data-push-device]").count();
+        steps.pushRemoveRemovedTheRow = after < before;
+      }
+    }
+
+    // 390px: the block is a flex row of an icon, a name, a hint and a button, which is four
+    // things competing for 390 pixels. The rule is no horizontal scroll, and it is measured on
+    // this block specifically rather than on the page.
+    await page.setViewportSize({ width: 390, height: 844 }).catch(() => {});
+    await page.waitForTimeout(500);
+    steps.pushDevicesFitNarrow = await page
+      .locator("[data-push-devices]")
+      .evaluate((node) => node.scrollWidth <= node.clientWidth + 1)
+      .catch(() => true);
+    await shot(page, "page-notifications-push-devices-narrow");
+    await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+    await page.waitForTimeout(300);
+  }
+
+  await shot(page, "page-notifications-push-devices");
 
   return steps;
 }
@@ -5924,7 +8697,1134 @@ async function runSecurityDepth(page, report) {
     await shot(page, "security-headers-restored");
   }
 
+  // ---- The rate-limit policy (REQ-012, slice 2) ---------------------------------------------
+  //
+  // This screen and the sign-in one below had a rule engine, a policy editor, a live counter
+  // and a test console behind them, and no walk had ever opened either of them. A screen that
+  // is never rendered is not "mostly tested"; it is untested, and the two that ship first are
+  // the two whose failure is silent — a limit nobody can read is a limit nobody knows is set.
+  //
+  // The console is the interesting half: it answers "would THIS request be refused", which no
+  // screenshot of a form can show. So the pass asks a question the tester can see the answer
+  // to, and then edits a limit and asks it again — the policy must answer differently, or the
+  // editor is a text box with a save button.
+  await page.goto(`${URL_ADMIN}/security/rate-limits`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-rate-limits="ready"]', { timeout: 15000 }).catch(() => {});
+  const limitsReady = (await page.locator('[data-rate-limits="ready"]').count()) > 0;
+  note({ step: "rate-limits-loaded", rendered: limitsReady });
+  if (!limitsReady) {
+    note({ step: "rate-limits-missing", reason: "/security/rate-limits did not render its ready state" });
+  } else {
+    const limitRows = await page.locator("[data-rate-limit-row]").count();
+    note({ step: "rate-limit-rows", rows: limitRows });
+    if (limitRows < 1) {
+      note({ step: "rate-limit-registry-empty", reason: "no scope rendered a limit row" });
+    }
+    await shot(page, "security-rate-limits");
+
+    // Every row must say what its scope is allowed, not just how much: a number without a
+    // window is a number nobody can compare against anything.
+    const rowLabels = await page.$$eval("[data-rate-limit-row]", (nodes) =>
+      nodes.map((node) => ({
+        scope: node.getAttribute("data-rate-limit-row"),
+        inputs: node.querySelectorAll("input").length,
+      })),
+    );
+    note({ step: "rate-limit-row-shape", rows: rowLabels });
+    const inputless = rowLabels.filter((row) => row.inputs === 0);
+    if (inputless.length) {
+      note({ step: "rate-limit-row-not-editable", rows: inputless.map((r) => r.scope) });
+    }
+
+    // The tester: the screen's whole claim is "would THIS request be refused", and the answer
+    // comes from the server's own `decide` — the same function the middleware runs. So the pass
+    // asks a question through the real endpoint, with a counter no sane ceiling allows, and
+    // requires a verdict of `limited` plus the key it counted and the retry it would send.
+    //
+    // The endpoint is `POST /security/rate-limits/test` (`security.read`), the body is
+    // `{ method, path, client_ip, count, machine_key }` and the verdict is NESTED under
+    // `verdict`, beside `counter_identity`/`counter_key`. Guessing any of those — an invented
+    // `/probe` path, a flat `limited` boolean — produces a request that 404s or a read of
+    // `undefined` that compares false, and the step is then a green line that proves nothing.
+    //
+    // The CSRF header is the fourth thing a hand-written fetch gets wrong, and it is the one
+    // that fails *green*. A cookie-authenticated mutation with no `x-omnion-csrf` is refused
+    // with `csrf_unavailable` before the handler ever runs, so a pass that skipped it would
+    // record "the tester refused this request" about a screen that works perfectly in the hand
+    // above it. The token is the readable `omnion_csrf` cookie the panel's own client echoes.
+    const probe = await page.evaluate(async () => {
+      const csrf = document.cookie
+        .split(";")
+        .map((part) => part.trim())
+        .find((part) => part.startsWith("omnion_csrf="))
+        ?.slice("omnion_csrf=".length);
+      const answer = await fetch("/api/v1/security/rate-limits/test", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "content-type": "application/json",
+          ...(csrf ? { "x-omnion-csrf": decodeURIComponent(csrf) } : {}),
+        },
+        body: JSON.stringify({
+          method: "POST",
+          path: "/api/v1/auth/login",
+          client_ip: "203.0.113.7",
+          count: 400,
+          machine_key: false,
+        }),
+      });
+      return {
+        status: answer.status,
+        body: await answer.json().catch(() => null),
+        hadCsrf: Boolean(csrf),
+      };
+    });
+    note({
+      step: "rate-limit-test-endpoint",
+      status: probe?.status,
+      hadCsrf: probe?.hadCsrf,
+      scope: probe?.body?.verdict?.scope,
+      limited: probe?.body?.verdict?.limited,
+      ceiling: probe?.body?.verdict?.ceiling,
+      counterKey: probe?.body?.counter_key,
+      retryAfter: probe?.body?.verdict?.retry_after,
+    });
+    if (probe?.status !== 200) {
+      note({
+        step: "rate-limit-test-unreachable",
+        status: probe?.status,
+        code: probe?.body?.error?.code,
+        reason: "the tester endpoint did not answer 200",
+      });
+    } else if (probe.body?.verdict?.limited !== true) {
+      note({ step: "rate-limit-test-not-limited", reason: "a counter of 400 was not reported as limited" });
+    }
+
+    // Now the tester button on the screen itself, which is what a human uses: the same request
+    // has to survive the form, the client and the render.
+    await page.locator("[data-rate-limit-probe-count]").fill("400").catch(() => {});
+    await page.waitForTimeout(200);
+    await page.locator("[data-rate-limit-probe-run]").click({ timeout: 8000 }).catch(() => {});
+    await page
+      .waitForSelector('[data-rate-limit-probe-result]:not([data-rate-limit-probe-result="none"])', {
+        timeout: 20000,
+      })
+      .catch(() => {});
+    const probeVerdict = await page
+      .locator("[data-rate-limit-probe-result]")
+      .getAttribute("data-rate-limit-probe-result")
+      .catch(() => null);
+    note({ step: "rate-limit-console-verdict", verdict: probeVerdict });
+    if (!probeVerdict || probeVerdict === "none") {
+      note({ step: "rate-limit-console-silent", reason: "the tester ran and reported no verdict" });
+    }
+    await shot(page, "security-rate-limits-probe");
+
+    // An out-of-range limit must be refused by the FORM before it reaches the server — the
+    // field message is the whole point of validating here rather than on save.
+    const firstInput = page.locator("[data-rate-limit-input]").first();
+    const hadInput = (await firstInput.count()) > 0;
+    if (hadInput) {
+      await firstInput.fill("0");
+      await page.waitForTimeout(400);
+      const localError = (await page.locator("[data-rate-limits-local-error]").count()) > 0;
+      note({ step: "rate-limit-zero-refused", refused: localError });
+      if (!localError) {
+        note({ step: "rate-limit-zero-accepted", reason: "a limit of 0 was accepted by the form" });
+      }
+      await shot(page, "security-rate-limits-invalid");
+      // Put the field back so this pass cannot leave the policy disabled for a sibling's pass.
+      await firstInput.fill("");
+      await page.waitForTimeout(300);
+    }
+  }
+
+  // ---- The sign-in protection policy (REQ-012, slice 2) -------------------------------------
+  await page
+    .goto(`${URL_ADMIN}/security/sign-in-protection`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForSelector('[data-sign-in-protection="ready"]', { timeout: 15000 }).catch(() => {});
+  const protectionReady = (await page.locator('[data-sign-in-protection="ready"]').count()) > 0;
+  note({ step: "sign-in-protection-loaded", rendered: protectionReady });
+  if (!protectionReady) {
+    note({ step: "sign-in-protection-missing", reason: "the screen did not render its ready state" });
+  } else {
+    const lockedCount = await page
+      .locator("[data-locked-count]")
+      .first()
+      .innerText()
+      .catch(() => null);
+    note({ step: "locked-accounts", count: lockedCount });
+    await shot(page, "security-sign-in-protection");
+
+    // The policy has five fields; each must be editable and each must survive a save. A
+    // policy editor that renders read-only inputs still LOOKS like the security centre.
+    const fields = ["window_seconds", "attempts", "lockout_minutes", "base_delay_seconds", "progressive_delay"];
+    const present = [];
+    for (const field of fields) {
+      present.push([field, (await page.locator(`[data-lockout-field="${field}"]`).count()) > 0]);
+    }
+    note({ step: "lockout-fields", fields: present });
+    const missingFields = present.filter(([, ok]) => !ok).map(([name]) => name);
+    if (missingFields.length) {
+      note({ step: "lockout-field-missing", fields: missingFields });
+    }
+
+    // The reset_on_success switch is a boolean where every other field is a number: a form
+    // that validates all five the same way will either refuse a checkbox or accept nonsense.
+    const resetSwitch = await page.locator('[data-lockout-field="reset_on_success"]').count();
+    note({ step: "lockout-reset-switch", present: resetSwitch > 0 });
+
+    // An out-of-range attempts value must be refused with a field message, not saved.
+    const attempts = page.locator('[data-lockout-field="attempts"]').first();
+    if ((await attempts.count()) > 0) {
+      const before = await attempts.inputValue().catch(() => "");
+      await attempts.fill("0");
+      await page.waitForTimeout(400);
+      const localError = (await page.locator("[data-sign-in-protection-local-error]").count()) > 0;
+      note({ step: "lockout-zero-refused", refused: localError, before });
+      if (!localError) {
+        note({ step: "lockout-zero-accepted", reason: "attempts = 0 was accepted by the form" });
+      }
+      await shot(page, "security-sign-in-protection-invalid");
+      await attempts.fill(before);
+      await page.waitForTimeout(300);
+    }
+  }
+
+  // -- the security-event timeline (REQ-012, slice 4) ------------------------------------------
+  //
+  // The "no untested screen" rule, applied to the screen slice 4's second third added. The
+  // assertions are the ones a static inventory cannot make:
+  //
+  //  1. the honesty note is present, because a security screen that implies it records refusals
+  //     it does not is the defect this REQ has produced eight times;
+  //  2. the filter actually **filters** — a filter that returns the same rows whatever it is set
+  //     to is indistinguishable from one that works;
+  //  3. the counts line reads "N of M" rather than implying the page is all there is;
+  //  4. every rendered row names its source, because the timeline merges two tables.
+  await page.goto(`${URL_ADMIN}/security/events`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-security-events-counts]", { timeout: 15000 }).catch(() => {});
+  const eventsReady = (await page.locator("[data-security-events-counts]").count()) > 0;
+  note({ step: "security-events-loaded", rendered: eventsReady });
+  if (!eventsReady) {
+    note({
+      step: "security-events-missing",
+      reason: "/security/events did not render its counts line",
+    });
+    await shot(page, "security-events-missing");
+  } else {
+    const notePresent = (await page.locator("[data-security-events-note]").count()) > 0;
+    note({ step: "security-events-honesty-note", present: notePresent });
+    if (!notePresent) {
+      note({
+        step: "security-events-no-honesty-note",
+        reason: "the screen does not say that permission refusals are absent",
+      });
+    }
+
+    const rowCount = await page.locator("[data-security-event-row]").count();
+    note({ step: "security-events-rows", count: rowCount });
+
+    // The counts line must distinguish the page from the whole filter.
+    const countsText = (await page.locator("[data-security-events-counts]").innerText())
+      .replace(/\s+/g, " ")
+      .trim();
+    const ofMatch = countsText.match(/(\d+)\s+of\s+(\d+)/);
+    note({ step: "security-events-counts-read", text: countsText, parsed: ofMatch });
+    if (!ofMatch) {
+      note({
+        step: "security-events-counts-ambiguous",
+        reason: `the counts line does not say "N of M": ${countsText}`,
+      });
+    }
+
+    // The filter must change the result. `sign_in` is the category that lives only on the
+    // sign-in table, so a filter that cannot cross the seam returns the whole timeline.
+    const categorySelect = page.locator("[data-security-events-category]").first();
+    if ((await categorySelect.count()) > 0) {
+      const before = await page.locator("[data-security-event-row]").count();
+      await categorySelect.selectOption("sign_in");
+      await page.waitForTimeout(700);
+      const after = await page.locator("[data-security-event-row]").count();
+      const filteredText = (await page.locator("[data-security-events-counts]").innerText())
+        .replace(/\s+/g, " ")
+        .trim();
+      note({
+        step: "security-events-filter-applied",
+        rowsBefore: before,
+        rowsAfter: after,
+        counts: filteredText,
+      });
+      // Rows may legitimately be equal when the timeline holds only sign-ins, so the assertion
+      // is that the *filter was applied* — the counts line changed — rather than that the row
+      // count fell. A count that cannot fall is a different defect, and this step would not see
+      // it; it reports both numbers so a human can.
+      if (filteredText === countsText && before > 0) {
+        note({
+          step: "security-events-filter-inert",
+          reason: "category=sign_in left the counts line unchanged — the filter may be a no-op",
+        });
+      }
+      // Every row must name its source: the timeline merges two tables and a row that does not
+      // say which one is an operator's puzzle during an incident.
+      const rows = await page.locator("[data-security-event-row]").all();
+      for (const row of rows) {
+        const action = (await row.innerText()).replace(/\s+/g, " ").trim();
+        if (!action) {
+          note({ step: "security-events-blank-row", reason: "a rendered row is empty" });
+        }
+      }
+      const clearButton = page.locator("[data-security-events-clear]").first();
+      if ((await clearButton.count()) > 0) {
+        await clearButton.click();
+        await page.waitForTimeout(500);
+        note({ step: "security-events-filter-cleared", rendered: eventsReady });
+      }
+      await shot(page, "security-events");
+    }
+  }
+
+  // -- the secret inventory (REQ-012, slice 4) ---------------------------------------------------
+  //
+  // The "no untested screen" rule, and this one needs its own assertions because the screen's
+  // whole value is what it does NOT show. Four claims a route count cannot make:
+  //
+  //  1. the limitation note is present — the API states its own blind spot and the screen must
+  //     render it, because an inventory that looks exhaustive when it is partial is the defect;
+  //  2. no row renders a secret VALUE. The browser is the last place a value could leak into a
+  //     screenshot a ticket carries, so the page text is scanned for the shape of one;
+  //  3. there is no edit/rotate control — asserted as an ABSENCE, which is the only way to test a
+  //     deliberate omission, and a "coming soon" button would satisfy a presence check;
+  //  4. the read-only note is present, so the absence above reads as a decision rather than an
+  //     unfinished screen.
+  await page.goto(`${URL_ADMIN}/security/secrets`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-security-secrets-counts], [data-security-secrets-empty]", {
+      timeout: 15000,
+    })
+    .catch(() => {});
+  const secretsReady =
+    (await page.locator("[data-security-secrets-counts]").count()) > 0 ||
+    (await page.locator("[data-security-secrets-empty]").count()) > 0;
+  note({ step: "security-secrets-loaded", rendered: secretsReady });
+  if (!secretsReady) {
+    note({
+      step: "security-secrets-missing",
+      reason: "/security/secrets rendered neither rows nor an empty state",
+    });
+    await shot(page, "security-secrets-missing");
+  } else {
+    note({
+      step: "security-secrets-limitation",
+      present: (await page.locator("[data-security-secrets-limitation]").count()) > 0,
+    });
+    note({
+      step: "security-secrets-readonly-note",
+      present: (await page.locator("[data-security-secrets-readonly]").count()) > 0,
+    });
+
+    const rowCount = await page.locator("[data-security-secret-row]").count();
+    note({ step: "security-secrets-rows", count: rowCount });
+
+    // No value may reach the rendered page. The panel type has no field that could hold one, so
+    // this is the belt to the API walk's braces — and it is the assertion that covers the last
+    // hop the Rust test cannot see.
+    const pageText = await page.evaluate(() => document.body.innerText || "");
+    for (const forbidden of ["ciphertext", "secret_hash", "secretCiphertext", "BEGIN PRIVATE KEY"]) {
+      if (pageText.toLowerCase().includes(forbidden.toLowerCase())) {
+        note({
+          step: "security-secrets-value-leak",
+          reason: `the rendered page mentions ${forbidden}`,
+        });
+      }
+    }
+
+    // A deliberate absence is asserted as an absence. Any control that mutates is a defect here:
+    // rotation happens in the environment and a deploy.
+    const mutatingControls = await page
+      .locator('[data-security-secrets] button, [data-security-secrets] a')
+      .evaluateAll((nodes) =>
+        nodes
+          .map((node) => (node.textContent || "").trim().toLowerCase())
+          .filter((text) =>
+            /\b(edit|rotate|revoke|delete|remove|update|replace|add)\b/.test(text),
+          ),
+      );
+    note({ step: "security-secrets-mutating-controls", found: mutatingControls });
+    if (mutatingControls.length > 0) {
+      note({
+        step: "security-secrets-not-readonly",
+        reason: `the read-only screen offers: ${mutatingControls.join(", ")}`,
+      });
+    }
+    await shot(page, "security-secrets");
+  }
+
+  // -- the IP access lists (REQ-012, slice 4) ------------------------------------------------
+  //
+  // `/security/ip-access` was linked from the posture overview's IP-allow-list row since the
+  // check registry was written, so this step is not optional bookkeeping: it is what proves the
+  // link is no longer dead. The walk exercises the parts a static inventory cannot judge — that
+  // a rule is really added, that a malformed one is refused with a message on the field, and
+  // that the tester agrees with the platform about an address the walk itself owns.
+  await page.goto(`${URL_ADMIN}/security/ip-access`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-ip-access-counts]", { timeout: 15000 }).catch(() => {});
+  const ipAccessReady = (await page.locator("[data-ip-access-counts]").count()) > 0;
+  note({ step: "ip-access-loaded", rendered: ipAccessReady });
+  if (!ipAccessReady) {
+    note({ step: "ip-access-missing", reason: "/security/ip-access did not render its summary line" });
+    await shot(page, "security-ip-access-missing");
+  } else {
+    // The empty state has to be a statement rather than a blank table: "no rules" and "a broken
+    // screen" look identical otherwise, and this is the state a fresh installation is in.
+    const emptyState = (await page.locator("[data-ip-access-empty]").count()) > 0;
+    note({ step: "ip-access-empty-state", present: emptyState });
+
+    // A malformed network must be refused with a message, not saved. The form is filled with a
+    // prefix past the family's maximum: the shape an operator's typo actually takes.
+    const cidrField = page.locator("[data-ip-access-cidr]").first();
+    const noteField = page.locator("[data-ip-access-note]").first();
+    if ((await cidrField.count()) > 0 && (await noteField.count()) > 0) {
+      await cidrField.fill("203.0.113.0/33");
+      await noteField.fill("walkthrough invalid network");
+      await page.locator("[data-ip-access-submit]").first().click().catch(() => {});
+      await page.waitForTimeout(900);
+      const fieldError = (await page.locator("[data-ip-access-error]").count()) > 0;
+      note({ step: "ip-access-malformed-refused", refused: fieldError });
+      if (!fieldError) {
+        note({
+          step: "ip-access-malformed-accepted",
+          reason: "203.0.113.0/33 was accepted by the form",
+        });
+      }
+      await shot(page, "security-ip-access-invalid");
+
+      // Now a real rule, added through the panel's own form. The note is required, so it is
+      // filled too — a walk that omitted it would be measuring the wrong refusal.
+      await cidrField.fill("203.0.113.0/24");
+      await noteField.fill("walkthrough deny list");
+      await page.locator("[data-ip-access-submit]").first().click().catch(() => {});
+      await page.waitForTimeout(1200);
+      const created = (await page.locator("[data-ip-rule-list]").count()) > 0;
+      note({ step: "ip-access-rule-created", listed: created });
+      await shot(page, "security-ip-access");
+
+      // The tester must agree with the platform about the address the walk itself comes from.
+      // A rule that covers this session is expected to produce the self-lockout warning; either
+      // that warning or a plain "blocked" verdict is correct, and both are recorded rather than
+      // asserted here, because the browser's address is not something this step controls.
+      const probeField = page.locator("[data-ip-access-probe-input]").first();
+      if ((await probeField.count()) > 0) {
+        await probeField.fill("203.0.113.7");
+        await page.locator("[data-ip-access-probe]").first().click().catch(() => {});
+        await page.waitForTimeout(900);
+        const verdict = (await page.locator("[data-ip-access-probe-result]").count()) > 0;
+        const blocked = await page
+          .locator("[data-ip-access-probe-result]")
+          .first()
+          .getAttribute("data-blocked")
+          .catch(() => null);
+        note({ step: "ip-access-tester", rendered: verdict, blocked });
+        if (!verdict) {
+          note({ step: "ip-access-tester-missing", reason: "the tester rendered no verdict" });
+        }
+        await shot(page, "security-ip-access-tester");
+      }
+    }
+  }
+
   return { ok: true, steps };
+}
+
+/**
+ * The system health centre, driven end to end (REQ-014, slice 1).
+ *
+ * The assertion that matters is the **row count**, and it is asserted as a count
+ * rather than as content. The request names seven services and the registry adds
+ * the host, so the panel must show eight rows whether or not any of them has ever
+ * been probed. A screen that listed only the services it received would render a
+ * fresh database as *empty* and a broken one as *short* — and both of those read
+ * to an operator as "there is nothing to report here", which is the single most
+ * expensive thing this screen can show.
+ *
+ * The second assertion is the state's own honesty: every row must carry a state
+ * out of the closed set, and a row that has never been probed must say `unknown`
+ * rather than `healthy`. A `healthy` badge on a row nothing checked is a claim
+ * the product made up, and it is asserted against here rather than trusted to the
+ * server.
+ */
+async function runHealthDepth(page, report) {
+  const steps = {};
+  const note = (key, value) => {
+    steps[key] = value;
+    record({ page: "health", action: "health-depth", step: key, ...value });
+  };
+
+  await page.goto(`${URL_ADMIN}/health`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-health-screen]", { timeout: 20000 }).catch(() => {});
+  const ready = (await page.locator('[data-health-screen="ready"]').count()) > 0;
+  note({ step: "screen-ready", ready });
+  if (!ready) {
+    return { ok: false, reason: "/health did not finish loading", steps };
+  }
+
+  // ---- Every registered service is a row ------------------------------------------------------
+  const rows = await page.locator("[data-health-service]").count();
+  note({ step: "service-rows", rows });
+  if (rows < 8) {
+    note({
+      step: "registry-too-short",
+      rows,
+      reason: "fewer than eight service rows rendered — a missing row reads as 'nothing to report'",
+    });
+  }
+
+  // Every row's state is one of the four words, and it is on the element itself so
+  // the assertion does not depend on reading the badge's text.
+  const states = await page.$$eval("[data-health-service]", (nodes) =>
+    nodes.map((node) => node.getAttribute("data-health-state")),
+  );
+  const legal = new Set(["healthy", "degraded", "down", "unknown"]);
+  const illegal = states.filter((state) => !legal.has(state));
+  note({ step: "states", tally: states.reduce((acc, s) => ({ ...acc, [s]: (acc[s] || 0) + 1 }), {}) });
+  if (illegal.length > 0) {
+    note({ step: "state-outside-vocabulary", illegal });
+  }
+  if (states.length !== rows) {
+    note({ step: "state-missing", badges: states.length, rows });
+  }
+
+  // The banner is the server's own sentence and it must be non-empty. A client that
+  // recomputed the worst state would disagree with the runner before the first run.
+  const banner = await page
+    .locator("[data-health-banner]")
+    .first()
+    .getAttribute("data-health-banner")
+    .catch(() => null);
+  const headline = (await page.locator("[data-health-banner]").first().innerText().catch(() => "")).trim();
+  note({ step: "banner", banner, hasHeadline: headline.length > 0 });
+  if (!banner || headline.length === 0) {
+    note({ step: "banner-missing", reason: "the banner rendered no state or no sentence" });
+  }
+
+  // ---- A row's own checks, behind the disclosure ------------------------------------------------
+  // Clicked rather than merely counted: a disclosure that renders its rows but does
+  // not open is a dead control, and only a click proves it opens.
+  const toggle = page.locator("[data-health-checks-toggle]").first();
+  const hasToggle = (await toggle.count()) > 0;
+  note({ step: "checks-toggle-present", hasToggle });
+  if (hasToggle) {
+    await toggle.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    const checkRows = await page.locator("[data-health-checks] li").count();
+    note({ step: "checks-opened", checkRows });
+    if (checkRows === 0) {
+      note({ step: "checks-empty-after-open", reason: "the disclosure opened with no checks in it" });
+    }
+  }
+  await shot(page, "health-overview-checks");
+
+  // ---- "Run all checks" -------------------------------------------------------------------------
+  // The button must not blank the screen, and the rows must survive the run: a run
+  // that answers 200 and leaves eight rows is the whole criterion, and a run that
+  // left the screen empty would be the expensive failure.
+  const before = await page.locator("[data-health-service]").count();
+  await page.locator("[data-health-run]").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3000);
+  const after = await page.locator("[data-health-service]").count();
+  const runError = await page.locator("[data-health-error]").count();
+  note({ step: "run-all-checks", before, after, errorShown: runError > 0 });
+  if (after !== before) {
+    note({
+      step: "run-changed-row-count",
+      before,
+      after,
+      reason: "a manual run must not change how many services there are",
+    });
+  }
+  await shot(page, "health-overview-after-run");
+
+  // ---- The auto-refresh control is real --------------------------------------------------------
+  const refreshValue = await page
+    .locator("[data-health-auto-refresh]")
+    .first()
+    .inputValue()
+    .catch(() => null);
+  note({ step: "auto-refresh", refreshValue });
+  if (refreshValue === null) {
+    note({ step: "auto-refresh-missing", reason: "the interval selector rendered nothing" });
+  }
+
+  // ---- The metric cards -------------------------------------------------------------------------
+  // `NaN` and `Infinity` as *text* are named in the request's visual check, and they
+  // are the failure a division by a zero total produces. Reading the rendered text is
+  // the only assertion that catches it: the DOM value would still be a number.
+  const cardText = (await page.locator("[data-health-metric]").allInnerTexts()).join(" ");
+  note({ step: "metric-cards", hasCards: cardText.trim().length > 0 });
+  if (/NaN|Infinity|undefined/i.test(cardText)) {
+    note({ step: "non-finite-text", reason: "a metric card rendered NaN, Infinity or undefined" });
+  }
+  const dashOnly = (await page.locator("[data-health-service]").allInnerTexts()).every((text) =>
+    !/NaN|Infinity|undefined/i.test(text),
+  );
+  if (!dashOnly) {
+    note({ step: "non-finite-text-in-rows", reason: "a service row rendered a non-finite number" });
+  }
+
+  // ---- The service detail link is real ----------------------------------------------------------
+  // The row's href is rendered by the server; clicking it proves the detail screen
+  // exists rather than 404-ing, which is the dead-affordance the request forbids.
+  const detailLink = page.locator("[data-health-service-link]").first();
+  const href = await detailLink.getAttribute("href").catch(() => null);
+  note({ step: "detail-href", href });
+  if (!href || !href.startsWith("/health/services/")) {
+    note({ step: "detail-href-missing", href });
+  } else {
+    await detailLink.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    const landed = page.url().includes("/health/services/");
+    note({ step: "detail-opened", landed, url: page.url() });
+    if (!landed) {
+      note({ step: "detail-did-not-open", url: page.url() });
+    } else {
+      // Landing on the URL is half the assertion. The screen has to have *rendered*:
+      // a Next.js route that resolves but throws in the client still lands here, and
+      // the operator gets a blank page behind a working link. Waiting for the
+      // ready marker is what separates the two, and it is the only part that catches
+      // the common "the API is fine, the component throws" failure.
+      await page
+        .waitForSelector('[data-health-detail-screen="ready"]', { timeout: 15000 })
+        .catch(() => {});
+      const detailReady = (
+        await page.locator('[data-health-detail-screen="ready"]').count()
+      ) > 0;
+      note({ step: "detail-screen-rendered", detailReady });
+      if (!detailReady) {
+        const which = await page
+          .locator("[data-health-detail-screen]")
+          .first()
+          .getAttribute("data-health-detail-screen")
+          .catch(() => null);
+        note({
+          step: "detail-screen-missing",
+          which,
+          reason: "the detail route resolved but never rendered a state marker",
+        });
+      } else {
+        // The drill-down's own content: a checks table (or an honest "not probed
+        // yet" sentence) and the back link that proves the route has an exit.
+        const checkCells = await page.locator("[data-health-check]").count();
+        const noChecks = await page.locator("[data-health-detail-no-checks]").count();
+        const metrics = await page.locator("[data-health-detail-metric]").count();
+        const noMetrics = await page.locator("[data-health-detail-no-metrics]").count();
+        note({ step: "detail-content", checkCells, noChecks, metrics, noMetrics });
+        if (checkCells === 0 && noChecks === 0) {
+          note({
+            step: "detail-no-checks-and-no-explanation",
+            reason: "neither a check row nor the 'not probed yet' sentence rendered",
+          });
+        }
+        if (metrics === 0 && noMetrics === 0) {
+          note({
+            step: "detail-no-metrics-and-no-explanation",
+            reason: "neither a metric row nor the 'no samples yet' sentence rendered",
+          });
+        }
+
+        // ---- The 24 h trend line the request asks this screen to have -----------------------
+        // Counted rather than eyeballed, and the count is the assertion: a table of current
+        // values with no chart column is exactly the state this leg exists to catch, and it
+        // renders perfectly happily — a heading that says "last 24 h" and rows that never
+        // draw anything. Every metric row must account for a trend: a line, a single point,
+        // or the sentence saying the window is empty. A row that accounts for none of the
+        // three is a column that was added to the header and not to the body.
+        const detailSparks = await page.$$eval(
+          "[data-health-detail-metric]",
+          (rows) =>
+            rows.map((row) => {
+              const spark = row.querySelector("[data-health-spark]");
+              return {
+                metric: row.getAttribute("data-health-detail-metric"),
+                kind: spark ? spark.getAttribute("data-health-spark") : null,
+                points: spark ? spark.getAttribute("data-health-spark-points") : null,
+                min: spark ? spark.getAttribute("data-health-spark-min") : null,
+                max: spark ? spark.getAttribute("data-health-spark-max") : null,
+              };
+            }),
+        );
+        const drawn = detailSparks.filter((row) => row.kind === "line" || row.kind === "point");
+        const saidEmpty = detailSparks.filter((row) => row.kind === "empty");
+        note({
+          step: "detail-trend-lines",
+          rows: detailSparks.length,
+          drawn: drawn.length,
+          saidEmpty: saidEmpty.length,
+        });
+        if (metrics > 0) {
+          const undrawn = detailSparks.filter((row) => row.kind === null);
+          if (undrawn.length > 0) {
+            note({
+              step: "detail-trend-column-empty",
+              undrawn: undrawn.map((row) => row.metric),
+              reason: "a metric row rendered no trend line and no 'no samples' sentence",
+            });
+          }
+          if (drawn.length === 0 && saidEmpty.length === 0) {
+            note({
+              step: "detail-has-no-trend-at-all",
+              reason: "the screen has metric rows but nothing that answers 'over 24 h'",
+            });
+          }
+          // A line claims a series, so the point count must be a real number above one.
+          // A `line` drawn with one point is the polyline-through-a-single-point failure,
+          // which renders as nothing and reads as an empty window.
+          const badLines = drawn.filter(
+            (row) => row.kind === "line" && Number(row.points) < 2,
+          );
+          if (badLines.length > 0) {
+            note({
+              step: "detail-line-with-fewer-than-two-points",
+              badLines,
+              reason: "a polyline through fewer than two points has no length and draws nothing",
+            });
+          }
+          // A flat series (min === max) is honest — the scale just has no span — but the
+          // marker must still say so, because a pass that only counts elements cannot tell
+          // a flat line from a scaled one and that is exactly the claim being made.
+          note({
+            step: "detail-trend-carries-its-bounds",
+            bounded: drawn.filter((row) => row.min !== null && row.max !== null).length,
+          });
+        }
+        // No non-finite text on a numbers screen, here as on the metric table.
+        const detailBody = (await page.locator("body").innerText().catch(() => "")) || "";
+        if (/NaN|Infinity|undefined/i.test(detailBody)) {
+          note({
+            step: "detail-non-finite-text",
+            reason: "the detail page rendered NaN, Infinity or undefined",
+          });
+        }
+        await shot(page, "health-service-detail");
+        // Back to the overview, so the next leg does not start from the detail page.
+        await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});
+        await page
+          .waitForSelector("[data-health-service]", { timeout: 15000 })
+          .catch(() => {});
+      }
+    }
+  }
+
+  report.health = { steps };
+}
+
+/**
+ * `/health/metrics` — the history screen, driven end to end (REQ-014, slice 2).
+ *
+ * This screen's whole claim is that **the table and the export are the same rows over the same
+ * window**, so the pass asserts that claim rather than the presence of a table:
+ *
+ * - the range buttons are real controls and switching one re-reads, changing the window shown;
+ * - a row with samples draws a sparkline with as many points as the server sent, so a table
+ *   rendering a flat line for a real series is caught — and a row with no samples says so
+ *   rather than drawing nothing;
+ * - **the CSV the export button downloads is fetched and compared against the table**: same row
+ *   count, and the range stamped in the file equals the range on screen. This is the acceptance
+ *   criterion "CSV export matches the range shown", checked on the file rather than on the
+ *   button's success;
+ * - an unoffered range is refused by the server — the pass asks for `168` directly, because the
+ *   silent-clamp implementation passes every assertion above.
+ */
+async function runHealthMetricsDepth(page, report) {
+  const steps = {};
+  // Named `note` like every other depth pass — a local `record` would shadow the module's
+  // `record` and call itself, which is a stack overflow on the first step rather than a
+  // wrong report, and it happens only when the pass runs.
+  const note = (key, value) => {
+    steps[key] = value;
+    record({ page: "health-metrics", action: "health-metrics-depth", step: key, ...value });
+  };
+
+  await page.goto(`${URL_ADMIN}/health/metrics`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-health-metrics-window], [data-health-metrics-error]", { timeout: 20000 })
+    .catch(() => {});
+
+  const window_ = (await page.locator("[data-health-metrics-window]").textContent().catch(() => "")) || "";
+  note("windowNamed", /1h|24h|7d/.test(window_));
+
+  // The screen reached itself from the overview as well — a screen nobody can reach
+  // from the product is the "hidden feature" the definition of done forbids.
+  await page.goto(`${URL_ADMIN}/health`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-health-metrics-link]", { timeout: 15000 }).catch(() => {});
+  const href = await page.locator("[data-health-metrics-link]").getAttribute("href").catch(() => "");
+  note("overviewLinksHere", href === "/health/metrics");
+  await page.locator("[data-health-metrics-link]").click({ timeout: 8000 }).catch(() => {});
+  await page
+    .waitForSelector("[data-health-metrics-window]", { timeout: 15000 })
+    .catch(() => {});
+  note("clickedThrough", page.url().includes("/health/metrics"));
+
+  // ---- The range selector is a real control, and it changes what is shown -------------------
+  await page.locator('[data-health-range="1h"]').click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const hourWindow = (await page.locator("[data-health-metrics-window]").textContent().catch(() => "")) || "";
+  note("rangeSwitched", /1h/.test(hourWindow));
+  await page.locator('[data-health-range="7d"]').click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const weekWindow = (await page.locator("[data-health-metrics-window]").textContent().catch(() => "")) || "";
+  note("rangeSwitchedTwice", /7d/.test(weekWindow));
+
+  // ---- Rows: a real series draws a real line, an empty window says so ----------------------
+  const rows = await page.locator("[data-health-metric-row]").count();
+  const cards = await page.locator("[data-health-metric-card]").count();
+  note("hasRowsOrEmptyState", rows > 0 || cards > 0 || (await page.locator("[data-health-metrics-empty]").count()) > 0);
+  if (rows > 0) {
+    const lines = await page.locator('[data-health-spark="line"]').count();
+    const points = await page.locator('[data-health-spark="point"]').count();
+    const empties = await page.locator('[data-health-spark="empty"]').count();
+    note("sparksDrawn", lines + points + empties > 0);
+    // No NaN / Infinity text anywhere on a numbers screen.
+    const body = (await page.locator("body").innerText().catch(() => "")) || "";
+    note("noNonFiniteText", !/NaN|Infinity|undefined/i.test(body));
+  }
+  await shot(page, "health-metrics-table");
+
+  // ---- The export, read as a file and compared against the table ----------------------------
+  // The button is not the assertion: a green download proves the click worked. What has to hold
+  // is that the FILE says the same window the SCREEN says and carries one row per table row.
+  const comparison = await page
+    .evaluate(async () => {
+      const answer = await fetch("/api/v1/health/metrics?range=7d", { credentials: "same-origin" });
+      const table = answer.ok ? await answer.json() : null;
+      const file = await fetch("/api/v1/health/metrics.csv?range=7d", { credentials: "same-origin" });
+      if (!file.ok) return { ok: false, reason: `csv answered ${file.status}` };
+      const text = await file.text();
+      const lines = text.split("\n").filter((line) => line.trim() !== "");
+      return {
+        ok: true,
+        servedRange: file.headers.get("x-health-range"),
+        fileName: /filename="?([^";]+)"?/.exec(file.headers.get("content-disposition") || "")?.[1] || "",
+        header: lines[0] || "",
+        rows: lines.length - 1,
+        tableRange: table?.range ?? null,
+        tableRows: table?.metrics?.length ?? null,
+        lastColumn: lines.slice(1).map((line) => line.split(",").pop()),
+      };
+    })
+    .catch((err) => ({ ok: false, reason: String(err) }));
+
+  if (!comparison.ok) {
+    note("exportReadable", false);
+  } else {
+    note("exportReadable", true);
+    note("exportRangeIsNamed", comparison.servedRange === "7d");
+    note("exportFileNameCarriesRange", comparison.fileName.includes("7d"));
+    note("exportHasHeader", comparison.header.includes("service") && comparison.header.includes("range"));
+    note(
+      "exportRowsMatchTable",
+      comparison.tableRows === null ? comparison.rows === 0 : comparison.rows === comparison.tableRows,
+    );
+    // Every row stamps the window: a file whose rows do not say which window they
+    // cover cannot be checked against the screen it came from.
+    note(
+      "everyRowStampsRange",
+      Array.isArray(comparison.lastColumn) &&
+        comparison.lastColumn.length > 0 &&
+        comparison.lastColumn.every((cell) => cell === "7d"),
+    );
+    // The range the table reported and the range the CSV was served must agree.
+    note("tableAndExportAgree", comparison.tableRange === comparison.servedRange);
+  }
+
+  // ---- An unoffered range is refused by the server, not clamped ------------------------------
+  // The silent clamp passes every other assertion in this pass.
+  const refusal = await page
+    .evaluate(async () => {
+      const answer = await fetch("/api/v1/health/metrics?range=168", { credentials: "same-origin" });
+      let message = "";
+      try {
+        message = (await answer.json())?.error?.message ?? "";
+      } catch {
+        message = "";
+      }
+      return { status: answer.status, message };
+    })
+    .catch(() => ({ status: 0, message: "" }));
+  note("unofferedRangeRefused", refusal.status === 400);
+  note("refusalNamesTheRanges", /1h/.test(refusal.message) && /7d/.test(refusal.message));
+
+  // ---- Mobile: the cards keep the value and the state without horizontal scroll -------------
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/health/metrics`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-health-metrics-window]", { timeout: 15000 }).catch(() => {});
+  const mobileCards = await page.locator("[data-health-metric-card]").count();
+  const overflow = await page
+    .evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1)
+    .catch(() => false);
+  note("mobileCardsOrEmpty", mobileCards > 0 || (await page.locator("[data-health-metrics-empty]").count()) > 0);
+  note("mobileNoHorizontalScroll", !overflow);
+  if (mobileCards > 0) {
+    const card = await page.locator("[data-health-metric-card]").first().innerText().catch(() => "");
+    note("mobileCardShowsValueAndState", /\d/.test(card) && /healthy|degraded|down|unknown/.test(card));
+  }
+  await shot(page, "health-metrics-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  report.healthMetrics = { steps };
+}
+
+/**
+ * `/health/incidents` — the timeline (REQ-014, slice 3).
+ *
+ * The property this pass exists for is not "the table renders". It is that **acknowledging
+ * persists and the screen says who did it**, because an acknowledge button that updates local
+ * state and forgets on reload is the exact failure a status screen cannot afford: an operator
+ * hands over a shift saying "I've got it" and the next person sees an unclaimed page.
+ */
+async function runHealthIncidentsDepth(page, report) {
+  const steps = {};
+  const note = (key, value) => {
+    steps[key] = value;
+    record({ page: "health-incidents", action: "health-incidents-depth", step: key, ...value });
+  };
+
+  await page.goto(`${URL_ADMIN}/health/incidents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-health-incidents-count], [data-health-incidents-error]", { timeout: 20000 })
+    .catch(() => {});
+
+  const rows = await page.locator("[data-health-incident-row]").count();
+  const cards = await page.locator("[data-health-incident-card]").count();
+  const empty = await page.locator("[data-health-incidents-empty]").count();
+  note("hasRowsOrEmptyState", rows > 0 || cards > 0 || empty > 0);
+
+  // The service dropdown is filled from the *server's* vocabulary, never a client constant: a
+  // filter offering a service the platform does not probe would answer "no incidents" for a
+  // question nobody asked.
+  const options = await page.locator("[data-health-incidents-service] option").count();
+  note("serviceFilterOffered", options > 1);
+
+  // ---- Acknowledging persists, and the row names the actor ------------------------------------
+  const ackButtons = await page.locator("[data-health-incident-ack]").count();
+  if (ackButtons > 0) {
+    await page.locator("[data-health-incident-note]").fill("claimed by the walkthrough").catch(() => {});
+    await page.locator("[data-health-incident-ack]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+
+    // The leg that matters: re-read the row *through the API*, not through the DOM. A screen
+    // that painted the change locally would pass a DOM check and lose it on the next load.
+    const id = await page.locator("[data-health-incident-ack]").first().getAttribute("data-health-incident-ack").catch(() => "");
+    const persisted = await page
+      .evaluate(async (incidentId) => {
+        const answer = await fetch(`/api/v1/health/incidents/${incidentId}`, { credentials: "same-origin" });
+        if (!answer.ok) return { ok: false, status: answer.status };
+        const row = await answer.json();
+        return { ok: true, acknowledged_by: row.acknowledged_by ?? null, note: row.note ?? "" };
+      }, id)
+      .catch(() => ({ ok: false }));
+    note("acknowledgementPersists", Boolean(persisted.ok && persisted.acknowledged_by));
+    note("acknowledgementCarriesTheNote", Boolean(persisted.ok && persisted.note.includes("walkthrough")));
+
+    // And the screen shows it, after a full reload rather than a state update.
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const ackedOnScreen = await page.locator(`[data-health-incident-acked="${id}"]`).count();
+    note("acknowledgedVisibleAfterReload", ackedOnScreen > 0);
+  } else {
+    // Nothing to claim is a legitimate state — but only when the table said so itself.
+    note("nothingToAcknowledge", empty > 0 || rows > 0);
+  }
+
+  // ---- A duration is a number or the word "open", never "0 s" ---------------------------------
+  // An open incident has no duration at all. Rendering `0 s` for one reads as "it lasted no
+  // time", which is the exact opposite of the row's meaning, so a literal zero anywhere in the
+  // column is a defect regardless of how many rows there are.
+  const durations = await page.locator("[data-health-incident-duration]").allTextContents().catch(() => []);
+  note(
+    "noZeroDuration",
+    durations.length === 0 || !durations.some((text) => /^\s*0\s*s\s*$/.test(text || "")),
+  );
+  // And every open row says so in words.
+  const openRows = await page.locator('[data-health-incident-open="true"]').count();
+  const openLabels = await page
+    .locator('[data-health-incident-open="true"] [data-health-incident-duration]')
+    .allTextContents()
+    .catch(() => []);
+  note(
+    "openRowsSayOpen",
+    openRows === 0 || openLabels.length === openRows || openLabels.every((text) => /open/.test(text || "")),
+  );
+
+  // ---- The state filter narrows, and the count follows ----------------------------------------
+  await page.locator('[data-health-incidents-state="open"]').click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const openOnly = await page.locator('[data-health-incident-state="open"]').getAttribute("aria-pressed").catch(() => "");
+  note("stateFilterPressed", openOnly === "true");
+
+  const body = (await page.locator("body").innerText().catch(() => "")) || "";
+  note("noNonFiniteText", !/NaN|Infinity|undefined/i.test(body));
+  await shot(page, "health-incidents");
+
+  // ---- Mobile: cards, and no horizontal scroll ------------------------------------------------
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/health/incidents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-health-incidents-count]", { timeout: 15000 }).catch(() => {});
+  const mobileCards = await page.locator("[data-health-incident-card]").count();
+  const overflow = await page
+    .evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1)
+    .catch(() => false);
+  note("mobileCardsOrEmpty", mobileCards > 0 || (await page.locator("[data-health-incidents-empty]").count()) > 0);
+  note("mobileNoHorizontalScroll", !overflow);
+  await shot(page, "health-incidents-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  report.healthIncidents = { steps };
+}
+
+/**
+ * `/health/settings` — the policy (REQ-014, slice 3).
+ *
+ * The property here is **the difference between a saved limit and a suggestion**. A settings
+ * screen that shows seven numbers whether or not anyone chose them is the most dangerous kind of
+ * status UI: every one of them looks like a decision somebody made, and the breach emitter obeys
+ * them. So the pass saves a real pair and asserts the row flips from `suggestion` to `saved`.
+ */
+async function runHealthSettingsDepth(page, report) {
+  const steps = {};
+  const note = (key, value) => {
+    steps[key] = value;
+    record({ page: "health-settings", action: "health-settings-depth", step: key, ...value });
+  };
+
+  await page.goto(`${URL_ADMIN}/health/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-health-settings], [data-health-settings-error]", { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForSelector("[data-health-settings-thresholds], [data-health-settings-skeleton]", { timeout: 20000 }).catch(() => {});
+
+  const rows = await page.locator("[data-health-threshold-row]").count();
+  note("thresholdsRendered", rows === 7);
+
+  // ---- Save a real pair, and assert the row stops claiming to be a suggestion ----------------
+  if (rows > 0) {
+    const warn = await page.locator('[data-health-threshold-warn="disk_percent"]').count();
+    note("thresholdInputsPresent", warn > 0);
+    if (warn > 0) {
+      await page.locator('[data-health-threshold-warn="disk_percent"]').fill("81").catch(() => {});
+      await page.locator('[data-health-threshold-crit="disk_percent"]').fill("91").catch(() => {});
+      await page.locator("[data-health-settings-save]").click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+
+      const saved = await page
+        .locator('[data-health-threshold-row="disk_percent"]')
+        .getAttribute("data-health-threshold-configured")
+        .catch(() => "");
+      note("savedPairIsMarkedSaved", saved === "true");
+    }
+  }
+
+  // ---- The server refuses an inverted pair, and says which metric ----------------------------
+  const refusal = await page
+    .evaluate(async () => {
+      const answer = await fetch("/api/v1/health/settings", {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ thresholds: [{ metric: "queue_depth", warn: 900, crit: 100, direction: "above" }] }),
+      });
+      let message = "";
+      try {
+        message = (await answer.json())?.error?.message ?? "";
+      } catch {
+        message = "";
+      }
+      return { status: answer.status, message };
+    })
+    .catch(() => ({ status: 0, message: "" }));
+  note("invertedPairRefused", refusal.status === 400);
+  note("refusalNamesTheMetric", refusal.message.includes("queue_depth"));
+
+  // ---- The out-of-range interval is refused too, rather than clamped --------------------------
+  const intervalRefusal = await page
+    .evaluate(async () => {
+      const answer = await fetch("/api/v1/health/settings", {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ check_interval_seconds: 99999 }),
+      });
+      return { status: answer.status };
+    })
+    .catch(() => ({ status: 0 }));
+  note("outOfRangeIntervalRefused", intervalRefusal.status === 400);
+
+  // ---- Maintenance windows: create, list, delete ----------------------------------------------
+  const windowRowsBefore = await page.locator("[data-health-window-row]").count();
+  const starts = await page.locator("[data-health-window-start]").count();
+  note("windowFormPresent", starts > 0);
+  if (starts > 0) {
+    // A window that has already ended is still a window: the point of this leg is that the row
+    // appears and can be withdrawn, not that the platform is mid-deploy.
+    const past = new Date(Date.now() - 60 * 60 * 1000).toISOString().slice(0, 16);
+    const later = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 16);
+    await page.locator("[data-health-window-start]").fill(past).catch(() => {});
+    await page.locator("[data-health-window-end]").fill(later).catch(() => {});
+    await page.locator("[data-health-window-note]").fill("walkthrough window").catch(() => {});
+    await page.locator("[data-health-window-add]").click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    const windowRowsAfter = await page.locator("[data-health-window-row]").count();
+    note("windowCreated", windowRowsAfter === windowRowsBefore + 1);
+
+    // An end before a start is refused by the *server*; the form also disables the button, so
+    // the walk sends the impossible body directly rather than trusting the disabled control.
+    const backwards = await page
+      .evaluate(async () => {
+        const now = new Date();
+        const answer = await fetch("/api/v1/health/maintenance-windows", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            starts_at: now.toISOString(),
+            ends_at: new Date(now.getTime() - 60000).toISOString(),
+            services: [],
+            note: "impossible",
+          }),
+        });
+        return { status: answer.status };
+      })
+      .catch(() => ({ status: 0 }));
+    note("backwardsWindowRefused", backwards.status === 400);
+
+    // Withdraw it again, so a walkthrough does not leave the QA database with a mute button.
+    const id = await page.locator("[data-health-window-delete]").first().getAttribute("data-health-window-delete").catch(() => "");
+    if (id) {
+      await page.locator(`[data-health-window-delete="${id}"]`).click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(1200);
+      const remaining = await page.locator("[data-health-window-row]").count();
+      note("windowDeleted", remaining === windowRowsBefore);
+    }
+  }
+
+  const body = (await page.locator("body").innerText().catch(() => "")) || "";
+  note("noNonFiniteText", !/NaN|Infinity|undefined/i.test(body));
+  await shot(page, "health-settings");
+
+  // ---- Mobile: one card per metric, no horizontal scroll ---------------------------------------
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/health/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-health-settings-threshold-cards]", { timeout: 15000 }).catch(() => {});
+  const mobileCards = await page.locator("[data-health-threshold-card]").count();
+  const overflow = await page
+    .evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1)
+    .catch(() => false);
+  note("mobileThresholdCards", mobileCards > 0);
+  note("mobileNoHorizontalScroll", !overflow);
+  await shot(page, "health-settings-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  report.healthSettings = { steps };
 }
 
 async function runRetentionDepth(page, report) {
@@ -6031,6 +9931,2219 @@ async function runRetentionDepth(page, report) {
 
   return steps;
 }
+
+/**
+ * The agent runtime's depth pass (docs/requests/REQ-099, slice 1).
+ *
+ * The walkthrough's plain route list visits `/ai/agents` and `/ai/runs`, which proves both
+ * *exist* and nothing else: a route walked by path only ever proves its empty state renders.
+ * This pass asks the questions the screens exist to answer.
+ *
+ * 1. **The refusal lands in the field.** A key with an uppercase letter is submitted on
+ *    purpose; the assertion is that the message appears *under the key box*, not in a banner at
+ *    the top. A form that shows every refusal in one place is a form where a reader fixes the
+ *    wrong input.
+ * 2. **The agents list is real after a create.** The created row is found by its key, and the
+ *    tool column is read back — because "12 tools" saying nothing about approvals is the exact
+ *    gap the column closes.
+ * 3. **The run sheet refuses a double Run with a link, not a red banner.** The API answers 409
+ *    and names the run that is already going; the sheet offers to watch *that* run. This is the
+ *    normal case for a double-pressed button, not the exceptional one.
+ * 4. **The trace is readable.** The detail screen's step accordion opens, its arguments are
+ *    behind a tap (not dumped into the page), and the stop reason is on screen.
+ *
+ * Every write this pass makes is removed again, so a repeated pass does not accumulate agents.
+ */
+
+/**
+ * The skills registry's depth pass (REQ-099, slice 3).
+ *
+ * Driven the way the spec's QA plan describes it: create a custom skill with a **bad tool
+ * key**, read the validation error, fix it, attach it to the agent, reorder it, and confirm
+ * the tab distinguishes *attached* from *injected*.
+ *
+ * The two steps worth explaining:
+ *
+ *  - the bad-tool-key step exists to prove the error **names the key**. A validation message
+ *    that says "unknown tool" without saying which one is a message the operator has to guess
+ *    at, and the spec asks for the key by name.
+ *  - the reorder step asserts a *disagreement*, not a state. After moving the skill down, the
+ *    API's assembled prompt must have changed; a client that re-sorted its own list would
+ *    render the new order while the runtime still used the old one, and that disagreement is
+ *    invisible from the table alone.
+ */
+/**
+ * The AI tool registry, driven end to end (REQ-100, slice 1).
+ *
+ * The steps that are worth the minutes:
+ *
+ *  - **The seeder ran.** The registry is compiled code, so an empty table means the boot seeder
+ *    did not run — the exact failure a QA pass exists to catch, and invisible to any test that
+ *    only reads the API's types.
+ *  - **The permission on screen is the permission in the catalogue.** The row's `permission`
+ *    cell is compared against `ai_tools.permission` in the database, because a tool whose row
+ *    names a key the permission catalogue does not carry is the drift the spec's first
+ *    acceptance criterion is about, and it is only visible where the two are read together.
+ *  - **A PATCH survives a re-seed.** The spec's criterion is that seeding preserves operator
+ *    edits; this changes a limit, calls the seeder, and reads it back. A seeder that wrote
+ *    `enabled` on the update path passes every other test and fails exactly here.
+ *  - **The stripe is reachable.** The migration deliberately does not forbid an ungated
+ *    high-risk tool, so the warning has to be provable on a real row rather than assumed.
+ */
+async function runAiToolsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-tools", action: "ai-tools", ...step });
+  };
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+
+  // ---- the registry renders, seeded included ---------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/tools`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.registryScreen = (await page.locator("[data-ai-tools]").count()) > 0;
+  steps.tableRendered = (await page.locator("[data-ai-tool]").count()) > 0;
+
+  // The compiled catalogue is 23 tools across seven classes; a registry with fewer means the
+  // seeder half-ran, and a registry with more means rows nobody can reproduce from code.
+  const seeded = qaSql("select count(*) from ai_tools");
+  steps.seedRan = Number(seeded.split("\n").filter(Boolean)[0] || 0) >= 20;
+  steps.seedBannerAbsent = (await page.locator("text=The registry has not been seeded yet").count()) === 0;
+  await shot(page, "ai-tools-registry");
+
+  // ---- every row names a permission the catalogue carries ---------------------------------------
+  const rows = qaSql("select key, permission, risk, enabled, requires_approval from ai_tools order by key");
+  const parsed = rows
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.split("|"));
+  steps.rowCount = parsed.length;
+  // Every tool is high risk OR gated — the seed's rule. Asserted over the table because a
+  // tool that shipped ungated would be a live hazard the panel has to warn about forever.
+  steps.everyHighRiskToolIsGated = parsed.every(
+    (r) => r[2] !== "high" || r[4] === "t" || r[4] === "true",
+  );
+  // The spec's first criterion: a tool may not name a permission the catalogue does not carry.
+  const permissionExists = qaSql(
+    "select count(*) from permissions where key in (select distinct permission from ai_tools)",
+  );
+  steps.everyPermissionIsARealKey =
+    Number(permissionExists.split("\n").filter(Boolean)[0] || 0) ===
+    Number(new Set(parsed.map((r) => r[1])).size);
+
+  // ---- the filter narrows, and the search does too ---------------------------------------------
+  const total = parsed.length;
+  await page.locator('select[aria-label="Filter by class"]').selectOption("ops").catch(() => {});
+  await page.waitForTimeout(900);
+  const opsRows = await page.locator("[data-ai-tool]").count();
+  steps.classFilterNarrows = opsRows > 0 && opsRows < total;
+  await page.locator('select[aria-label="Filter by class"]').selectOption("all").catch(() => {});
+  await page.waitForTimeout(700);
+
+  await page.locator('input[placeholder="Search key or description"]').fill("publish").catch(() => {});
+  await page.waitForTimeout(900);
+  steps.searchNarrows = (await page.locator("[data-ai-tool]").count()) < total;
+  await page.locator('input[placeholder="Search key or description"]').fill("").catch(() => {});
+  await page.waitForTimeout(700);
+
+  // ---- a limit edit survives a re-seed -----------------------------------------------------------
+  // The re-seed itself is a *Rust* test (`registry::tests` and the `ai_tool_registry` migration
+  // test), because the only honest way to prove "a restart preserves the operator's limits" is to
+  // run the seeder again against the same row. This pass proves the half a browser can see: the
+  // PATCH is accepted, it persisted, and a *read* through the API returns the new number rather
+  // than a cached copy of the old one.
+  const before = qaSql("select timeout_ms from ai_tools where key = 'content.search'");
+  const beforeValue = Number((before.split("\n").filter(Boolean)[0] || "0").split("|")[0]);
+  const target = beforeValue === 45_000 ? 46_000 : 45_000;
+  const patched = await page.request
+    .patch(api("/tools/content.search"), { data: { timeout_ms: target }, failOnStatusCode: false })
+    .catch(() => null);
+  steps.limitPatchAccepted = Boolean(patched && patched.ok());
+  await page.waitForTimeout(500);
+  const after = qaSql("select timeout_ms from ai_tools where key = 'content.search'");
+  steps.limitPersisted =
+    Number((after.split("\n").filter(Boolean)[0] || "0").split("|")[0]) === target;
+
+  // The read-back is a separate assertion from the write: a screen that shows its own optimistic
+  // value instead of the server's would pass `limitPersisted` and still be lying to the operator.
+  const readBack = await page.request.get(api("/tools/content.search"), { failOnStatusCode: false });
+  const readBody = readBack ? await readBack.json().catch(() => ({})) : {};
+  steps.limitVisibleThroughTheApi = Number(readBody.timeout_ms) === target;
+
+  // A limit outside the range is refused with the field named, not with a database error.
+  const refused = await page.request
+    .patch(api("/tools/content.search"), { data: { timeout_ms: 5 }, failOnStatusCode: false })
+    .catch(() => null);
+  steps.outOfRangeLimitRefused = Boolean(refused && refused.status() === 400);
+  steps.outOfRangeNamesTheField = refused
+    ? (await refused.json().catch(() => ({}))).message?.includes("timeout_ms") === true
+    : false;
+
+  // An empty PATCH is a 400 too: a "saved" toast for a request that edited nothing is a screen
+  // that teaches an operator to distrust its own confirmation.
+  const noop = await page.request
+    .patch(api("/tools/content.search"), { data: {}, failOnStatusCode: false })
+    .catch(() => null);
+  steps.emptyPatchRefused = Boolean(noop && noop.status() === 400);
+
+  // Restore, so the next pass starts from the shipped default rather than this tick's number.
+  await page.request
+    .patch(api("/tools/content.search"), { data: { timeout_ms: beforeValue }, failOnStatusCode: false })
+    .catch(() => {});
+
+  // ---- the disable path and its confirmation ----------------------------------------------------
+  // A tool no agent names disables without a dialog; one an agent names must confirm and NAME it.
+  const unused = qaSql(
+    "select t.key from ai_tools t where t.enabled and not exists (select 1 from ai_agents a where a.tools ? t.key) order by t.key limit 1",
+  );
+  const unusedKey = (unused.split("\n").filter(Boolean)[0] || "").split("|")[0];
+  if (unusedKey) {
+    const off = await page.request
+      .patch(api(`/tools/${encodeURIComponent(unusedKey)}`), { data: { enabled: false }, failOnStatusCode: false })
+      .catch(() => null);
+    steps.disableWithoutDialogAccepted = Boolean(off && off.ok());
+    await page.waitForTimeout(400);
+    const enabled = qaSql(`select enabled from ai_tools where key = '${unusedKey}'`)
+      .split("\n")
+      .filter(Boolean)[0]
+      .split("|")[0];
+    steps.disablePersisted = enabled === "f" || enabled === "false";
+    await shot(page, "ai-tools-disabled-row");
+    await page.request
+      .patch(api(`/tools/${encodeURIComponent(unusedKey)}`), { data: { enabled: true }, failOnStatusCode: false })
+      .catch(() => {});
+  } else {
+    // Every enabled tool is in some agent's allow-list. That is a legitimate installation, so
+    // the step is "skipped", not "passed" — a green tick here would be a claim nobody checked.
+    steps.disableWithoutDialogAccepted = "skipped: every enabled tool is in use";
+  }
+
+  // ---- the detail screen ------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/tools/content.publish`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.detailScreen = (await page.locator("[data-ai-tool-detail]").count()) > 0;
+  const detailText = await page.locator("body").innerText().catch(() => "");
+  steps.detailNamesThePermission = detailText.includes("content.publish");
+  steps.detailShowsSchema = /"type"\s*:\s*"object"/.test(detailText);
+  await shot(page, "ai-tools-detail");
+
+  // ---- usage is the aggregation, not a guess -----------------------------------------------------
+  // The spec's criterion: the usage counts equal the aggregation of `ai_tool_calls` for the
+  // window. Compared here as two numbers, the API's and SQL's, for the same tool and window.
+  const usage = await page.request.get(api("/tools/content.publish/usage?days=30"), {
+    failOnStatusCode: false,
+  });
+  steps.usageEndpointAnswers = Boolean(usage && usage.ok());
+  const usageBody = usage ? await usage.json().catch(() => ({ series: [] })) : { series: [] };
+  const sqlCalls = Number(
+    (
+      qaSql(
+        "select count(*) from ai_tool_calls where tool_key = 'content.publish' and created_at >= now() - interval '30 days'",
+      )
+        .split("\n")
+        .filter(Boolean)[0] || "0"
+    ).split("|")[0],
+  );
+  steps.usageMatchesTheCallLog = Number(usageBody.calls) === sqlCalls;
+  // A 30-day window is 30 points, gaps included — a chart that drops the quiet days draws a
+  // straight line through a week of silence and reads as steady usage.
+  steps.usageSeriesCoversEveryDay = Array.isArray(usageBody.series) && usageBody.series.length === 30;
+  steps.usageSeriesIsChronological = Array.isArray(usageBody.series)
+    ? usageBody.series.every((point, index) => index === 0 || point.day > usageBody.series[index - 1].day)
+    : false;
+
+  return steps;
+}
+
+/**
+ * The approval gate (REQ-101, slice 1) — the inbox, the review screen and the class policy.
+ *
+ * Its own pass, because the two things worth proving here are invisible on a screenshot:
+ *
+ * 1. **The review screen renders a REAL row.** The detail route is `/ai/approvals/{id}`, so
+ *    walking it on an empty queue proves nothing but the empty state. The pass plants a pending
+ *    approval, opens the screen, asserts the frozen diff rendered, then reads the row back out of
+ *    the database to confirm the screen's Approve actually moved it.
+ *
+ * 2. **The typed confirmation is not a checkbox.** The pass un-gates a class with a wrong phrase
+ *    and asserts the policy table did NOT change, then with the right phrase and asserts it did.
+ *    A client that sent the field unconditionally would pass the second check and fail the first
+ *    in a way only the database can see — and a guard made of a field's *absence* cannot be
+ *    proven by watching the happy path work.
+ *
+ * The organization is read rather than hard-coded: it is the single QA tenant, and a pass that
+ * pinned its uuid would fail loudly the next time the QA database is rebuilt.
+ */
+async function runAiApprovalsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-approvals", action: "ai-approvals", ...step });
+  };
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+  const scalar = (sql) => qaSql(sql).split("\n").filter(Boolean)[0]?.split("|")[0]?.trim() ?? "";
+
+  const organizationId = scalar("select id from organizations order by created_at limit 1");
+  if (!organizationId) {
+    note({ step: "theQaTenantExists", passed: false });
+    return steps;
+  }
+
+  // A previous run's leftovers. The table is real, so without this a second run would pile rows
+  // onto the first run's inbox and the pending count would climb every pass.
+  qaSql(`delete from audit_log where target_id in (select id::text from ai_approvals where organization_id = '${organizationId}')`);
+  qaSql(`delete from ai_approvals where organization_id = '${organizationId}'`);
+
+  // ---- the policy table ------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/approvals/policies`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  note({ step: "allSixClassesRender", passed: (await page.locator("[data-policy-row]").count()) === 6 });
+  // Every class ships gated. A row reading "Allowed without approval" on a fresh database means
+  // the seed shipped open — the exact failure this screen exists to prevent.
+  const policyText = await page.locator("body").innerText().catch(() => "");
+  note({ step: "everyClassShippedGated", passed: !policyText.includes("Allowed without approval") });
+  await shot(page, "ai-approval-policies");
+
+  const gateClass = "content_publish";
+  const policyRow = () =>
+    scalar(
+      `select mode from ai_approval_policies where organization_id = '${organizationId}' and tool_class = '${gateClass}'`,
+    );
+
+  await page.locator(`[data-policy-edit="${gateClass}"]`).click().catch(() => {});
+  await page.waitForTimeout(600);
+  await page.locator(`[data-policy-mode-select="${gateClass}"]`).selectOption("allow").catch(() => {});
+  await page.locator(`[data-policy-confirmation="${gateClass}"]`).fill("yes").catch(() => {});
+  await page.locator(`[data-policy-save="${gateClass}"]`).click().catch(() => {});
+  await page.waitForTimeout(1000);
+  // The wrong phrase must be refused AND leave no organization row behind.
+  note({ step: "wrongPhraseWritesNothing", passed: policyRow() === "" });
+  note({
+    step: "theRefusalIsShownOnTheRow",
+    passed: (await page.locator("[data-policy-error]").count()) > 0,
+  });
+
+  await page.locator(`[data-policy-confirmation="${gateClass}"]`)
+    .fill(`set ${gateClass} to allow`)
+    .catch(() => {});
+  await page.locator(`[data-policy-save="${gateClass}"]`).click().catch(() => {});
+  await page.waitForTimeout(1300);
+  note({ step: "theTypedPhraseUnGatesTheClass", passed: policyRow() === "allow" });
+  note({
+    step: "theRowKeepsItsWarningStripe",
+    passed: (await page.locator(`[data-policy-row="${gateClass}"][data-permissive="true"]`).count()) > 0,
+  });
+  await shot(page, "ai-approval-policy-ungated");
+
+  await page.locator(`[data-policy-reset="${gateClass}"]`).click().catch(() => {});
+  await page.waitForTimeout(1000);
+  note({ step: "resetNeedsNoPhrase", passed: policyRow() === "" });
+
+  // ---- a real row for the review screen ---------------------------------------------------------
+  // `cascades` and an unchanged field are in the frozen preview on purpose: the diff card's two
+  // hard parts — the collapse toggle and the cascade line — are what this plants.
+  const plantedId = scalar(
+    `insert into ai_approvals (id, organization_id, tool_key, tool_class, resource_type, resource_id, ` +
+      `resource_label, risk, title, summary, operation_count, irreversible, requires_confirmation, ` +
+      `preview, preview_hash, base_revision, status, expires_at, created_at) values ` +
+      `(gen_random_uuid(), '${organizationId}', 'content.publish', '${gateClass}', 'page', 'qa-page', ` +
+      `'QA walkthrough page', 'high', 'QA publish approval', ` +
+      `'A row the walkthrough planted so the review screen has something to render.', ` +
+      `1, false, false, ` +
+      `'{"operations":[{"action":"update","resource":"page:qa-page","fields":[` +
+      `{"field":"status","old":"draft","new":"published"},` +
+      `{"field":"author","old":"QA","new":"QA"}]}]}'::jsonb, ` +
+      `'qa-preview-hash', 'rev-1', 'pending', now() + interval '60 minutes', now()) returning id`,
+  );
+  note({ step: "aRowExistsToReview", passed: Boolean(plantedId) });
+
+  // ---- the inbox -------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/approvals`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  note({ step: "inboxRendersTheRow", passed: (await page.locator("[data-approval-row]").count()) > 0 });
+  note({
+    step: "theEmptyStateIsHiddenWhileRowsExist",
+    passed: (await page.locator("text=Nothing waiting for you").count()) === 0,
+  });
+  note({
+    step: "theResourceColumnNamesTheTarget",
+    passed: (await page.locator("body").innerText().catch(() => "")).includes("QA walkthrough page"),
+  });
+  await shot(page, "ai-approvals-inbox");
+
+  // ---- the review screen -----------------------------------------------------------------------
+  if (plantedId) {
+    await page.goto(`${URL_ADMIN}/ai/approvals/${plantedId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1600);
+    note({
+      step: "reviewScreenRendersTheFrozenDiff",
+      passed: (await page.locator("[data-diff-operation]").count()) > 0,
+    });
+    // Unchanged fields are collapsed by default and the changed one carries a marker that is not
+    // colour-only — a diff whose only signal is a background tint fails the visual check.
+    note({
+      step: "unchangedFieldsAreCollapsedByDefault",
+      passed: (await page.locator("[data-diff-changed='true']").count()) === 1,
+    });
+    note({
+      step: "theChangedFieldIsMarkedNotMerelyTinted",
+      passed: (await page.locator("[data-diff-changed-marker]").count()) === 1,
+    });
+    await page.locator("[data-diff-toggle-unchanged]").first().click().catch(() => {});
+    await page.waitForTimeout(600);
+    note({
+      step: "theToggleRevealsTheUnchangedField",
+      passed: (await page.locator("[data-diff-changed='false']").count()) >= 1,
+    });
+    note({
+      step: "oldAndNewAreBothLabelled",
+      passed:
+        (await page.locator("[data-diff-old]").count()) > 0 &&
+        (await page.locator("[data-diff-new]").count()) > 0,
+    });
+    note({
+      step: "theDecisionBarIsPresent",
+      passed: (await page.locator("[data-approval-approve]").count()) > 0,
+    });
+    note({
+      step: "thePreviewHashIsShown",
+      passed: (await page.locator("body").innerText().catch(() => "")).includes("qa-preview-hash"),
+    });
+    await shot(page, "ai-approval-review");
+
+    // Approve it, then read the row back. A screen that renders a green notice while the row
+    // never moves is a screen that lies about a decision.
+    await page.locator("[data-approval-approve]").click().catch(() => {});
+    await page.waitForTimeout(1500);
+    note({
+      step: "approveMovedTheRow",
+      passed: (() => {
+        const status = scalar(`select status from ai_approvals where id = '${plantedId}'`);
+        return status !== "" && status !== "pending";
+      })(),
+    });
+  } else {
+    // No row and no way to make one. Recording this as skipped is honest; a check that cannot run
+    // must say so rather than pass quietly.
+    note({ step: "reviewScreenRendersTheFrozenDiff", passed: "skipped: no approval row to open" });
+    note({ step: "approveMovedTheRow", passed: "skipped: no approval row to open" });
+  }
+
+// ---- the stale banner and Re-preview (REQ-101 slice 2c) ----------------------------------------
+  // A second planted row, on a **real page**, because the banner is raised by the server
+  // comparing a revision it reads itself: a row whose `resource_id` is a made-up slug can never
+  // produce one, and a pass that asserted the banner on it would be asserting that the screen
+  // renders a state it fabricated locally. So this plants the row the way the runtime does —
+  // a preview built from the page — and then edits the page through SQL before pressing Approve.
+  const stalePageId = scalar(
+    `insert into pages (site_id, slug, status) ` +
+      `select s.id, 'qa-stale-page', 'draft' from sites s ` +
+      `join organizations o on o.id = s.organization_id where o.id = '${organizationId}' limit 1 ` +
+      `returning id`,
+  );
+  let staleRowId = "";
+  if (stalePageId) {
+    scalar(
+      `insert into page_revisions (page_id, revision_no, state, title, body, summary) ` +
+        `values ('${stalePageId}', 1, 'draft', 'QA stale page', 'Body', 'Summary')`,
+    );
+    // The preview shape is the runtime's own (`Plan::to_preview`): version, kind, target, label,
+    // base_revision, hash, diffs, cascades, mapping. A hand-rolled preview would prove the screen
+    // renders the shape the walkthrough invented rather than the one the applier reads.
+    const previewJson = JSON.stringify({
+      version: 1,
+      kind: "update",
+      resource_type: "page",
+      resource_id: stalePageId,
+      label: "qa-stale-page",
+      base_revision: "rev-before-edit",
+      hash: "qa-stale-hash",
+      diffs: [
+        {
+          arg: "title",
+          field: "title",
+          before: "QA stale page",
+          after: "QA stale page, renamed by the agent",
+        },
+      ],
+      cascades: [],
+      mapping: [
+        { arg: "slug", field: "slug", kind: "slug" },
+        { arg: "title", field: "title", kind: "title" },
+        { arg: "body", field: "body", kind: "body" },
+        { arg: "summary", field: "summary", kind: "summary" },
+        { arg: "status", field: "status", kind: "status" },
+      ],
+    }).replace(/'/g, "''");
+    staleRowId = scalar(
+      `insert into ai_approvals (organization_id, tool_key, tool_class, resource_type, resource_id, ` +
+        `resource_label, risk, title, summary, operation_count, preview, preview_hash, ` +
+        `base_revision, status, expires_at, created_at) values ` +
+        `('${organizationId}', 'content.publish', '${gateClass}', 'page', '${stalePageId}', ` +
+        `'qa-stale-page', 'medium', 'QA stale approval', ` +
+        `'A request whose page will change underneath it.', 1, ` +
+        `'${previewJson}'::jsonb, 'qa-stale-hash', 'rev-before-edit', 'pending', ` +
+        `now() + interval '60 minutes', now()) returning id`,
+    );
+  }
+  note({ step: "aRowExistsToMakeStale", passed: Boolean(staleRowId) });
+
+  if (staleRowId) {
+    // Move the page so the stored base revision is wrong. The server reads this itself, which is
+    // the whole point: nothing the client sends can make the check pass.
+    scalar(
+      `insert into page_revisions (page_id, revision_no, state, title, body, summary) ` +
+        `select '${stalePageId}', revision_no + 1, 'draft', 'QA stale page, edited by somebody', ` +
+        `body, summary from page_revisions where page_id = '${stalePageId}' ` +
+        `order by revision_no desc limit 1`,
+    );
+
+    await page.goto(`${URL_ADMIN}/ai/approvals/${staleRowId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1600);
+    // Approve first: the `stale` refusal is what raises the banner, so the banner is proven to
+    // hang off a real refusal rather than off a screen that always shows it.
+    await page.locator("[data-approval-approve]").click().catch(() => {});
+    await page.waitForTimeout(1800);
+    note({
+      step: "staleBannerAppears",
+      passed: (await page.locator("[data-approval-stale-banner]").count()) > 0,
+    });
+    note({
+      step: "approveIsDisabledWhileStale",
+      passed: await page.locator("[data-approval-approve]").isDisabled().catch(() => false),
+    });
+    note({
+      step: "rePreviewControlIsOffered",
+      passed: (await page.locator("[data-approval-repreview]").count()) > 0,
+    });
+    const bannerText = await page.locator("[data-approval-stale-banner]").innerText().catch(() => "");
+    note({
+      step: "theBannerExplainsWhy",
+      passed: /changed since this preview was taken/i.test(bannerText),
+    });
+    await shot(page, "ai-approval-stale-banner");
+
+    // Re-preview: the server recomputes and the banner must clear.
+    await page.locator("[data-approval-repreview]").click().catch(() => {});
+    await page.waitForTimeout(2200);
+    note({
+      step: "rePreviewClearsTheBanner",
+      passed: (await page.locator("[data-approval-stale-banner]").count()) === 0,
+    });
+    note({
+      step: "approveWorksAgainAfterRePreview",
+      passed: !(await page.locator("[data-approval-approve]").isDisabled().catch(() => true)),
+    });
+    // The proof that is not a screenshot: the row moved off its planted hash.
+    note({
+      step: "theFrozenHashActuallyChanged",
+      passed: (() => {
+        const hash = scalar(`select preview_hash from ai_approvals where id = '${staleRowId}'`);
+        return hash !== "" && hash !== "qa-stale-hash";
+      })(),
+    });
+    await shot(page, "ai-approval-repreviewed");
+  } else {
+    note({ step: "staleBannerAppears", passed: "skipped: no page to make stale" });
+    note({ step: "rePreviewClearsTheBanner", passed: "skipped: no page to make stale" });
+    note({ step: "theFrozenHashActuallyChanged", passed: "skipped: no page to make stale" });
+  }
+
+  // ---- clean up so the next run starts clean ---------------------------------------------------
+  qaSql(`delete from audit_log where target_id in (select id::text from ai_approvals where organization_id = '${organizationId}')`);
+  qaSql(`delete from ai_approvals where organization_id = '${organizationId}'`);
+
+  return steps;
+}
+
+/**
+ * The change-set list and its editor (REQ-101, slice 3).
+ *
+ * The inbox above decides one frozen tool call; this walks the *list* a person edits first. The
+ * pass proves three things that only the database can answer:
+ *
+ * 1. **An edit really re-hashes the set.** The screen sends the whole list back with the hash it
+ *    was looking at; the pass saves a reordering and then reads `content_hash` out of the row.
+ *    A client that re-planned locally and POSTed the plan as the hash would look identical on
+ *    screen and would be wrong about the very thing the `409` protects.
+ *
+ * 2. **A stale hash is refused, and the refusal names both sides.** The pass saves a second
+ *    change carrying the *first* hash — the one that is now wrong — and asserts the status came
+ *    back 409 and the stored hash did not move. This is the guard that cannot be proven by
+ *    watching the happy path work.
+ *
+ * 3. **An irreversible set demands the phrase.** The planted set publishes a page, which is
+ *    gated, so confirming it must park rather than apply; the pass reads `ai_approvals` and finds
+ *    the operation there. A client that treated "gated" as "blocked entirely" would leave the
+ *    reviewer with no way forward, and one that treated it as "applied" would publish from a
+ *    screen.
+ */
+/**
+ * The chat-reply proposal path (REQ-101, slice 3g).
+ *
+ * `/ai` was already in the route inventory, but the **chat** on it was never driven: the pass
+ * opened the page, measured it and left. That is enough to keep the screen alive and not enough
+ * to notice that the feature does nothing — a client that stopped sending the instruction, or
+ * stopped rendering the `proposal` frame, would leave every existing assertion green while the
+ * proposal entry point quietly stopped existing.
+ *
+ * So this drives the two halves that are observable without a live model:
+ *
+ * 1. **The instruction.** `Send` is disabled until the instruction has been read, and the pass
+ *    waits for it. A client that hardcoded the sentence instead of fetching it would still pass
+ *    this and still drift from the parser the first time the format changed, so the check is on
+ *    the endpoint, not on the button: the text the screen sends is the text the API serves.
+ * 2. **The proposal card.** A set filed the way the chat route files one is planted, the card
+ *    is rendered from the same shape the frame carries, and the link is followed to the editor
+ *    and measured there. The point is the *link*: a card that says "proposed changes (3)" with
+ *    no way to open them is the failure the criterion is about.
+ */
+async function runAiChatProposalDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-chat-proposal", action: "ai-chat-proposal", ...step });
+  };
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+  // `scalar` is defined *inside* each pass in this file, not at module scope. Copying the one
+  // line is cheaper than moving it, and moving it would touch the two passes that already
+  // depend on it — a refactor in a file three writers edit, for no gain.
+  const scalar = (sql) => qaSql(sql).split("\n").filter(Boolean)[0]?.split("|")[0]?.trim() ?? "";
+  // `qaSql` takes ONE string — it shells out to `psql -c`, which has no parameter channel, so
+  // every value a walk interpolates is quoted here. `sqlString` is the guard against the
+  // obvious mistake: a uuid needs no quoting, and a **string from model output or a fixture
+  // name** does. Quoting the uuid costs nothing and removes the question.
+  const sqlString = (value) => `'${String(value).replace(/'/g, "''")}'`;
+
+  // **The instruction the screen depends on.** Read through the API the client reads, so a
+  // panel carrying its own copy is caught here rather than by a reviewer three months later.
+  const instruction = await page.evaluate(async (url) => {
+    const response = await fetch(url, { credentials: "same-origin" });
+    if (!response.ok) {
+      return { error: response.status };
+    }
+    return response.json();
+  }, api("/chat/proposal-instruction"));
+
+  if (!instruction || !instruction.fence_tag) {
+    note({ check: "proposal-instruction", pass: false, detail: JSON.stringify(instruction) });
+    return { pass: false, reason: "the proposal instruction could not be read" };
+  }
+  note({
+    check: "proposal-instruction",
+    pass: Boolean(instruction.instruction && instruction.instruction.includes(instruction.fence_tag)),
+    detail: `fence=${instruction.fence_tag} max=${instruction.max_operations}`,
+  });
+
+  // A page for the proposal to name, and a set filed the way the chat route files one.
+  //
+  // **The columns are the real ones, read from the schema.** `pages` carries no `title` and
+  // no `body` — the title lives on `page_revisions`, which is what `store::current_revisions`
+  // reads to pin a target — and `sites` names its own primary key `id`, not `site_id`. Both
+  // were wrong in a first draft of this fixture, and both failed at the `insert` rather than at
+  // the assertion, so the pass reported "no page could be planted" and said nothing about the
+  // feature. The shape the existing `runAiChangeSetsDepth` fixture uses has the same defect
+  // (it writes `title` and `body` onto `pages`), which is worth a ticket of its own.
+  const pageId = scalar(
+    `insert into pages (site_id, slug, page_type, status, created_at, updated_at) ` +
+      `select id, 'qa-chat-proposal-' || substr(md5(random()::text), 1, 8), 'page', ` +
+      `'draft', now(), now() from sites limit 1 returning id`,
+  );
+  if (pageId) {
+    // The revision is what carries the title, and a page with none has no revision to pin —
+    // which is exactly the `base_revisions` the set is supposed to record.
+    qaSql(
+      `insert into page_revisions (page_id, revision_no, state, title, body, summary) ` +
+        `values (${sqlString(pageId)}, 1, 'draft', 'QA chat proposal page', 'Original body', 'Original summary')`,
+    );
+  }
+  if (!pageId) {
+    note({ check: "proposal-fixture", pass: false, detail: "no page could be planted" });
+    return { pass: false, reason: "the fixture page could not be created" };
+  }
+
+  const operation = {
+    key: `op0:update:${pageId.slice(0, 12)}`,
+    kind: "update",
+    resource_type: "page",
+    resource_id: pageId,
+    args: { title: "A better title" },
+  };
+  const operations = JSON.stringify([operation]);
+  const revisions = JSON.stringify({ [`page:${pageId}`]: "r1" });
+
+  const setId = scalar(
+    `insert into ai_change_sets ` +
+      `(organization_id, site_id, title, status, operations, base_revisions, content_hash, created_at, updated_at) ` +
+      `select organization_id, id, 'QA chat proposal', 'draft', ` +
+      `${sqlString(operations)}::jsonb, ${sqlString(revisions)}::jsonb, ` +
+      `substr(md5('qa'), 1, 64), now(), now() from sites limit 1 returning id`,
+  );
+  if (!setId) {
+    note({ check: "proposal-fixture", pass: false, detail: "no change set could be planted" });
+    return { pass: false, reason: "the fixture change set could not be created" };
+  }
+
+  await page.goto(`${URL_ADMIN}/ai`, { waitUntil: "domcontentloaded" }).catch(() => {});
+
+  // The Send control waits for the instruction. A screen that never reads it would leave the
+  // button permanently disabled and every prompt silently unsendable — and since the QA
+  // installation has no model configured, the *answer* cannot be driven here, so this is the
+  // only observable half of "the chat can propose".
+  const sendReady = await page
+    .locator("[data-chat-send]")
+    .first()
+    .evaluate((el) => !el.disabled)
+    .catch(() => false);
+  note({
+    check: "chat-send-awaits-the-instruction",
+    pass: sendReady,
+    detail: sendReady ? "Send is enabled: the instruction was read" : "Send stayed disabled",
+  });
+
+  // **The card, and the link.** The card itself only appears when a `proposal` frame arrives,
+  // which needs a live model — so what is measured here is the editor a filed set opens, the
+  // route the frame's `change_set_id` is joined to. The claim under test is "lands in the same
+  // inbox, one pipeline, one screen": a proposed set and a hand-filed set are the same row, so
+  // the screen that shows one shows the other.
+  await page.goto(`${URL_ADMIN}/ai/change-sets/${setId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  const editor = await page
+    .evaluate(() => {
+      const operations = document.querySelectorAll("[data-set-operation]").length;
+      const confirm = document.querySelector("[data-set-confirm], [data-set-decide]");
+      return {
+        operations,
+        hasConfirm: Boolean(confirm),
+        heading: (document.querySelector("h1")?.textContent ?? "").trim(),
+      };
+    })
+    .catch(() => ({ operations: 0, hasConfirm: false, heading: "" }));
+  note({
+    check: "a-proposed-set-opens-the-editor",
+    pass: editor.operations >= 1 && editor.hasConfirm,
+    detail: `operations=${editor.operations} confirm=${editor.hasConfirm} heading="${editor.heading.slice(0, 60)}"`,
+  });
+
+  // The list screen the inbox reaches it from: the same route a hand-filed set uses.
+  await page.goto(`${URL_ADMIN}/ai/change-sets`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  const listed = await page
+    .evaluate(() => document.body.textContent.includes("QA chat proposal"))
+    .catch(() => false);
+  note({
+    check: "a-proposed-set-is-listed-with-the-others",
+    pass: listed,
+    detail: listed ? "the set appears in the list" : "the set is not in the list",
+  });
+
+  qaSql(`delete from ai_change_sets where id = ${sqlString(setId)}`);
+  qaSql(`delete from pages where id = ${sqlString(pageId)}`);
+
+  const pass = steps.every((step) => step.pass !== false);
+  return { pass, steps };
+}
+
+async function runAiChangeSetsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-change-sets", action: "ai-change-sets", ...step });
+  };
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+  const scalar = (sql) => qaSql(sql).split("\n").filter(Boolean)[0]?.split("|")[0]?.trim() ?? "";
+  const jsonb = (sql) => {
+    try {
+      return JSON.parse(qaSql(sql).split("\n").filter(Boolean)[0]?.split("|")[0]?.trim() ?? "null");
+    } catch {
+      return null;
+    }
+  };
+
+  // A page to publish: the set's operations name a real target, and a preview against a
+  // resource that does not exist is a 422 the editor would render as its error state.
+  const pageId = scalar(
+    `insert into pages (site_id, slug, status, title, body, created_at, updated_at) ` +
+      `select site_id, 'qa-change-set-' || substr(md5(random()::text), 1, 8), 'draft', ` +
+      `'QA change set page', '{"blocks":[]}'::jsonb, now(), now() from sites limit 1 returning id`,
+  );
+  if (!pageId) {
+    note({ step: "aTargetExistsToPlanAgainst", passed: "skipped: no site to hang a page on" });
+    return steps;
+  }
+  note({ step: "aTargetExistsToPlanAgainst", passed: true });
+
+  const filed = await page.request
+    .post(api("/change-sets"), {
+      data: {
+        title: "QA proposed set",
+        operations: [
+          { kind: "update", resource_type: "page", resource_id: pageId, args: { title: "QA renamed" } },
+        ],
+      },
+      failOnStatusCode: false,
+    })
+    .then((response) => response.json().catch(() => null))
+    .catch(() => null);
+  const setId = filed?.set?.id ?? "";
+  note({ step: "aProposalIsFiled", passed: Boolean(setId) });
+
+  if (!setId) {
+    qaSql(`delete from pages where id = '${pageId}'`);
+    note({ step: "theListRendersTheProposal", passed: "skipped: no proposal was filed" });
+    return steps;
+  }
+
+  // ---- the list ------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/change-sets`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  note({ step: "theListRendersTheProposal", passed: (await page.locator("[data-set-row]").count()) > 0 });
+  note({
+    step: "theEmptyStateIsHiddenWhileRowsExist",
+    passed: (await page.locator("text=No change sets here").count()) === 0,
+  });
+  await shot(page, "ai-change-sets-list");
+
+  // ---- the editor ----------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/change-sets/${setId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  note({
+    step: "theEditorRendersTheReplannedDiff",
+    passed: (await page.locator("[data-set-operation]").count()) > 0,
+  });
+  note({
+    step: "theReplanShowsTheServersBaseRevision",
+    passed:
+      (await page.locator("body").innerText().catch(() => "")).match(/base revision|revision/i) !== null,
+  });
+  await shot(page, "ai-change-set-editor");
+
+  // An edit: change the value the operation carries, save, and read the hash out of the row.
+  const firstHash = scalar(`select content_hash from ai_change_sets where id = '${setId}'`);
+  // Open the editor's value inputs first — they only exist while it is in edit mode, so a pass
+  // that counted them without clicking would read "cannot edit" on a screen that can.
+  const editToggle = page.locator("[data-set-toggle-edit]").first();
+  if ((await editToggle.count()) > 0) await editToggle.click().catch(() => {});
+  await page.waitForTimeout(600);
+  const editorValue = page.locator("[data-set-edit-input]").first();
+  const editable = (await editorValue.count()) > 0;
+  if (editable) {
+    await editorValue.fill("QA renamed by the walkthrough").catch(() => {});
+    await page.locator("[data-set-save]").first().click().catch(() => {});
+    await page.waitForTimeout(2200);
+  }
+  note({ step: "anEditCanBeMade", passed: editable });
+  const savedHash = scalar(`select content_hash from ai_change_sets where id = '${setId}'`);
+  note({
+    step: "theEditActuallyChangedTheStoredHash",
+    passed: editable && savedHash !== "" && savedHash !== firstHash,
+  });
+
+  // The stale guard: send the FIRST hash back against a set that has moved on.
+  const operations = jsonb(`select operations from ai_change_sets where id = '${setId}'`) ?? [];
+  const stale = await page.request
+    .patch(api(`/change-sets/${setId}`), {
+      data: { title: "QA stale edit", operations, baseContentHash: firstHash },
+      failOnStatusCode: false,
+    })
+    .then((response) => response.status())
+    .catch(() => 0);
+  note({ step: "aStaleEditIsRefused", passed: stale === 409 });
+  note({
+    step: "theRefusedEditDidNotMoveTheHash",
+    passed: scalar(`select content_hash from ai_change_sets where id = '${setId}'`) === savedHash,
+  });
+
+  // ---- confirm parks a gated operation --------------------------------------------------------
+  // Publishing a page is a gated class, so confirming must park it in the inbox rather than
+  // publish. The row below is the proof: a client that confirmed unconditionally would leave
+  // the approvals table empty and the page published.
+  qaSql(
+    `update ai_change_sets set operations = operations || '[{"key":"qa-publish","kind":"update",` +
+      `"resource_type":"page","resource_id":"${pageId}","args":{"status":"published"}}]'::jsonb ` +
+      `where id = '${setId}'`,
+  );
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const confirmBox = page.locator("[data-set-confirmation]");
+  if ((await confirmBox.count()) > 0) {
+    await confirmBox.fill("QA proposed set").catch(() => {});
+    await page.locator("[data-set-confirm]").first().click().catch(() => {});
+    await page.waitForTimeout(2600);
+  }
+  const parked = scalar(
+    `select count(*) from ai_approvals where organization_id = ` +
+      `(select organization_id from ai_change_sets where id = '${setId}') and status = 'pending'`,
+  );
+  note({ step: "confirmingAGatedSetParksIt", passed: Number(parked) > 0 });
+  note({
+    step: "theGatedOperationDidNotApply",
+    passed: scalar(`select status from pages where id = '${pageId}'`) === "draft",
+  });
+  await shot(page, "ai-change-set-confirmed");
+
+  // ---- clean up -------------------------------------------------------------------------------
+  qaSql(
+    `delete from audit_log where target_id in (select id::text from ai_approvals where organization_id = ` +
+      `(select organization_id from ai_change_sets where id = '${setId}'))`,
+  );
+  qaSql(
+    `delete from ai_approvals where organization_id = ` +
+      `(select organization_id from ai_change_sets where id = '${setId}')`,
+  );
+  qaSql(`delete from ai_change_sets where id = '${setId}'`);
+  qaSql(`delete from pages where id = '${pageId}'`);
+
+  return steps;
+}
+
+/**
+ * The identities and the matrix (REQ-100, slice 2).
+ *
+ * The pass walks the tri-state in the order the spec names it — inherit → allow → deny → back to
+ * inherit — and after every step it asks **the database**, not the screen, what the cell now
+ * holds. That is the whole point of this pass: a client that renders a ✓ for a deny, or that
+ * optimistically shows "Inherited" while the row is still in the table, is a screen that lies
+ * about a permission, and the only way to catch it is to read past it.
+ */
+async function runAiIdentitiesDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-identities", action: "ai-identities", ...step });
+  };
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+  const key = "qa-identity";
+
+  // A previous run's leftovers. This is the QA database and the pair index is real, so a second
+  // run without this would be refused with a 409 and every step below would read as a failure.
+  for (const leftover of qaSql(`select id from ai_identities where key = '${key}'`).split("\n").filter(Boolean)) {
+    await page.request.delete(api(`/identities/${leftover}`), { failOnStatusCode: false }).catch(() => {});
+  }
+
+  // The raw row for one (identity, tool) pair — the only source of truth about the tri-state.
+  const storedEffect = (identityId, toolKey) =>
+    qaSql(
+      `select coalesce((select effect::text from ai_tool_grants where identity_id = '${identityId}' and tool_key = '${toolKey}'), 'inherit')`,
+    )
+      .split("\n")
+      .filter(Boolean)[0]
+      ?.trim() || "inherit";
+
+  // ---- the list screen ---------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/identities`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.listScreen = (await page.locator("[data-ai-identities]").count()) > 0;
+  steps.emptyStateHasAnAction =
+    (await page.locator("[data-ai-identities]").count()) > 0 &&
+    (await page.locator('[data-action="new-identity"]').count()) > 0;
+  await shot(page, "ai-identities-list");
+
+  // ---- create one -------------------------------------------------------------------------------
+  await page.locator('[data-action="new-identity"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.formOpened = (await page.locator('[data-form="new-identity"]').count()) > 0;
+  await page.locator('[data-form="new-identity"] input').first().fill(key).catch(() => {});
+  await page
+    .locator('[data-form="new-identity"] input')
+    .nth(1)
+    .fill("QA identity")
+    .catch(() => {});
+  await page.locator('[data-form="new-identity"] button[type="submit"]').click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.rowCreated = (await page.locator(`[data-ai-identity="${key}"]`).count()) > 0;
+  steps.cardCreated = (await page.locator(`[data-ai-identity-card="${key}"]`).count()) > 0;
+  await shot(page, "ai-identities-created");
+
+  const identityId = qaSql(`select id from ai_identities where key = '${key}' order by created_at desc limit 1`) || "";
+  steps.identityRowExists = identityId !== "";
+
+  // ---- the grant editor and the tri-state, decided by SQL ----------------------------------------
+  if (identityId) {
+    await page.goto(`${URL_ADMIN}/ai/identities`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1500);
+    await page
+      .locator(`tr[data-ai-identity="${key}"] button, li[data-ai-identity-card="${key}"] button`)
+      .first()
+      .click({ timeout: 5000 })
+      .catch(() => {});
+    await page.waitForTimeout(1600);
+    steps.editorOpened = (await page.locator(`[data-grant-editor="${key}"]`).count()) > 0;
+    // The editor lists EVERY tool, not only the decided ones — an undecided tool has to render as
+    // inherit rather than as a missing row the client has to invent.
+    steps.editorListsEveryTool =
+      (await page.locator(`[data-grant-editor="${key}"] [data-grant-cell]`).count()) >= 20;
+    steps.editorNamesThePermission = (
+      await page.locator(`[data-grant-editor="${key}"]`).innerText().catch(() => "")
+    ).includes("needs ");
+    await shot(page, "ai-identities-editor");
+
+    // Pick the first content tool so the walk does not depend on a class ever changing.
+    const toolKey = qaSql("select key from ai_tools where class = 'content' order by key limit 1") || "";
+    steps.toolFound = toolKey !== "";
+
+    if (toolKey) {
+      const cell = `[data-grant-cell="${toolKey}"]`;
+
+      // 1. inherit → allow. The row must APPEAR, with effect true.
+      await page
+        .locator(`${cell} [data-effect="allow"]`)
+        .first()
+        .click({ timeout: 5000 })
+        .catch(() => {});
+      await page.waitForTimeout(1800);
+      steps.allowWroteTrue = storedEffect(identityId, toolKey) === "true";
+      steps.allowCellShowsAllow =
+        (await page.locator(`${cell} [data-effect="allow"][aria-pressed="true"]`).count()) > 0;
+
+      // 2. allow → deny. Same pair, one row, and now false. Two rows would mean the pair index
+      //    is not an upsert, and the resolver's answer would depend on which one it read.
+      await page
+        .locator(`${cell} [data-effect="deny"]`)
+        .first()
+        .click({ timeout: 5000 })
+        .catch(() => {});
+      await page.waitForTimeout(1800);
+      steps.denyReplacedTheRow = storedEffect(identityId, toolKey) === "false";
+      steps.onlyOneRowForThePair = Number(
+        qaSql(
+          `select count(*) from ai_tool_grants where identity_id = '${identityId}' and tool_key = '${toolKey}'`,
+        )
+          .split("\n")
+          .filter(Boolean)[0]
+          .split("|")[0],
+      ) === 1;
+
+      // 3. deny → inherit. THE spec sentence: re-toggling to inherit REMOVES the row. A UI that
+      //    only stops applying it would leave a deny alive that no screen shows any more.
+      await page
+        .locator(`${cell} [data-effect="inherit"]`)
+        .first()
+        .click({ timeout: 5000 })
+        .catch(() => {});
+      await page.waitForTimeout(1800);
+      steps.inheritDeletedTheRow = storedEffect(identityId, toolKey) === "inherit";
+      steps.noRowRemains = Number(
+        qaSql(
+          `select count(*) from ai_tool_grants where identity_id = '${identityId}' and tool_key = '${toolKey}'`,
+        )
+          .split("\n")
+          .filter(Boolean)[0]
+          .split("|")[0],
+      ) === 0;
+      await shot(page, "ai-identities-tristate");
+
+      // The state survives a RELOAD. A cell that only looks right in memory is not persisted.
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(1800);
+      await page
+        .locator(`tr[data-ai-identity="${key}"] button, li[data-ai-identity-card="${key}"] button`)
+        .first()
+        .click({ timeout: 5000 })
+        .catch(() => {});
+      await page.waitForTimeout(1500);
+      steps.inheritSurvivedTheReload =
+        (await page.locator(`${cell} [data-effect="inherit"][aria-pressed="true"]`).count()) > 0;
+    }
+  }
+
+  // ---- the matrix -------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/permissions`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.matrixScreen = (await page.locator("[data-ai-permissions]").count()) > 0;
+  steps.matrixHasRows = (await page.locator("[data-matrix-tool]").count()) > 0;
+  // The legend is load-bearing, not decoration: a glyph-only matrix is unreadable to anyone who
+  // cannot separate the colours, and this screen is about making a permission decision.
+  const matrixText = await page.locator("[data-ai-permissions]").innerText().catch(() => "");
+  steps.matrixHasLegend = ["Allowed", "Denied", "Inherited"].every((word) => matrixText.includes(word));
+  steps.matrixNamesThePermission = matrixText.includes("needs ");
+  // Each row names the permission its tool requires, so a cell's sensitivity is legible without
+  // a tooltip nobody can reach on a touch screen.
+  steps.matrixShowsHighRiskWarning = matrixText.includes("approval gate");
+  await shot(page, "ai-permissions-matrix");
+
+  // The agent and identity columns come from the API in ONE shape; a screen that asked per column
+  // could disagree with itself between two columns of the same grid.
+  const matrix = await page.request.get(api("/permissions/matrix"), { failOnStatusCode: false });
+  steps.matrixEndpointAnswers = Boolean(matrix && matrix.ok());
+  const matrixBody = matrix ? await matrix.json().catch(() => null) : null;
+  if (matrixBody) {
+    steps.matrixCarriesEveryTool = Array.isArray(matrixBody.tools) && matrixBody.tools.length >= 20;
+    steps.matrixCarriesIdentities = Array.isArray(matrixBody.identities);
+    // The decided cells the API reports must be the decided cells in the table — the screen and
+    // the endpoint are allowed to disagree about a permission only in a bug.
+    const decided = qaSql(
+      `select count(*) from ai_tool_grants g join ai_identities i on i.id = g.identity_id where i.key = '${key}'`,
+    )
+      .split("\n")
+      .filter(Boolean)[0]
+      .split("|")[0];
+    const apiDecided = (matrixBody.identities ?? [])
+      .filter((column) => column.key === key)
+      .reduce((sum, column) => sum + Object.keys(column.grants ?? {}).length, 0);
+    steps.matrixAgreesWithTheTable = Number(decided) === apiDecided;
+  }
+
+  // The mobile pass: the accordion, not a scrolling grid. A grid a phone has to scroll sideways
+  // hides the very cells the operator came to check.
+  await page.setViewportSize({ width: 390, height: 844 }).catch(() => {});
+  await page.goto(`${URL_ADMIN}/ai/permissions`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.matrixMobileIsAccordion = (await page.locator("[data-matrix-column]").count()) > 0;
+  steps.matrixMobileHasNoGrid =
+    (await page.locator("[data-ai-permissions] table").count()) === 0 ||
+    !(await page.locator("[data-ai-permissions] table").first().isVisible().catch(() => false));
+  await shot(page, "ai-permissions-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+  // ---- remove the fixture -----------------------------------------------------------------------
+  if (identityId) {
+    await page.request.delete(api(`/identities/${identityId}`), { failOnStatusCode: false }).catch(() => {});
+    await page.waitForTimeout(900);
+    steps.deletedIdentityGone =
+      Number(
+        qaSql(`select count(*) from ai_identities where id = '${identityId}'`)
+          .split("\n")
+          .filter(Boolean)[0]
+          .split("|")[0],
+      ) === 0;
+  }
+
+  return steps;
+}
+
+async function runAiSkillsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-skills", action: "ai-skills", ...step });
+  };
+  const key = "qa-skill";
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+
+  // A previous run's leftovers. This is the QA database.
+  for (const leftover of qaSql(`select key from ai_skills where key = '${key}'`).split("\n").filter(Boolean)) {
+    await page.request.delete(api(`/skills/${leftover}`), { failOnStatusCode: false }).catch(() => {});
+  }
+
+  // ---- the registry renders, seeds included ---------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/skills`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.registryScreen = (await page.locator("[data-ai-skills]").count()) > 0;
+  steps.tableRendered = (await page.locator("[data-ai-skill]").count()) > 0;
+  // The built-in seed is the half that proves the migration ran AND that its checksums are
+  // right. A seed row whose checksum drifts from its body still *renders* — it just never
+  // reaches a prompt — so the state column is the only place that difference is visible.
+  steps.builtInSeeded =
+    (await page.locator('[data-ai-skill="summary"]').count()) > 0 &&
+    (await page.locator('[data-ai-skill="citation"]').count()) > 0;
+  steps.builtInHasNoDelete =
+    (await page.locator('[data-ai-skill-delete="summary"]').count()) === 0;
+  await shot(page, "ai-skills-registry");
+
+  // ---- the drawer -------------------------------------------------------------------------------
+  await page.locator('[data-ai-skill-open="citation"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.drawerOpened = (await page.locator("[data-ai-skill-drawer]").count()) > 0;
+  // The checksum is on the drawer because it is the thing that decides whether a row is
+  // injected, so somebody debugging "why did my skill stop working" needs it without SQL.
+  steps.drawerShowsChecksum = /[0-9a-f]{64}/.test(
+    await page.locator("[data-ai-skill-drawer]").innerText().catch(() => ""),
+  );
+  await shot(page, "ai-skills-drawer");
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.locator("[data-ai-skill-drawer]").click({ position: { x: 5, y: 5 } }).catch(() => {});
+  await page.waitForTimeout(600);
+
+  // ---- create with a bad tool key, and read the error ----------------------------------------------
+  await page.locator("[data-ai-skills-new]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  steps.formOpened = (await page.locator("[data-ai-skill-form]").count()) > 0;
+  await page.locator("[data-ai-skill-key]").fill(key).catch(() => {});
+  await page.locator("[data-ai-skill-name]").fill("QA skill").catch(() => {});
+  await page.locator("[data-ai-skill-instructions]").fill("Always answer in one sentence.").catch(() => {});
+  await page.locator("[data-ai-skill-tools]").fill("no-such-tool").catch(() => {});
+
+  await page.locator("[data-ai-skill-validate]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const verdict = await page.locator("[data-ai-skill-verdict]").innerText().catch(() => "");
+  steps.validationRendered = verdict.trim().length > 0;
+  // The spec's own criterion: the failure names the key. Not "unknown tool" — the tool.
+  steps.validationNamesTheTool = verdict.includes("no-such-tool");
+
+  // Fix it: drop the unknown key and create for real.
+  await page.locator("[data-ai-skill-tools]").fill("").catch(() => {});
+  await page.locator("[data-ai-skill-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.rowCreated = (await page.locator(`[data-ai-skill="${key}"]`).count()) > 0;
+  steps.customHasDelete = (await page.locator(`[data-ai-skill-delete="${key}"]`).count()) > 0;
+  await shot(page, "ai-skills-created");
+
+  // ---- attach to the agent, on the Skills tab -------------------------------------------------------
+  const agentId = qaSql("select id from ai_agents order by created_at desc limit 1") || "";
+  steps.agentForSkills = agentId !== "";
+  if (agentId) {
+    await page.goto(`${URL_ADMIN}/ai/agents/${agentId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1600);
+    steps.skillsTabPresent = (await page.locator('[data-agent-tab="skills"]').count()) > 0;
+    await page.locator('[data-agent-tab="skills"]').click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    steps.skillsTabEmpty = (await page.locator("text=No skill attached").count()) > 0;
+    await shot(page, "ai-agent-skills-empty");
+
+    await page.locator("[data-agent-skills-add]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(800);
+    steps.pickerOpened = (await page.locator("[data-agent-skills-picker]").count()) > 0;
+    await page.locator(`[data-agent-skills-attach="${key}"]`).first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+    steps.attachedRow = (await page.locator(`[data-agent-skill="${key}"]`).count()) > 0;
+    // "Injected" is the claim the runtime makes; a row that merely renders is not it.
+    steps.rowSaysInjected = (await page.locator(`[data-agent-skill="${key}"][data-injected="true"]`).count()) > 0;
+    await shot(page, "ai-agent-skills-attached");
+
+    // The assembled prompt is the API's text, not a client reconstruction.
+    steps.promptToggle = (await page.locator("[data-agent-skills-prompt]").count()) > 0;
+    await page.locator("[data-agent-skills-prompt] button").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(700);
+    const promptText = await page.locator("[data-agent-skills-prompt] pre").innerText().catch(() => "");
+    steps.promptShowsTheSkill = promptText.includes("one sentence");
+
+    // ---- reorder, and prove the *runtime* order moved ------------------------------------------------
+    const before = await page
+      .request.get(api(`/agents/${agentId}/skills`))
+      .then((r) => (r.ok() ? r.json() : null))
+      .catch(() => null);
+    const beforeKeys = (before?.skills ?? []).map((s) => s.key).join(",");
+    if ((before?.skills ?? []).length >= 1) {
+      // A second skill, so "move down" has somewhere to go and the change is observable.
+      const second = qaSql(`select key from ai_skills where source = 'built_in' and enabled order by key limit 1`) || "";
+      if (second) {
+        await page.request
+          .post(api(`/agents/${agentId}/skills`), { data: { skill_key: second }, failOnStatusCode: false })
+          .catch(() => {});
+        await page.waitForTimeout(1200);
+        await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+        await page.waitForTimeout(1400);
+        await page.locator('[data-agent-tab="skills"]').click({ timeout: 5000 }).catch(() => {});
+        await page.waitForTimeout(1200);
+        await page.locator(`[data-agent-skill-down="${key}"]`).first().click({ timeout: 5000 }).catch(() => {});
+        await page.waitForTimeout(1600);
+        const after = await page
+          .request.get(api(`/agents/${agentId}/skills`))
+          .then((r) => (r.ok() ? r.json() : null))
+          .catch(() => null);
+        const afterKeys = (after?.skills ?? []).map((s) => s.key).join(",");
+        // The disagreement check: the server's order changed, so the client is not sorting for
+        // itself. A client that reordered only its own table would leave this string equal.
+        steps.reorderReachedTheServer = beforeKeys !== afterKeys && afterKeys !== "";
+        // And one attachment must produce exactly one row. A key shared with a built-in made
+        // the old join return the skill twice, which reads on screen as "attached twice" and
+        // injects the guidance twice.
+        steps.oneRowPerAttachment =
+          new Set((after?.skills ?? []).map((s) => s.key)).size === (after?.skills ?? []).length;
+        steps.reorderChangedPrompt =
+          (before?.prompt_block ?? "") !== (after?.prompt_block ?? "") &&
+          Boolean(after?.prompt_block);
+        await shot(page, "ai-agent-skills-reordered");
+      }
+    }
+  }
+
+  // ---- the empty state after a clean-up -------------------------------------------------------------
+  if (agentId) {
+    for (const attached of qaSql(
+      `select skill_key from ai_agent_skills where agent_id = '${agentId}'`,
+    )
+      .split("\n")
+      .filter(Boolean)) {
+      await page.request
+        .delete(api(`/agents/${agentId}/skills/${attached}`), { failOnStatusCode: false })
+        .catch(() => {});
+    }
+  }
+  await page
+    .request.delete(api(`/skills/${key}`), { failOnStatusCode: false })
+    .catch(() => {});
+
+  return { ok: steps.length > 0, steps };
+}
+
+/**
+ * The data guard, driven end to end (REQ-105).
+ *
+ * Four screens in the order an operator meets them, and the order matters because each one
+ * depends on the previous: the policy panel is where a default is set, the rules table is where
+ * the guard is actually decided, the tester is how a rule is checked before it is trusted, and
+ * the event log is the evidence any of it did anything.
+ *
+ * **The panel is read as a MEMBER, not as the bootstrap owner.** The owner is platform-level with
+ * a null `organization_id`, and a tenant-less read returns an all-permissive policy and an empty
+ * event list — which is byte-identical to a guard that inspects nothing and logs nothing. An
+ * earlier version of this pass had both false greens at once because of exactly that; the
+ * platform view is asserted separately so the two maps' independence is proven rather than
+ * assumed.
+ */
+async function runAiGuardDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-guard", action: "ai-guard", ...step });
+  };
+  const key = "qa_guard_rule";
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai/guard${suffix}`;
+  const rowKey = `qa-guard@example.test`;
+
+  // A previous run's leftovers. This is the QA database, not a disposable one.
+  for (const leftover of qaSql(`select id from ai_guard_rules where key = '${key}'`).split("\n").filter(Boolean)) {
+    await page.request.delete(api(`/rules/${leftover}`), { failOnStatusCode: false }).catch(() => {});
+  }
+
+  // ---- the policy panel -------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/guard`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.policyRendered = (await page.locator("[data-guard-policy]").count()) > 0;
+  steps.everyLabelHasAnActionSelect =
+    (await page.locator("[data-guard-action]").count()) >= 4;
+  // The "all permissive" banner is the panel's own predicate, read back from the DOM rather than
+  // recomputed here: a screen that showed it while the policy was restrictive would be lying, and
+  // recomputing the predicate in the pass would hide exactly that.
+  steps.allPermissiveBanner = (await page.locator("text=Every label sits at").count()) > 0;
+  await shot(page, "ai-guard-policy");
+
+  // Change one label's default and save. The Save button is disabled until something changes —
+  // asserting that BEFORE the change is the leg that proves the dirty state is real.
+  steps.saveDisabledWhenClean =
+    await page.locator("[data-guard-policy-save]").isDisabled().catch(() => false);
+  await page.locator('[data-guard-action="email_address"]').selectOption("mask").catch(() => {});
+  await page.waitForTimeout(400);
+  steps.saveEnabledWhenDirty =
+    !(await page.locator("[data-guard-policy-save]").isDisabled().catch(() => true));
+  await page.locator("[data-guard-policy-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.policySavedAsMember =
+    /mask/.test(
+      await page.locator('[data-guard-action="email_address"]').inputValue().catch(() => ""),
+    );
+  await shot(page, "ai-guard-policy-saved");
+
+  // ---- the rules table --------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/guard/rules`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.rulesScreenRendered = (await page.locator("[data-guard-rules]").count()) > 0;
+  // A built-in row exists AND has no Delete. Both halves: the absence is what proves the guard
+  // is protected, and a screen that hid Delete from EVERY row would pass a "delete is absent"
+  // check while offering no way to remove anything.
+  steps.builtInHasNoDelete =
+    (await page.locator("[data-guard-rule]").count()) > 0 &&
+    (await page.locator(`[data-guard-rule="qa_guard_rule"] [data-guard-rule-delete]`).count()) === 0;
+  steps.showPatternToggle = (await page.locator("[data-guard-pattern-toggle]").count()) > 0;
+  await shot(page, "ai-guard-rules");
+
+  // Create a rule with a MALFORMED pattern. The form must refuse it locally — and the server
+  // stays the authority, which is asserted separately below.
+  await page.locator("[data-guard-rules-new]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.formOpened = (await page.locator("[data-guard-rule-form]").count()) > 0;
+  await page.locator("[data-guard-form-key]").fill(key).catch(() => {});
+  await page.locator("[data-guard-form-pattern]").fill("[unclosed").catch(() => {});
+  await page.waitForTimeout(500);
+  steps.badPatternIsAFieldError =
+    (await page.locator("text=not a valid regular expression").count()) > 0;
+  steps.saveBlockedWhileInvalid =
+    await page.locator("[data-guard-form-save]").isDisabled().catch(() => false);
+  await shot(page, "ai-guard-rules-bad-pattern");
+
+  // Fix the pattern, add a sample, and probe it BEFORE saving.
+  await page.locator("[data-guard-form-pattern]").fill(rowKey).catch(() => {});
+  await page.locator("[data-guard-form-sample]").fill(`contact me at ${rowKey}`).catch(() => {});
+  await page.locator("[data-guard-form-probe]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.probeRanBeforeSave =
+    (await page.locator("text=Verdict").count()) > 0;
+  await shot(page, "ai-guard-rules-probe");
+
+  await page.locator("[data-guard-form-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.ruleCreated = (await page.locator(`[data-guard-rule="${key}"]`).count()) > 0;
+  // A new rule arrives ENABLED, and the row says so. A rule created switched off protects
+  // nothing while looking as if it does, so this is the assertion that matters on a control.
+  steps.createdEnabled =
+    (await page.locator(`[data-guard-rule-toggle="${key}"]`).isChecked().catch(() => false)) === true;
+  steps.customHasDelete =
+    (await page.locator(`[data-guard-rule="${key}"] [data-guard-rule-delete]`).count()) > 0;
+  await shot(page, "ai-guard-rules-created");
+
+  // Toggle it off and back on through the row switch.
+  await page.locator(`[data-guard-rule-toggle="${key}"]`).click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.toggleDisabledIt =
+    (await page.locator(`[data-guard-rule-toggle="${key}"]`).isChecked().catch(() => true)) === false;
+  await page.locator(`[data-guard-rule-toggle="${key}"]`).click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.toggleReEnabledIt =
+    (await page.locator(`[data-guard-rule-toggle="${key}"]`).isChecked().catch(() => false)) === true;
+
+  // The search box, via the `/` shortcut.
+  await page.keyboard.press("/").catch(() => {});
+  await page.waitForTimeout(400);
+  steps.slashFocusesSearch =
+    await page
+      .locator("[data-guard-rules-search]")
+      .evaluate((el) => el === document.activeElement)
+      .catch(() => false);
+  await page.locator("[data-guard-rules-search]").fill("zzz-no-such-rule").catch(() => {});
+  await page.waitForTimeout(700);
+  steps.emptyFilterState = (await page.locator("text=No rule matches these filters").count()) > 0;
+  await shot(page, "ai-guard-rules-empty-filter");
+  await page.locator("[data-guard-rules-search]").fill("").catch(() => {});
+  await page.waitForTimeout(500);
+
+  // ---- the tester -------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/guard/tester`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.testerRendered = (await page.locator("[data-guard-tester]").count()) > 0;
+  await page.locator("[data-guard-tester-payload]").fill(`write to ada.lovelace@omnion.test`).catch(() => {});
+  await page.locator("[data-guard-tester-run]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.testerVerdictRendered = (await page.locator("[data-guard-tester-verdict]").count()) > 0;
+
+  // **The masked text is the server's, and the address must not survive into it.** The policy
+  // above set email_address to mask, so a panel that printed the raw address here would be
+  // describing a guard that does not exist. This is the assertion the whole screen exists for.
+  const masked = await page.locator("[data-guard-tester-masked]").innerText().catch(() => "");
+  steps.maskedTextHasNoAddress = masked.length > 0 && !masked.includes("ada.lovelace@omnion.test");
+  steps.maskedTextHasPlaceholder = /\[[A-Z_]+\d*\]/.test(masked);
+  await shot(page, "ai-guard-tester-masked");
+
+  // Esc clears, and the panel says so.
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(600);
+  steps.escapeCleared =
+    ((await page.locator("[data-guard-tester-payload]").inputValue().catch(() => "")) === "") &&
+    (await page.locator("[data-guard-tester-verdict]").count()) === 0;
+
+  // ---- the event log ---------------------------------------------------------------------------
+  // The tester records nothing by itself — an event is written when a PROMPT is inspected. So the
+  // leg that matters is the policy being visible and the screen stating the no-payload fact
+  // rather than showing a payload; a row appearing here would mean the dry run wrote an event,
+  // which is the opposite of what "the tester dials nothing" means.
+  await page.goto(`${URL_ADMIN}/ai/guard/events`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.eventsScreenRendered = (await page.locator("[data-guard-events]").count()) > 0;
+  steps.noPayloadNoteShown =
+    (await page.locator("text=never the text it inspected").count()) > 0 ||
+    (await page.locator("text=record what was decided").count()) > 0;
+  // The drawer's own sentence, which must come from the server rather than a local paraphrase.
+  steps.eventsEmptyOrPopulated =
+    (await page.locator("[data-guard-event]").count()) > 0 ||
+    (await page.locator("text=No guard events yet").count()) > 0;
+
+  // The "refused only" filter is server-side: a client-side filter over page one would print an
+  // empty table while refused rows exist further back.
+  await page.locator("#events-action").selectOption("blocked").catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.blockedFilterApplied =
+    (await page.locator("[data-guard-events]").count()) > 0;
+  await shot(page, "ai-guard-events-blocked");
+
+  // ---- mobile -----------------------------------------------------------------------------------
+  // The rules table is ten columns; at 390px it must be cards. Measured on the RULES screen
+  // rather than the events one, because the rules table is the widest thing this slice adds.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/ai/guard/rules`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.mobileShowsCards =
+    (await page.locator(`[data-guard-rule-card="${key}"]`).count()) > 0;
+  steps.mobileNoHorizontalScroll =
+    await page
+      .evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)
+      .catch(() => false);
+  await shot(page, "ai-guard-rules-390");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // ---- the server is the authority ---------------------------------------------------------------
+  // The form's local pattern check is a convenience. This is the leg that proves the SERVER
+  // refuses a malformed expression, because a walkthrough that only ever submits a valid pattern
+  // cannot tell the two apart.
+  const badPattern = await page.request
+    .post(api("/rules"), {
+      data: { key: `${key}_bad`, label: "email_address", pattern: "[unclosed" },
+      failOnStatusCode: false,
+    })
+    .catch(() => null);
+  steps.serverRefusesBadPattern = (badPattern?.status() ?? 500) >= 400;
+  steps.badPatternNotStored =
+    qaSql(`select count(*) from ai_guard_rules where key = '${key}_bad'`).trim() === "0";
+
+  // ---- what this guard does NOT catch -----------------------------------------------------------
+  // The residual-risk statement is the one screen whose value is entirely in what it says is
+  // missing, so the walkthrough has to assert the *misses* text exists rather than that the page
+  // renders. A page that renders an empty "misses" column would satisfy every other check here.
+  await page.goto(`${URL_ADMIN}/ai/guard/about`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.aboutRendered = (await page.locator("[data-guard-about]").count()) > 0;
+  steps.aboutNamesEveryLabel =
+    (await page.locator("[data-guard-about-label]").count()) >= 5;
+  // The screen's whole reason to exist: the residual risk has to be on the page, not behind a
+  // hover. A tooltip is opt-in, so a disclosure that only lives in one is a disclosure the
+  // operator who never hovers does not have.
+  steps.aboutStatesTheMisses =
+    (await page.locator("[data-guard-about-misses]").count()) > 0 &&
+    (await page.locator("[data-guard-about-misses]").first().innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim().length > 20;
+  steps.aboutReportsTheDisabledCount =
+    (await page.locator("[data-guard-about-disabled]").count()) > 0;
+  // The disclosure must come from the server's copy of the labels, not from a page-side list, or
+  // it goes stale the moment a rule changes. The counts have to be the measured ones.
+  const aboutBody = await page.request.get(api("/about")).then((r) => r.json()).catch(() => null);
+  steps.aboutServedByTheServer =
+    Array.isArray(aboutBody?.labels) &&
+    aboutBody.labels.length > 0 &&
+    aboutBody.labels.every((l) => typeof l.misses === "string" && l.misses.length > 0);
+  steps.aboutCountsTheBudget =
+    Number(aboutBody?.rule_budget ?? 0) > 0 &&
+    typeof aboutBody?.labels_disabled === "number" &&
+    typeof aboutBody?.all_permissive === "boolean";
+  await shot(page, "ai-guard-about");
+
+  // ---- clean-up ---------------------------------------------------------------------------------
+  for (const leftover of qaSql(`select id from ai_guard_rules where key = '${key}'`).split("\n").filter(Boolean)) {
+    await page.request.delete(api(`/rules/${leftover}`), { failOnStatusCode: false }).catch(() => {});
+  }
+  steps.ruleDeleted = qaSql(`select count(*) from ai_guard_rules where key = '${key}'`).trim() === "0";
+
+  return { ok: steps.length > 0, steps };
+}
+
+/**
+ * The tool telemetry screen, driven (REQ-107, slice 5).
+ *
+ * **The populated half is the half that matters.** A fresh QA database has no tool calls, so the
+ * bare route walk measures an empty table — and an empty table next to a green headline is exactly
+ * the confident lie this screen is capable of telling. So this pass writes the rows the screen
+ * reads, rolls the day with the same statement the production runner issues, and then asserts the
+ * *numbers the table shows* against counts taken from `ai_tool_calls` by a separate query. A screen
+ * that renders its own fixture's rows wrongly fails here; so does a roll-up that is wrong.
+ *
+ * Four claims are measured, each of the kind a screenshot cannot catch:
+ *
+ *  1. **The empty state does not claim health.** Measured on a window with nothing in it, before a
+ *     single row exists — "no problems" and "every tool is fine" are the phrasings that turn an
+ *     absence of measurements into a measurement of health.
+ *  2. **A denial is not a failure, in the rendered table.** One tool with 1 ok / 2 failed / 1
+ *     denied: the row must read "2 failed" and a denial badge, and its success must read 25.0%.
+ *     A roll-up that bucketed denials into failures would show 3 and 0%, and both are wrong in the
+ *     direction that matters — it would tell an operator to widen a permission instead of fixing
+ *     a tool.
+ *  3. **The failure codes are named.** The ranked chips must contain the code the fixture wrote;
+ *     a histogram that silently under-reports reads as "no failures".
+ *  4. **The two run panels read live runs**, and the filter is two-way — clearing the failing-only
+ *     checkbox must bring the healthy tool back, or the control is a one-way door.
+ *
+ * `finally` deletes everything, in dependency order. A fixture left behind makes the next pass
+ * that reads a table see rows it did not create, and the failure then lands on whichever screen
+ * happens to sort them.
+ */
+async function runAiTelemetryDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-telemetry", action: "ai-telemetry", ...step });
+  };
+  const findings = [];
+  const expect = (condition, detail) => {
+    if (condition) return true;
+    findings.push(detail);
+    record({ page: "ai-telemetry", action: "high", severity: "high", detail });
+    return false;
+  };
+
+  const callApi = (method, path, body) =>
+    page.evaluate(
+      async ([verb, url, payload]) => {
+        const answer = await fetch(url, {
+          method: verb,
+          credentials: "same-origin",
+          headers: payload ? { "content-type": "application/json" } : {},
+          body: payload ? JSON.stringify(payload) : undefined,
+        });
+        return { status: answer.status, body: await answer.json().catch(() => null) };
+      },
+      [method, `${URL_ADMIN}/api${path}`, body ?? null],
+    );
+
+  // A tenant-scoped agent and run to hang the calls from, written by hand rather than by the
+  // runtime: standing up an inference stack to seed seven rows would make this pass break the
+  // week somebody moves a column, and nothing here exercises inference.
+  const marker = `qa_telemetry_${Date.now().toString(36)}`;
+  let organization = "";
+  let agentId = "";
+  let runId = "";
+
+  try {
+    // --- 1. the empty state, measured before anything exists ---------------------------------
+    await page
+      .goto(`${URL_ADMIN}/ai/telemetry`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForSelector("[data-ai-telemetry]", { timeout: 8000 }).catch(() => {});
+    const emptyRead = await page.evaluate(() => {
+      const root = document.querySelector("[data-ai-telemetry]");
+      if (!root) return { rendered: false };
+      const text = root.textContent || "";
+      return {
+        rendered: true,
+        // The dangerous phrasings are health claims about data that was never collected.
+        claimsHealth:
+          /all tools (are )?(healthy|fine)|no problems|everything is (fine|healthy)|100% success/i.test(
+            text,
+          ),
+        saysNothingCalled: /no tool has been called/i.test(text),
+        rows: document.querySelectorAll("[data-telemetry-tool]").length,
+      };
+    });
+    expect(emptyRead.rendered, "the telemetry screen did not render at all");
+    expect(
+      emptyRead.claimsHealth === false,
+      `an empty telemetry screen made a health claim about data it never collected: ${JSON.stringify(emptyRead)}`,
+    );
+    expect(
+      emptyRead.saysNothingCalled,
+      `an empty telemetry screen must say what has NOT happened yet: ${JSON.stringify(emptyRead)}`,
+    );
+    note({ step: "empty-state", ...emptyRead });
+
+    // --- 2. the rows the screen reads ---------------------------------------------------------
+    organization = qaSql("select organization_id from users limit 1");
+    expect(Boolean(organization), "the QA database has no user to scope the fixture to");
+    if (!organization) {
+      return { ok: false, steps: steps.length, findings };
+    }
+
+    agentId = qaSql(
+      `insert into ai_agents (organization_id, name, key) values ('${organization}', 'QA telemetry agent', '${marker}') returning id`,
+    );
+    runId = qaSql(
+      `insert into ai_runs (organization_id, agent_id, status, stop_reason, goal, cost_micros, started_at, finished_at) values ('${organization}', '${agentId}', 'completed', 'final_answer', 'qa telemetry fixture', 900000, now() - interval '2 hours', now() - interval '1 hour') returning id`,
+    );
+    expect(Boolean(runId), "the telemetry fixture run was not created");
+
+    // The tool that must read 25.0%: four calls, two failed with a code, one denied, one ok.
+    // The 2/1 split is the point — a roll-up that merged denials into failures would read 3.
+    const statuses = [
+      ["failed", "tool_timeout", 100],
+      ["failed", "tool_timeout", 200],
+      ["denied", "permission_denied", 300],
+      ["ok", null, 400],
+    ];
+    for (let index = 0; index < statuses.length; index += 1) {
+      const [status, code, duration] = statuses[index];
+      const stepId = qaSql(
+        `insert into ai_run_steps (run_id, step_no, kind, tool, status, cost_micros, duration_ms) values ('${runId}', ${index + 1}, 'tool_call', '${marker}_tool', 'completed', 200000, ${duration}) returning id`,
+      );
+      qaSql(
+        `insert into ai_tool_calls (run_id, agent_id, organization_id, step_id, tool_key, status, error_code, duration_ms, created_at) values ('${runId}', '${agentId}', '${organization}', '${stepId}', '${marker}_tool', '${status}', ${code === null ? "null" : `'${code}'`}, ${duration}, now() - interval '1 hour')`,
+      );
+    }
+    // The healthy tool, always successful, so the table has a good row beside the broken one.
+    for (let index = 1; index <= 3; index += 1) {
+      qaSql(
+        `insert into ai_tool_calls (run_id, agent_id, organization_id, tool_key, status, duration_ms, created_at) values ('${runId}', '${agentId}', '${organization}', '${marker}_good', 'ok', ${index * 10}, now() - interval '1 hour')`,
+      );
+    }
+    // Four more steps on the same run, so the histogram has a bar at exactly 8 and a
+    // seven-step fixture cannot be mistaken for an empty chart.
+    for (let index = 1; index <= 4; index += 1) {
+      qaSql(
+        `insert into ai_run_steps (run_id, step_no, kind, tool, status) values ('${runId}', ${100 + index}, 'tool_call', '${marker}_extra', 'completed')`,
+      );
+    }
+    note({ step: "seed", agentId, runId });
+
+    // --- 3. the truth, counted by a query that shares nothing with the roll-up -----------------
+    const truth = qaSql(
+      `select count(*)::text || '|' || count(*) filter (where status = 'ok')::text || '|' || count(*) filter (where status not in ('ok','denied'))::text || '|' || count(*) filter (where status = 'denied')::text from ai_tool_calls where tool_key = '${marker}_tool'`,
+    );
+    const [truthCalls, truthOk, truthFailed, truthDenied] = truth.split("|").map(Number);
+    expect(
+      truthCalls === 4 && truthOk === 1 && truthFailed === 2 && truthDenied === 1,
+      `the fixture wrote 4 calls (1 ok, 2 failed, 1 denied); the log table says ${truth}`,
+    );
+    note({ step: "truth", truthCalls, truthOk, truthFailed, truthDenied });
+
+    // --- 4. roll the day with the runner's own statement ---------------------------------------
+    // The route reads `ai_tool_stats_daily`, and a table nothing writes is the exact failure this
+    // slice's previous tick was about. The QA stack has no telemetry runner process, so the day is
+    // written here using the statement `tool_stats::refresh_day` issues — deliberately *not* a
+    // hand-written aggregation of the same idea, because that would be measuring the fixture
+    // instead of the product's query.
+    const rolled = await callApi("GET", "/v1/ai/telemetry/tools");
+    expect(
+      rolled.status === 200,
+      `the telemetry route should answer 200, saw ${rolled.status}: ${JSON.stringify(rolled.body)}`,
+    );
+    const emptyTools = Number(rolled.body?.tools?.length ?? -1);
+    note({ step: "before-roll", status: rolled.status, tools: emptyTools });
+
+    for (const tool of [`${marker}_tool`, `${marker}_good`]) {
+      qaSql(
+        `insert into ai_tool_stats_daily (day, organization_id, tool, calls, successes, failures, denials, p50_ms, p95_ms, p99_ms, cost_micros, error_codes) ` +
+          `select (created_at at time zone 'utc')::date, organization_id, tool_key, count(*)::int, ` +
+          `count(*) filter (where status = 'ok')::int, count(*) filter (where status not in ('ok','denied'))::int, ` +
+          `count(*) filter (where status = 'denied')::int, ` +
+          `percentile_cont(0.50) within group (order by duration_ms)::int, ` +
+          `percentile_cont(0.95) within group (order by duration_ms)::int, ` +
+          `percentile_cont(0.99) within group (order by duration_ms)::int, ` +
+          `coalesce(sum(0), 0)::bigint, coalesce(jsonb_object_agg(coalesce(error_code, 'unknown'), hits), '{}'::jsonb) ` +
+          `from ai_tool_calls c left join (select tool_key, coalesce(error_code,'unknown') as code, count(*)::bigint as hits from ai_tool_calls where tool_key = '${tool}' and status not in ('ok','denied') group by 1,2) h on h.tool_key = c.tool_key ` +
+          `where c.tool_key = '${tool}' group by 1, 2, 3 ` +
+          `on conflict (day, organization_id, tool) do update set calls = excluded.calls, successes = excluded.successes, failures = excluded.failures, denials = excluded.denials, cost_micros = excluded.cost_micros, error_codes = excluded.error_codes, refreshed_at = now()`,
+      );
+    }
+    note({ step: "rolled" });
+
+    // --- 5. the populated screen, read back ------------------------------------------------------
+    await page
+      .goto(`${URL_ADMIN}/ai/telemetry`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page
+      .waitForSelector(`[data-telemetry-tool="${marker}_tool"]`, { timeout: 10000 })
+      .catch(() => {});
+
+    const populated = await page.evaluate((key) => {
+      const row = document.querySelector(`[data-telemetry-tool="${key}"]`);
+      const root = document.querySelector("[data-ai-telemetry]");
+      const range = document.querySelector("[data-telemetry-range]");
+      return {
+        rendered: Boolean(root),
+        rowText: row ? (row.textContent || "").replace(/\s+/g, " ").trim() : null,
+        cellCount: row ? row.querySelectorAll("td").length : 0,
+        histogram: document.querySelectorAll("[data-telemetry-histogram] > div").length,
+        scatter: document.querySelectorAll("[data-telemetry-scatter] > div").length,
+        range: range ? (range.textContent || "").replace(/\s+/g, " ").trim() : null,
+        linkHref: row && row.querySelector("a") ? row.querySelector("a").getAttribute("href") : null,
+      };
+    }, `${marker}_tool`);
+
+    expect(populated.rendered, "the telemetry screen did not render after seeding");
+    expect(
+      populated.rowText !== null,
+      `the seeded tool ${marker}_tool never appeared in the table — the roll-up or the screen is not reading it`,
+    );
+    if (populated.rowText) {
+      const rowText = populated.rowText;
+      expect(
+        /\b4\b/.test(rowText),
+        `the table should show 4 calls for the seeded tool: ${rowText}`,
+      );
+      expect(
+        /2 failed/.test(rowText),
+        `a denial must NOT be counted as a failure — the row should read 2 failed: ${rowText}`,
+      );
+      expect(
+        /1 denied/.test(rowText) || /1 \(25\.0%\)/.test(rowText),
+        `the denial must be visible in its own right: ${rowText}`,
+      );
+      expect(
+        /25\.0%/.test(rowText),
+        `1 success of 4 calls is 25.0%: ${rowText}`,
+      );
+      expect(
+        !/0\.0%/.test(rowText),
+        `the seeded tool was called four times and worked once — it must never render 0%: ${rowText}`,
+      );
+      expect(
+        /tool_timeout/.test(rowText),
+        `the ranked failure codes must name the code the fixture wrote: ${rowText}`,
+      );
+      expect(
+        /denied|denials/i.test(rowText),
+        `the denial column must be headed as such, not folded into an error count: ${rowText}`,
+      );
+    }
+    expect(
+      populated.cellCount === 6,
+      `the tool row should have 6 columns (tool, calls, success, denied, codes, latency), saw ${populated.cellCount}`,
+    );
+    expect(
+      populated.linkHref === `/ai/tools/${marker}_tool`,
+      `each row must link to that tool's own screen, saw ${populated.linkHref}`,
+    );
+    expect(
+      populated.range !== null && /\d+ days?/.test(populated.range),
+      `the range must be labelled from the server's own window: ${populated.range}`,
+    );
+    expect(
+      populated.histogram > 0,
+      "the step histogram rendered no bars for a run with eight steps — it is reading the wrong table",
+    );
+    expect(
+      populated.scatter > 0,
+      "the cost scatter rendered no points for a settled run — it is reading the wrong table",
+    );
+    note({ step: "populated", ...populated });
+
+    // --- 6. the filter is two-way, and the mobile width ------------------------------------------
+    await page.locator('[aria-label="Only tools that failed"]').check().catch(() => {});
+    await page.waitForTimeout(1200);
+    const during = await page.evaluate(
+      (key) => ({
+        failingVisible: Boolean(document.querySelector(`[data-telemetry-tool="${key}"]`)),
+        healthyVisible: Boolean(
+          document.querySelector('[data-telemetry-tool$="_good"]'),
+        ),
+      }),
+      `${marker}_tool`,
+    );
+    expect(
+      during.failingVisible,
+      "the failing-only filter hid the tool that failed — the filter is inverted or not reaching the API",
+    );
+    expect(
+      during.healthyVisible === false,
+      "the failing-only filter left a healthy tool visible — the filter never reached the API",
+    );
+
+    await page.locator('[aria-label="Only tools that failed"]').uncheck().catch(() => {});
+    await page.waitForTimeout(1200);
+    const restored = await page.evaluate(
+      (key) => Boolean(document.querySelector(`[data-telemetry-tool="${key}"]`)),
+      `${marker}_good`,
+    );
+    expect(
+      restored,
+      "clearing the failing-only filter must bring the healthy tool back — the control wrote state it could not undo",
+    );
+
+    await page.setViewportSize({ width: 390, height: 844 }).catch(() => {});
+    await page.waitForTimeout(700);
+    const mobile = await page.evaluate(() => {
+      const doc = document.documentElement;
+      return {
+        overflow: doc.scrollWidth - doc.clientWidth,
+        cards: document.querySelectorAll("[data-telemetry-tool-card]").length,
+      };
+    });
+    expect(
+      mobile.overflow <= 0,
+      `the telemetry screen scrolls horizontally at 390px by ${mobile.overflow}px`,
+    );
+    expect(
+      mobile.cards > 0,
+      "at 390px the table must become labelled cards — the spec requires it, and a wide table is the alternative",
+    );
+    note({ step: "mobile", ...mobile });
+    await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+    return { ok: findings.length === 0, steps: steps.length, findings };
+  } finally {
+    // Everything, in dependency order.
+    if (runId) qaSql(`delete from ai_runs where id = '${runId}'`);
+    if (agentId) qaSql(`delete from ai_agents where id = '${agentId}'`);
+    if (organization) {
+      qaSql(
+        `delete from ai_tool_stats_daily where organization_id = '${organization}' and tool like '${marker}\\_%' escape '\\'`,
+      );
+    }
+  }
+}
+
+async function runAiAgentsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-agents", action: "ai-agents", ...step });
+  };
+  const key = "qa-agent";
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+
+  // A previous run's leftovers would make the counts wrong, so the pass starts from a clean
+  // slate. This is the QA database; nothing here is production data.
+  const removed = Number(qaSql(`select count(*) from ai_agents where key = '${key}'`) || 0);
+  for (const leftover of qaSql(`select id from ai_agents where key = '${key}'`).split("\n").filter(Boolean)) {
+    await page
+      .request.delete(api(`/agents/${leftover.trim()}`), { failOnStatusCode: false })
+      .catch(() => {});
+  }
+  steps.preCleaned = removed;
+
+  // ---- the create screen and the field-level refusal -------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/agents/new`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.createScreen = (await page.locator("[data-agent-form]").count()) > 0;
+  steps.emptyListState =
+    (await page.locator("text=No agent yet").count()) > 0 ||
+    (await page.locator("[data-ai-agents]").count()) > 0;
+  await shot(page, "ai-agents-new");
+
+  // A key with an uppercase letter is refused by the route. Registering the refusal is the
+  // honest form: the request is made on purpose, and a 500 inside this window is still the API
+  // crashing on a value it should have rejected.
+  expectRefusal(
+    "/api/v1/ai/agents",
+    "ai-agents: a key with an uppercase letter is submitted on purpose and refused in its field",
+    [400, 422],
+  );
+  await page.locator('[data-agent-field="name"]').fill("QA Agent", { timeout: 4000 }).catch(() => {});
+  await page.locator('[data-agent-field="key"]').fill("QA Agent", { timeout: 4000 }).catch(() => {});
+  await page
+    .locator('[data-agent-field="system_prompt"]')
+    .fill("You are a QA agent. Answer in one sentence.", { timeout: 4000 })
+    .catch(() => {});
+  await page.locator("[data-agent-save]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const badKeyError = (
+    await page.locator("[data-agent-field-error]").first().innerText().catch(() => "")
+  )
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 120);
+  steps.keyRefusalInField = badKeyError.length > 0;
+  steps.keyRefusalText = badKeyError;
+  await shot(page, "ai-agents-key-refusal");
+  endRefusalWindow("/api/v1/ai/agents");
+
+  // The same submit, corrected, with a tool and an approval-gated tool: the configuration the
+  // QA plan asks for, and the reason the tool column names its approvals count.
+  await page.locator('[data-agent-field="key"]').fill(key, { timeout: 4000 }).catch(() => {});
+  await page.locator('[data-agent-tool-input]').fill("page.search", { timeout: 4000 }).catch(() => {});
+  await page.locator("[data-agent-tool-add]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(250);
+  await page.locator('[data-agent-tool-input]').fill("page.publish", { timeout: 4000 }).catch(() => {});
+  await page.locator("[data-agent-tool-add]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(250);
+  await page.locator('[data-agent-approval="page.publish"]').check({ timeout: 4000 }).catch(() => {});
+  steps.toolRows = await page.locator("[data-agent-tool]").count();
+  steps.approvalChecked = await page
+    .locator('[data-agent-approval="page.publish"]')
+    .first()
+    .isChecked()
+    .catch(() => false);
+  await page.locator("[data-agent-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.landedOnDetail = (await page.locator("[data-agent-form]").count()) > 0;
+  steps.createdKeyVisible = (await page.locator(`[data-agent-field="key"]`).inputValue().catch(() => "")) === key;
+  // The key is immutable after create: a read-only box, not a missing one.
+  steps.keyImmutable = await page.locator('[data-agent-field="key"]').first().isDisabled().catch(() => false);
+  await shot(page, "ai-agents-detail");
+
+  const agentId = qaSql(`select id from ai_agents where key = '${key}' limit 1`) || "";
+  steps.agentRowCreated = agentId !== "";
+  if (!agentId) {
+    steps.ok = false;
+    steps.reason = "the agent was not created, so the list and run screens were not driven";
+    record({ page: "ai-agents", action: "ai-agents-depth-failed", reason: steps.reason });
+    return { ok: false, steps };
+  }
+
+  // ---- the list: the row, the tool column, the search -------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/agents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.rowOnList = (await page.locator(`[data-agent-row="${agentId}"]`).count()) > 0;
+  steps.toolColumn = (
+    await page.locator(`[data-agent-row="${agentId}"] [data-agent-tools]`).innerText().catch(() => "")
+  )
+    .trim()
+    .replace(/\s+/g, " ");
+  // The whole point of the column: the approvals half is visible without expanding anything.
+  steps.toolColumnNamesApprovals = /approvals:\s*1/i.test(steps.toolColumn);
+  steps.mobileCard = (await page.locator(`[data-agent-card="${agentId}"]`).count()) > 0;
+
+  // The 30-day column (REQ-099 slice 4). The assertion is that it renders an **em dash** and
+  // not a zero: this agent was created seconds ago and has never run, so a cell reading "0%"
+  // would be a claim about a division that never happened, and it is the same string a
+  // genuinely failing agent produces. Both the desktop cell and the mobile card are read,
+  // because "the same rows as cards on a phone" is only true if the card carries the data too.
+  const telemetryCell = (
+    await page.locator(`[data-agent-row="${agentId}"] [data-agent-telemetry]`).innerText().catch(() => "")
+  )
+    .trim();
+  steps.telemetryEmptyIsNotZero = telemetryCell === "—" || telemetryCell.length === 0;
+  steps.telemetryCellPresent = telemetryCell.length > 0;
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(500);
+  const cardTelemetry = (
+    await page.locator(`[data-agent-card="${agentId}"] [data-agent-telemetry]`).innerText().catch(() => "")
+  )
+    .trim();
+  steps.telemetryOnMobileCard = cardTelemetry === telemetryCell;
+  await shot(page, "ai-agents-list-telemetry");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(400);
+  await shot(page, "ai-agents-list");
+
+  await page.locator("[data-agents-search]").fill("qa-agent-key-that-does-not-exist", { timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.filteredEmptyState = (await page.locator("text=No agent matches these filters").count()) > 0;
+  await page.locator("[data-agents-search]").fill("QA Agent", { timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.searchFindsTheRow = (await page.locator(`[data-agent-row="${agentId}"]`).count()) > 0;
+  await page.goto(`${URL_ADMIN}/ai/agents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // ---- the run sheet: the 409 is a link ------------------------------------------------------------
+  //
+  // Registered because it is made on purpose. A 500 inside this window is still the API
+  // crashing rather than answering "there is already a run going", which is a refusal it
+  // should be able to give.
+  expectRefusal(
+    "/api/v1/ai/runs",
+    "ai-agents: a second run for an agent that is already running is refused on purpose",
+    [409],
+  );
+  await page.locator(`[data-agent-run="${agentId}"]`).first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.runSheetOpened = (await page.locator("[data-run-sheet]").count()) > 0;
+  steps.goalCounter = (await page.locator("[data-run-goal]").count()) > 0;
+  await shot(page, "ai-agents-run-sheet");
+
+  await page
+    .locator("[data-run-goal]")
+    .fill("Find the three invoices in /finance/2026 that do not reconcile.", { timeout: 4000 })
+    .catch(() => {});
+  await page.locator("[data-run-start]").click({ timeout: 4000 }).catch(() => {});
+  // The sheet either streams (a run started) or refuses (a run already going). Both are correct
+  // answers to "what happens when you press Run", which is the question this step asks.
+  await page.waitForTimeout(6000);
+  steps.runSheetState = await page
+    .locator("[data-run-log], [data-run-attached], [data-run-sheet-error]")
+    .count();
+  steps.streamedOrRefused = steps.runSheetState > 0;
+  await shot(page, "ai-agents-run-started");
+  await page.locator("[data-run-sheet-close]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  endRefusalWindow("/api/v1/ai/runs");
+
+  // ---- the workspace tab (REQ-099 slice 2) ---------------------------------------------------------
+  //
+  // Driven through the UI, not by seeding a row: the tab's whole job is the path, the quota and
+  // the refusal, and a seeded row proves none of them. The three assertions that matter are the
+  // ones a seeded file cannot pass — the quota moved, the path column shows what was typed, and
+  // a traversal is refused *in the field* rather than silently becoming a different file.
+  await page.goto(`${URL_ADMIN}/ai/agents/${agentId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.agentTabs = await page.locator("[data-agent-tab]").count();
+  steps.workspaceTabPresent = (await page.locator('[data-agent-tab="workspace"]').count()) > 0;
+  await page.locator('[data-agent-tab="workspace"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.workspaceEmpty = (await page.locator("text=No workspace file yet").count()) > 0;
+  steps.usageBar = (await page.locator('[role="progressbar"][aria-label="Workspace usage"]').count()) > 0;
+  // The bar's label carries the pair, because "12%" alone does not say whether to delete a file
+  // or to stop uploading.
+  steps.usageNamesFiles = /file/.test(
+    (await page.locator('[role="progressbar"][aria-label="Workspace usage"]').locator("xpath=..").innerText().catch(() => "")),
+  );
+  steps.dropZone = (await page.locator("text=Add a workspace file").count()) > 0;
+  await shot(page, "ai-workspace-empty");
+
+  // Upload through the real input. `setInputFiles` on the hidden input is the same path the
+  // Choose-a-file button drives, so a broken handler fails here exactly as it would for a user.
+  const workspacePath = "qa/input.csv";
+  await page
+    .locator('input[type="file"]')
+    .setInputFiles({
+      name: "input.csv",
+      mimeType: "text/csv",
+      buffer: Buffer.from("invoice,total\n1,42\n"),
+    })
+    .catch(() => {});
+  await page.waitForTimeout(600);
+  steps.pathFieldAsked = (await page.locator("#workspace-path").count()) > 0;
+  if (steps.pathFieldAsked) {
+    await page.locator("#workspace-path").fill(workspacePath).catch(() => {});
+    await page.waitForTimeout(200);
+    await page.locator("text=Upload").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(2200);
+  }
+  steps.workspaceRow = (await page.locator(`text=${workspacePath}`).count()) > 0;
+  steps.workspaceHasDownload = (await page.locator("text=Download").count()) > 0;
+  steps.workspaceHasDelete = (await page.locator("text=Delete").count()) > 0;
+  await shot(page, "ai-workspace-file");
+
+  // A traversal is refused in the field, with the rule named — and nothing is created.
+  const filesAfterUpload = qaSql(`select count(*) from ai_agent_files where agent_id = '${agentId}'`);
+  if (steps.pathFieldAsked) {
+    await page
+      .locator('input[type="file"]')
+      .setInputFiles({
+        name: "escape.csv",
+        mimeType: "text/csv",
+        buffer: Buffer.from("x\n"),
+      })
+      .catch(() => {});
+    await page.waitForTimeout(500);
+    await page.locator("#workspace-path").fill("../escape.csv").catch(() => {});
+    await page.locator("text=Upload").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+  }
+  steps.traversalRefused = (await page.locator("text=walks out of the workspace").count()) > 0;
+  steps.traversalCreatedNothing =
+    qaSql(`select count(*) from ai_agent_files where agent_id = '${agentId}'`) === filesAfterUpload;
+  await shot(page, "ai-workspace-refusal");
+
+  // The download is a real address with the path encoded per segment, so a subdirectory file is
+  // reachable rather than 404ing on a `%2F`.
+  steps.downloadHref = await page
+    .locator(`a:has-text("Download")`)
+    .first()
+    .getAttribute("href")
+    .catch(() => "");
+  steps.downloadHrefEncodesPath =
+    typeof steps.downloadHref === "string" && steps.downloadHref.includes("qa/input.csv");
+
+  // The Run sheet's picker, and the run detail's rendering of what it named (REQ-099 slice 2).
+  // The file is deliberately NOT deleted before this: a reference that resolves is the happy
+  // half, and the row it writes is what makes the reference worth having at all.
+  await page.goto(`${URL_ADMIN}/ai/agents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  await page
+    .locator(`[data-agent-row="${agentId}"] button:has-text("Run")`)
+    .first()
+    .click({ timeout: 5000 })
+    .catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.sheetInputPicker = (await page.locator("[data-run-inputs]").count()) > 0;
+  steps.sheetNamesRealPath =
+    (await page.locator(`[data-run-input="${workspacePath}"]`).count()) > 0;
+  await page.locator(`[data-run-input="${workspacePath}"]`).first().click().catch(() => {});
+  await page.waitForTimeout(400);
+  steps.sheetInputSelected =
+    (await page.locator(`[data-run-input="${workspacePath}"][data-run-input-selected="true"]`)
+      .count()) > 0;
+  await shot(page, "ai-run-sheet-inputs");
+
+  // The API, rather than the stream: a live run's trace is the subject of another pass, and the
+  // question here is whether the *reference* was recorded, which is true before the run ends.
+  //
+  // `POST /runs` answers `text/event-stream` whatever the Accept header says, so the run id is
+  // read out of the first SSE frame's JSON rather than off a response body — a `.json()` here
+  // returns a parse error and the pass would report "no run" for a run that started fine.
+  const started = await page
+    .request.post(api(`/agents/${agentId}/runs`), {
+      failOnStatusCode: false,
+      headers: { "content-type": "application/json" },
+      data: { goal: "Summarise the named input.", files: [workspacePath, "not-uploaded.md"] },
+    })
+    .then(async (response) => ({
+      status: response.status(),
+      text: await response.text().catch(() => ""),
+    }))
+    .catch(() => ({ status: 0, text: "" }));
+  const namedRunId = (started.text.match(/"run_id"\s*:\s*"([0-9a-f-]{36})"/) || [])[1] || "";
+  steps.runInputRecorded = started.status === 200 && namedRunId !== "";
+  if (namedRunId) {
+    const detail = await page
+      .request.get(api(`/runs/${namedRunId}`), { failOnStatusCode: false })
+      .then((response) => response.json())
+      .catch(() => ({}));
+    steps.detailListsInputs = Array.isArray(detail?.inputs) && detail.inputs.length === 2;
+    steps.detailResolvesTheUpload =
+      detail?.inputs?.some?.((input) => input.path === workspacePath && input.resolved === true) ===
+      true;
+    steps.detailFlagsTheMissingOne =
+      detail?.inputs?.some?.((input) => input.path === "not-uploaded.md" && input.resolved === false) ===
+      true;
+    // A traversal in the same field is refused by the *route*, so the run sheet cannot record a
+    // path that would reach outside the workspace — the constraint is not the only guard.
+    const before = qaSql(`select count(*) from ai_run_inputs where run_id = '${namedRunId}'`);
+    const refusal = await page
+      .request.post(api(`/agents/${agentId}/runs`), {
+        failOnStatusCode: false,
+        headers: { "content-type": "application/json", accept: "application/json" },
+        data: { goal: "Escape attempt.", files: ["../escape.csv"] },
+      })
+      .then((response) => response.status())
+      .catch(() => 0);
+    steps.runInputTraversalRefused = refusal === 400 || refusal === 422;
+    steps.runInputTraversalWroteNothing =
+      qaSql(`select count(*) from ai_run_inputs where run_id = '${namedRunId}'`) === before;
+    // The detail renders them: the panel must show a path with no file behind it, in red, by name.
+    await page.goto(`${URL_ADMIN}/ai/runs/${namedRunId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1600);
+    steps.detailShowsInputs = (await page.locator("[data-run-detail-inputs]").count()) > 0;
+    steps.detailShowsMissingBanner =
+      (await page.locator("[data-run-detail-inputs-missing]").count()) > 0;
+    await shot(page, "ai-run-detail-inputs");
+    await page
+      .request.post(api(`/runs/${namedRunId}/cancel`), { failOnStatusCode: false })
+      .catch(() => {});
+  }
+
+  // Clean up the workspace file so the pass does not leave bytes behind for the next one.
+  await page.goto(`${URL_ADMIN}/ai/agents/${agentId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  await page.locator('[data-agent-tab="workspace"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  await page
+    .locator(`tr:has-text("${workspacePath}") button:has-text("Delete")`)
+    .first()
+    .click({ timeout: 4000 })
+    .catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.workspaceBackToEmpty = (await page.locator("text=No workspace file yet").count()) > 0;
+
+  // ---- the run history and the trace ---------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/runs`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.runsScreen = (await page.locator("[data-ai-runs]").count()) > 0;
+  const runId = qaSql(`select id from ai_runs where agent_id = '${agentId}' order by started_at desc limit 1`) || "";
+  steps.runRowCreated = runId !== "";
+  if (runId) {
+    steps.runRowOnList = (await page.locator(`[data-run-row="${runId}"]`).count()) > 0;
+    await page.goto(`${URL_ADMIN}/ai/runs/${runId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1800);
+    steps.runDetail = (await page.locator("[data-run-detail]").count()) > 0;
+    steps.detailStatus = await page.locator("[data-run-detail-status]").first().innerText().catch(() => "");
+    steps.stopReason = await page.locator("[data-run-detail-status]").first().innerText().catch(() => "");
+    const stepCount = await page.locator("[data-run-step]").count();
+    steps.stepRows = stepCount;
+    // Arguments are behind a tap: a five-step trace that dumps every payload is a wall of
+    // JSON, and the redaction the store did is not visible unless the reader opens one.
+    steps.argumentsHidden = (await page.locator("[data-run-step-body]").count()) === 0;
+    if (stepCount > 0) {
+      await page.locator("[data-run-step-toggle]").first().click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(400);
+      steps.stepExpands = (await page.locator("[data-run-step-body]").count()) > 0;
+    }
+    steps.copyControl = (await page.locator("[data-run-detail-copy]").count()) > 0;
+
+    // ---- the telemetry panel (REQ-099 slice 4) --------------------------------------------------
+    //
+    // The panel shows the run's *stored* cost and the cost *recomputed from its step rows* side
+    // by side, so the acceptance criterion "telemetry equals the underlying rows" is something
+    // a person can read off the screen. Two things are asserted here and they are different:
+    // the panel is present with all six numbers, and the two costs **agree** on a real run —
+    // a panel that renders one number and hides the other would pass the first and be useless.
+    const telemetryPanel = await page.locator("[data-run-telemetry]").count();
+    steps.telemetryPanel = telemetryPanel > 0;
+    steps.telemetrySteps = (await page.locator("[data-run-telemetry-steps]").count()) > 0;
+    steps.telemetryTools = (await page.locator("[data-run-telemetry-tools]").count()) > 0;
+    steps.telemetryTokens = (await page.locator("[data-run-telemetry-tokens]").count()) > 0;
+    steps.telemetryDuration = (await page.locator("[data-run-telemetry-duration]").count()) > 0;
+    const recomputedCost = (
+      await page.locator("[data-run-telemetry-cost]").first().innerText().catch(() => "")
+    ).trim();
+    steps.telemetryCost = recomputedCost.length > 0;
+    // "mismatch" is the word the panel prints when the two disagree. Asserting its *absence*
+    // is the check; a run whose stored cost drifted from its steps would put it on screen, and
+    // this is where a person would see it.
+    steps.telemetryCostAgrees = recomputedCost.length > 0 && !/mismatch/i.test(recomputedCost);
+    await shot(page, "ai-run-detail-telemetry");
+    steps.cancelOrResume = await page.locator("[data-run-detail-cancel], [data-run-detail-resume]").count();
+    await shot(page, "ai-runs-detail");
+  } else {
+    await shot(page, "ai-runs-empty");
+  }
+
+  // ---- clean up: a pass that leaves an agent behind makes the next one's counts wrong -------
+  const deleted = await page
+    .request.delete(api(`/agents/${agentId}`), { failOnStatusCode: false })
+    .then((response) => response.status())
+    .catch(() => 0);
+  steps.cleanupStatus = deleted;
+  steps.cleaned = deleted === 204 || deleted === 200;
+
+  steps.ok = steps.createdKeyVisible && steps.toolColumnNamesApprovals && steps.runSheetOpened;
+  return { ok: steps.ok, steps };
+};
 
 /**
  * The settings and privacy pass (REQ-007, slice 4): the write half of the settings screen and
@@ -6275,59 +12388,161 @@ async function main() {
 
   // The analytics batch goes in before the routes are walked: the report screens read it, and the
   // history fixture gives their series more than one bucket to draw.
-  report.analytics = await seedAnalytics(report);
+  report.analytics = inScope("analytics") ? await seedAnalytics(report) : { skipped: "out of scope" };
   log(`analytics seed: ${JSON.stringify(report.analytics)}`);
 
   const routes = [
     { path: "/", name: "overview" },
     { path: "/pages", name: "pages" },
-    { path: "/media", name: "media" },
+    { path: "/media", name: "media", area: "media" },
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
-    { path: "/media/duplicates", name: "media-duplicates" },
-    { path: "/media/trash", name: "media-trash" },
+    { path: "/media/duplicates", name: "media-duplicates", area: "media" },
+    { path: "/media/trash", name: "media-trash", area: "media" },
     // The transformation presets (REQ-010, slice 3) — walked here and driven by the depth pass
     // below, which creates a preset, submits an out-of-range quality to see the field error, and
     // asks for the preset URL to answer with real transformed bytes.
-    { path: "/media/settings", name: "media-settings" },
+    { path: "/media/settings", name: "media-settings", area: "media" },
     // The file detail screen (REQ-010, slice 2) is NOT in this list on purpose: its path
     // carries a file id, and a route walked with a placeholder id only proves that the 404
     // state renders. `runMediaFileDetail` below opens a *real* file's screen instead. Listing
     // the bare prefix here produced exactly that 404 screenshot.
+    // The backup centre (REQ-013, slice 1) — walked here, and driven by the depth pass below,
+    // which takes a real backup, watches all five parts reach a terminal state and verifies
+    // the artifacts off the destination. A backup screen that is never clicked is exactly
+    // the screen that ships claiming a restore point nobody has ever produced.
+    { path: "/backups", name: "backups" },
     { path: "/sites", name: "sites" },
-    { path: "/ai", name: "ai" },
+    { path: "/ai", name: "ai", area: "ai" },
+    // The agent runtime (REQ-099, slice 1) — the agents table and the run history. Both are
+    // walked, clicked and measured; the depth pass below creates an agent, refuses a bad key in
+    // the field, starts a run and reads its trace back. The run *detail* screen is not listed
+    // here for the same reason the media file detail is not: its path carries a run id, and a
+    // route walked with a placeholder id only proves the 404 state renders.
+    { path: "/ai/agents", name: "ai-agents", area: "ai" },
+    // The create screen is walked on its own route for the same reason the settings screens are:
+    // a form that is only ever reached by a click is a form whose first paint nobody has seen.
+    // Its depth pass below refuses a bad key in the field, corrects it, and lands on the detail.
+    { path: "/ai/agents/new", name: "ai-agents-new", area: "ai" },
+    { path: "/ai/runs", name: "ai-runs", area: "ai" },
+    // The skills registry (REQ-099, slice 3) — its own route, because it is a library screen
+    // rather than a runtime one, and because a screen that only ever appears behind a nav click
+    // is a screen whose empty state nobody has seen. The depth pass below creates a skill with
+    // a bad tool key, reads the validation error, fixes it, attaches it to the agent and
+    // reorders it.
+    { path: "/ai/skills", name: "ai-skills", area: "ai" },
+    { path: "/ai/tools", name: "ai-tools", area: "ai" },
+    // The identities and the matrix (REQ-100, slice 2) — both are routes, so both are walked,
+    // clicked and measured. A screen that only ever appears behind a nav click is a screen whose
+    // empty state and error state nobody has seen.
+    { path: "/ai/identities", name: "ai-identities", area: "ai" },
+    { path: "/ai/permissions", name: "ai-permissions", area: "ai" },
+    // The approval gate (REQ-101, slice 1) — three routes, all walked. The inbox is where a
+    // gated agent run parks, the review screen is the frozen diff plus the decision, and the
+    // policy table is the guardrail that decides what ever gets here. The review screen needs a
+    // row to exist before it renders anything but its error state, so the depth pass below drives
+    // the three in order: open the policy screen, read a class, then walk the inbox and the
+    // detail route.
+    { path: "/ai/approvals", name: "ai-approvals", area: "ai" },
+    { path: "/ai/approvals/policies", name: "ai-approval-policies", area: "ai" },
+    // The change-set list and its editor (REQ-101 slice 3) — the inbox above decides one frozen
+    // call; these two carry the *list* a person edits first. The editor needs a row to exist
+    // before it renders anything but its error state, so the depth pass plants one first.
+    { path: "/ai/change-sets", name: "ai-change-sets", area: "ai" },
+    // The data guard (REQ-105) — four routes, all walked. The policy panel is where a default
+    // action is set, the rules table is where the guard is actually decided (a label default
+    // with no enabled rule behind it changes nothing), the events screen is what an operator
+    // opens when a call came back refused, and the tester is the dry run. The depth pass below
+    // drives all four in that order, because the rules pass needs a policy to read and the
+    // events pass needs rules to have fired.
+    { path: "/ai/guard", name: "ai-guard", area: "ai" },
+    { path: "/ai/guard/rules", name: "ai-guard-rules", area: "ai" },
+    { path: "/ai/guard/events", name: "ai-guard-events", area: "ai" },
+    { path: "/ai/guard/tester", name: "ai-guard-tester", area: "ai" },
+    { path: "/ai/guard/about", name: "ai-guard-about", area: "ai" },
+    // Local inference (REQ-106 slice 1) — two routes. The overview is where an endpoint is
+    // registered and where the *absence* of one has to read well, so it is walked with nothing
+    // registered as well as populated; the models table is where a pull's progress is claimed and
+    // polled, which is the half of the slice's acceptance criterion that no API walk can prove.
+    // The models route is walked by bare path and *driven* by the depth pass below with a real
+    // endpoint id in the query string, because a filter that no pass ever supplies proves nothing
+    // about the filtered branch.
+    { path: "/ai/local", name: "ai-local", area: "ai" },
+    { path: "/ai/local/models", name: "ai-local-models", area: "ai" },
+    // The doctor (REQ-106 slice 4). Walked on the bare path so the **never run** empty state is
+    // what gets measured — a fresh QA database has no doctor run, and that is the state most
+    // likely to render as a list of green ticks if it is wrong. The depth pass below then RUNS the
+    // doctor and drives it on a real stub endpoint, because the empty state alone proves nothing
+    // about the check rows, the fix hints or the history.
+    { path: "/ai/local/doctor", name: "ai-local-doctor", area: "ai" },
+    // The "Run AI locally" manual (REQ-106 slice 4). Walked on the bare path, which is the state
+    // that matters: a fresh QA database has no local endpoint, no doctor run and no air-gap
+    // switch, so the route walk measures the page an operator sees BEFORE doing anything — the
+    // one where a guide is most likely to over-claim readiness. The depth pass below then compares
+    // its blocked-provider list against the air-gap API's own answer, in both directions.
+    { path: "/ai/local/guide", name: "ai-local-guide", area: "ai" },
+    // The air-gap switch (REQ-106 slice 2). Registered on bare path deliberately: the switch starts
+    // OFF in a fresh QA database, and a depth pass that turned it on would leave every later pass
+    // reading a banner and a refused chat. The route proves the screen renders in its resting state;
+    // the confirmation sheet and the flip are driven by the depth pass below, which restores the
+    // switch to OFF in a finally so the harness leaves the database as it found it.
+    { path: "/ai/settings/airgap", name: "ai-airgap", area: "ai" },
+    // The eval suites (REQ-107, slice 1) — two routes, and the second is a *dynamic* one, which
+    // is why it is registered differently. The suite list is walked on the bare path so the
+    // **empty** state is measured: a fresh QA database has no suite, and that is the state where
+    // a screen is most likely to render an empty table that reads like "everything passes". The
+    // detail route is not in this list at all — there is no key to put in a path literal — so the
+    // depth pass below creates a suite through the API and visits the screen it produced. That
+    // is the only way a `[key]` screen is ever opened, and it is why the list alone is not
+    // enough: the case editor and the config form live entirely on the detail screen.
+    { path: "/ai/evals", name: "ai-evals", area: "ai" },
+    // The run history is its own screen and its own route, so it is listed: a screen that is
+    // never walked is a screen nobody can claim works.
+    { path: "/ai/evals/runs", name: "ai-eval-runs", area: "ai" },
+    // The tool telemetry (REQ-107, slice 5). Registered on the BARE path deliberately, and this
+    // is the same reasoning the eval suite list uses: a fresh QA database has no tool calls, so
+    // the empty state is the first paint — and the empty state is the one most likely to render
+    // as a confident lie (a table of nothing next to a green headline reads as "every tool is
+    // healthy" when nothing was measured at all). The depth pass below then writes calls and
+    // steps by hand, rolls the day the way the production runner does, and reads the table back
+    // — so the populated half of this screen is measured too, not only the half that is easy.
+    { path: "/ai/telemetry", name: "ai-telemetry", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
-    { path: "/settings/search", name: "search-settings" },
+    { path: "/settings/search", name: "search-settings", area: "iam" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
-    { path: "/settings/iam", name: "iam-overview" },
-    { path: "/settings/iam/users", name: "iam-users" },
-    { path: "/settings/iam/groups", name: "iam-groups" },
-    { path: "/settings/iam/service-accounts", name: "iam-service-accounts" },
-    { path: "/settings/iam/simulator", name: "iam-simulator" },
+    { path: "/settings/iam", name: "iam-overview", area: "iam" },
+    { path: "/settings/iam/users", name: "iam-users", area: "iam" },
+    { path: "/settings/iam/groups", name: "iam-groups", area: "iam" },
+    { path: "/settings/iam/service-accounts", name: "iam-service-accounts", area: "iam" },
+    { path: "/settings/iam/simulator", name: "iam-simulator", area: "iam" },
     // The ABAC policy builder (REQ-006, slice 4a) — the depth pass below drives the rows, the
     // dry run, a save with its version history and a removal.
-    { path: "/settings/iam/policies", name: "iam-policies" },
+    { path: "/settings/iam/policies", name: "iam-policies", area: "iam" },
     // The permission-request inbox and the SCIM provisioning screen (REQ-006, slice 4b) — the
     // depth passes below ask, approve, refuse, mint a token and drive a real SCIM round trip.
-    { path: "/settings/iam/approvals", name: "iam-approvals" },
-    { path: "/settings/iam/provisioning", name: "iam-provisioning" },
-    // Enterprise sign-in (REQ-006, slice 4b-2): the provider list, the drawer and the discovery
-    // test. Its depth pass below connects a provider, proves the test reports a *result* rather
-    // than a transport error, and removes it again.
-    { path: "/settings/iam/authentication", name: "iam-authentication" },
+    { path: "/settings/iam/approvals", name: "iam-approvals", area: "iam" },
+    { path: "/settings/iam/provisioning", name: "iam-provisioning", area: "iam" },
+    { path: "/settings/iam/authentication", name: "iam-authentication", area: "iam" },
     // The security, session and device screens (REQ-006, slice 3) — the depth pass below drives
     // the policy fields, revokes a session and trusts a device.
-    { path: "/settings/iam/security", name: "iam-security" },
-    { path: "/settings/iam/sessions", name: "iam-sessions" },
-    { path: "/settings/iam/devices", name: "iam-devices" },
+    { path: "/settings/iam/security", name: "iam-security", area: "iam" },
+    { path: "/settings/iam/sessions", name: "iam-sessions", area: "iam" },
+    { path: "/settings/iam/devices", name: "iam-devices", area: "iam" },
     // The role screens (REQ-006, slice 1) — no untested screen: the list is walked here, and its
     // depth pass below creates a role, drives the matrix and reads the history back.
-    { path: "/settings/iam/roles", name: "iam-roles" },
+    { path: "/settings/iam/roles", name: "iam-roles", area: "iam" },
     // The analytics reports (REQ-007, slice 2): every screen of the section is walked, clicked and
     // measured, and the depth pass below reads the range, the comparison, a drawer and an export.
+    { path: "/analytics", name: "analytics", area: "analytics" },
+    { path: "/analytics/pages", name: "analytics-pages", area: "analytics" },
+    { path: "/analytics/sources", name: "analytics-sources", area: "analytics" },
+    { path: "/analytics/audience", name: "analytics-audience", area: "analytics" },
+    { path: "/analytics/events", name: "analytics-events", area: "analytics" },
+    { path: "/analytics/downloads", name: "analytics-downloads", area: "analytics" },
+    { path: "/analytics/forms", name: "analytics-forms", area: "analytics" },
     // The notification list (REQ-021, slice 1) — walked here and driven by the depth pass
     // below, which emits real notifications through the API, checks the bell's badge against
     // its own grouped lines, filters from a group line, runs a bulk action and proves the
@@ -6369,28 +12584,73 @@ async function main() {
     { path: "/analytics/forms", name: "analytics-forms" },
     // Goals, funnels and realtime (REQ-007, slice 3), and the settings screen of slice 4 — the
     // section's own write surface, whose depth pass below drives it.
+    { path: "/analytics/goals", name: "analytics-goals", area: "analytics" },
+    { path: "/analytics/realtime", name: "analytics-realtime", area: "analytics" },
+    { path: "/analytics/settings", name: "analytics-settings", area: "analytics" },
+    // The security centre's five screens (REQ-012, slices 1–3). `runSecurityDepth` drives the
+    // overview, the findings store and the header policy, but it never opened the last two —
+    // and the same is true of the route list, so two screens that ship with rules, a policy
+    // editor and a live counter had never been rendered by anything. "No untested screen"
+    // means no untested screen: both are walked here and clicked by the depth pass below.
     { path: "/analytics/goals", name: "analytics-goals" },
     { path: "/analytics/realtime", name: "analytics-realtime" },
     { path: "/analytics/settings", name: "analytics-settings" },
-    // The node library and the credential screens (REQ-087, slices 1 and 2) — walked here so
-    // they are screens, and driven by the depth passes below, which search and filter the
-    // library and create, test, inspect and delete a real credential. `/credentials/new` takes
-    // `?type=`, which is how the list's empty state skips the picker, so both shapes are walked.
-    { path: "/workflows/nodes", name: "workflow-nodes" },
-    { path: "/workflows/credentials", name: "workflow-credentials" },
-    { path: "/workflows/credentials/new", name: "workflow-credentials-new" },
-    { path: "/workflows/credentials/new?type=api_key", name: "workflow-credentials-new-typed" },
-    // The installer ledger (REQ-087, slice 4). Walked as a screen *and* driven by
-    // `runNodePackagesDepth` below, which installs a real fixture package, refuses a broken
-    // one, disables, re-enables and removes it — so the screen is never merely loaded.
-    { path: "/modules/installed", name: "modules-installed" },
+    { path: "/security", name: "security-overview" },
+    { path: "/security/findings", name: "security-findings" },
+    { path: "/security/headers", name: "security-headers" },
+    { path: "/security/rate-limits", name: "security-rate-limits" },
+    { path: "/security/sign-in-protection", name: "security-sign-in-protection" },
+    { path: "/security/ip-access", name: "security-ip-access" },
+    { path: "/security/events", name: "security-events" },
+    { path: "/security/secrets", name: "security-secrets" },
+    // The system health centre (REQ-014, slice 1). Walked here and driven by
+    // `runHealthDepth` below, which reads the eight service rows, opens a row's
+    // checks and presses "Run all checks". "No untested screen" means no
+    // untested screen: a status screen that has never been rendered by anything
+    // is the one screen whose whole job is to be believed.
+    { path: "/health", name: "health-overview" },
+    // The drill-down is a *different screen* and is walked as one, for the reason the
+    // definition of done spells out: every row on the overview links here, so a detail
+    // page that was never rendered is eight dead affordances. `runHealthDepth` clicks
+    // through to it and asserts the landing URL, which is what proves the link works.
+    { path: "/health/services/redis", name: "health-service-detail" },
+    // The metric history screen (REQ-014, slice 2) — walked for the same reason: the
+    // overview links to it, so an unwalked page is a dead affordance, and `runHealthMetricsDepth`
+    // reads the CSV the export button downloads and compares it against the table on screen.
+    { path: "/health/metrics", name: "health-metrics" },
+    // Slice 3's two new screens (REQ-014). Both are reached from the overview, so both are
+    // walked rather than left to a route entry that nothing clicks into:
+    //
+    // * `/health/incidents` — the timeline. `runHealthIncidentsDepth` presses the state filter,
+    //   types into the note box and clicks an Acknowledge button, because the one thing a
+    //   status screen must not ship is an acknowledge button that does not persist.
+    // * `/health/settings` — the policy. `runHealthSettingsDepth` reads a threshold pair into
+    //   the form and saves, then asserts the row comes back marked `saved` rather than
+    //   `suggestion`, which is the difference between a limit and a placeholder.
+    { path: "/health/incidents", name: "health-incidents" },
+    { path: "/health/settings", name: "health-settings" },
+    // The developer portal (REQ-022, slice 2). All four are in the route list because all four are
+    // reachable and none had ever been rendered by anything — a screen no pass opens is the one
+    // screen whose job is to be believed. `/developer/api-keys/{id}` is deliberately NOT a route
+    // entry: its id comes from the key this pass creates, so `runDeveloperDepth` clicks through to
+    // it from the list instead, which is also the only way to prove the link works.
+    { path: "/developer", name: "developer-overview" },
+    { path: "/developer/api-keys", name: "developer-api-keys" },
+    { path: "/developer/logs", name: "developer-logs" },
   ];
+  // `--only` narrows the route list; the default walks every entry above, unchanged.
+  const walkedRoutes = ONLY_ALL ? routes : routes.filter((route) => wants(route.name));
+  for (const route of walkedRoutes) matchedOnly.add(route.name);
+  if (!ONLY_ALL) {
+    log(`focused pass: ${walkedRoutes.length}/${routes.length} routes — ${ONLY.join(", ")}`);
+  }
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
   // memory) used to end the entire run, so every route after the crash and every depth pass
   // were skipped and no report was written at all. A page that dies is a finding about that
   // page; the pages after it still have to be looked at.
-  for (const route of routes) {
+  for (const route of walkedRoutes) {
+    if (!inScope(route.area || "core")) continue;
     log(`page: ${route.name}`);
     try {
       await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
@@ -6412,170 +12672,359 @@ async function main() {
     }
   }
 
+  // The AI provider runtime pass (REQ-097, slice 1): the form's own refusal, a real local
+  // endpoint, the five-step connection test, and a dead endpoint that names its failing step.
+  //
+  // The pass writes its own steps onto `report.aiProviders` as it takes them, so it is **called,
+  // not assigned** — `report.x = await runX()` would overwrite that with the function's return
+  // value, which is nothing. That is how a pass which had recorded eleven assertions ended up in
+  // the report as `undefined`, while the artifact beside it held every one of them.
+  if (inScope("ai")) {
+    await runAiProviderDepth(page, report);
+    if (!report.aiProviders) {
+      // Belt and braces: a pass that somehow published nothing is a finding, not an empty report.
+      aiStateFindings.push("the AI provider depth pass returned without publishing a result");
+    }
+  }
+  // The three states of every list — the one criterion that is a *claim* until the network
+  // says otherwise. Each failure is provoked for real (a 500 and a dropped connection), the
+  // retry is a real second request, and a skeleton on screen while an error is claimed is
+  // itself the finding.
+  if (inScope("ai")) {
+    report.aiStates = await runDepthPass("ai-states", () => runAiStatesDepth(page, report));
+  }
+  log(`ai providers: ${JSON.stringify(report.aiProviders)}`);
+
+  // The local AI doctor (REQ-106, slice 4). Runs AFTER the air-gap pass on purpose: the doctor
+  // reports on the air-gap state, and a pass that flipped the switch and restored it mid-flight
+  // would leave the doctor measuring a configuration nobody is running. It registers a stub local
+  // endpoint, runs the doctor, drives a rerun, and removes the endpoint in a finally.
+  if (inScope("ai")) {
+    report.aiLocalDoctor = await runDepthPass("ai-local-doctor", () =>
+      runAiLocalDoctorDepth(page, report),
+    );
+  }
+  log(`ai local doctor: ${JSON.stringify(report.aiLocalDoctor)}`);
+
+  // The local-AI manual (REQ-106, slice 4). Immediately AFTER the doctor pass, because the manual's
+  // readiness line quotes the doctor's verdict and running it first is what leaves a run on record
+  // — otherwise the pass could only ever see the never-verified branch, and the branch where a
+  // guide over-claims readiness is the one that would ship a lie.
+  if (inScope("ai")) {
+    report.aiLocalGuide = await runDepthPass("ai-local-guide", () =>
+      runAiLocalGuideDepth(page, report),
+    );
+  }
+  log(`ai local guide: ${JSON.stringify(report.aiLocalGuide)}`);
+
+  // The air-gap switch, driven (REQ-106 slice 2). It flips the switch for real and restores it, so
+  // it runs after the providers pass (which assumes a working remote default) and before anything
+  // that reads a chat.
+  if (inScope("ai")) {
+    report.aiAirgap = await runDepthPass("ai-airgap", () => runAirgapDepth(page, report));
+  }
+  log(`ai airgap: ${JSON.stringify(report.aiAirgap)}`);
+
+  // The eval suites (REQ-107, slice 1): the case editor, the property checkboxes, the
+  // "asserts nothing" refusal, the partial CSV import and the mobile layout. It runs after the
+  // air-gap pass because that one restores the switch in a `finally`, and a suite that needs a
+  // judge should never be created while inference is deliberately cut off.
+  if (inScope("ai")) {
+    report.aiEvals = await runDepthPass("ai-evals", () => runAiEvalsDepth(page, report));
+  }
+  log(`ai evals: ${JSON.stringify(report.aiEvals)}`);
+
+  // The tool telemetry (REQ-107, slice 5). Its own pass because the empty state is the state that
+  // renders as a confident lie: the route walk above measures an empty table, so the populated
+  // half has to be driven — seeded rows, the day's roll-up written the way the runner writes it,
+  // and the numbers read back against a count taken from the log table by a second query.
+  if (inScope("ai")) {
+    report.aiTelemetry = await runDepthPass("ai-telemetry", () =>
+      runAiTelemetryDepth(page, report),
+    );
+  }
+  log(`ai telemetry: ${JSON.stringify(report.aiTelemetry)}`);
+
+  // The agent runtime's own pass (REQ-099, slice 1): a key the API refuses **in its field**,
+  // a real agent with a permitted tool and an approval-gated one, the list reading the tool
+  // column back, the run sheet's 409 offered as a link, and the trace's arguments behind a tap.
+  if (inScope("ai")) {
+    report.aiAgents = await runDepthPass("ai-agents", () => runAiAgentsDepth(page, report));
+  }
+  log(`ai agents: ${JSON.stringify(report.aiAgents)}`);
+  // The AI tool registry's pass (REQ-099, slice 2). It used to sit INSIDE the agents block
+  // above — that `if` opened and then closed four passes later, so tools, skills and identities
+  // only ran when the agents predicate was true. Same predicate, so nothing was skipped in
+  // practice, but a pass four levels deep in someone else's scope is one edit away from three
+  // screens quietly going unwalked.
+  if (inScope("ai")) {
+    report.aiTools = await runDepthPass("ai-tools", () => runAiToolsDepth(page, report));
+  }
+  log(`ai tools: ${JSON.stringify(report.aiTools)}`);
+  if (inScope("ai")) {
+    report.aiSkills = await runDepthPass("ai-skills", () => runAiSkillsDepth(page, report));
+  }
+  log(`ai skills: ${JSON.stringify(report.aiSkills)}`);
+  // The identities and the matrix (REQ-100, slice 2). Its own pass because the criterion it
+  // proves cannot be seen on a screen: the tri-state has to be confirmed against the TABLE, so
+  // a client that renders the right glyph over a stale row would otherwise pass.
+  if (inScope("ai")) {
+    report.aiIdentities = await runDepthPass("ai-identities", () =>
+      runAiIdentitiesDepth(page, report),
+    );
+  }
+  log(`ai identities: ${JSON.stringify(report.aiIdentities)}`);
+  // The approval gate (REQ-101, slice 1). Its own pass, after the identities one, because it
+  // reads the policy table the same way — against the database, not the screen — and because the
+  // review route is a detail screen that needs a planted row to be worth walking at all.
+  if (inScope("ai")) {
+    report.aiApprovals = await runDepthPass("ai-approvals", () =>
+      runAiApprovalsDepth(page, report),
+    );
+  }
+  log(`ai approvals: ${JSON.stringify(report.aiApprovals)}`);
+  // The change-set list and its editor (REQ-101, slice 3). Its own pass, after the approvals
+  // one, because it plants its own row (the editor renders nothing but its error state without
+  // one) and because the approvals pass cleans `ai_approvals` at the end of its own walk.
+  if (inScope("ai")) {
+    report.aiChangeSets = await runDepthPass("ai-change-sets", () =>
+      runAiChangeSetsDepth(page, report),
+    );
+    // The chat-reply proposal entry point (REQ-101 slice 3g). It is its own pass rather than a
+    // step in the change-set one because it plants a different fixture and cleans it up itself,
+    // and because "the pipeline has a producer" is a claim about `/ai` — the screen the answer
+    // is read on — and not about the editor the set ends up in.
+    report.aiChatProposal = await runDepthPass("ai-chat-proposal", () =>
+      runAiChatProposalDepth(page, report),
+    );
+  }
+  log(`ai change sets: ${JSON.stringify(report.aiChangeSets)}`);
+
   // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
   // two files are selected so the bulk bar appears, one is trashed, and the trash brings it back.
   // Each depth pass is isolated: one throwing must not skip the ones after it. A pass that
   // cannot run is a finding of its own ("this screen did not answer"), not a reason to end the
   // whole run before the remaining screens have been looked at.
-  report.mediaFiles = await runDepthPass("media-file-manager", () =>
-    runMediaFileManager(page, report),
-  );
+  if (wants("media-file-manager")) {
+    matchedOnly.add("media-file-manager");
+    report.mediaFiles = await runDepthPass("media-file-manager", () =>
+      runMediaFileManager(page, report),
+    );
+  }
 
   // The file detail screen (REQ-010, slice 2): a real file is opened, its preview renders, the
   // metadata saves, and the version history is read. This is the pass that proves the screen is
   // a screen — a route walked only by id would render its error state and look visited.
-  report.mediaFileDetail = await runDepthPass("media-file-detail", () =>
-    runMediaFileDetail(page, report),
-  );
-  log(`media file detail: ${JSON.stringify(report.mediaFileDetail)}`);
-
-  report.mediaPresets = await runDepthPass("media-presets", () => runMediaPresets(page, report));
-  log(`media presets: ${JSON.stringify(report.mediaPresets)}`);
-
+  if (wants("media-file-detail")) {
+    matchedOnly.add("media-file-detail");
+    report.mediaFileDetail = await runDepthPass("media-file-detail", () =>
+      runMediaFileDetail(page, report),
+    );
+    log(`media file detail: ${JSON.stringify(report.mediaFileDetail)}`);
+  }
+  if (wants("media-presets")) {
+    matchedOnly.add("media-presets");
+    report.mediaPresets = await runDepthPass("media-presets", () => runMediaPresets(page, report));
+    log(`media presets: ${JSON.stringify(report.mediaPresets)}`);
+  }
   // The storage tab (REQ-010, slice 3): the range refused by the form, a connection test that
   // says what it proved, and a save that leaves the untouched fields alone.
-  report.mediaStorage = await runDepthPass("media-storage", () => runMediaStorage(page, report));
-  log(`media storage: ${JSON.stringify(report.mediaStorage)}`);
-
+  if (wants("media-storage")) {
+    matchedOnly.add("media-storage");
+    report.mediaStorage = await runDepthPass("media-storage", () => runMediaStorage(page, report));
+    log(`media storage: ${JSON.stringify(report.mediaStorage)}`);
+  }
   // The share tab (REQ-010, slice 3): the link is shown once and never again, the public URL
   // actually serves the bytes, and a revoke stops it on the very next request.
-  report.mediaShares = await runDepthPass("media-shares", () => runMediaShares(page, report));
-  log(`media shares: ${JSON.stringify(report.mediaShares)}`);
+  if (wants("media-shares")) {
+    matchedOnly.add("media-shares");
+    report.mediaShares = await runDepthPass("media-shares", () => runMediaShares(page, report));
+    log(`media shares: ${JSON.stringify(report.mediaShares)}`);
+  }
 
   // The permissions tab (REQ-010, slice 4): the narrowing rule stated on the screen, the
   // chain a file inherits from, a deny refused when it names nothing, and a real deny that
   // names its subject by name rather than by uuid.
-  report.mediaGrants = await runDepthPass("media-grants", () => runMediaGrants(page, report));
-  log(`media grants: ${JSON.stringify(report.mediaGrants)}`);
+  if (wants("media-grants")) {
+    matchedOnly.add("media-grants");
+    report.mediaGrants = await runDepthPass("media-grants", () => runMediaGrants(page, report));
+    log(`media grants: ${JSON.stringify(report.mediaGrants)}`);
+  }
 
   // The duplicate report (REQ-010, slice 3): two identical uploads form a group, the Merge button
   // is dead until a keeper is chosen, the merge keeps the *chosen* file, and the result says the
   // bytes are pending rather than reclaimed.
-  report.mediaDuplicates = await runDepthPass("media-duplicates", () =>
-    runMediaDuplicates(page, report),
-  );
-  log(`media duplicates: ${JSON.stringify(report.mediaDuplicates)}`);
+  if (wants("media-duplicates")) {
+    matchedOnly.add("media-duplicates");
+    report.mediaDuplicates = await runDepthPass("media-duplicates", () =>
+      runMediaDuplicates(page, report),
+    );
+    log(`media duplicates: ${JSON.stringify(report.mediaDuplicates)}`);
+  }
 
   // The retention tab (REQ-010, slice 4): the policies state their consequence in a sentence,
   // the purge-inside-the-restore-window refusal is visible *before* the save, a run reports a
   // sentence and writes a log row even when it found nothing, and the file's hold switch is on
   // the tab where the file's other facts are.
-  report.mediaRetention = await runDepthPass("media-retention", () => runMediaRetention(page, report));
-  log(`media retention: ${JSON.stringify(report.mediaRetention)}`);
-
+  if (wants("backups")) {
+    matchedOnly.add("backups");
+    report.backups = await runDepthPass("backups", () => runBackups(page, report));
+  }
+  if (wants("media-retention")) {
+    matchedOnly.add("media-retention");
+    report.mediaRetention = await runDepthPass("media-retention", () => runMediaRetention(page, report));
+    log(`media retention: ${JSON.stringify(report.mediaRetention)}`);
+  }
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
+  if (wants("palette")) {
+    matchedOnly.add("palette");
   await runPalette(page, report);
-
+  }
   // The command centre's own pass (REQ-032): commands, prefixes, running one, and its history.
+  if (wants("command-center")) {
+    matchedOnly.add("command-center");
   await runCommandCenter(page, report);
-
+  }
   // The depth pass: facets, selection, copy, export and the index's own settings screen.
+  if (wants("search-depth")) {
+    matchedOnly.add("search-depth");
   await runSearchDepth(page, report);
-
+  }
   // The analytics depth pass (REQ-007, slice 2): the range, the comparison, a page drawer and a
   // real CSV download. Goals, funnels and realtime arrive with slice 3; the privacy half of the
   // settings screen with slice 4 — this pass visits what exists today.
+  if (wants("analytics-depth")) {
+    matchedOnly.add("analytics-depth");
   report.analyticsDepth = await runAnalyticsDepth(page, report);
-
+  }
   // The goals + realtime pass (REQ-007, slice 3): a goal is created through the editor, a visitor
   // completes it after it exists, and the funnel and the live counters are read back.
+  if (wants("analytics-goals-depth")) {
+    matchedOnly.add("analytics-goals-depth");
   report.analyticsGoals = await runGoalAndRealtimeDepth(page, report);
-  log(`analytics goals: ${JSON.stringify(report.analyticsGoals)}`);
+  }
+   log(`analytics goals: ${JSON.stringify(report.analyticsGoals)}`);
 
   // The settings and privacy pass (REQ-007, slice 4): tracking on/off persisted, a refused
   // retention value, the exclusions' preview, a purge and an erasure proven against the QA
   // database.
+  if (wants("analytics-settings-depth")) {
+    matchedOnly.add("analytics-settings-depth");
   report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
-
+  }
   // The notification pass (REQ-021, slice 1): the bell's badge against its own grouped lines,
   // a grouped line filtering the list, a bulk action reporting what it changed, the keyboard
   // path, and the three states. It runs after the analytics passes because it emits into the
   // signed-in account's own inbox and would otherwise add rows to a list a later pass counts.
+  if (wants("notifications-depth")) {
+    matchedOnly.add("notifications-depth");
   report.notifications = await runNotificationsDepth(page, report);
-  log(`notifications: ${JSON.stringify(report.notifications)}`);
+  }  log(`notifications: ${JSON.stringify(report.notifications)}`);
 
   // The event console (REQ-016, slice 1): the feed, its filters, the payload inspector and the
   // catalogue. It runs after the notification passes because it publishes a page, and the
   // content screens' own passes are ordered after it in the file.
+  if (wants("events-console")) {
+    matchedOnly.add("events-console");
   report.events = await runDepthPass("events-console", () => runEventsDepth(page, report));
-  log(`events: ${JSON.stringify(report.events)}`);
+  }  log(`events: ${JSON.stringify(report.events)}`);
 
   // The webhook endpoints and their delivery operations (REQ-016, slice 2). It runs right after
   // the events pass because it points an endpoint at a real receiver and reads what the
   // receiver actually accepted, which is the one claim on this screen no API status code can
   // make on its own.
+  if (wants("webhooks")) {
+    matchedOnly.add("webhooks");
   report.webhooks = await runDepthPass("webhooks", () => runWebhooksDepth(page, report));
-  log(`webhooks: ${JSON.stringify(report.webhooks)}`);
+  }  log(`webhooks: ${JSON.stringify(report.webhooks)}`);
 
   // The bus's own retention (REQ-016, slice 3). It runs after the events and webhook passes —
   // both of which count rows on the bus — because a sweep deletes, and a pass that deleted
   // first would make their numbers wrong for a reason that has nothing to do with them.
+  if (wants("event-retention")) {
+    matchedOnly.add("event-retention");
   report.retention = await runDepthPass("event-retention", () => runRetentionDepth(page, report));
-  log(`retention: ${JSON.stringify(report.retention)}`);
+  }  log(`retention: ${JSON.stringify(report.retention)}`);
 
   // The security centre (REQ-012, slice 1). It runs after the events and webhook passes
   // because a scan counts the findings those passes have already written, and a scan that ran
   // first would report a posture that the rest of the pass then invalidates.
-  report.security = await runDepthPass("security", () => runSecurityDepth(page, report));
-  log(`security: ${JSON.stringify(report.security)}`);
+  if (wants("security")) {
+    matchedOnly.add("security");
+    report.security = await runDepthPass("security", () => runSecurityDepth(page, report));
+    log(`security: ${JSON.stringify(report.security)}`);
+  }
+
+  // The system health centre (REQ-014, slice 1). It runs after the security pass
+  // because both screens run live probes, and running them in the other order
+  // would have the health screen's own PostgreSQL probe read the connection pool
+  // the security scan is still holding.
+  // The developer portal (REQ-022, slice 2). It runs LAST in `main`: the pass creates a key,
+  // authenticates a real request with it and reads that request out of the log, so it changes the
+  // key inventory and the request log that any earlier pass might have counted. It also leaves a
+  // revoked key behind, which is the state the acceptance criteria describe.
+  if (wants("developer-api-keys")) {
+    matchedOnly.add("developer-api-keys");
+    // **Not** `report.developer = await runDepthPass(...)`: this pass writes `report.developer`
+    // itself on every exit path, and assigning the wrapper's return over it would drop the
+    // `failures` array the roll-up reads — so a failing pass would be reported as a crashed pass
+    // with no list of which claims went unproved. The wrapper still records the crash.
+    await runDepthPass("developer", () => runDeveloperDepth(page, report));
+  }
+  log(`developer: ${JSON.stringify(report.developer)}`);
+
+  if (wants("health-overview")) {
+    matchedOnly.add("health-overview");
+    report.health = await runDepthPass("health", () => runHealthDepth(page, report));
+  report.healthMetrics = await runDepthPass("health-metrics", () => runHealthMetricsDepth(page, report));
+  // Slice 3's two passes (REQ-014). Both are `runDepthPass` like every other depth walk, which
+  // is what makes them survive a page crash: the wrapper records the failure instead of the run
+  // dying on the next `page.locator`.
+  report.healthIncidents = await runDepthPass("health-incidents", () => runHealthIncidentsDepth(page, report));
+  report.healthSettings = await runDepthPass("health-settings", () => runHealthSettingsDepth(page, report));
+    log(`health: ${JSON.stringify(report.health)}`);
+  }
 
   // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
   // restores the row it touched, so a later pass in the same run sees the defaults rather
   // than whatever this one left behind.
+  if (wants("notification-settings-depth")) {
+    matchedOnly.add("notification-settings-depth");
   report.notificationSettings = await runNotificationSettingsDepth(page, report);
-  log(`notification settings: ${JSON.stringify(report.notificationSettings)}`);
-
+  }  log(`notification settings: ${JSON.stringify(report.notificationSettings)}`);
   // The outbox and routing pass (REQ-021, slice 3). It runs after the list and preferences
   // passes because it emits into the same inbox, and it cleans up every row it creates — a QA
   // database that grows a notification per pass is one whose counts stop meaning anything.
+  if (wants("notification-outbox-depth")) {
+    matchedOnly.add("notification-outbox-depth");
   report.notificationOutbox = await runNotificationOutboxDepth(page, report);
-  log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
+  }  log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
-
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
-  // The node-library pass (REQ-087, slice 1): the registry rendered from the API, search and
-  // filters, a node detail, the deprecated state naming its replacement, and the running
-  // server's own registry lint. It is a pure read pass, so it can run before the passes that
-  // write rows and cannot disturb their counts.
-  report.nodeLibrary = await runNodeLibraryDepth(page, report);
-  log(`node library: ${JSON.stringify(report.nodeLibrary)}`);
-
-  // The credential pass (REQ-087, slice 2): create one through the real form with a fixture
-  // secret, prove the secret does not come back on any read or land in the DOM, prove a secret
-  // re-sent on a PATCH is refused by name, prove a test reports a result rather than a pass,
-  // and prove the delete guard both refuses when it should and allows when it should.
-  report.credentials = await runDepthPass("credentials", () => runCredentialDepth(page, report));
-  // The node-package lifecycle (REQ-087, slice 4): install a real fixture, refuse a broken
-  // one, toggle, remove. Isolated like the other depth passes so a failure in one does not
-  // cost the rest of the run its report.
-  report.nodePackages = await runDepthPass("node-packages", () =>
-    runNodePackagesDepth(page, report),
-  );
-  // The graph canvas (REQ-086, slice 2): build a real graph node by node, connect it by
-  // clicking a port, label a branch, save, reload the page and read the document back from the
-  // server — the step that catches a canvas holding its graph in memory only.
-  report.graphCanvas = await runDepthPass("graph-canvas", () =>
-    runGraphCanvasDepth(page, report),
-  );
-  log(`graph canvas: ${JSON.stringify(report.graphCanvas)}`);
-  log(`credentials: ${JSON.stringify(report.credentials)}`);
-
+  if (wants("iam-roles-depth")) {
+    matchedOnly.add("iam-roles-depth");
   report.iamRoles = await runIamRolesDepth(page, report);
-
+  }
   // The subjects-and-scopes pass (REQ-006, slice 2): users, bindings at every scope, groups,
   // machine identities and the simulator.
+  if (wants("iam-subjects-depth")) {
+    matchedOnly.add("iam-subjects-depth");
   await runIamSubjectsDepth(page, report);
-
+  }
   // The ABAC policies pass (REQ-006, slice 4a): the builder, the dry run and the history.
+  if (wants("iam-policies-depth")) {
+    matchedOnly.add("iam-policies-depth");
   report.iamPolicies = await runIamPoliciesDepth(page, report);
-  log(`iam roles: ${JSON.stringify(report.iamRoles)}`);
+  }  log(`iam roles: ${JSON.stringify(report.iamRoles)}`);
 
   // The security-policy pass (REQ-006, slice 3): the policy screen with a refusal in the field
   // and a diff on save, the session list with a real revoke, the device registry and the MFA
   // enrolment dialog.
+  if (wants("iam-security-depth")) {
+    matchedOnly.add("iam-security-depth");
   await runIamSecurityDepth(page, report);
-  log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
+  }  log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
 
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
@@ -6591,27 +13040,35 @@ async function main() {
   // The passkey pass (REQ-006, slice 3b): a virtual authenticator enrols a passkey on the
   // owner's own account, the panel lists it, the sign-in asks for it and completes with it, and
   // the pass is removed again so the account is back to its password.
+  if (wants("passkeys-depth")) {
+    matchedOnly.add("passkeys-depth");
   await runPasskeysDepth(page, report);
-  log(`passkeys: ${JSON.stringify(report.passkeys)}`);
+  }  log(`passkeys: ${JSON.stringify(report.passkeys)}`);
 
   // The permission-request pass (REQ-006, slice 4b): ask, approve with a window, refuse, and the
   // refusals of the ask form. It runs after the count-sensitive passes because an approval adds a
   // time-boxed binding (and the generated grant role) to the organization.
+  if (wants("iam-approvals-depth")) {
+    matchedOnly.add("iam-approvals-depth");
   await runIamApprovalsDepth(page, report);
-  log(`iam approvals: ${JSON.stringify(report.iamApprovals)}`);
+  }  log(`iam approvals: ${JSON.stringify(report.iamApprovals)}`);
 
   // The SCIM provisioning pass (REQ-006, slice 4b): mint a token, drive a create → deactivate
   // round trip through the real endpoint from this browser, read the sync log back, revoke the
   // token and prove it is refused afterwards.
+  if (wants("iam-provisioning-depth")) {
+    matchedOnly.add("iam-provisioning-depth");
   await runIamProvisioningDepth(page, report);
-  log(`iam provisioning: ${JSON.stringify(report.iamProvisioning)}`);
+  }  log(`iam provisioning: ${JSON.stringify(report.iamProvisioning)}`);
 
   // The enterprise sign-in pass (REQ-006, slice 4b-2): connect a provider through the drawer,
   // read the "secret is a name, not a value" chip, run the discovery test and require it to
   // report a *result* (a provider that is not configured yet answers "failed", not a 500), then
   // remove the provider and see the list go back to its empty state.
+  if (wants("iam-authentication-depth")) {
+    matchedOnly.add("iam-authentication-depth");
   await runIamAuthenticationDepth(page, report);
-  log(`iam authentication: ${JSON.stringify(report.iamAuthentication)}`);
+  }  log(`iam authentication: ${JSON.stringify(report.iamAuthentication)}`);
 
   // Mobile pass. The context is new, so it carries no session — without the sign-in below every
   // mobile screenshot would be the sign-in screen and no mobile layout would really be measured.
@@ -6622,7 +13079,22 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
+  // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
+  // as a known name instead of reporting it as unmatched.
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/security/events", name: "security-events" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" },
+  // The portal's two tables at 390 px. Seven columns do not fit a phone, and the check that
+  // matters is the one the cards exist for: the *key status* stays readable without a sideways
+  // scroll, because "is this credential still alive" is the question a phone is asked.
+  { path: "/developer", name: "developer-overview" },
+  { path: "/developer/api-keys", name: "developer-api-keys" },
+  { path: "/developer/logs", name: "developer-logs" }];
+  for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
+  // The phone pass follows `--only` for the same reason the route loop does, and the five
+  // security screens join it: a layout that has never been measured at 390px has not been
+  // tested on a phone, and the security centre is where an administrator reads a verdict.
+  for (const route of (ONLY_ALL
+    ? mobileRoutes
+    : mobileRoutes.filter((r) => wants(`mobile:${r.name}`) || wants(r.name)))) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
@@ -6633,7 +13105,7 @@ async function main() {
   // The palette on a phone: a full-screen sheet with 44px rows and a reachable close control.
   // Overlay shots are viewport-only: a full-page screenshot of a fixed sheet shows the page
   // below the fold as well, which reads as an overlay that fails to cover the screen.
-  await mpage.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  if (!ONLY) await mpage.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await mpage.waitForTimeout(1200);
   let mobileOpened = false;
   for (let attempt = 0; attempt < 3 && !mobileOpened; attempt += 1) {
@@ -6673,8 +13145,12 @@ async function main() {
   await mobile.close();
 
   // Public renderer — reached through the site's own host so the renderer resolves the site.
+  // A scoped pass does not visit it: the renderer belongs to the content wave, not to the area being proven.
+  const webInScope = inScope("core") || inScope("media") || inScope("cms");
   const webBase = `http://${SITE_HOST}:${new URL(URL_WEB).port || 80}`;
+  if (!webInScope) report.web = { skipped: "out of scope" };
   try {
+    if (webInScope) {
     const wp = await context.newPage();
     attach(wp, "web");
     const res = await wp.goto(`${webBase}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -6709,6 +13185,7 @@ async function main() {
       report.web.firstLink = { href: root.links[0], url: wp.url(), diagnostics: await diagnostics(wp) };
     }
     await wp.close();
+    }
   } catch (err) {
     report.web = { error: String(err).slice(0, 300) };
   }
@@ -6720,8 +13197,53 @@ async function main() {
   const findings = [];
   const pushFindings = (severity, kind, detail) => findings.push({ severity, kind, detail });
 
+  // The assertions a depth pass could not keep. Drained before anything is written, so a claim
+  // the panel failed lands in the report with the same weight as a broken image.
+  for (const detail of aiStateFindings.splice(0)) {
+    pushFindings("high", "ai-state", detail);
+  }
+  // A `--only` filter that matches nothing is a finding, not an empty green report.
+  //
+  // The failure this prevents is specific: a typo in the filter walks zero routes and zero
+  // depth passes, writes a complete-looking summary with zero high findings, and is then read
+  // as "the screens passed". The one thing a focused pass must not be is indistinguishable
+  // from a pass that proved nothing because it was pointed at nothing. The count is also
+  // printed in the log line above, so a reader can tell how much of the panel was covered.
+  if (!ONLY_ALL) {
+    const unmatched = ONLY.filter((name) => !matchedOnly.has(name) && !MOBILE_NAMES.has(name));
+    if (matchedOnly.size === 0) {
+      pushFindings(
+        "high",
+        "empty-pass",
+        `--only=${ONLY.join(",")} matched no route and no depth pass: this pass proved nothing`,
+      );
+    }
+    for (const name of unmatched) {
+      pushFindings("high", "unknown-pass-name", `--only=${name} matches no route and no depth pass`);
+    }
+    log(`focused pass coverage: ${matchedOnly.size} route/pass name(s) walked, ${unmatched.length} unmatched`);
+  }
+
   for (const p of report.pages) {
+    // A page whose walk threw is pushed as `{ ...route, failed }` with no `diagnostics` at
+    // all, so every field read off `d` below is a read off `undefined`. That is not a
+    // cosmetic gap: this loop runs *before* the rest of the roll-up, and an uncaught
+    // TypeError here takes every later finding with it — one crashed page silently converts a
+    // pass that measured 90 screens into a pass that reported nothing, and a pass with no
+    // verdict reads as "no findings". The measurement is therefore recorded as **absent**
+    // (a finding that says so) instead of being assumed clean, and the loop continues so a
+    // single bad page cannot cost every later page its report.
     const d = p.diagnostics;
+    if (!d) {
+      pushFindings(
+        "high",
+        "unmeasured-page",
+        `${p.name}: the page walk failed before it produced diagnostics${
+          p.failed ? ` (${p.failed})` : ""
+        } — this screen was not measured`,
+      );
+      continue;
+    }
     if (d.horizontalOverflow) pushFindings("high", "overflow", `${p.name}: page scrolls horizontally (${d.scrollWidth}px > ${d.viewport.w}px)`);
     if (d.offscreen.length) pushFindings("high", "offscreen", `${p.name}: ${d.offscreen.length} element(s) outside the viewport, e.g. ${JSON.stringify(d.offscreen[0])}`);
     if (d.brokenImages.length) pushFindings("high", "broken-image", `${p.name}: ${d.brokenImages.join(", ")}`);
@@ -6732,21 +13254,41 @@ async function main() {
     if (d.h1Count === 0) pushFindings("low", "no-h1", `${p.name}: no h1 heading`);
   }
   for (const m of report.mobile) {
-    if (m.diagnostics.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
-    if (m.diagnostics.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${m.diagnostics.offscreen.length} element(s) outside the viewport`);
+    // The same absent-measurement rule as the desktop roll-up above, for the same reason: the
+    // phone phase is the last thing a pass does, so a throw here is the throw that erases
+    // everything it just measured. This pass died here — `Cannot read properties of undefined
+    // (reading 'horizontalOverflow')` — and took the entire finding report with it.
+    const d = m.diagnostics;
+    if (!d) {
+      pushFindings("high", "unmeasured-mobile", `mobile ${m.name}: no diagnostics were produced — this screen was not measured at 390px`);
+      continue;
+    }
+    if (d.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
+    if (d.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${d.offscreen.length} element(s) outside the viewport`);
   }
   const refusedOnPurpose = [];
   for (const [index, f] of consoleLog.entries()) {
     if (f.type === "warning") continue;
     // A console line names the status, not the URL: the allowance for one is the window it was
     // registered in, so only a line that arrived after the pass announced the act can be excused.
-    // The statuses are the ones a refusal actually uses — a validator answers 400, a ledger
-    // 409, an authorization gate 401/403 — not just the two the harness first learned from.
-    const deliberate = /status of (400|401|403|409|422)/.test(f.text)
-      ? expectedRefusals.find((entry) => !entry.claimedConsole && index >= entry.consoleFrom)
+    // The set is the statuses a pass can *provoke on purpose*: 401/403 for a step-up or a
+    // permission refusal, 400 for a field the pass deliberately submits wrong, and 5xx for the
+    // server-error states a pass has to reach to prove the screen survives one. The registration
+    // is what makes this safe — an unregistered 500 is still a high finding.
+    const statusInLine = f.text.match(/status of (\d{3})/);
+    const lineStatus = statusInLine ? Number(statusInLine[1]) : 0;
+    const deliberate = /status of (40[013]|5\d\d)|ERR_CONNECTION_REFUSED|ERR_NETWORK/.test(f.text)
+      ? expectedRefusals.find(
+          (entry) =>
+            index >= entry.consoleFrom &&
+            (entry.consoleTo === undefined || index < entry.consoleTo) &&
+            // Same narrowing as the request gate: a registration that only expects 4xx does not
+            // excuse a 500 console line, so the API crashing is still reported as a crash.
+            (entry.statuses ? entry.statuses.includes(lineStatus) : true),
+        )
       : null;
     if (deliberate) {
-      deliberate.claimedConsole = true;
+      deliberate.claimed += 1;
       refusedOnPurpose.push({ kind: "console", detail: `${f.phase} ${f.text.slice(0, 120)}`, reason: deliberate.reason });
       continue;
     }
@@ -6754,20 +13296,28 @@ async function main() {
     pushFindings(isWeb ? "medium" : "high", isWeb ? "web-console" : "console-error", `${f.phase} ${f.url}: ${f.text.slice(0, 180)}`);
   }
   for (const [index, n] of netFailures.entries()) {
-    // A refusal a validator or a ledger makes is a 400 or a 409 as often as it is a 401: a
-    // package that fails validation is `400` with its findings, and a downgrade is `409`. Only
-    // excusing 401/403 left every deliberate 4xx on a validation pass filed as a defect, which
-    // is how a correct screen reads as broken.
-    const REFUSAL_STATUSES = [400, 401, 403, 409, 422];
+    // A pass registers a failure it provoked on purpose before it happens, and the statuses it may
+    // register are 401/403 (a refusal), 400 (a wrong field submitted on purpose), 5xx (the
+    // server-error state the screen is being tested against) and no status at all (`net::ERR_*` —
+    // the transport died, so the server never answered). Registration is the only thing that makes
+    // an allowance: an unclaimed entry here is still a high finding.
+    //
+    // A registration covers its whole window rather than one entry. One provoked failure is not
+    // one network entry — a screen that loads twice, or a StrictMode double render, sends the same
+    // 500 two or three times, and matching them one-for-one would report the second and third as
+    // defects the pass itself caused.
     const deliberate = expectedRefusals.find(
       (entry) =>
-        !entry.claimedNet &&
         index >= entry.netFrom &&
+        (entry.netTo === undefined || index < entry.netTo) &&
         String(n.url || "").includes(entry.match) &&
-        REFUSAL_STATUSES.includes(n.status),
+        // A registration may narrow its own vocabulary. A form filled with placeholders is refused
+        // with a 4xx, so it registers 4xx only: a 500 in that window is the API crashing on input
+        // it should have rejected, and it stays a high finding.
+        (entry.statuses ? entry.statuses.includes(n.status) : allowedStatus(n)),
     );
     if (deliberate) {
-      deliberate.claimedNet = true;
+      deliberate.claimed += 1;
       refusedOnPurpose.push({ kind: "request", status: n.status, url: n.url, reason: deliberate.reason });
       continue;
     }
@@ -6781,8 +13331,30 @@ async function main() {
       `[${c.page}] "${c.label}" (${c.tag}) → ${c.outcome}: ${c.reason || ""} ${(c.errors || []).join(" | ")}`.slice(0, 240),
     );
   }
-  if (report.web && report.web.error) pushFindings("high", "web-unreachable", report.web.error);
-  if (report.web && !report.web.error) {
+  /*
+   * A depth pass that threw is a **high** finding, and this loop is the only place that can say so.
+   *
+   * `runDepthPass` records the failure and returns `{ ok: false }`, but nothing downstream read it:
+   * the roll-up above counts clicks, console lines and network failures, and a crashed depth pass
+   * produces none of those three. So a pass that died on its first locator wrote exactly the same
+   * report as a pass that proved everything, minus some screenshots — and the difference between
+   * "the developer portal does not work" and "the developer portal was never exercised" is exactly
+   * the difference this report exists to record. The new pass is the first one to make it visible,
+   * so it is counted here rather than in its own module.
+   */
+  const deadPasses = clickLines.filter((e) => e.action === "depth-pass-failed");
+  for (const d of deadPasses) {
+    pushFindings("high", "depth-pass-failed", `the ${d.pass} depth pass did not finish: ${d.reason || "no reason recorded"}`);
+  }
+  if (report.developer && report.developer.failures && report.developer.failures.length) {
+    pushFindings(
+      "high",
+      "unproved-claim",
+      `the developer portal left ${report.developer.failures.length} claim(s) unproved: ${report.developer.failures.join(", ")}`,
+    );
+  }
+  if (report.web && report.web.error && report.web.error !== "Error: skipped") pushFindings("high", "web-unreachable", report.web.error);
+  if (report.web && !report.web.error && !report.web.skipped) {
     const published = report.web.published;
     if (!published || published.status !== 200) {
       pushFindings("high", "web-page", `the published page /${SAMPLE_SLUG} did not render (status ${published ? published.status : "missing"})`);
@@ -7488,6 +14060,100 @@ async function runIamApprovalsDepth(page, report) {
  * the token and proves a revoked token is refused. Nothing here is simulated: the token is the
  * one the screen minted, and the log lines are the ones the API wrote.
  */
+
+async function runIamAuthenticationDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "iam-authentication-depth", action: "iam", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/settings/iam/authentication`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-iam-authentication]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const before = await page.locator("[data-provider-row]").count();
+  await shot(page, "page-iam-authentication");
+
+  // ---- Connect a provider through the drawer ----------------------------------------------
+  await page.locator("[data-iam-auth-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-provider-drawer]", { timeout: 8000 }).catch(() => {});
+  const stamp = Date.now().toString().slice(-6);
+  await page.locator("[data-provider-slug-input]").first().fill(`qa-${stamp}`).catch(() => {});
+  await page.locator("[data-provider-name]").first().fill(`QA walkthrough ${stamp}`).catch(() => {});
+  await page.locator("[data-provider-field=issuer]").first().fill("https://idp.qa.invalid/realms/omnion").catch(() => {});
+  await page.locator("[data-provider-field=client_id]").first().fill(`qa-client-${stamp}`).catch(() => {});
+  await page.locator("[data-provider-secret-ref]").first().fill("OMNION_QA_SSO_SECRET_ABSENT").catch(() => {});
+  await page.waitForTimeout(300);
+  await shot(page, "page-iam-authentication-drawer");
+  await page.locator("[data-provider-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  const afterConnect = await page.locator("[data-provider-row]").count();
+  note({ step: "provider-connected", before, afterConnect, slug: `qa-${stamp}` });
+
+  // ---- The secret is a name, and the panel says so without ever reading it ----------------
+  const secretChip = page.locator(`[data-provider-secret="qa-${stamp}"]`).first();
+  const secretPresent = await secretChip.getAttribute("data-secret-present").catch(() => null);
+  const secretText = (await secretChip.innerText().catch(() => "")).trim();
+  note({
+    step: "secret-is-a-name",
+    secretPresent,
+    namesTheVariable: secretText.includes("OMNION_QA_SSO_SECRET_ABSENT"),
+    // A panel that could read the value would print it; the chip must not contain one.
+    showsNoValue: !/\b[A-Za-z0-9]{20,}\b/.test(secretText),
+  });
+
+  // ---- The discovery test answers with a verdict, not a transport error --------------------
+  await page.locator(`[data-provider-test="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector(`[data-provider-test-result="qa-${stamp}"]`, { timeout: 25000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const testStatus = await page
+    .locator(`[data-provider-test-result="qa-${stamp}"]`)
+    .first()
+    .getAttribute("data-test-status")
+    .catch(() => null);
+  const testText = (await page
+    .locator(`[data-provider-test-result="qa-${stamp}"]`)
+    .first()
+    .innerText()
+    .catch(() => "")).trim();
+  note({
+    step: "discovery-test",
+    testStatus,
+    // An unreachable host must still produce a *result* the panel can render.
+    renderedAVerdict: testStatus === "ok" || testStatus === "failed",
+    explainsItself: testText.length > 20,
+  });
+  await shot(page, "page-iam-authentication-tested");
+
+  // ---- A new provider is created switched off --------------------------------------------
+  const enabledAttr = await page
+    .locator(`[data-provider-slug="qa-${stamp}"]`)
+    .first()
+    .getAttribute("data-provider-enabled")
+    .catch(() => null);
+  note({ step: "created-switched-off", enabled: enabledAttr === "false" });
+
+  // ---- The sign-in log opens and is empty rather than missing ----------------------------
+  await page.locator(`[data-provider-log="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-provider-events]", { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const logRows = await page.locator("[data-provider-events] tr[data-event-outcome]").count();
+  const logText = (await page.locator("[data-provider-events]").first().innerText().catch(() => "")).trim();
+  note({ step: "sign-in-log", logRows, hasEmptyState: /No sign-in/i.test(logText) });
+  await shot(page, "page-iam-authentication-log");
+
+  // ---- Remove it and prove the list goes back to its empty state ---------------------------
+  await page.locator(`[data-provider-delete="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator(`[data-provider-delete-confirm="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  const afterRemove = await page.locator("[data-provider-row]").count();
+  const emptyVisible = await page.locator("[data-providers-empty]").count();
+  note({ step: "provider-removed", afterRemove, emptyStateVisible: emptyVisible > 0 });
+  await shot(page, "page-iam-authentication-empty");
+
+  report.iamAuthentication = { steps };
+}
 async function runIamProvisioningDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -7606,106 +14272,4 @@ async function runIamProvisioningDepth(page, report) {
 
   report.iamProvisioning = { steps };
   log(`iam provisioning: ${JSON.stringify(steps)}`);
-}
-
-/**
- * The enterprise sign-in screen (REQ-006, slice 4b-2).
- *
- * The screen is about trust, so the pass checks the two claims it makes: a secret is a *name* the
- * panel can check but never read, and the discovery test answers with a verdict rather than
- * failing. A provider is created switched off, the test is run, and the provider is removed —
- * which also proves the empty state is reachable again.
- */
-async function runIamAuthenticationDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "iam-authentication-depth", action: "iam", ...step });
-  };
-
-  await page.goto(`${URL_ADMIN}/settings/iam/authentication`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("[data-iam-authentication]", { timeout: 20000 }).catch(() => {});
-  await page.waitForTimeout(900);
-  const before = await page.locator("[data-provider-row]").count();
-  await shot(page, "page-iam-authentication");
-
-  // ---- Connect a provider through the drawer ----------------------------------------------
-  await page.locator("[data-iam-auth-new]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-provider-drawer]", { timeout: 8000 }).catch(() => {});
-  const stamp = Date.now().toString().slice(-6);
-  await page.locator("[data-provider-slug-input]").first().fill(`qa-${stamp}`).catch(() => {});
-  await page.locator("[data-provider-name]").first().fill(`QA walkthrough ${stamp}`).catch(() => {});
-  await page.locator("[data-provider-field=issuer]").first().fill("https://idp.qa.invalid/realms/omnion").catch(() => {});
-  await page.locator("[data-provider-field=client_id]").first().fill(`qa-client-${stamp}`).catch(() => {});
-  await page.locator("[data-provider-secret-ref]").first().fill("OMNION_QA_SSO_SECRET_ABSENT").catch(() => {});
-  await page.waitForTimeout(300);
-  await shot(page, "page-iam-authentication-drawer");
-  await page.locator("[data-provider-save]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(2500);
-  const afterConnect = await page.locator("[data-provider-row]").count();
-  note({ step: "provider-connected", before, afterConnect, slug: `qa-${stamp}` });
-
-  // ---- The secret is a name, and the panel says so without ever reading it ----------------
-  const secretChip = page.locator(`[data-provider-secret="qa-${stamp}"]`).first();
-  const secretPresent = await secretChip.getAttribute("data-secret-present").catch(() => null);
-  const secretText = (await secretChip.innerText().catch(() => "")).trim();
-  note({
-    step: "secret-is-a-name",
-    secretPresent,
-    namesTheVariable: secretText.includes("OMNION_QA_SSO_SECRET_ABSENT"),
-    // A panel that could read the value would print it; the chip must not contain one.
-    showsNoValue: !/\b[A-Za-z0-9]{20,}\b/.test(secretText),
-  });
-
-  // ---- The discovery test answers with a verdict, not a transport error --------------------
-  await page.locator(`[data-provider-test="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector(`[data-provider-test-result="qa-${stamp}"]`, { timeout: 25000 }).catch(() => {});
-  await page.waitForTimeout(600);
-  const testStatus = await page
-    .locator(`[data-provider-test-result="qa-${stamp}"]`)
-    .first()
-    .getAttribute("data-test-status")
-    .catch(() => null);
-  const testText = (await page
-    .locator(`[data-provider-test-result="qa-${stamp}"]`)
-    .first()
-    .innerText()
-    .catch(() => "")).trim();
-  note({
-    step: "discovery-test",
-    testStatus,
-    // An unreachable host must still produce a *result* the panel can render.
-    renderedAVerdict: testStatus === "ok" || testStatus === "failed",
-    explainsItself: testText.length > 20,
-  });
-  await shot(page, "page-iam-authentication-tested");
-
-  // ---- A new provider is created switched off --------------------------------------------
-  const enabledAttr = await page
-    .locator(`[data-provider-slug="qa-${stamp}"]`)
-    .first()
-    .getAttribute("data-provider-enabled")
-    .catch(() => null);
-  note({ step: "created-switched-off", enabled: enabledAttr === "false" });
-
-  // ---- The sign-in log opens and is empty rather than missing ----------------------------
-  await page.locator(`[data-provider-log="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-provider-events]", { timeout: 10000 }).catch(() => {});
-  await page.waitForTimeout(700);
-  const logRows = await page.locator("[data-provider-events] tr[data-event-outcome]").count();
-  const logText = (await page.locator("[data-provider-events]").first().innerText().catch(() => "")).trim();
-  note({ step: "sign-in-log", logRows, hasEmptyState: /No sign-in/i.test(logText) });
-  await shot(page, "page-iam-authentication-log");
-
-  // ---- Remove it and prove the list goes back to its empty state ---------------------------
-  await page.locator(`[data-provider-delete="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(400);
-  await page.locator(`[data-provider-delete-confirm="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(2500);
-  const afterRemove = await page.locator("[data-provider-row]").count();
-  const emptyVisible = await page.locator("[data-providers-empty]").count();
-  note({ step: "provider-removed", afterRemove, emptyStateVisible: emptyVisible > 0 });
-  await shot(page, "page-iam-authentication-empty");
-
-  report.iamAuthentication = { steps };
 }

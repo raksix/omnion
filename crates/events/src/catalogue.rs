@@ -282,6 +282,116 @@ catalogue! {
     "media.retention_applied", "media", Live,
     "A retention rule changed or removed items.",
     [("rule", String, req), ("affected", Integer, opt)];
+
+    // The AI router (REQ-098). `unresolved` is the only one that is recorded today, and it is
+    // the one an operator actually needs: it is the signal that a request came in and *nothing*
+    // in the pool could answer it, which is the failure that otherwise surfaces as a feature
+    // that quietly stopped working rather than as an error anywhere.
+    "ai.route.unresolved", "ai", Live,
+    "A model request could not be resolved to a usable model by any rule.",
+    [("decision_id", Uuid, req), ("task", String, req), ("rule", String, opt),
+     ("feature", String, opt), ("requested", String, opt), ("requirements", Json, opt)];
+    // The approval gate (REQ-101). `ai.approval.applied` is the one an operator subscribes to,
+    // because the approval events themselves only say what a *person decided* and this one is
+    // the only signal that the change actually reached the content table -- a missing name here
+    // would leave the whole "nothing dangerous happens without a human" claim verifiable only
+    // by reading the audit log.
+    "ai.approval.applied", "ai", Live,
+    "An approved preview was written through its gated pipeline.",
+    [("approval_id", Uuid, req), ("resource_type", String, req),
+     ("resource_id", String, req)];
+    // The change-set editor (REQ-101 slice 3). All three are `Live` because a proposal nobody
+    // hears about is a proposal nobody confirms: the editor's whole purpose is to put an
+    // operation in front of a human, and a screen that fills up while a person is looking at
+    // a different tab has failed quietly. `confirmed` is the one an operator subscribes to --
+    // it is the only signal that a model's proposed work became a promise, and the payload
+    // carries `irreversible` because a set that deletes is the one worth an e-mail.
+    "ai.changeset.proposed", "ai", Live,
+    "A conversation proposed a set of operations for a person to review.",
+    [("change_set_id", Uuid, req), ("title", String, req),
+     ("operations", Integer, req)];
+    "ai.changeset.confirmed", "ai", Live,
+    "A person confirmed a change set, moving it towards application.",
+    [("change_set_id", Uuid, req), ("operations", Integer, req),
+     ("irreversible", Boolean, req)];
+    "ai.changeset.discarded", "ai", Live,
+    "A person discarded a change set, with the reason they gave.",
+    [("change_set_id", Uuid, req), ("reason", String, req)];
+    // `failed` and `applied` are the two halves of the same promise, and both carry `reason`
+    // so a subscriber can render the same line for either. `failed` is the one that matters
+    // most: an all-or-nothing apply that rolled back writes nothing anywhere, so without this
+    // name a subscriber cannot tell "the set is still waiting" from "the set was tried and
+    // undid itself" — and the second is the one a person has to act on.
+    "ai.changeset.failed", "ai", Live,
+    "A confirmed change set was rolled back: no operation was applied.",
+    [("change_set_id", Uuid, req), ("reason", String, req)];
+    "ai.changeset.applied", "ai", Live,
+    "A confirmed change set applied every operation it carried, in one transaction.",
+    [("change_set_id", Uuid, req), ("operations", Integer, req)];
+    // The tool registry (REQ-100). `ai.tool.denied` is the one an operator subscribes to: it
+    // is the signal that a model tried to reach something it was not granted, which is the
+    // visible form of a probing agent. The rest are the panel's own audit trail — a registry
+    // whose limits and gates changed is a registry nobody could explain after an incident.
+    "ai.tool.registered", "ai", Live,
+    "A tool from the compiled catalogue was seeded into the registry.",
+    [("tool_key", String, req), ("class", String, req), ("seed_version", Integer, opt)];
+    "ai.tool.updated", "ai", Live,
+    "A tool's limits, gate or enabled state changed.",
+    [("tool_key", String, req), ("changed", Json, opt)];
+    "ai.tool.disabled", "ai", Live,
+    "A tool was switched off while agents still referenced it.",
+    [("tool_key", String, req), ("agents", Json, opt)];
+    "ai.tool.grant_changed", "ai", Live,
+    "An identity's grant for one tool changed.",
+    [("identity_id", Uuid, req), ("tool_key", String, req), ("effect", Boolean, req),
+     ("changed_by", Uuid, opt)];
+    "ai.tool.denied", "ai", Live,
+    "An agent named a tool its identity does not grant. The alert hook for a probing agent.",
+    [("run_id", Uuid, opt), ("step_id", Uuid, opt), ("tool_key", String, req),
+     ("identity_id", Uuid, opt), ("reason", String, opt)];
+    "ai.tool.failed", "ai", Live,
+    "A tool call ran and failed.",
+    [("run_id", Uuid, opt), ("step_id", Uuid, opt), ("tool_key", String, req),
+     ("error_code", String, opt), ("duration_ms", Integer, opt)];
+    "ai.tool.limited", "ai", Live,
+    "A run hit a tool's per-run call cap.",
+    [("run_id", Uuid, opt), ("tool_key", String, req), ("cap", Integer, opt)];
+    // The tool telemetry roll-up (REQ-107 slice 4). This is the one event in the AI group that
+    // fires **from a scheduler rather than from a request**: the daily roll-up compares a tool's
+    // success rate against its own trailing week and publishes the fall. Nothing in a call path
+    // can know whether a drop is a regression, because "regression" is a statement about time —
+    // which is why it lives with the task that owns the days.
+    "ai.telemetry.tool.degraded", "ai", Live,
+    "A tool's success rate fell at least five points below its own trailing seven-day rate.",
+    [("tool", String, req), ("day", String, req), ("calls", Integer, req),
+     ("success_percent", Json, req), ("baseline_percent", Json, req),
+     ("drop_points", Json, req)];
+    "ai.identity.created", "ai", Live,
+    "An AI identity — a named set of tool grants — was created.",
+    [("identity_id", Uuid, req), ("key", String, req)];
+    "ai.identity.updated", "ai", Live,
+    "An AI identity's details or default flag changed.",
+    [("identity_id", Uuid, req), ("key", String, req), ("changed", Json, opt)];
+    "ai.identity.removed", "ai", Live,
+    "An AI identity was removed along with its grants.",
+    [("identity_id", Uuid, req), ("key", String, req)];
+    // The air gap (REQ-106 slice 2). Two of these are the switch's PROOF rather than its
+    // effects, which is why both sides are named: `enabled`/`disabled` is the audit entry an
+    // operator reads to answer "who stopped the installation from calling out, and why", and
+    // `call_refused` is the only evidence that the switch is still doing its job. A switch that
+    // emits nothing when it fires is indistinguishable from a switch that is off, so the refusal
+    // carries the provider AND the host — the count of these is the answer to "is anything still
+    // leaving this machine?".
+    "ai.airgap.enabled", "ai", Live,
+    "The air-gap switch was turned on; every non-local AI call is now refused.",
+    [("reason", String, req), ("actor_id", Uuid, opt), ("providers_blocked", Integer, opt)];
+    "ai.airgap.disabled", "ai", Live,
+    "The air-gap switch was turned off, so non-local calls are permitted again.",
+    [("actor_id", Uuid, opt), ("reason", String, opt)];
+    "ai.airgap.call_refused", "ai", Live,
+    "The air gap refused a call before any request left the installation.",
+    [("provider", String, req), ("host", String, opt), ("task", String, opt),
+     ("model_key", String, opt)];
     "media.duplicate_merged", "media", Live,
     "A duplicate item was merged into the one that was kept.",
     [("kept_media_id", Uuid, req), ("merged_media_id", Uuid, req), ("affected", Integer, opt)];
@@ -297,6 +407,24 @@ catalogue! {
     "media.grant_removed", "media", Live,
     "Access to a media item was taken away.",
     [("media_id", Uuid, req), ("subject", String, req)];
+
+    // The retention route emits this pair from one `NewEvent::new(if hold { … } else { … })`, so
+    // the two names never appear as a plain string literal beside the constructor — which is why
+    // the drift gate only found them once it learned to read a name that follows the marker on
+    // the same line rather than inside it. The rows are `Live` because the route has been
+    // recording them since legal hold shipped.
+    //
+    // `reason` is **required** on both: a hold with no stated reason is a retention decision
+    // nobody can defend later, and the pair is how an outside system learns that a file it asked
+    // to delete is not going to be deleted.
+    "media.hold_placed", "media", Live,
+    "A legal hold was placed on a file: retention will not touch it until the hold is released.",
+    [("media_id", Uuid, req), ("site_id", Uuid, req), ("filename", String, opt),
+     ("reason", String, req)];
+    "media.hold_released", "media", Live,
+    "A legal hold was released; retention may now apply to the file again.",
+    [("media_id", Uuid, req), ("site_id", Uuid, req), ("filename", String, opt),
+     ("reason", String, req)];
 
     // ---- Identity ------------------------------------------------------------------------------
     "user.created", "identity", Live,
@@ -335,6 +463,75 @@ catalogue! {
     "iam.approval_decided", "identity", Live,
     "An access request was approved or refused.",
     [("subject", String, req), ("permission", String, opt), ("approved", Boolean, opt)];
+
+    // ---- Security (REQ-012) -------------------------------------------------------------------
+    //
+    // Four names, and the reason they are all here rather than one is that they answer four
+    // different questions an operator subscribes to separately: *did the platform check itself*,
+    // *what does it now send on the wire*, *what does it refuse* and *somebody released a lock*.
+    //
+    // The payloads deliberately carry no policy **values**. `security.headers.updated` names the
+    // CSP directive *names* and the mode; it does not carry the origins, because a header
+    // policy travels to every webhook receiver and is still configuration somebody considers
+    // sensitive. `security.rate_limits.updated` carries the *count* of scopes, not the numbers —
+    // the numbers are in the audit entry and in the panel, and a bus event is the wrong place to
+    // publish a limit to.
+    "security.scan.completed", "security", Live,
+    "The posture checks were re-run and a fresh result set was recorded.",
+    [("run_id", Uuid, req), ("checks", Integer, req)];
+    "security.headers.updated", "security", Live,
+    "The response-header policy was saved; the next response already carries it.",
+    [("csp_mode", String, req), ("directives", String, opt)];
+    "security.rate_limits.updated", "security", Live,
+    "The rate-limit document was saved, so the limiter is deciding by the new numbers.",
+    [("scopes", Integer, req)];
+    // `user_id` is the account that was locked, NOT the actor: the release is the unlock, and an
+    // operator subscribing to it wants to know which account was let back in. The actor already
+    // rides the envelope, so repeating it here would be a second place for the two to disagree.
+    "security.lockout.released", "security", Live,
+    "An operator released an account's brute-force lockout before it expired.",
+    [("user_id", Uuid, req)];
+    // `user_id` is the account that was locked, NOT the actor, for the same reason as the
+    // release above, and there is no actor to name here at all: the lock is applied by an
+    // anonymous caller guessing a password. `attempts` is the threshold that fired and
+    // `lockout_minutes` how long it lasts — both are configuration an operator subscribed here
+    // wants, and neither is a credential. What is deliberately absent is the attempted password
+    // and the address: an event bus is a fan-out to third-party receivers, and a brute-force
+    // attempt is exactly the payload nobody should be copying anywhere.
+    "security.lockout.triggered", "security", Live,
+    "An account reached its brute-force threshold and is now locked out.",
+    [("user_id", Uuid, req), ("attempts", Integer, req), ("lockout_minutes", Integer, opt)];
+    // A finding that *opens* is the one security fact an operator wires to a third party, so
+    // this is the name REQ-012's Events section promises them. Two payload decisions, and both
+    // are about the same thing — **the scan's content must not travel**:
+    //
+    // * `title` and `description` are absent. A dependency title is a package name and a
+    //   description is whatever the CI vendor wrote, which is attacker-influenced free text
+    //   being copied to every receiver the operator has. The finding is *identifiable* from
+    //   `finding_id` alone, because the panel reads it back with the same guard it protects.
+    // * `evidence` is absent for the same reason with more force: it is the raw report entry,
+    //   and the ingest path's own heuristic for "this document carries a credential" is a
+    //   heuristic. A bus is not the place to test it again.
+    //
+    // `severity` IS carried, because the receiver's decision is "page me or file a ticket",
+    // and that decision is unreadable from a finding id alone.
+    "security.finding.opened", "security", Live,
+    "A new finding was raised — a check that found something, or a report that was ingested.",
+    [("finding_id", Uuid, req), ("severity", String, req), ("source", String, req),
+     ("component", String, opt), ("component_version", String, opt), ("fixed_in", String, opt)];
+    // `action` is what makes this one event rather than two: a receiver that has to infer
+    // whether a network was opened or closed from a diff of `cidr` lists is reimplementing this
+    // module. `note` is the operator's own free text and is deliberately absent for the same
+    // reason a finding's title is — this one fans out to third-party receivers.
+    //
+    // This row was MISSING while slice 4(a) shipped, and `every_emitted_name_is_in_the_catalogue`
+    // is what said so: an emitter whose name is not in the catalogue records an event no
+    // endpoint can subscribe to, so the rule an operator believes they are running applies to
+    // nobody. It went unnoticed because nothing in the workspace asserts that gate is green on
+    // the branch it was written on.
+    "security.ip_rule.changed", "security", Live,
+    "An IP access rule was added or removed, and the next request is judged by the new set.",
+    [("action", String, req), ("rule_id", Uuid, req), ("kind", String, req), ("cidr", String, req)];
 
     // ---- Tenancy -------------------------------------------------------------------------------
     "site.created", "tenancy", Live,
@@ -444,6 +641,59 @@ catalogue! {
     "notification.preferences.changed", "notifications", Live,
     "Somebody changed how or whether they are notified.",
     [("user_id", Uuid, req), ("field", String, opt)];
+
+    // ---- System health --------------------------------------------------------------------------
+    // The five names REQ-014's Events section names, and the reason this area exists at all is
+    // the sentence "an operations endpoint subscribes to degraded and recovered" — which was,
+    // until the emitters shipped, a sentence with no name behind it: the table had no `health`
+    // area, so there was nothing to subscribe to and nothing for a receiver to wait on.
+    //
+    // `degraded` and `recovered` are a **pair on purpose**, and they are what the request calls
+    // the two an operations endpoint listens for. A receiver that gets only `degraded` cannot
+    // tell a resolved outage from a deleted endpoint, and one that gets only `recovered` has no
+    // idea what came back.
+    "health.service.degraded", "health", Live,
+    "A dependency stopped answering, or answered too slowly.",
+    [("service", String, req), ("from_state", String, req), ("to_state", String, req),
+     ("message", String, opt), ("incident_id", Uuid, opt), ("suppressed", Boolean, opt)];
+    "health.service.recovered", "health", Live,
+        "A dependency that had been unhealthy is answering again.",
+        [("service", String, req), ("from_state", String, req), ("to_state", String, req),
+         ("duration_seconds", Integer, opt), ("incident_id", Uuid, opt)];
+    "health.threshold.breached", "health", Live,
+    "A metric went past its configured critical limit. Fires once per metric per window.",
+    [("metric", String, req), ("value", Integer, opt), ("crit_limit", Integer, opt),
+     ("window_start", Timestamp, opt)];
+    "health.incident.acknowledged", "health", Live,
+    "An operator claimed an incident.",
+    [("incident_id", Uuid, req), ("service", String, req), ("actor", Uuid, req),
+     ("note", String, opt)];
+    "health.checks.completed", "health", Live,
+    "A probe run finished; the worst state it concluded is on the payload.",
+    [("state", String, req), ("services", Integer, req), ("worst_service", String, opt),
+     ("samples", Integer, opt)];
+
+    // ---- Backups and restoration -----------------------------------------------------------------
+    // The two rows the backup centre's own routes emit, added when the drift gate started
+    // naming them. Both are **Live and emitted**; what was missing was the row, which is the same
+    // failure as any other unlisted name — an operator cannot subscribe to an event the picker
+    // has never heard of, and the route has been recording it for every restore all along.
+    "backup.restored", "backups", Live,
+    "A restore finished. Carries what came back and what did not, so a receiver can tell a clean \
+     restore from a partial one.",
+    [("backup_id", Uuid, req), ("parts", Integer, opt), ("objects_restored", Integer, opt),
+     ("objects_failed", Integer, opt), ("safety_backup_id", Uuid, opt)];
+
+    // `notification.delivery.succeeded` is deliberately *not* here as a second row: the delivery
+    // lifecycle already publishes `notification.created` and the per-channel state lives in
+    // `notification_deliveries`. A "test delivery succeeded" audit fact is what this name is —
+    // one key says whether it was a test — and `test` is required rather than optional precisely
+    // so a receiver cannot read "succeeded" as a production delivery and page somebody for a
+    // message a person deliberately asked the platform to send.
+    "notification.delivery.succeeded", "notifications", Live,
+    "A channel accepted a notification the reader asked to be sent, one attempt at a time.",
+    [("notification_id", Uuid, req), ("channel", String, req), ("test", Boolean, req),
+     ("delivered", Boolean, opt)];
 
     // ---- Commerce (reserved: the module is not shipped yet) -------------------------------------
     "order.created", "commerce", Reserved,
@@ -799,7 +1049,10 @@ mod tests {
         assert_eq!(order.area, "commerce");
         assert_eq!(order.group(), "order");
 
-        assert!(group_members("commerce").is_empty(), "no event is emitted as commerce.*");
+        assert!(
+            group_members("commerce").is_empty(),
+            "no event is emitted as commerce.*"
+        );
         assert!(!group_members("order").is_empty());
         assert!(lookup("commerce.*").is_none());
     }
@@ -814,7 +1067,10 @@ mod tests {
         .expect("valid");
 
         assert_eq!(
-            stored.iter().filter(|name| *name == "page.published").count(),
+            stored
+                .iter()
+                .filter(|name| *name == "page.published")
+                .count(),
             1,
             "the same subscription twice is one subscription"
         );
@@ -840,9 +1096,18 @@ mod tests {
     fn an_empty_or_broken_subscription_is_refused() {
         assert!(reconcile(&[]).is_err());
         assert!(reconcile(&["   ".to_owned()]).is_err());
-        assert!(reconcile(&["page".to_owned()]).is_err(), "a bare name is not a name");
-        assert!(reconcile(&["*".to_owned()]).is_err(), "an empty group is not a group");
-        assert!(reconcile(&["PAGE.*".to_owned()]).is_err(), "a group is lower-case");
+        assert!(
+            reconcile(&["page".to_owned()]).is_err(),
+            "a bare name is not a name"
+        );
+        assert!(
+            reconcile(&["*".to_owned()]).is_err(),
+            "an empty group is not a group"
+        );
+        assert!(
+            reconcile(&["PAGE.*".to_owned()]).is_err(),
+            "a group is lower-case"
+        );
     }
 
     #[test]
@@ -862,7 +1127,10 @@ mod tests {
     #[test]
     fn areas_are_listed_once_in_table_order() {
         let areas = areas();
-        assert_eq!(areas.len(), BTreeSet::from_iter(areas.iter().copied()).len());
+        assert_eq!(
+            areas.len(),
+            BTreeSet::from_iter(areas.iter().copied()).len()
+        );
         assert!(areas.contains(&"content"));
         assert!(areas.contains(&"commerce"));
         assert!(
@@ -875,7 +1143,10 @@ mod tests {
     fn the_ceiling_counts_what_the_operator_typed_not_what_it_expanded_to() {
         // Eight groups covering every member of the catalogue: forty-odd names once expanded,
         // eight selections as typed.
-        let typed: Vec<String> = areas().into_iter().map(|area| format!("{area}.*")).collect();
+        let typed: Vec<String> = areas()
+            .into_iter()
+            .map(|area| format!("{area}.*"))
+            .collect();
         assert!(
             typed.len() <= crate::validation::MAX_SUBSCRIPTIONS,
             "the table has more areas than the ceiling allows, so this test cannot say what it means"
@@ -903,6 +1174,228 @@ mod tests {
         assert!(!live.contains(&"order.created"));
     }
 
+    /// REQ-101's change-set names, asserted the way the tool-registry ones are.
+    ///
+    /// The drift test walks the sources for `NewEvent::new("…")` and fails on a name this table
+    /// does not carry, so listing a name here is the *permission* to emit it. `ai.changeset.failed`
+    /// is the one that matters: an all-or-nothing apply that rolled back writes nothing anywhere,
+    /// so this name is the only signal a subscriber gets that a set was tried and undid itself.
+    #[test]
+    fn the_change_set_names_are_live_and_typed() {
+        for (name, required_field, kind) in [
+            ("ai.changeset.proposed", "change_set_id", FieldKind::Uuid),
+            ("ai.changeset.confirmed", "change_set_id", FieldKind::Uuid),
+            ("ai.changeset.discarded", "reason", FieldKind::String),
+            ("ai.changeset.failed", "reason", FieldKind::String),
+            ("ai.changeset.applied", "operations", FieldKind::Integer),
+        ] {
+            let entry = lookup(name).unwrap_or_else(|| panic!("{name} must be in the catalogue"));
+            assert_eq!(
+                entry.status,
+                Status::Live,
+                "{name} is emitted today, not reserved"
+            );
+            assert_eq!(entry.area, "ai", "{name} belongs to the AI area");
+            let field = entry
+                .payload_fields
+                .iter()
+                .find(|candidate| candidate.name == required_field)
+                .unwrap_or_else(|| panic!("{name} must declare {required_field}"));
+            assert!(field.required, "{name}.{required_field} is required");
+            assert_eq!(field.kind, kind, "{name}.{required_field} has the wrong kind");
+        }
+
+        // `failed` and `applied` are the two halves of one promise, and a subscriber has to be
+        // able to tell them apart: the same id, one that rolled back and one that committed.
+        // If either were renamed to the other's spelling, this fails.
+        let failed = lookup("ai.changeset.failed").expect("listed");
+        let applied = lookup("ai.changeset.applied").expect("listed");
+        assert!(
+            !failed.payload_fields.iter().any(|f| f.name == "operations"),
+            "`failed` has no operation count: it applied none"
+        );
+        assert!(
+            applied.payload_fields.iter().any(|f| f.name == "operations"),
+            "`applied` says how many operations committed"
+        );
+    }
+
+    #[test]
+    fn the_tool_registry_names_are_live_and_typed() {
+        // REQ-100's event table, asserted rather than assumed. The drift test walks the sources
+        // for `NewEvent::new("…")` and fails on a name the table does not carry, so a name added
+        // here is the *permission* to emit it — this test is what makes that permission and the
+        // payload shape agree.
+        for (name, required_field, kind) in [
+            ("ai.tool.registered", "tool_key", FieldKind::String),
+            ("ai.tool.updated", "tool_key", FieldKind::String),
+            ("ai.tool.disabled", "tool_key", FieldKind::String),
+            ("ai.tool.grant_changed", "tool_key", FieldKind::String),
+            ("ai.tool.denied", "tool_key", FieldKind::String),
+            ("ai.tool.failed", "tool_key", FieldKind::String),
+            ("ai.tool.limited", "tool_key", FieldKind::String),
+            ("ai.identity.created", "key", FieldKind::String),
+            ("ai.identity.updated", "key", FieldKind::String),
+            ("ai.identity.removed", "key", FieldKind::String),
+        ] {
+            let entry = lookup(name).unwrap_or_else(|| panic!("{name} must be in the catalogue"));
+            assert_eq!(
+                entry.status,
+                Status::Live,
+                "{name} is emitted today, not reserved"
+            );
+            assert_eq!(entry.area, "ai", "{name} belongs to the AI area");
+            let field = entry
+                .payload_fields
+                .iter()
+                .find(|candidate| candidate.name == required_field)
+                .unwrap_or_else(|| panic!("{name} must declare {required_field}"));
+            assert!(field.required, "{name}.{required_field} is required");
+            assert_eq!(
+                field.kind, kind,
+                "{name}.{required_field} has the wrong kind"
+            );
+        }
+    }
+    fn the_health_area_carries_the_five_names_the_request_names() {
+        // REQ-014's Events section lists exactly these five, and the reason this test exists is
+        // that for four of the REQ's slices the sentence "an operations endpoint subscribes to
+        // degraded and recovered" had nothing behind it. A name that is emitted but not listed
+        // is refused by the drift test; a name that is listed but never emitted is invisible to
+        // every green gate in the workspace, so it needs an assertion of its own.
+        let in_health = in_area("health");
+        let health = names_of(&in_health);
+        assert_eq!(
+            health.len(),
+            5,
+            "the health area is {:?}; the request names five",
+            health
+        );
+        for name in [
+            "health.service.degraded",
+            "health.service.recovered",
+            "health.threshold.breached",
+            "health.incident.acknowledged",
+            "health.checks.completed",
+        ] {
+            let entry = lookup(name).unwrap_or_else(|| panic!("{name} must be listed"));
+            assert_eq!(entry.area, "health");
+            assert_eq!(entry.status, Status::Live, "{name} is emitted today");
+            // All five share one group, so a single `health.*` subscription reaches all of them.
+            // That is the subscription the request describes an operations endpoint making, and
+            // it only works if every name sits behind the same first segment.
+            assert_eq!(entry.group(), "health", "{name} is not behind health.*");
+        }
+        // The pair the request calls out, stated as a pair.
+        assert!(subscribed_to(
+            &["health.*".to_owned()],
+            "health.service.degraded"
+        ));
+        assert!(subscribed_to(
+            &["health.*".to_owned()],
+            "health.service.recovered"
+        ));
+    }
+
+    #[test]
+    fn the_health_names_carry_the_fields_a_receiver_needs() {
+        // What makes an operations subscription usable rather than decorative: a receiver that
+        // gets `health.service.degraded` with only a name cannot decide anything, and the
+        // required fields are the promise in the picker that it can.
+        for (name, field) in [
+            ("health.service.degraded", "service"),
+            ("health.service.degraded", "to_state"),
+            ("health.service.recovered", "service"),
+            ("health.service.recovered", "from_state"),
+            ("health.threshold.breached", "metric"),
+            ("health.incident.acknowledged", "actor"),
+            ("health.checks.completed", "state"),
+        ] {
+            let entry = lookup(name).expect("listed");
+            let found = entry
+                .payload_fields
+                .iter()
+                .find(|candidate| candidate.name == field)
+                .unwrap_or_else(|| panic!("{name} must declare {field}"));
+            assert!(found.required, "{name}.{field} is required in the test");
+        }
+    }
+
+    #[test]
+    fn a_denied_call_names_the_run_and_the_step_it_was_refused_in() {
+        // `ai.tool.denied` is the alert hook. A denial with no `run_id` and no `reason` is not
+        // actionable, so both must be *optional* (a denial outside a run is real — the execution
+        // path also enforces a named tool) rather than required and wrong.
+        let entry = lookup("ai.tool.denied").expect("listed");
+        let required: Vec<&str> = entry.required_fields().map(|f| f.name).collect();
+        assert_eq!(
+            required,
+            vec!["tool_key"],
+            "a denial must always name the tool"
+        );
+        for optional in ["run_id", "step_id", "identity_id", "reason"] {
+            assert!(
+                entry
+                    .payload_fields
+                    .iter()
+                    .any(|f| f.name == optional && !f.required),
+                "ai.tool.denied must carry {optional} as optional"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grant_change_says_which_way_it_moved_and_who_moved_it() {
+        let entry = lookup("ai.tool.grant_changed").expect("listed");
+        // `effect` is required because the whole event is the direction of the change: a payload
+        // that could carry "no change" would be an event nobody could alert on.
+        assert!(
+            entry
+                .required_fields()
+                .any(|f| f.name == "effect" && f.kind == FieldKind::Boolean)
+        );
+        assert!(
+            entry
+                .payload_fields
+                .iter()
+                .any(|f| f.name == "changed_by" && !f.required)
+        );
+    }
+
+    /// REQ-106's air-gap names, asserted the way the change-set ones are.
+    ///
+    /// `ai.airgap.call_refused` is the one that matters: a switch that refuses calls silently is
+    /// indistinguishable from a switch that is off, and the count of these events is the only
+    /// answer to "is anything still leaving this machine?". Its `provider` and `host` are required
+    /// for the same reason the refusal message names them — an event saying only "blocked" tells
+    /// an operator to go looking in the wrong place.
+    #[test]
+    fn the_airgap_names_are_live_and_typed() {
+        for (name, required_field, kind) in [
+            ("ai.airgap.enabled", "reason", FieldKind::String),
+            ("ai.airgap.call_refused", "provider", FieldKind::String),
+        ] {
+            let entry = lookup(name).unwrap_or_else(|| panic!("{name} must be listed"));
+            assert_eq!(entry.status, Status::Live, "{name} is emitted today");
+            let field = entry
+                .payload_fields
+                .iter()
+                .find(|candidate| candidate.name == required_field)
+                .unwrap_or_else(|| panic!("{name} must declare {required_field}"));
+            assert!(field.required, "{name}.{required_field} is required");
+            assert_eq!(field.kind, kind, "{name}.{required_field} has the wrong kind");
+        }
+
+        // The host is optional on the wire because a base URL the platform cannot parse has no
+        // host — but it is declared, so a consumer reading the schema sees the field exists and
+        // knows the null is meaningful rather than "the emitter forgot".
+        let refused = lookup("ai.airgap.call_refused").expect("listed");
+        assert!(
+            refused.payload_fields.iter().any(|f| f.name == "host"),
+            "call_refused declares host"
+        );
+    }
+
     #[test]
     fn required_fields_are_documented_where_they_are_claimed() {
         // Every required field of a live name the emitter shape is known for.
@@ -923,7 +1416,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} must declare {field}"));
             assert!(found.required, "{name}.{field} is required in the test");
             assert!(
-                entry.required_fields().any(|candidate| candidate.name == field),
+                entry
+                    .required_fields()
+                    .any(|candidate| candidate.name == field),
                 "{name}.{field} must be reachable through required_fields()"
             );
         }

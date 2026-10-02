@@ -33,7 +33,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_events::{NewEvent, bus};
 use omnion_notifications::{
-    CATEGORIES, CategoryCount, ListQuery, MAX_BULK_IDS, NewNotification, Notification,
+    CATEGORIES, CategoryCount, DeliveryRow, ListQuery, MAX_BULK_IDS, NewNotification, Notification,
     PreferenceCell, Settings, StatedPreference, Summary,
 };
 use serde::{Deserialize, Serialize};
@@ -245,6 +245,51 @@ pub struct NotificationBody {
     pub archived_at: Option<String>,
     /// When it happened.
     pub created_at: String,
+    /// What became of each channel it was tried on. Empty for a notification with no attempts
+    /// yet, and the drawer says so rather than showing an empty box.
+    #[serde(default)]
+    pub deliveries: Vec<DeliveryBody>,
+}
+
+/// One channel's delivery row, as the drawer reads it.
+///
+/// **The error text is the platform's, not the transport's.** A driver string like
+/// `connection refused (os error 111)` tells a reader nothing about whether to retry, and the
+/// runner already translates transport failures into words — so the row carries those, and this
+/// type adds no formatting of its own.
+#[derive(Debug, Serialize)]
+pub struct DeliveryBody {
+    /// Which channel: `in_app`, `email`, `web_push`, `webhook` or `chat`.
+    pub channel: String,
+    /// Where it got to.
+    pub status: String,
+    /// How many tries, against the cap.
+    pub attempts: i32,
+    /// The number of tries before giving up.
+    pub max_attempts: i32,
+    /// The transport's status code, when it gave one.
+    pub response_status: Option<i32>,
+    /// Why it did not go out, in words the reader can act on.
+    pub error: Option<String>,
+    /// When it arrived, if it did.
+    pub sent_at: Option<String>,
+    /// When the next attempt is due; `None` once the row is no longer retryable.
+    pub next_attempt_at: Option<String>,
+}
+
+impl From<DeliveryRow> for DeliveryBody {
+    fn from(value: DeliveryRow) -> Self {
+        Self {
+            channel: value.channel,
+            status: value.status,
+            attempts: value.attempts,
+            max_attempts: value.max_attempts,
+            response_status: value.response_status,
+            error: value.error,
+            sent_at: value.sent_at.map(|at| at.to_string()),
+            next_attempt_at: value.next_attempt_at.map(|at| at.to_string()),
+        }
+    }
 }
 
 impl From<Notification> for NotificationBody {
@@ -262,6 +307,11 @@ impl From<Notification> for NotificationBody {
             read_at: value.read_at.map(|at| at.to_string()),
             archived_at: value.archived_at.map(|at| at.to_string()),
             created_at: value.created_at.to_string(),
+            // Filled in by the detail route, which is the only caller that knows the reader's
+            // own delivery rows. The list carries no deliveries: it is a page of rows the
+            // reader has not opened, and one query per row to prove "nothing was sent" is
+            // the wrong price for a list that may hold fifty of them.
+            deliveries: Vec::new(),
         }
     }
 }
@@ -411,6 +461,12 @@ pub async fn summary(
 ///
 /// `404` for a row that is not the caller's, and for a row that is gone. The two are the same
 /// answer on purpose; see the module header.
+///
+/// **The delivery read happens after the ownership check, never before it.** The delivery rows
+/// are keyed by `notification_id` alone — they do not carry a `user_id`, so nothing in that
+/// query can be scoped to the caller. Read first, they would answer "in_app, email, webhook"
+/// for somebody else's notification, which turns a `404` into an oracle: request any id, and a
+/// non-empty list of channels tells you the row exists. Two statements, the filter first.
 pub async fn get(
     State(state): State<AppState>,
     session: CurrentSession,
@@ -420,7 +476,14 @@ pub async fn get(
         .await
         .map_err(map_store)?
         .ok_or_else(not_found)?;
-    Ok(Json(NotificationBody::from(row)))
+
+    let deliveries = omnion_notifications::store::deliveries(state.db().pool(), row.id)
+        .await
+        .map_err(map_store)?;
+
+    let mut body = NotificationBody::from(row);
+    body.deliveries = deliveries.into_iter().map(DeliveryBody::from).collect();
+    Ok(Json(body))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -666,7 +729,7 @@ pub async fn emit(
             draft = draft.with_dedupe_key(key.clone());
         }
 
-        if omnion_notifications::store::record(
+        if omnion_notifications::store::record_with_deliveries(
             state.db().pool(),
             session.user.organization_id,
             Some(session.user.id),
@@ -674,6 +737,7 @@ pub async fn emit(
         )
         .await
         .map_err(map_store)?
+        .is_some()
         {
             created += 1;
         } else {

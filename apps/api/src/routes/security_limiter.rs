@@ -32,7 +32,7 @@ use omnion_events::{NewEvent, bus};
 use omnion_security::{
     ClientId, LockoutPolicy, LockoutState, RATE_SCOPES, RatePolicy, RequestFacts, Verdict, decide,
     evaluate_lockout, failures_in_window, load_documents, load_lockout, load_rate_limits,
-    lockout_to_document, locked_accounts, locked_count, merge_with_defaults, parse_lockout,
+    locked_accounts, locked_count, lockout_to_document, merge_with_defaults, parse_lockout,
     parse_rate_limits, rate_limits_to_document, save_lockout, save_rate_limits, scope_of,
     unlock_account,
 };
@@ -58,9 +58,11 @@ fn map_store(error: omnion_security::SecurityError) -> ApiError {
     use omnion_security::SecurityError as E;
     match error {
         E::Invalid(message) => ApiError::bad_request("invalid_security_input", message),
-        E::NotFound => {
-            ApiError::new(StatusCode::NOT_FOUND, "not_found", "security setting not found")
-        }
+        E::NotFound => ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "security setting not found",
+        ),
         E::Database(inner) => ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -230,7 +232,9 @@ pub async fn get_rate_limits(
     session: CurrentSession,
 ) -> Result<Json<RateLimitsBody>, ApiError> {
     let _ = &session;
-    let document = load_rate_limits(state.db().pool()).await.map_err(map_store)?;
+    let document = load_rate_limits(state.db().pool())
+        .await
+        .map_err(map_store)?;
     let policies = merge_with_defaults(&document);
     let updated_at = load_documents(state.db().pool())
         .await
@@ -275,7 +279,11 @@ pub async fn put_rate_limits(
     let saved = save_rate_limits(
         state.db().pool(),
         &rate_limits_to_document(&policies),
-        Some(&load_rate_limits(state.db().pool()).await.map_err(map_store)?),
+        Some(
+            &load_rate_limits(state.db().pool())
+                .await
+                .map_err(map_store)?,
+        ),
         session.user.id,
     )
     .await
@@ -304,8 +312,18 @@ pub async fn put_rate_limits(
         tracing::warn!(error = %error, "the limits were saved but the event was not emitted");
     }
 
-    let saved_policies =
-        parse_rate_limits(&saved.rate_limits).unwrap_or_else(|_| policies.clone());
+    let saved_policies = parse_rate_limits(&saved.rate_limits).unwrap_or_else(|_| policies.clone());
+
+    // The installed layer now decides by the numbers that were just saved (REQ-012, slice 3).
+    // Without this the limiter would keep enforcing whatever it read at boot, and the screen's own
+    // tester - which reads the store - would answer differently from the middleware that refuses
+    // the request. A failure here is logged and not surfaced for the same reason the header save
+    // logs its own: the write committed, and a 500 would report it as lost.
+    if !crate::rate_limit_middleware::reload_from_store(&state).await {
+        tracing::info!(
+            "the rate limits were saved; the running process picks them up from the store"
+        );
+    }
     Ok(Json(RateLimitsBody {
         scopes: saved_policies.iter().map(RateLimitBody::from).collect(),
         vocabulary: RATE_SCOPES.to_vec(),
@@ -321,7 +339,11 @@ pub async fn test_rate_limit(
     _session: CurrentSession,
     Json(body): Json<TestRequest>,
 ) -> Result<Json<TestResponse>, ApiError> {
-    let policies = merge_with_defaults(&load_rate_limits(state.db().pool()).await.map_err(map_store)?);
+    let policies = merge_with_defaults(
+        &load_rate_limits(state.db().pool())
+            .await
+            .map_err(map_store)?,
+    );
 
     let ip = match body.client_ip.as_deref() {
         None => None,
@@ -483,10 +505,9 @@ pub async fn probe_lockout(
 ) -> Result<Json<LockoutState>, ApiError> {
     let policy = parse_lockout(&load_lockout(state.db().pool()).await.map_err(map_store)?)
         .map_err(map_store)?;
-    let failures =
-        failures_in_window(state.db().pool(), body.user_id, policy.window_seconds)
-            .await
-            .map_err(map_store)?;
+    let failures = failures_in_window(state.db().pool(), body.user_id, policy.window_seconds)
+        .await
+        .map_err(map_store)?;
     let evaluated = evaluate_lockout(&policy, failures).map_err(map_store)?;
     Ok(Json(evaluated))
 }
@@ -496,7 +517,9 @@ pub async fn get_locked_accounts(
     State(state): State<AppState>,
     _session: CurrentSession,
 ) -> Result<Json<LockedAccountsBody>, ApiError> {
-    let accounts = locked_accounts(state.db().pool(), 200).await.map_err(map_store)?;
+    let accounts = locked_accounts(state.db().pool(), 200)
+        .await
+        .map_err(map_store)?;
     let total = locked_count(state.db().pool()).await.map_err(map_store)?;
     Ok(Json(LockedAccountsBody {
         accounts: accounts
@@ -519,7 +542,9 @@ pub async fn unlock(
     session: CurrentSession,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let unlocked = unlock_account(state.db().pool(), user_id).await.map_err(map_store)?;
+    let unlocked = unlock_account(state.db().pool(), user_id)
+        .await
+        .map_err(map_store)?;
     if !unlocked {
         // A user who is not locked has no unlock to perform. `404` rather than `200` with a
         // false, because a `200` that changed nothing is what makes an operator think the screen
@@ -610,9 +635,7 @@ mod tests {
         // The field-level refusal: the message names what was sent, so the operator does not
         // have to remember what they typed.
         let raw = "203.0.113.999";
-        let error = raw
-            .parse::<IpAddr>()
-            .expect_err("999 is not an octet");
+        let error = raw.parse::<IpAddr>().expect_err("999 is not an octet");
         let message = format!("\"{raw}\" is not an IP address");
         assert!(message.contains(raw));
         assert!(!error.to_string().is_empty());

@@ -7,6 +7,19 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+# Web Push (REQ-021 slice 6): the JWT signature over a push request. `vapid` needs no HTTP
+# client and no mail stack, which is what makes it fit in core; the encrypted body
+# (`push_crypto`) belongs in the notification crate beside the transport that sends it.
+hmac.workspace = true
+p256.workspace = true
+sha2.workspace = true
+getrandom = "0.2"
+# The encrypted body (RFC 8291 + RFC 8188): a key agreement against the subscriber's own
+# public key, two key expansions and AES-128-GCM. `hkdf`/`aes-gcm` are workspace-pinned so a
+# second reader of the same primitive cannot arrive with a different version.
+hkdf.workspace = true
+aes-gcm.workspace = true
+
 tokio.workspace = true
 sqlx.workspace = true
 redis.workspace = true

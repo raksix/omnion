@@ -2,22 +2,7 @@
 #
 # The Rust side is a Cargo workspace at the repository root; the JavaScript/TypeScript side
 # is this pnpm workspace. `apps/api` has no package.json, so pnpm simply skips it.
-#
-# The CodeMirror override is not a preference, it is a type-level requirement: the six
-# packages share private-branded state classes, so two copies in the tree make `KeyBinding`
-# from one unassignable to `KeyBinding` from another — every editor extension list fails to
-# typecheck and the error text is 15 lines of structural mismatch with no mention of the real
-# cause. `^6` would let pnpm pick two copies the moment one package drifts a patch version.
 packages:
   - "apps/*"
   - "packages/*"
   - "themes/*"
-
-overrides:
-  "@codemirror/state": "^6.7.6"
-  "@codemirror/view": "^6.43.13"
-  "@codemirror/language": "^6.12.4"
-  "@codemirror/commands": "^6.11.1"
-  "@codemirror/autocomplete": "^6.20.3"
-  "@codemirror/search": "^6.7.2"
-  "@codemirror/lint": "^6.9.7"

@@ -128,6 +128,16 @@ enum Filter {
     ScanStatus(String),
     /// `version_count > 1` — no value.
     HasVersions,
+    /// `metadata -> $n = $n+1` — the pair exists with exactly this value.
+    ///
+    /// Built from the **pair path** rather than a containment operator. `@>` would be the obvious
+    /// choice and it is wrong here for three reasons: `metadata @> '{"k":"v"}'` is false when the
+    /// stored value is the *number* `v`, it is false for any row that also carries other pairs
+    /// only in the `?` variants, and — the real one — a jsonb equality test cannot use the
+    /// default `jsonb_ops` GIN opclass efficiently, so the index built in 0025 was never on the
+    /// path this filter would have used. `->` with `=` compares one key against one value and is
+    /// the form the index was created for.
+    MetadataPair { key: String, value: String },
 }
 
 impl Filter {
@@ -207,6 +217,21 @@ impl Filter {
                 // number, so there is nothing to bind.
                 builder.push("version_count > 1");
             }
+            Self::MetadataPair { key, value } => {
+                // `->` takes the key as its right operand, so the key is bound FIRST and the
+                // operator is written after the bind — the same ordering rule `Filter::Tag`
+                // records for `$n = any(tags)`. Writing the text first and binding after would
+                // read `$n = any(tags)`, which PostgreSQL rejects when it plans the query.
+                //
+                // `->>` extracts the value as **text**, which is what makes the comparison work
+                // for every row: the pairs are stored as jsonb strings, and `->` returns jsonb,
+                // so `-> = $n` against a jsonb bind would be a jsonb-to-jsonb equality that a
+                // number in the row silently fails. `->> = $n` compares text to text.
+                builder.push("metadata ->> ");
+                builder.push_bind(key.clone());
+                builder.push(" = ");
+                builder.push_bind(value.clone());
+            }
         }
     }
 
@@ -247,6 +272,13 @@ pub struct ListQuery {
     pub scan_status: Option<String>,
     /// Only files with more than one version.
     pub has_versions: bool,
+    /// Only files whose custom pairs carry this `key=value`; `None` is no metadata filter.
+    ///
+    /// One pair, not a query language. A `jsonpath` or an operator grammar here would let a
+    /// listing take a fragment of SQL out of a URL, and the browser's own toolbar has one field
+    /// for one pair. `metadata_pairs::filter_clause` is what decides whether a typed term is a
+    /// filter at all.
+    pub metadata: Option<String>,
     /// How many rows to return (1–500).
     pub limit: i64,
     /// How many rows to skip.
@@ -264,7 +296,12 @@ impl ListQuery {
     }
 
     /// The filter list, in the order the placeholders are numbered.
-    fn filters(&self) -> Vec<Filter> {
+    ///
+    /// `Result` because a range an operator typed on two adjacent boxes can contradict itself, and
+    /// the honest answer to `min_bytes` above `max_bytes` is a message under the box — not an
+    /// empty library. The clamping stays: a *negative* size is a typo, not a contradiction, and
+    /// it is quietly read as zero.
+    fn filters(&self) -> Result<Vec<Filter>> {
         let mut filters = Vec::new();
         if let Some(id) = self.folder_id {
             filters.push(Filter::Folder {
@@ -289,6 +326,21 @@ impl ListQuery {
         if let Some(max_bytes) = self.max_bytes {
             filters.push(Filter::MaxBytes(max_bytes.max(0)));
         }
+        // The two size boxes are adjacent and typed independently, so the pair is checked
+        // together *after* clamping — `min=-5, max=3` is a 0..3 range, not a contradiction, and
+        // rejecting it would refuse a form a person can obviously mean.
+        if let (Some(min_bytes), Some(max_bytes)) = (self.min_bytes, self.max_bytes)
+            && min_bytes.max(0) > max_bytes.max(0)
+        {
+            return Err(MediaError::InvalidFilter {
+                field: "min_bytes".to_owned(),
+                reason: format!(
+                    "the smallest size cannot be above the largest ({} B > {} B)",
+                    min_bytes.max(0),
+                    max_bytes.max(0)
+                ),
+            });
+        }
         if let Some(user) = self.uploaded_by {
             filters.push(Filter::UploadedBy(user));
         }
@@ -297,6 +349,18 @@ impl ListQuery {
         }
         if let Some(before) = self.created_before {
             filters.push(Filter::CreatedBefore(before));
+        }
+        // Same rule for the two date boxes, and the same reason: an operator who picks a start
+        // after the end meant the pair the other way round, and an empty listing says neither.
+        if let (Some(after), Some(before)) = (self.created_after, self.created_before)
+            && after > before
+        {
+            return Err(MediaError::InvalidFilter {
+                field: "created_after".to_owned(),
+                reason: format!(
+                    "the earliest date cannot be after the latest date ({after} > {before})"
+                ),
+            });
         }
         if let Some(tag) = self.tag.as_deref().filter(|v| !v.is_empty()) {
             filters.push(Filter::Tag(tag.to_owned()));
@@ -307,8 +371,69 @@ impl ListQuery {
         if self.has_versions {
             filters.push(Filter::HasVersions);
         }
-        filters
+        // The one place a metadata term becomes a filter. A half-typed `campaign=` is not a
+        // filter, so it narrows nothing — a toolbar field that has not been finished yet must not
+        // change the listing out from under the person typing it.
+        if let Some(term) = self.metadata.as_deref()
+            && let Some((key, value)) = crate::metadata_pairs::filter_clause(term)
+        {
+            filters.push(Filter::MetadataPair { key, value });
+        }
+        Ok(filters)
     }
+}
+
+/// One account that appears in a site's library as an uploader.
+///
+/// The uploader filter needs a list of *candidates*, and the obvious source is `GET
+/// /api/v1/iam/users` — which is guarded by `users.read`, a key a media operator does not
+/// hold. A toolbar that calls it would render its filter behind a `403` for exactly the people
+/// who run the library. So the list is derived from the library itself: an account that uploaded
+/// nothing is not a candidate for a filter, and every account that did is, by definition, one
+/// this module already reads.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct Uploader {
+    /// The account id, the value the filter binds.
+    pub id: Uuid,
+    /// Their display name, falling back to their address (see [`list_uploaders`]).
+    pub label: String,
+    /// How many live files of this site they uploaded.
+    pub files: i64,
+}
+
+/// The accounts that uploaded into a site's live library, most prolific first.
+///
+/// Left-joined over `users` so a row whose account has since been deleted still appears — its
+/// files are still in the library, and a listing that silently omits them because the person left
+/// is how a filter "loses" a file. `display_name` is coalesced onto `email` for the same reason:
+/// the column is `not null default ''`, so a name is never null, but it is *empty* for every
+/// account created before it was filled in, and an empty dropdown label is worse than an address.
+pub async fn list_uploaders(pool: &PgPool, site_id: Uuid) -> Result<Vec<Uploader>> {
+    // Two PostgreSQL rules, each found by the walk rather than by reading, and both of which
+    // answer `500: column "label" does not exist`:
+    //
+    // 1. An output alias is visible to `order by` **only when it is the whole expression**. Wrap
+    //    it — `lower(label)` — and the lookup falls through to the input columns, where there is
+    //    no `label`. The escape is to repeat the expression; the other one, a positional
+    //    reference, is worse, because `lower(2)` is `lower(integer)` and the hint names a missing
+    //    function rather than a missing column.
+    // 2. `group by` never sees an output alias at all, so it groups by **position** here. That is
+    //    also the property the count needs: grouping by exactly what is selected keeps two
+    //    accounts that share a display name as two rows instead of collapsing them into one
+    //    combined count, which would show a name twice and count the files once between them.
+    let uploaders = sqlx::query_as::<_, Uploader>(
+        "select m.created_by as id, \
+                coalesce(nullif(u.display_name, ''), u.email, 'someone') as label, \
+                count(*) as files \
+         from media m left join users u on u.id = m.created_by \
+         where m.site_id = $1 and m.deleted_at is null \
+         group by 1, 2 \
+         order by files desc, lower(coalesce(nullif(u.display_name, ''), u.email, 'someone')), 1",
+    )
+    .bind(site_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(uploaders)
 }
 
 /// Escape the wildcards of a user-supplied search term.
@@ -355,7 +480,7 @@ pub async fn list_files(
     // The clause and the binds are generated by ONE loop over ONE filter list, so the `$n` in a
     // clause and the value pushed after it can never drift apart — the failure mode that makes a
     // count disagree with the page it counts.
-    push_filters(&mut builder, query, site_id);
+    push_filters(&mut builder, query, site_id)?;
     // `limit`/`offset` need their keywords: the two values are pushed back to back, and
     // without `offset` in between PostgreSQL parses `limit $n $n+1` as a syntax error. The
     // clause is built here rather than in `Sort::order_by` so the keyword cannot be lost
@@ -381,20 +506,30 @@ pub async fn list_files(
 /// One loop over ONE filter list, and each filter writes its own clause *and* its own values, so
 /// a placeholder can only exist where the value beside it was pushed. `count_files` runs the same
 /// function, which is what makes the count and the page it counts unable to disagree.
-fn push_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &ListQuery, site_id: Uuid) {
+///
+/// The `Result` is the range check in [`ListQuery::filters`]. It has to be able to refuse *before*
+/// the builder is half-written, which is why the filter list is built first and then written: a
+/// builder holding a clause for `size_bytes >= $n` and no `size_bytes <= $n` is a statement that
+/// is syntactically fine and answers the wrong question.
+fn push_filters(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    query: &ListQuery,
+    site_id: Uuid,
+) -> Result<()> {
     builder.push("media.site_id = ");
     builder.push_bind(site_id);
     builder.push(" and media.deleted_at is null");
-    for filter in query.filters() {
+    for filter in query.filters()? {
         builder.push(" and ");
         filter.push(builder);
     }
+    Ok(())
 }
 
 /// How many rows a filter matches, with the same predicate as [`list_files`].
 pub async fn count_files(pool: &PgPool, site_id: Uuid, query: &ListQuery) -> Result<i64> {
     let mut builder = QueryBuilder::<Postgres>::new("select count(*) from media where ");
-    push_filters(&mut builder, query, site_id);
+    push_filters(&mut builder, query, site_id)?;
     let total: i64 = builder.build_query_scalar().fetch_one(pool).await?;
     Ok(total)
 }
@@ -482,15 +617,47 @@ pub async fn purge_files(pool: &PgPool, ids: &[Uuid]) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
-/// The storage keys of files about to be purged, so the caller can remove exactly those bytes.
-pub async fn storage_keys(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<String>> {
+/// **Every** object key a set of files owns, so a delete can take the bytes with it.
+///
+/// Three tables, and missing any one of them orphans objects that nothing will ever name again:
+///
+/// | table | why it is in the union |
+/// |---|---|
+/// | `media` | the bytes the row serves today |
+/// | `media_versions` | every superseded version — a replace moves `media.storage_key` forward, so the old key is named **only** by the history |
+/// | `media_derivatives` | the preset cache — `on delete cascade` from `media`, so the row disappears with the file and leaves the object behind |
+///
+/// The two cascade tables are the trap. Deleting the `media` row is what makes the version and
+/// derivative rows go, so a caller that reads `media.storage_key` *first* and deletes objects
+/// *after* is reading the one key that is not the problem, and every other object the file owned
+/// becomes unreachable storage. The nightly sweep got this right (`purge_eligible` unions the
+/// history) while the three interactive purge paths did not, which is the class this function
+/// exists to end: the answer lives in one place, and there is no second, narrower one to reach
+/// for by mistake.
+///
+/// A derivative object is shared only in the sense that a second file with **identical** bytes
+/// and the same preset finds this row by its `cache_key` and serves its pixels. Deleting the
+/// object with the first file costs that second file one rebuild — a cache miss, never a wrong
+/// answer, which is the same bargain [`crate::preset_store::clear_derivatives`] already makes.
+pub async fn owned_object_keys(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<String>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let keys = sqlx::query_scalar::<_, String>("select storage_key from media where id = any($1)")
-        .bind(ids)
-        .fetch_all(pool)
-        .await?;
+    let mut keys = sqlx::query_scalar::<_, String>(
+        "select storage_key from media where id = any($1) \
+         union \
+         select storage_key from media_versions where media_id = any($1) \
+         union \
+         select storage_key from media_derivatives where media_id = any($1)",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    // Sorted and deduped so the caller cannot delete the same object twice — `union` already
+    // removes duplicates, but a key present in two of the three tables is returned once by
+    // `union` and this keeps the property if the query is ever rewritten as `union all`.
+    keys.sort();
+    keys.dedup();
     Ok(keys)
 }
 
@@ -642,11 +809,10 @@ mod tests {
         assert_eq!(escape_like("100%"), "100\\%");
         assert_eq!(escape_like("a_b"), "a\\_b");
         // Without the escape a search for `100%` would return every file in the library.
-        let filters = ListQuery {
+        let filters = built(&ListQuery {
             search: Some("100%".to_owned()),
             ..ListQuery::new()
-        }
-        .filters();
+        });
         assert!(
             matches!(filters.first(), Some(Filter::NameContains(pattern)) if pattern == "%100\\%%")
         );
@@ -654,13 +820,12 @@ mod tests {
 
     #[test]
     fn blank_filters_are_not_built() {
-        let filters = ListQuery {
+        let filters = built(&ListQuery {
             search: Some("   ".to_owned()),
             kind: Some(String::new()),
             tag: Some(String::new()),
             ..ListQuery::new()
-        }
-        .filters();
+        });
         assert!(
             filters.is_empty(),
             "blank filters are not filters: {filters:?}"
@@ -672,17 +837,145 @@ mod tests {
         // A trashed file never appears in the browser listing, whatever the filters say: the
         // clause is written once in `push_filters` and both statements go through it.
         let mut builder = QueryBuilder::<Postgres>::new("select count(*) from media where ");
-        push_filters(&mut builder, &query(), Uuid::nil());
+        push_filters(&mut builder, &query(), Uuid::nil()).expect("an empty query is a valid one");
         let sql = builder.sql().to_owned();
         assert!(sql.contains("media.site_id = $1"), "{sql}");
         assert!(sql.contains("media.deleted_at is null"), "{sql}");
     }
 
+    /// The filter list of a query that must be accepted.
+    ///
+    /// Every caller below hands it a query it believes is valid, so a refusal is a test that has
+    /// lost the case it was written for. The tests that want a refusal call `filters()` and match
+    /// on the error themselves — the two must not share a helper, or the refusal tests would be
+    /// asserting against a `panic`.
+    fn built(query: &ListQuery) -> Vec<Filter> {
+        query
+            .filters()
+            .unwrap_or_else(|error| panic!("a valid query must build: {error}"))
+    }
+
     /// Build the statement a listing would send, so the assertions can look at the SQL itself.
+    ///
+    /// `panic` rather than `unwrap`: every caller below hands it a *valid* query, so a refusal
+    /// here is a test that has lost the case it was written for, not a test to route around.
     fn statement(query: &ListQuery) -> String {
         let mut builder = QueryBuilder::<Postgres>::new("select 1 from media where ");
-        push_filters(&mut builder, query, Uuid::nil());
+        push_filters(&mut builder, query, Uuid::nil())
+            .unwrap_or_else(|error| panic!("a valid query must build: {error}"));
         builder.sql().to_owned()
+    }
+
+    #[test]
+    fn a_size_range_wider_than_itself_is_refused_by_name() {
+        // The two size boxes sit next to each other and are typed independently, so this is a
+        // thing an operator does. PostgreSQL's own answer is zero rows, which the panel renders
+        // as "no files match these filters" — a statement about the library rather than about
+        // the two boxes that disagree. The refusal has to name the box.
+        let error = ListQuery {
+            min_bytes: Some(4096),
+            max_bytes: Some(1024),
+            ..ListQuery::new()
+        }
+        .filters()
+        .expect_err("min above max is not a range");
+        assert!(
+            matches!(&error, MediaError::InvalidFilter { field, .. } if field == "min_bytes"),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("4096"), "{error}");
+    }
+
+    #[test]
+    fn a_date_range_wider_than_itself_is_refused_by_name() {
+        let after = OffsetDateTime::UNIX_EPOCH + time::Duration::days(20);
+        let before = OffsetDateTime::UNIX_EPOCH + time::Duration::days(10);
+        let error = ListQuery {
+            created_after: Some(after),
+            created_before: Some(before),
+            ..ListQuery::new()
+        }
+        .filters()
+        .expect_err("an earliest date after the latest is not a range");
+        assert!(
+            matches!(&error, MediaError::InvalidFilter { field, .. } if field == "created_after"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn one_sided_ranges_and_negative_sizes_are_not_contradictions() {
+        // Half a range is a range, and a negative size is a typo rather than a disagreement with
+        // the other box. Both must build, or the refusal above starts refusing forms a person
+        // can obviously mean.
+        assert!(
+            !built(&ListQuery {
+                min_bytes: Some(4096),
+                ..ListQuery::new()
+            })
+            .is_empty()
+        );
+        assert!(
+            !built(&ListQuery {
+                max_bytes: Some(1024),
+                ..ListQuery::new()
+            })
+            .is_empty()
+        );
+        // -5 clamps to 0, which is below 3, so this is a 0..3 range and not a contradiction.
+        let filters = built(&ListQuery {
+            min_bytes: Some(-5),
+            max_bytes: Some(3),
+            ..ListQuery::new()
+        });
+        assert!(
+            matches!(filters.first(), Some(Filter::MinBytes(0))),
+            "{filters:?}"
+        );
+        assert!(
+            matches!(filters.get(1), Some(Filter::MaxBytes(3))),
+            "{filters:?}"
+        );
+    }
+
+    #[test]
+    fn a_range_is_refused_before_the_statement_is_built() {
+        // Not "the statement still runs and returns nothing" — the builder must be left alone,
+        // so a caller can never send a half-written statement that answers the wrong question.
+        let query = ListQuery {
+            kind: Some("image".to_owned()),
+            min_bytes: Some(9000),
+            max_bytes: Some(10),
+            ..ListQuery::new()
+        };
+        let mut builder = QueryBuilder::<Postgres>::new("select 1 from media where ");
+        let error = push_filters(&mut builder, &query, Uuid::nil())
+            .expect_err("the range is contradictory");
+        assert!(
+            matches!(error, MediaError::InvalidFilter { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn the_size_and_date_filters_reach_the_statement() {
+        // The toolbar shipped after the store, so this is the test that would have caught the
+        // six months in which `min_bytes` had a filter, a store clause and no input.
+        let after = OffsetDateTime::UNIX_EPOCH;
+        let before = OffsetDateTime::UNIX_EPOCH + time::Duration::days(365);
+        let sql = statement(&ListQuery {
+            min_bytes: Some(1024),
+            max_bytes: Some(2048),
+            created_after: Some(after),
+            created_before: Some(before),
+            uploaded_by: Some(Uuid::nil()),
+            ..ListQuery::new()
+        });
+        assert!(sql.contains("size_bytes >= $"), "{sql}");
+        assert!(sql.contains("size_bytes <= $"), "{sql}");
+        assert!(sql.contains("created_at >= $"), "{sql}");
+        assert!(sql.contains("created_at < $"), "{sql}");
+        assert!(sql.contains("created_by = $"), "{sql}");
     }
 
     #[test]
@@ -735,6 +1028,13 @@ mod tests {
                 },
             ),
             (
+                "metadata",
+                ListQuery {
+                    metadata: Some("campaign=spring".to_owned()),
+                    ..ListQuery::new()
+                },
+            ),
+            (
                 "everything",
                 ListQuery {
                     folder_id: Some(Uuid::nil()),
@@ -771,6 +1071,76 @@ mod tests {
                 let _ = index;
             }
         }
+    }
+
+    #[test]
+    fn a_metadata_filter_binds_its_key_before_the_operator_writes_itself() {
+        // The defect this guards: the clause pushed `metadata -> $2 = $3` as *text* and then
+        // bound two more values, so every metadata-filtered listing sent `$2` for the key and
+        // PostgreSQL refused the statement. An unfiltered listing still worked, which is why no
+        // earlier test saw it — the same shape as the `$$` defect this suite already holds.
+        let sql = statement(&ListQuery {
+            metadata: Some("campaign=spring".to_owned()),
+            ..ListQuery::new()
+        });
+        assert!(sql.contains("metadata ->> $2 = $3"), "{sql}");
+        assert!(!sql.contains("$2$"), "{sql}");
+        // `->>` (text) rather than `->` (jsonb): the stored values are jsonb strings, and a
+        // jsonb equality against a text bind is false for every row holding a number.
+        assert!(
+            !sql.contains("metadata -> $"),
+            "must extract as text: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_half_typed_metadata_term_is_not_a_filter_at_all() {
+        // The toolbar field is free text and is re-read on every keystroke. `campaign=` must
+        // narrow nothing rather than match every row or none: a listing that changes while the
+        // word is being typed is a listing nobody trusts.
+        for term in ["", "   ", "campaign", "campaign=", "=spring", "  =  "] {
+            let filters = built(&ListQuery {
+                metadata: Some(term.to_owned()),
+                ..ListQuery::new()
+            });
+            assert!(
+                !filters
+                    .iter()
+                    .any(|filter| matches!(filter, Filter::MetadataPair { .. })),
+                "[{term:?}] must not build a metadata filter: {filters:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_metadata_filter_goes_through_the_same_builder_as_every_other_filter() {
+        // `count_files` runs the same `push_filters` over the same list, which is what makes the
+        // "Showing N of TOTAL" footer unable to disagree with the rows it counts. A filter built
+        // on a second path would reintroduce exactly that drift, so the assertion is on the
+        // statement the *count* sends, not on the rows it returns.
+        let sql = statement(&ListQuery {
+            metadata: Some("campaign=spring".to_owned()),
+            tag: Some("hero".to_owned()),
+            ..ListQuery::new()
+        });
+        assert!(sql.contains("= any(tags)"), "{sql}");
+        assert!(sql.contains("metadata ->> $"), "{sql}");
+        assert!(sql.contains("deleted_at is null"), "{sql}");
+    }
+
+    #[test]
+    fn a_metadata_pair_keeps_an_equals_sign_inside_its_value() {
+        // Splitting on the *first* `=` is what makes `note=width=3px` addressable; splitting on
+        // the last, or on every one, would truncate the value into something that never matches.
+        let filters = built(&ListQuery {
+            metadata: Some("note=width=3px".to_owned()),
+            ..ListQuery::new()
+        });
+        let Some(Filter::MetadataPair { key, value }) = filters.first() else {
+            panic!("expected one metadata filter: {filters:?}");
+        };
+        assert_eq!(key, "note");
+        assert_eq!(value, "width=3px");
     }
 
     #[test]
@@ -882,5 +1252,127 @@ mod tests {
         assert!(assert_same_site(&folder, Uuid::new_v4()).is_err());
         folder.site_id = Uuid::new_v4();
         assert!(assert_same_site(&folder, folder.site_id).is_ok());
+    }
+
+    #[test]
+    fn the_owned_keys_statement_names_every_table_a_file_lives_in() {
+        // The **SQL literal**, not the function's whole body. Two earlier shapes of this test
+        // were both wrong in the same way, and both were wrong in a way that would have shipped
+        // a gate which could not fail: slicing up to the `-> Result` signature reads the
+        // signature and nothing else, and counting `union` over the body counts the word in the
+        // prose that explains why the statement is a union. A gate that asserts on its own
+        // explanation is not a gate.
+        let source = include_str!("browser.rs");
+        let start = source
+            .find("pub async fn owned_object_keys")
+            .expect("the function is defined in this file");
+        let next = source[start + 1..]
+            .find("pub async fn ")
+            .map(|offset| start + 1 + offset)
+            .expect("a function after it");
+        let body = &source[start..next];
+        let query = body
+            .find("sqlx::query_scalar")
+            .expect("it queries something");
+        let end = body[query..]
+            .find(".bind(ids)")
+            .map(|offset| query + offset)
+            .expect("it binds the ids");
+        let sql = &body[query..end];
+
+        for table in [
+            "from media ",
+            "from media_versions ",
+            "from media_derivatives ",
+        ] {
+            assert!(
+                sql.contains(table),
+                "`owned_object_keys` must read `{table}` — without it, every object in that \
+                 table outlives the row that named it and nothing can ever name it again"
+            );
+        }
+        assert_eq!(
+            sql.matches("union").count(),
+            2,
+            "two unions make three tables; a rewritten statement must keep the count honest"
+        );
+        // The two predicates differ by column, and a copy of one pasted onto the other selects
+        // nothing rather than raising — the failure this exact query had to get right.
+        assert!(
+            sql.contains("from media where id = any($1)"),
+            "the row's own key is selected by `id`"
+        );
+        assert_eq!(
+            sql.matches("where media_id = any($1)").count(),
+            2,
+            "the history and the cache are both selected by `media_id`"
+        );
+    }
+
+    /// One question, one implementation.
+    ///
+    /// Three functions once answered *"what objects does this file own?"* — this one, the
+    /// retention sweep's `all_keys_of`, and `preset_store::derivative_keys` — and they had already
+    /// drifted: the sweep unioned only two of the three tables, so the nightly purge that exists to
+    /// reclaim storage nothing else will left every preset object behind while deleting the rows
+    /// that named it. Nothing failed when that drifted, because no walk reads the bucket after a
+    /// sweep.
+    ///
+    /// So this is a **counting** gate, and counting is the right instrument here precisely because
+    /// the failure mode is duplication: it fails the moment a fourth answer appears, and it fails
+    /// the moment a delegate is rewritten back into a query. It cannot tell whether a query is
+    /// *correct* — the sibling walk above answers that, against a real database.
+    #[test]
+    fn one_answer_to_what_a_file_owns_not_three() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        // (1) The other two modules must not query the union themselves.
+        for module in ["retention.rs", "preset_store.rs"] {
+            let source = std::fs::read_to_string(crate_root.join(module))
+                .unwrap_or_else(|err| panic!("{module} must be readable: {err}"));
+            assert!(
+                !source.contains("from media_versions where media_id"),
+                "`{module}` builds its own answer to what a file owns — `media_versions` is one of \
+                 the three tables and this is the copy that drifts. Call \
+                 `browser::owned_object_keys` instead."
+            );
+        }
+
+        // (2) And the one function that may answer it must stay the single entry point.
+        //
+        // Counted inside the `owned_object_keys` **body only**. The first version of this counted
+        // the whole file and got 2 — because the assertion message itself contains the string it
+        // counts, which is the same self-referential trap the sibling gate documents: a gate that
+        // reads its own explanation cannot fail.
+        let browser = std::fs::read_to_string(crate_root.join("browser.rs")).expect("readable");
+        let start = browser
+            .find("pub async fn owned_object_keys")
+            .expect("the function is defined there");
+        let after = &browser[start..];
+        let end = after[1..]
+            .find("pub async fn ")
+            .map(|offset| 1 + offset)
+            .unwrap_or(after.len());
+        assert_eq!(
+            after[..end].matches("from media_derivatives where media_id").count(),
+            1,
+            "exactly one place may select the preset cache for a set of files"
+        );
+
+        // (3) The sweep delegates rather than re-querying: a delegate keeps the exported name
+        // (callers and the retention walks use it) while the SQL lives in one place.
+        let retention = std::fs::read_to_string(crate_root.join("retention.rs")).expect("readable");
+        let start = retention
+            .find("pub async fn all_keys_of")
+            .expect("it is defined there");
+        let body = &retention[start..];
+        let end = body[1..]
+            .find("\n}")
+            .map(|o| start + 1 + o)
+            .unwrap_or(start);
+        assert!(
+            retention[start..end].contains("owned_object_keys"),
+            "`all_keys_of` must delegate to the one answer, not re-state it"
+        );
     }
 }

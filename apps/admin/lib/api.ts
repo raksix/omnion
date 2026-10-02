@@ -12,9 +12,30 @@ import type {
   SecurityFindingStatus,
   SecurityImportReport,
   SecurityOverview,
+  HealthOverview,
+  HealthServiceDetail,
+  HealthSamplePoint,
+  HealthSummary,
+  HealthPruneResult,
+  HealthMetricRow,
+  HealthMetricsReport,
+  HealthRangeKey,
+  HealthIncident,
+  HealthIncidentPage,
+  HealthIncidentAction,
+  HealthMaintenanceWindow,
+  HealthSettings,
+  HealthThreshold,
   HeaderPolicyDocument,
   HeaderPolicySave,
   HeaderPolicySaved,
+  CreateIpRuleInput,
+  CreateIpRuleResult,
+  IpRulesPage,
+  SecretInventory,
+  SecurityEventsFilter,
+  SecurityEventsPage,
+  IpTestResult,
   LockedAccountsPage,
   LockoutPolicy,
   RateLimitScope,
@@ -36,12 +57,6 @@ import type {
   WebhookTestReport,
   CreatedMediaShare,
   EventCatalogue,
-  GraphDocument,
-  GraphRead,
-  GraphSaved,
-  GraphValidated,
-  ExpressionPreviewed,
-  ExpressionCompleted,
   EventFilters,
   EventPage,
   RetentionStatus,
@@ -55,6 +70,7 @@ import type {
   MediaFilePage,
   MediaFilters,
   MediaFolder,
+  MediaUploader,
   MediaFolderTree,
   MediaMergeResult,
   MediaPreset,
@@ -78,6 +94,19 @@ import type {
   MediaRetentionPolicy,
   MediaRetentionPolicyInput,
   MediaRetentionRepair,
+  BackupCreateResult,
+  BackupDetail,
+  BackupList,
+  BackupSchedule,
+  BackupSettings,
+  BackupStatus,
+  BackupPurge,
+  BackupPurgeFailure,
+  BackupSweepReport,
+  RestoreJob,
+  RestoreOutcome,
+  RestorePreview,
+  BackupVerification,
   MediaRetentionRunList,
   MediaRetentionRunResult,
   MediaTrash,
@@ -90,32 +119,11 @@ import type {
   NotificationChannelReadiness,
   NotificationDevice,
   NotificationFilters,
-  NodeCategory,
-  NodeType,
-  NodeTypeFilters,
-  NodeTypePage,
-  CredentialType,
-  CredentialTypePage,
-  // Credential instances (REQ-087 slice 2). `Credential` is the masked read; there is no type
-  // here for a secret value because the API has no endpoint that returns one.
-  Credential,
-  CredentialDeleteResult,
-  CredentialFilters,
-  CredentialPage,
-  CredentialTestResult,
-  CredentialUsage,
-  NewCredential,
-  NodePackage,
-  NodePackageInstall,
-  NodePackagePage,
-  NodePackageRemoval,
-  NodePackageToggle,
-  PortKindCatalogue,
-  RegistryLint,
   NotificationOutbox,
   NotificationPage,
   NotificationPreferences,
   NotificationPreferencesSaved,
+  NotificationPushKey,
   NotificationPushOutcome,
   NotificationRouteReport,
   NotificationRouteRule,
@@ -125,6 +133,20 @@ import type {
   Site,
   User,
 } from "./types";
+// The portal's own shapes live in their own module rather than in `types.ts`, because they come
+// with a *rule* attached (only `IssuedDeveloperKey` may hold a token) that is worth reading
+// next to the type itself rather than one of two hundred lines of a shared list.
+import type {
+  CreateDeveloperKeyInput,
+  DeveloperKey,
+  DeveloperKeyDetail,
+  DeveloperLogDetail,
+  DeveloperLogFilters,
+  DeveloperLogPage,
+  DeveloperOverview,
+  DeveloperScopeCatalogue,
+  IssuedDeveloperKey,
+} from "./developer";
 
 /** An error answered by the API, or raised before the request could leave the browser. */
 export class ApiError extends Error {
@@ -139,24 +161,59 @@ export class ApiError extends Error {
    * `action`; without this the panel could only print the sentence.
    */
   readonly details: Record<string, unknown> | null;
+  /**
+   * Seconds the API asked the caller to wait, from `Retry-After`.
+   *
+   * `null` on everything that is not a refusal with a window behind it, and that distinction is
+   * the point: a screen that retried blindly would spin against the very limiter it exists to
+   * diagnose, and an operator watching a page refresh into `429` learns less from the error than
+   * from the number of seconds the platform is willing to wait.
+   */
+  readonly retryAfterSeconds: number | null;
 
   constructor(
     status: number,
     code: string,
     message: string,
     details: Record<string, unknown> | null = null,
+    retryAfterSeconds: number | null = null,
   ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.details = details;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 
   /** `true` when the session is missing or expired. */
   get isUnauthenticated(): boolean {
     return this.status === 401;
   }
+
+  /**
+   * `true` when the platform refused the request because a scope's budget is spent.
+   *
+   * A screen handles this differently from every other error: it says what was refused, by which
+   * scope and when to try again — instead of a "something went wrong" banner that implies the
+   * panel is broken when it is in fact doing exactly what it was configured to do.
+   */
+  get isRateLimited(): boolean {
+    return this.status === 429;
+  }
+}
+
+/**
+ * Read the wait the API attached, or `null` when there is none.
+ *
+ * Parsed rather than trusted: a header the platform sent is still a string that came off a wire,
+ * and `Number("soon")` is a number.
+ */
+function retryAfterOf(response: Response): number | null {
+  const raw = response.headers.get("retry-after");
+  if (!raw) return null;
+  const seconds = Number(raw);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
 }
 
 type ErrorBody = {
@@ -217,7 +274,16 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+/**
+ * The single fetch path every client call goes through.
+ *
+ * **Exported** because `lib/guard-api.ts` (REQ-105) reuses it instead of writing a second one.
+ * The alternative — a local `fetch` in that module — produces a request path that has to
+ * remember CSRF, credentials and the JSON content-type rule on its own, and every one of those
+ * is a `PUT` that the server silently refuses when it is missing. A second transport would
+ * eventually be the copy that drifts.
+ */
+export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
@@ -245,6 +311,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       body.error?.code ?? "unknown_error",
       body.error?.message ?? `The API answered with status ${response.status}.`,
       body.error?.details ?? null,
+      retryAfterOf(response),
     );
   }
 
@@ -491,9 +558,82 @@ function mediaQuery(siteId: string, filters: MediaFilters = {}): string {
     if (value === undefined || value === null || value === "" || value === false) {
       continue;
     }
+    if (key === "created_after" || key === "created_before") {
+      // The store's window is two instants, the toolbar's is two days, and the expansion happens
+      // here and NOT in the API for one reason: `new Date("2026-10-03")` on a server is midnight
+      // **UTC**, so a server-side expansion shifts the window by the server's offset from the
+      // operator's. A file uploaded at 23:00 on the 3rd in Istanbul is outside a UTC-midnight
+      // window, and the panel would report "nothing matches" about a file the operator can see.
+      // The browser knows the operator's own day, so the browser draws the line.
+      //
+      // `created_before` is the start of the day AFTER the one picked, because the store's
+      // clause is `created_at <` — sending the start of the picked day would exclude every file
+      // uploaded after midnight on the day the operator chose, and the window's last day would
+      // be silently empty.
+      const instant =
+        key === "created_after"
+          ? startOfLocalDay(value as string)
+          : startOfLocalDay(nextLocalDay(value as string));
+      if (instant) {
+        params.set(key, instant);
+      }
+      continue;
+    }
     params.set(key, value === true ? "true" : String(value));
   }
   return params.toString();
+}
+
+/**
+ * Split a `YYYY-MM-DD` string into numbers, or `null` when it is not a plain calendar day.
+ *
+ * The check exists so a malformed value cannot reach the query string as `Invalid Date` and come
+ * back from the store as a `400` nobody can act on. A date input hands over nothing else, so
+ * this is a guard against a hand-edited URL, not against the control.
+ */
+function calendarDay(day: string): [number, number, number] | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!match) {
+    return null;
+  }
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/**
+ * The first instant of a `YYYY-MM-DD` day **in this browser's timezone**, as RFC 3339.
+ *
+ * Built from the parts rather than from `new Date("2026-10-03")`, because that form is specified
+ * as UTC: an operator picking "3 October" means their own 3 October, and a UTC reading of the
+ * same string is a different day for most of the planet.
+ *
+ * `null` for a value that is not a plain calendar day.
+ */
+function startOfLocalDay(day: string): string | null {
+  const parts = calendarDay(day);
+  if (!parts) {
+    return null;
+  }
+  const [year, month, date] = parts;
+  const moment = new Date(year, month - 1, date, 0, 0, 0, 0);
+  return Number.isNaN(moment.getTime()) ? null : moment.toISOString();
+}
+
+/**
+ * The `YYYY-MM-DD` day after the one given, in this browser's timezone.
+ *
+ * Round-tripped through the offset rather than built by hand from the parts: adding a day to
+ * `31 December` has to be `1 January`, and `new Date(year, month - 1, 32)` does that while
+ * hand-rolled arithmetic on the month does not.
+ */
+function nextLocalDay(day: string): string {
+  const parts = calendarDay(day);
+  if (!parts) {
+    return day;
+  }
+  const [year, month, date] = parts;
+  const moment = new Date(year, month - 1, date + 1, 0, 0, 0, 0);
+  const shifted = new Date(moment.getTime() - moment.getTimezoneOffset() * 60_000);
+  return shifted.toISOString().slice(0, 10);
 }
 
 /** The folder tree of a site, with the file count of every folder. */
@@ -539,6 +679,20 @@ export function fetchMediaFiles(
   return request<MediaFilePage>(`/api/v1/media/files?${mediaQuery(siteId, filters)}`);
 }
 
+/**
+ * The accounts the uploader filter offers, most prolific first.
+ *
+ * Its own route rather than a field on the listing: a dropdown of candidates is a different
+ * question from the rows that question selects, and a list response carrying both would make
+ * every page of the library pay for a filter nobody touched. `media.read` is enough — it reads
+ * the `created_by` of rows the caller may already list.
+ */
+export function fetchMediaUploaders(siteId: string): Promise<MediaUploader[]> {
+  return request<{ site_id: string; uploaders: MediaUploader[] }>(
+    `/api/v1/media/uploaders?site_id=${encodeURIComponent(siteId)}`,
+  ).then((body) => body.uploaders);
+}
+
 /** Rename, move or edit the metadata of one file. */
 export function updateMediaFile(
   fileId: string,
@@ -548,6 +702,15 @@ export function updateMediaFile(
     caption?: string;
     description?: string;
     tags?: string[];
+    /**
+     * The whole custom pair set, sent as the editor holds it.
+     *
+     * `{}` clears the pairs; omitting the field leaves them alone. A *merge* would be the
+     * friendlier shape and the wrong one here — a caller that does not know the current set
+     * would drop every pair it did not send, which is how a licence number disappears during a
+     * caption edit.
+     */
+    metadata?: Record<string, string>;
     folder_id?: string | null;
   },
 ): Promise<MediaFile> {
@@ -1319,13 +1482,88 @@ export type AiProvider = {
   id: string;
   name: string;
   protocol: string;
+  kind: AiProviderKind;
   base_url: string;
   has_api_key: boolean;
+  timeout_ms: number;
+  max_retries: number;
+  priority: number;
+  last_health: AiHealthStatus;
+  last_checked_at: string | null;
+  last_error: string | null;
   enabled: boolean;
   is_default: boolean;
   model_count: number;
   created_at: string;
   updated_at: string;
+};
+
+/** Where a provider lives: a hosted API, or one on the operator's own network. */
+export type AiProviderKind = "cloud" | "local";
+
+/** What the last health probe found. `unknown` means it has never been probed. */
+export type AiHealthStatus = "ok" | "degraded" | "down" | "unknown";
+
+/** One protocol the form offers, with the note the panel shows under the select. */
+export type AiProtocol = {
+  protocol: string;
+  note: string;
+  chat_path: string;
+  auth: string;
+};
+
+/** The numeric ranges the form validates against, from the same constants the API uses. */
+export type AiProtocolBounds = {
+  timeout_ms_min: number;
+  timeout_ms_max: number;
+  max_retries_max: number;
+  priority_min: number;
+  priority_max: number;
+};
+
+/** One step of the connection test. */
+export type AiTestStep = {
+  step: string;
+  label: string;
+  status: "pending" | "ok" | "failed" | "skipped";
+  latency_ms: number;
+  error?: string;
+  note?: string;
+};
+
+/** The whole connection test, as the panel renders it. */
+export type AiTestReport = {
+  provider_id: string;
+  provider_name: string;
+  protocol: string;
+  steps: AiTestStep[];
+  total_ms: number;
+  ok: boolean;
+  failing_step?: string;
+  model_count?: number;
+  known_models?: number;
+  summary: string;
+};
+
+/** One named thing a model can do. The vocabulary is closed and comes from the API. */
+export type AiCapability =
+  | "chat"
+  | "streaming"
+  | "tools"
+  | "vision"
+  | "json_mode"
+  | "embeddings"
+  | "image_generation"
+  | "audio_generation"
+  | "transcription"
+  | "list_models";
+
+/** One entry of the closed capability catalog the flag editor renders. */
+export type AiCapabilityInfo = {
+  capability: AiCapability;
+  note: string;
+  /** `false` for a fact about the endpoint rather than a model's to claim. */
+  editable: boolean;
 };
 
 /** One model of the registry, with the provider it belongs to. */
@@ -1340,11 +1578,62 @@ export type AiModel = {
   supports_vision: boolean;
   supports_streaming: boolean;
   supports_embeddings: boolean;
+  supports_image_generation: boolean;
+  supports_audio_generation: boolean;
+  supports_transcription: boolean;
+  supports_json_mode: boolean;
+  max_output_tokens: number | null;
   enabled: boolean;
   is_default: boolean;
   model_id: string;
+  /** The closed vocabulary, so a new flag needs no second edit in the panel. */
+  capability_catalog: AiCapabilityInfo[];
+  /** The capabilities this model actually claims, in catalog order. */
+  capabilities: AiCapability[];
+  /** What it costs, in both precisions (REQ-098 slice 1). */
+  price: AiModelPrice;
+  /** Where the capability flags came from: `manual`, `discovery` or `probe`. */
+  capabilities_source: string;
+  /** When the capability flags were last confirmed against something. */
+  capabilities_verified_at: string | null;
   created_at: string;
   updated_at: string;
+};
+
+/**
+ * One model's price.
+ *
+ * Both the per-million figure the column stores and the per-1K rendering the table shows, so
+ * the panel can switch between them without rounding differently from the export. `complete` is
+ * the important one: a model with only an input price has an *unknown* cost, and rendering the
+ * missing half as zero would make every estimate built from this row too small.
+ */
+export type AiModelPrice = {
+  input_micros_per_mtok: number | null;
+  output_micros_per_mtok: number | null;
+  input_micros_per_1k: number | null;
+  output_micros_per_1k: number | null;
+  /** `manual`, `discovery` or `probe`. */
+  source: string;
+  /** What that source means, so the panel does not have to hard-code the wording. */
+  source_note: string;
+  updated_at: string | null;
+  complete: boolean;
+  age_days: number | null;
+  stale: boolean;
+};
+
+/** How a catalog listing is narrowed; every field is optional and independent. */
+export type AiModelQuery = {
+  /** Matches the model key, the display name and the provider name. */
+  q?: string;
+  /** Capabilities a row must **all** claim; empty means no filter. */
+  capabilities?: AiCapability[];
+  providerId?: string;
+  /** `enabled` or `disabled`; absent is both. */
+  status?: "enabled" | "disabled";
+  /** Which column the table is sorted by. */
+  sort?: "model" | "provider" | "context" | "price" | "updated";
 };
 
 /** A model to register on a provider. */
@@ -1356,6 +1645,37 @@ export type AiModelInput = {
   supports_vision?: boolean;
   supports_streaming?: boolean;
   supports_embeddings?: boolean;
+  supports_image_generation?: boolean;
+  supports_audio_generation?: boolean;
+  supports_transcription?: boolean;
+  supports_json_mode?: boolean;
+  max_output_tokens?: number;
+};
+
+/** What one discovery line means for the registry. */
+export type AiDiscoveryAction = "added" | "changed" | "removed";
+
+/** One line of a discovery diff. */
+export type AiDiscoveryLine = {
+  model_key: string;
+  action: AiDiscoveryAction;
+  changed_fields: string[];
+};
+
+/** What a discovery run found, and what applying it would do. Nothing is written by the read. */
+export type AiDiscoveryReport = {
+  provider_id: string;
+  provider_name: string;
+  reported: string[];
+  stored: string[];
+  lines: AiDiscoveryLine[];
+  reported_count: number;
+  stored_count: number;
+  added: number;
+  removed: number;
+  changed: number;
+  /** `true` when applying would change nothing. */
+  up_to_date: boolean;
 };
 
 /** One message of a chat request. */
@@ -1364,10 +1684,35 @@ export type ChatMessageInput = {
   content: string;
 };
 
+/**
+ * A change set the answer proposed, filed for review (REQ-101, slice 3g).
+ *
+ * The platform files it, not the client: a proposal read out of model text is a **claim**, so
+ * it becomes a `draft` in the same inbox every other request lands in, and the reviewer edits
+ * and confirms it there. A client that rendered its own "here are the changes" block would be
+ * describing work the platform has no record of.
+ */
+export type ChatProposal = {
+  change_set_id: string;
+  title: string;
+  operations: number;
+  /** `true` when confirming this set would park at least one operation for a second person. */
+  needs_approval: boolean;
+};
+
 /** What a finished chat stream reported. */
 export type ChatDone = {
   finish_reason: string | null;
   chars: number;
+  /**
+   * The requester's own view of the answer (REQ-105 slice 3).
+   *
+   * Present while the guard is masking. Absent on an older server — so the screen falls back to
+   * the streamed text rather than blanking the answer it already rendered.
+   */
+  answer?: string;
+  /** Tokens the guard saw and refused to put back, e.g. an ambiguous `[EMAIL_1]`. */
+  guard_withheld?: string[];
   usage: {
     prompt_tokens: number | null;
     completion_tokens: number | null;
@@ -1381,17 +1726,58 @@ export async function fetchAiProviders(): Promise<AiProvider[]> {
   return body.providers;
 }
 
-/** The model registry, across every provider. */
-export async function fetchAiModels(): Promise<AiModel[]> {
-  const body = await request<{ models: AiModel[] }>("/api/v1/ai/models");
+/**
+ * The model registry, narrowed (REQ-098 slice 1).
+ *
+ * The narrowing is sent to the server rather than applied here: the API and the table have to
+ * agree about which rows a query means, and a client-side filter would make the acceptance
+ * criterion that the capability chips narrow the *listing* true of the panel and false of the
+ * endpoint. An empty result therefore means the server found nothing — never "the panel hid
+ * them".
+ */
+export async function fetchAiModels(query: AiModelQuery = {}): Promise<AiModel[]> {
+  const params = new URLSearchParams();
+  // A blank search is omitted rather than sent as `q=`: an empty needle and no needle must mean
+  // the same thing, and the server treats a whitespace-only value as no filter anyway.
+  if (query.q?.trim()) params.set("q", query.q.trim());
+  if (query.capabilities?.length) params.set("capability", query.capabilities.join(","));
+  if (query.providerId) params.set("provider_id", query.providerId);
+  if (query.status) params.set("status", query.status);
+  if (query.sort) params.set("sort", query.sort);
+
+  const suffix = params.toString();
+  const body = await request<{ models: AiModel[] }>(
+    suffix ? `/api/v1/ai/models?${suffix}` : "/api/v1/ai/models",
+  );
   return body.models;
+}
+
+/** The protocols the provider form offers, and the ranges it validates against. */
+export async function fetchAiProtocols(): Promise<{
+  protocols: AiProtocol[];
+  bounds: AiProtocolBounds;
+}> {
+  return request<{ protocols: AiProtocol[]; bounds: AiProtocolBounds }>("/api/v1/ai/protocols");
+}
+
+/** Run the connection test against a stored provider, server-side. */
+export function testAiProvider(providerId: string): Promise<AiTestReport> {
+  return request<AiTestReport>(`/api/v1/ai/providers/${encodeURIComponent(providerId)}/test`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 }
 
 /** Connect a provider, optionally with the models it serves. */
 export function connectAiProvider(input: {
   name: string;
   baseUrl: string;
+  protocol?: string;
+  kind?: AiProviderKind;
   apiKey?: string;
+  timeoutMs?: number;
+  maxRetries?: number;
+  priority?: number;
   enabled?: boolean;
   isDefault?: boolean;
   models?: AiModelInput[];
@@ -1401,7 +1787,12 @@ export function connectAiProvider(input: {
     body: JSON.stringify({
       name: input.name,
       base_url: input.baseUrl,
+      protocol: input.protocol,
+      kind: input.kind,
       api_key: input.apiKey && input.apiKey.trim() ? input.apiKey.trim() : null,
+      timeout_ms: input.timeoutMs,
+      max_retries: input.maxRetries,
+      priority: input.priority,
       enabled: input.enabled ?? true,
       is_default: input.isDefault ?? false,
       models: input.models ?? [],
@@ -1416,6 +1807,10 @@ export function updateAiProvider(
     name?: string;
     baseUrl?: string;
     apiKey?: string | null;
+    kind?: AiProviderKind;
+    timeoutMs?: number;
+    maxRetries?: number;
+    priority?: number;
     enabled?: boolean;
     isDefault?: boolean;
   },
@@ -1424,6 +1819,10 @@ export function updateAiProvider(
   if (changes.name !== undefined) body.name = changes.name;
   if (changes.baseUrl !== undefined) body.base_url = changes.baseUrl;
   if (changes.apiKey !== undefined) body.api_key = changes.apiKey;
+  if (changes.kind !== undefined) body.kind = changes.kind;
+  if (changes.timeoutMs !== undefined) body.timeout_ms = changes.timeoutMs;
+  if (changes.maxRetries !== undefined) body.max_retries = changes.maxRetries;
+  if (changes.priority !== undefined) body.priority = changes.priority;
   if (changes.enabled !== undefined) body.enabled = changes.enabled;
   if (changes.isDefault !== undefined) body.is_default = changes.isDefault;
   return request<AiProvider>(`/api/v1/ai/providers/${encodeURIComponent(providerId)}`, {
@@ -1439,6 +1838,169 @@ export function removeAiProvider(providerId: string): Promise<null> {
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// AI Hub — health, usage and the failover chain (REQ-097 slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** One probe sample, newest first. `status` is what *this* probe saw. */
+export type AiHealthSample = {
+  id: number;
+  provider_id: string;
+  status: AiHealthStatus;
+  latency_ms: number;
+  http_status: number | null;
+  error: string | null;
+  checked_at: string;
+};
+
+/**
+ * The header above the samples.
+ *
+ * `uptime_percent` is `null` — not `0` and not `100` — when the window holds no sample at all: a
+ * provider nobody has probed yet has no uptime, and rendering it as a number is the first lie the
+ * panel would tell.
+ */
+export type AiHealthSummary = {
+  status: AiHealthStatus;
+  uptime_percent: number | null;
+  p95_latency_ms: number | null;
+  sample_count: number;
+  baseline_latency_ms: number | null;
+  last_checked_at: string | null;
+  last_error: string | null;
+};
+
+/** The Health tab's payload: header, samples and the windows it may offer, in one call. */
+export type AiHealthView = {
+  provider_id: string;
+  provider_name: string;
+  /** The window the *server* applied, echoed back so the label cannot lie. */
+  window: string;
+  summary: AiHealthSummary;
+  samples: AiHealthSample[];
+  windows: string[];
+};
+
+/** One day of a provider's usage. */
+export type AiUsageDay = {
+  day: string;
+  requests: number;
+  errors: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+};
+
+/**
+ * The Usage tab's totals.
+ *
+ * `missing_usage` is the number of calls that reported no token counts: they are excluded from the
+ * sums and reported here, so a stream that ended without a usage frame shows as unknown rather
+ * than quietly becoming free.
+ */
+export type AiUsageSummary = {
+  requests: number;
+  errors: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  missing_usage: number;
+  p95_latency_ms: number | null;
+  error_rate_percent: number;
+  /**
+   * REQ-098 slice 5: what the window cost, summed from the snapshots stored on each usage row.
+   *
+   * `null` is not zero. It means no call in the window had a knowable cost — either the model was
+   * never priced, or the endpoint reported no token counts. A window of only free models really
+   * does cost `0`, and the panel shows those two differently, because only one of them is a fact
+   * about the money and the other is a fact about the data.
+   */
+  cost_micros: number | null;
+  /** How many calls in the window had no knowable cost. */
+  uncosted_calls: number;
+  by_day: AiUsageDay[];
+};
+
+/** The Usage tab's payload. */
+export type AiUsageView = {
+  provider_id: string;
+  provider_name: string;
+  window: string;
+  summary: AiUsageSummary;
+  windows: string[];
+};
+
+/** One step of the failover chain, as the preview draws it. */
+export type AiFailoverEntry = {
+  rank: number;
+  id: string;
+  name: string;
+  priority: number;
+  health: AiHealthStatus;
+  is_default: boolean;
+};
+
+/** The chain and the membership it may be drawn from. */
+export type AiFailoverView = {
+  chain: AiFailoverEntry[];
+  providers: string[];
+};
+
+/** What "Probe now" answers with — the refreshed header, so the tab needs no reload. */
+export type AiProbeOutcome = {
+  provider_id: string;
+  ok: boolean;
+  latency_ms: number;
+  failing_step: string | null;
+  transition: { from: AiHealthStatus; to: AiHealthStatus } | null;
+  summary: AiHealthSummary;
+  report: AiTestReport;
+};
+
+/** Read a provider's Health tab over a window (`1h`, `6h`, `24h`, `7d`, `30d`). */
+export function fetchAiProviderHealth(
+  providerId: string,
+  window = "24h",
+): Promise<AiHealthView> {
+  return request<AiHealthView>(
+    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/health?window=${encodeURIComponent(window)}`,
+  );
+}
+
+/** Read a provider's Usage tab over a window. */
+export function fetchAiProviderUsage(
+  providerId: string,
+  window = "24h",
+): Promise<AiUsageView> {
+  return request<AiUsageView>(
+    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/usage?window=${encodeURIComponent(window)}`,
+  );
+}
+
+/** Take one probe sample now, and get the refreshed header back with it. */
+export function probeAiProvider(providerId: string): Promise<AiProbeOutcome> {
+  return request<AiProbeOutcome>(
+    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/probe`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+}
+
+/** The failover chain as the router walks it right now. */
+export function fetchAiFailover(): Promise<AiFailoverView> {
+  return request<AiFailoverView>("/api/v1/ai/failover");
+}
+
+/**
+ * Persist the failover order.
+ *
+ * The answer is the chain *as the server stored it* — a client that reordered optimistically must
+ * render this, not its own guess, or a rejected order would look accepted.
+ */
+export function setAiFailoverOrder(providerIds: string[]): Promise<AiFailoverView> {
+  return request<AiFailoverView>("/api/v1/ai/failover", {
+    method: "PUT",
+    body: JSON.stringify({ provider_ids: providerIds }),
+  });
+}
+
 /** Replace the set of models one provider serves. */
 export async function replaceAiProviderModels(
   providerId: string,
@@ -1451,24 +2013,94 @@ export async function replaceAiProviderModels(
   return body.models;
 }
 
-/** Ask a provider which models it serves. */
-export function discoverAiProviderModels(
-  providerId: string,
-): Promise<{ provider_id: string; provider_name: string; models: string[] }> {
-  return request(`/api/v1/ai/providers/${encodeURIComponent(providerId)}/discover-models`, {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
+/**
+ * Ask a provider which models it serves and get back a **diff** — what applying it would add,
+ * change and remove. Nothing is written: the panel shows the diff and the operator confirms by
+ * calling `applyAiProviderDiscovery`.
+ */
+export function discoverAiProviderModels(providerId: string): Promise<AiDiscoveryReport> {
+  return request<AiDiscoveryReport>(
+    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/discover-models`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
 }
 
-/** Switch a model on or off, or make it the installation's default. */
+/** Apply the diff a discovery run reported, after the operator confirmed it. */
+export function applyAiProviderDiscovery(providerId: string): Promise<AiDiscoveryReport> {
+  return request<AiDiscoveryReport>(
+    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/apply-discovery`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+}
+
+/**
+ * Change one model: its capability flags, its token limits, whether it is on, and whether it is
+ * the installation's default.
+ *
+ * `maxOutputTokens: null` forgets the stored ceiling and `undefined` leaves it alone, exactly
+ * like the provider key's three cases.
+ */
 export function updateAiModel(
   modelId: string,
-  changes: { enabled?: boolean; isDefault?: boolean },
+  changes: {
+    enabled?: boolean;
+    isDefault?: boolean;
+    displayName?: string;
+    contextWindow?: number | null;
+    supportsTools?: boolean;
+    supportsVision?: boolean;
+    supportsStreaming?: boolean;
+    supportsEmbeddings?: boolean;
+    supportsImageGeneration?: boolean;
+    supportsAudioGeneration?: boolean;
+    supportsTranscription?: boolean;
+    supportsJsonMode?: boolean;
+    maxOutputTokens?: number | null;
+    /**
+     * Micros per million tokens, in and out. `null` forgets the stored half and `undefined`
+     * leaves it alone — three cases, because a price has to be erasable or an operator who
+     * mistyped it can only ever make it more wrong.
+     *
+     * A price edit changes the cost of the **next** request only. Nothing recomputes what an
+     * earlier call was billed at, because a bill that changes after the fact is worse than one
+     * that was approximately right.
+     */
+    inputCostMicrosPerMtok?: number | null;
+    outputCostMicrosPerMtok?: number | null;
+    /**
+     * `manual`, `discovery` or `probe`. Omitted by a flag toggle on purpose: restamping the
+     * source on every capability edit would claim the price had been re-verified today.
+     */
+    priceSource?: string;
+    capabilitiesSource?: string;
+    capabilitiesVerifiedAt?: string | null;
+  },
 ): Promise<AiModel> {
   const body: Record<string, unknown> = {};
   if (changes.enabled !== undefined) body.enabled = changes.enabled;
   if (changes.isDefault !== undefined) body.is_default = changes.isDefault;
+  if (changes.displayName !== undefined) body.display_name = changes.displayName;
+  if (changes.contextWindow !== undefined) body.context_window = changes.contextWindow;
+  if (changes.supportsTools !== undefined) body.supports_tools = changes.supportsTools;
+  if (changes.supportsVision !== undefined) body.supports_vision = changes.supportsVision;
+  if (changes.supportsStreaming !== undefined) body.supports_streaming = changes.supportsStreaming;
+  if (changes.supportsEmbeddings !== undefined) body.supports_embeddings = changes.supportsEmbeddings;
+  if (changes.supportsImageGeneration !== undefined)
+    body.supports_image_generation = changes.supportsImageGeneration;
+  if (changes.supportsAudioGeneration !== undefined)
+    body.supports_audio_generation = changes.supportsAudioGeneration;
+  if (changes.supportsTranscription !== undefined)
+    body.supports_transcription = changes.supportsTranscription;
+  if (changes.supportsJsonMode !== undefined) body.supports_json_mode = changes.supportsJsonMode;
+  if (changes.maxOutputTokens !== undefined) body.max_output_tokens = changes.maxOutputTokens;
+  if (changes.inputCostMicrosPerMtok !== undefined)
+    body.input_cost_micros_per_mtok = changes.inputCostMicrosPerMtok;
+  if (changes.outputCostMicrosPerMtok !== undefined)
+    body.output_cost_micros_per_mtok = changes.outputCostMicrosPerMtok;
+  if (changes.priceSource !== undefined) body.price_source = changes.priceSource;
+  if (changes.capabilitiesSource !== undefined) body.capabilities_source = changes.capabilitiesSource;
+  if (changes.capabilitiesVerifiedAt !== undefined)
+    body.capabilities_verified_at = changes.capabilitiesVerifiedAt;
   return request<AiModel>(`/api/v1/ai/models/${encodeURIComponent(modelId)}`, {
     method: "PATCH",
     body: JSON.stringify(body),
@@ -1483,12 +2115,31 @@ export function updateAiModel(
  * provider that refuses after the stream opened arrives as that `error` frame, which this helper
  * raises as an `ApiError` so the caller handles one shape either way.
  */
+/**
+ * The instruction a chat sends so the model can propose changes (REQ-101, slice 3g).
+ *
+ * Read from the API rather than written here on purpose: the parser has one exact fence tag
+ * and one exact shape, and a copy of the sentence in the panel is a copy that goes stale
+ * quietly — the screen keeps working and never once files a set.
+ */
+export type ChatProposalInstruction = {
+  instruction: string;
+  fence_tag: string;
+  max_operations: number;
+};
+
+export function fetchChatProposalInstruction(): Promise<ChatProposalInstruction> {
+  return request<ChatProposalInstruction>("/api/v1/ai/chat/proposal-instruction");
+}
+
 export async function streamChat(
   input: { model?: string; messages: ChatMessageInput[] },
   handlers: {
     onStart?: (info: { provider: string; model: string; protocol: string }) => void;
     onDelta?: (content: string) => void;
     onDone?: (done: ChatDone) => void;
+    onProposal?: (proposal: ChatProposal) => void;
+    onProposalError?: (message: string) => void;
   } = {},
 ): Promise<void> {
   const response = await fetch("/api/v1/ai/chat", {
@@ -1545,6 +2196,14 @@ export async function streamChat(
         handlers.onStart?.(payload as { provider: string; model: string; protocol: string });
       } else if (event === "delta") {
         handlers.onDelta?.(String(payload.content ?? ""));
+      } else if (event === "proposal") {
+        handlers.onProposal?.(payload as unknown as ChatProposal);
+      } else if (event === "proposal_error") {
+        // **Not** the `error` branch. That one throws, which the screen renders as a failed
+        // answer — but the answer is complete and on screen; only the follow-up failed.
+        // Throwing here would replace a good reply with an error and hide the proposal the
+        // person was reading about.
+        handlers.onProposalError?.(String(payload.message ?? "The proposal could not be filed."));
       } else if (event === "done") {
         handlers.onDone?.(payload as unknown as ChatDone);
       } else if (event === "error") {
@@ -3894,6 +4553,757 @@ export function testMediaStorageConnection(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Task routing and feature overrides (REQ-098, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Which map a routing read or write addresses.
+ *
+ * The three cases are the three scopes the resolver walks, and they are spelled the way the
+ * endpoints spell them so the panel and the API cannot disagree about which map is on screen.
+ */
+export type AiRoutingScope =
+  | { kind: "installation" }
+  | { kind: "organization"; organizationId: string }
+  | { kind: "site"; siteId: string };
+
+/** One candidate in a task's ordered list. */
+export type AiRouteCandidate = {
+  /** 1-based; the primary is 1 and the order is the fallback order. */
+  position: number;
+  /** The model, or null when the row survives a model that was later removed. */
+  model_id: string | null;
+  /** The model key as the panel shows it. */
+  model_label: string | null;
+  /** True when the candidate cannot answer as it stands — the "needs attention" badge. */
+  needs_attention: boolean;
+  /** Why it cannot answer, when it cannot. */
+  refusal: string | null;
+  /** Capabilities this task's requests require here. */
+  requirements: string[];
+  /** Whether the model is switched off. */
+  enabled: boolean;
+};
+
+/** One task row of the routing screen. */
+export type AiTaskRoute = {
+  task: string;
+  description: string;
+  candidates: AiRouteCandidate[];
+  /** True when these candidates were inherited from a wider scope. */
+  inherited: boolean;
+  /** True when nothing is configured for this task anywhere in the chain. */
+  empty: boolean;
+};
+
+/** One feature pin. */
+export type AiFeatureOverride = {
+  feature: string;
+  model_id: string;
+  model_label: string;
+  scope: Record<string, string>;
+  updated_at: string;
+};
+
+/** A known feature key with its description, driving the override form. */
+export type AiFeatureInfo = { key: string; description: string };
+
+/** The whole routing screen in one response. */
+export type AiRouting = {
+  scope: Record<string, string>;
+  tasks: AiTaskRoute[];
+  overrides: AiFeatureOverride[];
+  chain: Record<string, string>[];
+  requirements: string[];
+  features: AiFeatureInfo[];
+  /** The resolution order, served so the legend cannot drift from the resolver. */
+  rules: string[];
+  /** Tasks that cannot resolve at this scope. */
+  unresolved: string[];
+};
+
+/** One line of a resolution walk. */
+export type AiWalkEntry = {
+  position: number | null;
+  model_id: string | null;
+  outcome: "chosen" | "skipped";
+  reason: string;
+  scope: Record<string, string>;
+  source: string;
+};
+
+/** The dry run's answer. */
+export type AiRoutingPreview = {
+  model: { model_id: string; position: number | null; source: string; scope: Record<string, string> } | null;
+  walk: AiWalkEntry[];
+  rule: string;
+  unresolved: boolean;
+  scope: Record<string, string>;
+  rules: string[];
+};
+
+/** The query parameters that select a scope, appended to a routing path. */
+function routingScopeParams(scope: AiRoutingScope): URLSearchParams {
+  const params = new URLSearchParams();
+  if (scope.kind === "organization") params.set("organization_id", scope.organizationId);
+  if (scope.kind === "site") params.set("site_id", scope.siteId);
+  return params;
+}
+
+/** The task map of one scope, with inherited rows marked. */
+export async function fetchAiRouting(scope: AiRoutingScope): Promise<AiRouting> {
+  const params = routingScopeParams(scope);
+  const suffix = params.toString();
+  return request<AiRouting>(
+    suffix ? `/api/v1/ai/routing?${suffix}` : "/api/v1/ai/routing",
+  );
+}
+
+// -------------------------------------------------------------------------------------------
+// AI approvals (REQ-101 slice 1 — the review inbox, the review screen and the class policy)
+// -------------------------------------------------------------------------------------------
+
+/**
+ * One approval row as the inbox and the review screen render it.
+ *
+ * `decidable`, `requires_confirmation` and `confirmation_phrase` are the server's answers, not
+ * something the panel re-derives. A client that computed "may this be approved" from `status`
+ * and `expires_at` would disagree with the server the moment a clock rounded differently — and a
+ * reviewer who is told a row is decidable and then gets `expired` has been told a lie by the
+ * screen rather than by the race.
+ */
+export type AiApproval = {
+  id: string;
+  organization_id: string;
+  site_id: string | null;
+  run_id: string | null;
+  step_id: string | null;
+  agent_id: string | null;
+  identity_id: string | null;
+  change_set_id: string | null;
+  tool_key: string;
+  tool_class: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  resource_label: string | null;
+  risk: string;
+  title: string;
+  summary: string;
+  operation_count: number;
+  irreversible: boolean;
+  preview: unknown;
+  preview_hash: string;
+  base_revision: string | null;
+  status: string;
+  requested_by: string | null;
+  model_id: string | null;
+  expires_at: string;
+  decided_by: string | null;
+  decided_at: string | null;
+  decision_note: string | null;
+  applied_at: string | null;
+  error: string | null;
+  created_at: string;
+  /** Whether the row is still pending AND unexpired. */
+  decidable: boolean;
+  /** Whether the decision demands a typed phrase, and what it is. */
+  requires_confirmation: boolean;
+  confirmation_phrase: string | null;
+};
+
+/** The inbox filters, exactly the query the API accepts. */
+export type AiApprovalQuery = {
+  status?: string;
+  tool?: string;
+  toolClass?: string;
+  q?: string;
+  limit?: number;
+};
+
+/**
+ * The inbox body.
+ *
+ * `viewer_missing` is the whole reason the row actions can be disabled *and named* rather than
+ * enabled-then-refused: the API enforces the same keys with a 403 naming them, so the disabled
+ * state is a promise it keeps.
+ */
+export type AiApprovalInbox = {
+  approvals: AiApproval[];
+  counts: Record<string, number>;
+  viewer_permissions: string[];
+  viewer_missing: string[];
+};
+
+/** One audit row of a request's trail. */
+export type AiApprovalAuditRow = {
+  id: number;
+  actor_type: string;
+  actor_user_id: string | null;
+  action: string;
+  target_type: string | null;
+  target_id: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+/** What a decision answers, whatever it decided. */
+export type AiDecisionResult = {
+  changed: boolean;
+  code: string | null;
+  approval: AiApproval;
+  current_revision?: string;
+};
+
+/** The effective policy of one dangerous class, as the policy screen renders it. */
+export type AiApprovalPolicy = {
+  tool_class: string;
+  label: string;
+  /** `organization` when an organization row overrides the platform default. */
+  source: string;
+  mode: string;
+  typed_confirmation: boolean;
+  expires_minutes: number;
+  /** True when the class is `allow` — the row stripes. */
+  permissive: boolean;
+  irreversible: boolean;
+  updated_at: string;
+  updated_by: string | null;
+};
+
+/** The six dangerous classes, served so the form never hard-codes their names a second time. */
+export type AiApprovalClass = {
+  key: string;
+  label: string;
+  irreversible: boolean;
+};
+
+/** The review inbox. */
+export async function fetchAiApprovals(
+  query: AiApprovalQuery = {},
+): Promise<AiApprovalInbox> {
+  const params = new URLSearchParams();
+  if (query.status && query.status !== "all") params.set("status", query.status);
+  if (query.tool?.trim()) params.set("tool", query.tool.trim());
+  if (query.toolClass && query.toolClass !== "all") params.set("tool_class", query.toolClass);
+  if (query.q?.trim()) params.set("q", query.q.trim());
+  if (query.limit) params.set("limit", String(query.limit));
+
+  const suffix = params.toString();
+  return request<AiApprovalInbox>(
+    suffix ? `/api/v1/ai/approvals?${suffix}` : "/api/v1/ai/approvals",
+  );
+}
+
+/**
+ * One request with its audit trail.
+ *
+ * The trail arrives in the same response as the row on purpose: a reviewer reading a decided
+ * request asks "who did this and why" as part of the same screen, and a second request could be
+ * answered from a different moment.
+ */
+export async function fetchAiApproval(id: string): Promise<{
+  approval: AiApproval;
+  audit: AiApprovalAuditRow[];
+}> {
+  return request(`/api/v1/ai/approvals/${encodeURIComponent(id)}`);
+}
+
+/**
+ * Approve one request.
+ *
+ * `confirmation` is sent ONLY when it is non-empty. Sending `"yes"` — or sending the field's
+ * placeholder — is exactly how a checkbox becomes a confirmation, and the API answers
+ * `confirmation_mismatch` to a wrong phrase rather than accepting any non-empty string, so an
+ * unconditional field would turn every irreversible class into a dead button.
+ */
+export function approveAiApproval(
+  id: string,
+  body: { confirmation?: string; currentRevision?: string } = {},
+): Promise<AiDecisionResult> {
+  return request(`/api/v1/ai/approvals/${encodeURIComponent(id)}/approve`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...(body.confirmation?.trim() ? { confirmation: body.confirmation.trim() } : {}),
+      ...(body.currentRevision ? { current_revision: body.currentRevision } : {}),
+    }),
+  });
+}
+
+/**
+ * Recompute a request's diff against the target as it is **now**.
+ *
+ * No body on purpose. The server rebuilds the operation from the frozen preview and reads the
+ * row itself — a re-preview that accepted a client-supplied diff would be a diff nobody
+ * approved. The answer is the row, so the screen re-renders from the same object the server
+ * wrote rather than from a second read that could be a different instant.
+ *
+ * `refreshed: false` with `code: "unchanged"` is the refusal the request asks for: the
+ * recomputed plan is identical, so nothing was written.
+ */
+export function rePreviewAiApproval(id: string): Promise<{
+  refreshed: boolean;
+  code: string | null;
+  approval: AiApproval;
+}> {
+  return request(`/api/v1/ai/approvals/${encodeURIComponent(id)}/preview`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+/** Reject one request. The reason is mandatory server-side; a blank one is refused there. */
+export function rejectAiApproval(
+  id: string,
+  reason: string,
+): Promise<AiDecisionResult> {
+  return request(`/api/v1/ai/approvals/${encodeURIComponent(id)}/reject`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  });
+}
+
+/** The class policy table, with the six classes' labels. */
+export async function fetchAiApprovalPolicies(): Promise<{
+  policies: AiApprovalPolicy[];
+  classes: AiApprovalClass[];
+}> {
+  return request("/api/v1/ai/approvals/policies");
+}
+
+/**
+ * Set one class's organization policy.
+ *
+ * `confirmation` carries the typed phrase the API demands for `mode: "allow"` — the exact text
+ * `set <class> to allow`. It is sent only when the caller typed it, for the same reason the
+ * approve path withholds an empty phrase.
+ */
+export function putAiApprovalPolicy(
+  toolClass: string,
+  body: {
+    mode: string;
+    typedConfirmation?: boolean;
+    expiresMinutes?: number;
+    confirmation?: string;
+  },
+): Promise<{ policies: AiApprovalPolicy[] }> {
+  return request(`/api/v1/ai/approvals/policies/${encodeURIComponent(toolClass)}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      mode: body.mode,
+      ...(body.typedConfirmation === undefined
+        ? {}
+        : { typed_confirmation: body.typedConfirmation }),
+      ...(body.expiresMinutes === undefined ? {} : { expires_minutes: body.expiresMinutes }),
+      ...(body.confirmation?.trim() ? { confirmation: body.confirmation.trim() } : {}),
+    }),
+  });
+}
+
+/**
+ * Drop one class's override, back to the platform default.
+ *
+ * A reset needs no phrase: removing an override can only tighten towards the fail-closed
+ * default, so it carries no risk worth a typed confirmation — and the API enforces that too.
+ */
+export function resetAiApprovalPolicy(toolClass: string): Promise<{ policies: AiApprovalPolicy[] }> {
+  return request(`/api/v1/ai/approvals/policies/${encodeURIComponent(toolClass)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Expire what is due, now. */
+export function sweepAiApprovals(): Promise<{ expired: number }> {
+  return request("/api/v1/ai/approvals/sweep", { method: "POST", body: JSON.stringify({}) });
+}
+
+// -------------------------------------------------------------------------------------------
+// The change-set editor (REQ-101 slice 3)
+// -------------------------------------------------------------------------------------------
+
+/** One operation of a proposed set, as the set stores it. */
+export type AiChangeOp = {
+  key: string;
+  kind: "create" | "update" | "delete";
+  resource_type: string;
+  resource_id: string;
+  args: Record<string, unknown>;
+};
+
+/** A change set row. */
+export type AiChangeSet = {
+  id: string;
+  organization_id: string;
+  site_id: string | null;
+  title: string;
+  status: "draft" | "pending" | "confirmed" | "applied" | "discarded" | "failed" | string;
+  operations: AiChangeOp[];
+  base_revisions: Record<string, string>;
+  /** sha256 over the operations and the revisions they were pinned to. */
+  content_hash: string;
+  created_by: string | null;
+  created_by_agent: string | null;
+  created_by_run: string | null;
+  updated_by: string | null;
+  confirmed_at: string | null;
+  applied_at: string | null;
+  discarded_reason: string | null;
+  created_at: string;
+  updated_at: string;
+  /** Whether the operation list may still be edited. Server-owned: it is the same list the
+   * PATCH's `where` clause runs as, so the panel cannot drift from what the API accepts. */
+  editable: boolean;
+  /** Whether confirming would park at least one operation for a second person. */
+  needs_approval: boolean;
+  /** Whether confirming demands a typed phrase — the set deletes content. */
+  irreversible: boolean;
+  /** The phrase itself: the set's title, which the server compares against. */
+  confirmation_phrase: string | null;
+};
+
+/** One field row of a resolved operation. */
+export type AiPlannedField = {
+  arg: string;
+  field: string;
+  before: unknown;
+  after: unknown;
+};
+
+/**
+ * One operation resolved against its target **as it is now**.
+ *
+ * This is what the editor renders instead of a client-side re-plan: `before` is read from the
+ * database, not from the operation's own arguments, and `cascades` is a count the server
+ * took. A browser cannot compute either.
+ */
+export type AiPlannedOp = {
+  key: string;
+  kind: string;
+  resource_type: string;
+  resource_id: string;
+  label: string;
+  diffs: AiPlannedField[];
+  cascades: string[];
+  base_revision: string;
+  gated_class: string | null;
+  no_op: boolean;
+};
+
+/** What a re-plan answers. */
+export type AiRePreviewed = AiChangeSet & {
+  planned: AiPlannedOp[];
+  drifted: string[];
+  needs_approval: boolean;
+};
+
+/** What a set list answers, with the decision keys the viewer holds. */
+export type AiChangeSetList = {
+  sets: AiChangeSet[];
+  viewer_permissions: string[];
+  /** The decision keys the viewer does NOT hold, named so a disabled control can explain
+   * itself. The same split the approval inbox makes, from the same helper. */
+  viewer_missing: string[];
+};
+
+/** What a confirm answers. */
+export type AiSetConfirmed = AiChangeSet & {
+  needs_approval: boolean;
+  approvals: { id: string; operation_key: string; class: string; status: string }[];
+  applied: boolean;
+};
+
+/**
+ * Resolve a set's operations against the targets as they are now.
+ *
+ * No body: the server rebuilds each operation from the stored one and reads the row itself, so
+ * a re-plan that accepted a client-supplied diff would be a diff nobody confirmed. The answer
+ * is the resolved operations, not a mutated set — a preview that re-pinned the revisions it
+ * observed would retire the staleness the confirm route enforces.
+ */
+export function replanAiChangeSet(id: string): Promise<AiRePreviewed> {
+  return request(`/api/v1/ai/change-sets/${encodeURIComponent(id)}/preview`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+/**
+ * Replace a set's operation list.
+ *
+ * The whole list is sent, not a patch: a set is a list the reviewer owns, and "move the third
+ * one to the top" has no vocabulary in a partial patch. `baseContentHash` is the hash the
+ * editor was looking at — a mismatch answers `409 content_moved` naming both, and nothing is
+ * written.
+ */
+export function updateAiChangeSet(
+  id: string,
+  body: {
+    title: string;
+    operations: AiChangeOp[];
+    baseRevisions?: Record<string, string>;
+    baseContentHash?: string;
+  },
+): Promise<AiChangeSet> {
+  return request(`/api/v1/ai/change-sets/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      title: body.title,
+      operations: body.operations,
+      base_revisions: body.baseRevisions ?? {},
+      // Withheld when absent rather than sent as null: a client that has not implemented the
+      // optimistic check keeps saving, and one that has gets it.
+      ...(body.baseContentHash ? { base_content_hash: body.baseContentHash } : {}),
+    }),
+  });
+}
+
+/**
+ * Confirm a set.
+ *
+ * `confirmationPhrase` is the set's own title and is sent **only** when the reviewer typed it —
+ * for the same reason `approveAiApproval` withholds an empty phrase. A set that deletes content
+ * is refused by the server without it, whatever the client rendered.
+ */
+export function confirmAiChangeSet(
+  id: string,
+  confirmationPhrase?: string,
+): Promise<AiSetConfirmed> {
+  return request(`/api/v1/ai/change-sets/${encodeURIComponent(id)}/confirm`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...(confirmationPhrase?.trim() ? { confirmation_phrase: confirmationPhrase.trim() } : {}),
+    }),
+  });
+}
+
+/** Drop a set. The reason is mandatory server-side; a blank one is refused there. */
+export function discardAiChangeSet(id: string, reason: string): Promise<AiChangeSet> {
+  return request(`/api/v1/ai/change-sets/${encodeURIComponent(id)}/discard`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  });
+}
+
+/** The sets a person may see, newest first. */
+export async function fetchAiChangeSets(
+  query: { status?: string; q?: string; limit?: number } = {},
+): Promise<AiChangeSetList> {
+  const params = new URLSearchParams();
+  if (query.status && query.status !== "all") params.set("status", query.status);
+  if (query.q?.trim()) params.set("q", query.q.trim());
+  if (query.limit) params.set("limit", String(query.limit));
+  const suffix = params.toString();
+  return request(
+    suffix ? `/api/v1/ai/change-sets?${suffix}` : "/api/v1/ai/change-sets",
+  );
+}
+
+/** Replace one task's candidate list at a scope. */
+export async function putAiTaskMap(
+  scope: AiRoutingScope,
+  task: string,
+  candidates: { modelId: string; requirements: string[] }[],
+): Promise<AiRouting> {
+  return request<AiRouting>("/api/v1/ai/routing", {
+    method: "PUT",
+    body: JSON.stringify({
+      task,
+      ...scopeParamsForBody(scope),
+      candidates: candidates.map((candidate) => ({
+        model_id: candidate.modelId,
+        requirements: candidate.requirements,
+      })),
+    }),
+  });
+}
+
+/** Pin (or unpin, with `null`) one feature at a scope. */
+export async function putAiFeatureOverride(
+  scope: AiRoutingScope,
+  feature: string,
+  modelId: string | null,
+): Promise<AiFeatureOverride[]> {
+  return request<AiFeatureOverride[]>("/api/v1/ai/routing/overrides", {
+    method: "PUT",
+    body: JSON.stringify({ feature, ...scopeParamsForBody(scope), model_id: modelId }),
+  });
+}
+
+/** Resolve a hypothetical request without calling a provider. */
+export async function previewAiRouting(input: {
+  scope: AiRoutingScope;
+  task?: string;
+  feature?: string;
+  requested?: string;
+  requires?: string[];
+}): Promise<AiRoutingPreview> {
+  return request<AiRoutingPreview>("/api/v1/ai/routing/preview", {
+    method: "POST",
+    body: JSON.stringify({
+      ...scopeParamsForBody(input.scope),
+      ...(input.task ? { task: input.task } : {}),
+      ...(input.feature ? { feature: input.feature } : {}),
+      ...(input.requested?.trim() ? { requested: input.requested.trim() } : {}),
+      requires: input.requires ?? [],
+    }),
+  });
+}
+
+// -------------------------------------------------------------------------------------------
+// The route decision log (REQ-098, slice 3).
+// -------------------------------------------------------------------------------------------
+
+/** One row of the decision log. */
+export type AiDecisionRow = {
+  id: number;
+  created_at: string;
+  task: string | null;
+  feature: string | null;
+  requested: string | null;
+  resolved_label: string | null;
+  resolved_model_id: string | null;
+  /** 0-based: 0 is the primary, anything above it is a fallback. */
+  fallback_index: number;
+  used_fallback: boolean;
+  unresolved: boolean;
+  rule: string;
+  requirements: string[];
+  reason: string;
+  run_id: string | null;
+};
+
+/** One page of the log. */
+export type AiDecisionPage = {
+  rows: AiDecisionRow[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+/** One decision with its full candidate walk. */
+export type AiDecisionDetail = AiDecisionRow & {
+  walk: AiWalkEntry[];
+  scope: string;
+  rules: string[];
+};
+
+/** A task that could not resolve, with the reason. */
+export type AiUnresolvedTask = {
+  task: string;
+  reason: string;
+  occurrences: number;
+  last_failed_at: string | null;
+};
+
+/** The filters the log screen offers. */
+export type AiDecisionFilter = {
+  task?: string;
+  feature?: string;
+  modelId?: string;
+  fallback?: boolean;
+  unresolved?: boolean;
+  from?: string;
+  to?: string;
+  limit?: number;
+  offset?: number;
+};
+
+/** The filters as a query string, shared by the table and the CSV export. */
+function decisionFilterParams(filter: AiDecisionFilter): string {
+  const params = new URLSearchParams();
+  if (filter.task) params.set("task", filter.task);
+  if (filter.feature) params.set("feature", filter.feature);
+  if (filter.modelId) params.set("model_id", filter.modelId);
+  if (filter.fallback) params.set("fallback", "true");
+  if (filter.unresolved) params.set("unresolved", "true");
+  if (filter.from) params.set("from", filter.from);
+  if (filter.to) params.set("to", filter.to);
+  if (filter.limit) params.set("limit", String(filter.limit));
+  if (filter.offset) params.set("offset", String(filter.offset));
+  return params.toString();
+}
+
+/** One page of the decision log. */
+export async function fetchAiDecisions(
+  filter: AiDecisionFilter = {},
+): Promise<AiDecisionPage> {
+  const suffix = decisionFilterParams(filter);
+  return request<AiDecisionPage>(
+    suffix ? `/api/v1/ai/logs/decisions?${suffix}` : "/api/v1/ai/logs/decisions",
+  );
+}
+
+/**
+ * The decision log as CSV, for the same filters the table is showing.
+ *
+ * Returns the text rather than triggering a download itself: the screen owns the button, so the
+ * export is a control the walkthrough can click and assert on, and a `window.location`
+ * navigation cannot be observed at all. The same filters go into the path as the table's — the
+ * two reads are only the same read if the query strings are, which is why one helper builds it.
+ */
+export async function fetchAiDecisionsCsv(filter: AiDecisionFilter = {}): Promise<string> {
+  const suffix = decisionFilterParams(filter);
+  const path = suffix
+    ? `/api/v1/ai/logs/decisions.csv?${suffix}`
+    : "/api/v1/ai/logs/decisions.csv";
+
+  let response: Response;
+  try {
+    response = await fetch(path, { credentials: "same-origin", headers: { accept: "text/csv" } });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+  if (!response.ok) {
+    // The refusal is usually a guard's plain-text 401/403 rather than the API's JSON error
+    // shape, so the body is reported as it arrived instead of being parsed into nothing.
+    const text = await response.text();
+    let code = "export_failed";
+    let message = `The export answered with status ${response.status}.`;
+    try {
+      const body = JSON.parse(text) as ErrorBody;
+      code = body.error?.code ?? code;
+      message = body.error?.message ?? message;
+    } catch {
+      // A non-JSON body is still an error; the status stays in the message.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+
+  return response.text();
+}
+
+/** One decision with its walk. */
+export async function fetchAiDecision(id: number): Promise<AiDecisionDetail> {
+  return request<AiDecisionDetail>(`/api/v1/ai/logs/decisions/${id}`);
+}
+
+/** The tasks that cannot resolve, with the reason. */
+export async function fetchAiUnresolved(): Promise<{
+  scope: Record<string, string>;
+  unresolved: AiUnresolvedTask[];
+  ok: boolean;
+}> {
+  return request("/api/v1/ai/routing/unresolved");
+}
+
+/** The newest decision per task, for the routing screen's "Last resolved" column. */
+export async function fetchAiLastResolved(): Promise<Record<string, AiDecisionRow>> {
+  return request<Record<string, AiDecisionRow>>("/api/v1/ai/routing/last-resolved");
+}
+
+/**
+ * The scope fields a JSON body carries.
+ *
+ * The same two keys as the query string, because the endpoints flatten one shape into both. A
+ * site carries only its id: the endpoint reads the site's organization from the database rather
+ * than trusting the payload, so a client cannot name a site and a different organization.
+ */
+function scopeParamsForBody(scope: AiRoutingScope): Record<string, string> {
+  if (scope.kind === "organization") return { organization_id: scope.organizationId };
+  if (scope.kind === "site") return { site_id: scope.siteId };
+  return {};
+}
+
+// ---------------------------------------------------------------------------------------------
 // Scanning (docs/requests/REQ-010, slice 4)
 // ---------------------------------------------------------------------------------------------
 
@@ -4158,231 +5568,7 @@ export function emitNotification(input: {
     body: JSON.stringify(input),
   });
 }
-// ---------------------------------------------------------------------------------------------
-// Node library and credential catalogue (REQ-087 slice 1)
-// ---------------------------------------------------------------------------------------------
-/** Build the node-type query string; an empty filter is left out, never sent as an empty value. */
-function nodeTypeQuery(filters: NodeTypeFilters): string {
-  const params = new URLSearchParams();
-  if (filters.search) params.set("search", filters.search);
-  if (filters.category) params.set("category", filters.category);
-  if (filters.capability) params.set("capability", filters.capability);
-  if (filters.include_deprecated === false) params.set("deprecated", "false");
-  if (filters.credential !== undefined) params.set("credential", String(filters.credential));
-  const query = params.toString();
-  return query ? `?${query}` : "";
-}
-/** The node library, filtered. `matched` and `total` come from the server, not from this list. */
-export async function fetchNodeTypes(filters: NodeTypeFilters = {}): Promise<NodeTypePage> {
-  return request<NodeTypePage>(`/api/v1/node-types${nodeTypeQuery(filters)}`);
-}
-/** One node definition, in full. */
-export async function fetchNodeType(key: string): Promise<NodeType> {
-  return request<NodeType>(`/api/v1/node-types/${encodeURIComponent(key)}`);
-}
-/** The palette's category tree, with its counts. */
-export async function fetchNodeCategories(): Promise<{ categories: NodeCategory[] }> {
-  return request<{ categories: NodeCategory[] }>("/api/v1/node-types/categories");
-}
-/** The registry's own lint, as the running server sees it. */
-export async function fetchRegistryLint(): Promise<RegistryLint> {
-  return request<RegistryLint>("/api/v1/node-types/lint");
-}
-/** The credential catalogue with every field schema. */
-export async function fetchCredentialTypes(): Promise<CredentialTypePage> {
-  return request<CredentialTypePage>("/api/v1/credential-types");
-}
-/** One credential type, in full. */
-export async function fetchCredentialType(key: string): Promise<CredentialType> {
-  return request<CredentialType>(`/api/v1/credential-types/${encodeURIComponent(key)}`);
-}
-/** The three port kinds and what each means. */
-export async function fetchPortKinds(): Promise<PortKindCatalogue> {
-  return request<PortKindCatalogue>("/api/v1/port-kinds");
-}
-/* ------------------------------------------------------------------ *
- * Credential instances (REQ-087, slice 2)
- * ------------------------------------------------------------------ */
 
-/**
- * `?organization_id=…` for a read route, or an empty string.
- *
- * Every credential read resolves its organization with `None` on the server unless the client
- * names one, so a platform account — which has no primary organization of its own — is refused
- * `organization_required` before a single row is read. The suffix is empty for a tenant, whose
- * own organization the server already knows.
- */
-function scopeSuffix(organizationId?: string | null): string {
-  return organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
-}
-
-/**
- * Build the query string of a credential read.
- *
- * `organizationId` rides along for a platform account. It is not a filter: a tenant's call is
- * byte-for-byte unchanged without it, and a platform account that omits it is refused
- * `organization_required` — the refusal has nothing to do with credentials, and it happens
- * before the list is read.
- */
-function credentialQuery(filters: CredentialFilters, organizationId?: string | null): string {
-  const params = new URLSearchParams();
-  if (organizationId) params.set("organization_id", organizationId);
-  if (filters.search) params.set("search", filters.search);
-  if (filters.type) params.set("type", filters.type);
-  if (filters.scope) params.set("scope", filters.scope);
-  if (filters.health) params.set("health", filters.health);
-  if (filters.sharing) params.set("sharing", filters.sharing);
-  const query = params.toString();
-  return query ? `?${query}` : "";
-}
-/** The credential list. */
-export async function fetchCredentials(
-  filters: CredentialFilters = {},
-  organizationId?: string | null,
-): Promise<CredentialPage> {
-  return request<CredentialPage>(`/api/v1/credentials${credentialQuery(filters, organizationId)}`);
-}
-/** One credential, masked. */
-export async function fetchCredential(
-  id: string,
-  organizationId?: string | null,
-): Promise<Credential> {
-  return request<Credential>(
-    `/api/v1/credentials/${encodeURIComponent(id)}${scopeSuffix(organizationId)}`,
-  );
-}
-/** Create one. Secrets ride in `secrets[]` and are never sent anywhere else. */
-export async function createCredential(
-  input: NewCredential,
-  organizationId?: string | null,
-): Promise<Credential> {
-  return request<Credential>("/api/v1/credentials", {
-    method: "POST",
-    body: JSON.stringify({ ...input, organization_id: organizationId ?? null }),
-  });
-}
-/** Update the non-secret half. Sending a secret here is refused by the API, by design. */
-export async function updateCredential(
-  id: string,
-  patch: {
-    name?: string;
-    scope?: string;
-    sharing?: string;
-    owner_user_id?: string;
-    settings?: Record<string, unknown>;
-  },
-  organizationId?: string | null,
-): Promise<Credential> {
-  return request<Credential>(
-    `/api/v1/credentials/${encodeURIComponent(id)}${scopeSuffix(organizationId)}`,
-    {
-      method: "PATCH",
-      body: JSON.stringify({ ...patch, organization_id: organizationId ?? null }),
-    },
-  );
-}
-/**
- * Remove one.
- *
- * `force` is the REQ's forced delete: it removes the row and returns the dependents so the
- * panel can name what it broke. Without it the API answers `credential_in_use` with the same
- * list in `details`, which is what the panel renders the "these workflows will break" line from.
- */
-export async function deleteCredential(
-  id: string,
-  force = false,
-  organizationId?: string | null,
-): Promise<CredentialDeleteResult> {
-  const params = new URLSearchParams();
-  if (force) params.set("force", "true");
-  if (organizationId) params.set("organization_id", organizationId);
-  const query = params.toString();
-  return request<CredentialDeleteResult>(
-    `/api/v1/credentials/${encodeURIComponent(id)}${query ? `?${query}` : ""}`,
-    { method: "DELETE" },
-  );
-}
-/** Who names this credential. */
-export async function fetchCredentialUsage(
-  id: string,
-  organizationId?: string | null,
-): Promise<CredentialUsage> {
-  return request<CredentialUsage>(
-    `/api/v1/credentials/${encodeURIComponent(id)}/usage${scopeSuffix(organizationId)}`,
-  );
-}
-/** Run the type's test hook. */
-export async function testCredential(
-  id: string,
-  organizationId?: string | null,
-): Promise<CredentialTestResult> {
-  return request<CredentialTestResult>(
-    `/api/v1/credentials/${encodeURIComponent(id)}/test${scopeSuffix(organizationId)}`,
-    { method: "POST" },
-  );
-}
-/** The only write path for a secret. The value is sent once and never read back. */
-export async function replaceCredentialSecret(
-  id: string,
-  secrets: { field: string; value: string }[],
-  organizationId?: string | null,
-): Promise<Credential> {
-  return request<Credential>(
-    `/api/v1/credentials/${encodeURIComponent(id)}/secret${scopeSuffix(organizationId)}`,
-    {
-      method: "POST",
-      body: JSON.stringify({ secrets, organization_id: organizationId ?? null }),
-    },
-  );
-}
-/**
- * The installer ledger.
- *
- * `organizationId` is sent by a platform account, which has no primary organization of its
- * own: without it the API refuses the read `organization_required` and the screen shows an
- * error instead of a ledger.
- */
-export async function fetchNodePackages(organizationId?: string | null): Promise<NodePackagePage> {
-  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
-  return request<NodePackagePage>(`/api/v1/node-packages${query}`);
-}
-/**
- * Install a package from its manifest.
- *
- * The body is the manifest, not a summary of it: the server validates what it is given and
- * computes the checksum itself, so there is no `checksum` field here to send and no way for a
- * client to talk the ledger into a checksum that does not match the package.
- */
-export async function installNodePackage(
-  manifest: unknown,
-  organizationId?: string | null,
-): Promise<NodePackageInstall> {
-  return request<NodePackageInstall>("/api/v1/node-packages", {
-    method: "POST",
-    body: JSON.stringify({ manifest, organization_id: organizationId ?? null }),
-  });
-}
-/** Enable or disable a package. Disabling never touches a workflow. */
-export async function setNodePackageEnabled(
-  key: string,
-  enabled: boolean,
-  organizationId?: string | null,
-): Promise<NodePackageToggle> {
-  return request<NodePackageToggle>(`/api/v1/node-packages/${encodeURIComponent(key)}`, {
-    method: "PATCH",
-    body: JSON.stringify({ enabled, organization_id: organizationId ?? null }),
-  });
-}
-/** Remove a package; the ledger row stays, marked removed, and the dependents come back. */
-export async function removeNodePackage(
-  key: string,
-  organizationId?: string | null,
-): Promise<NodePackageRemoval> {
-  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
-  return request<NodePackageRemoval>(`/api/v1/node-packages/${encodeURIComponent(key)}${query}`, {
-    method: "DELETE",
-  });
-}
 /**
  * The caller's own channel configuration (REQ-021, slice 2).
  *
@@ -4394,6 +5580,7 @@ export async function removeNodePackage(
 export function fetchNotificationPreferences(): Promise<NotificationPreferences> {
   return request<NotificationPreferences>("/api/v1/notifications/preferences");
 }
+
 /**
  * Save the stated cells and the settings row.
  *
@@ -4413,9 +5600,11 @@ export function saveNotificationPreferences(input: {
     body: JSON.stringify(input),
   });
 }
+
 // ---------------------------------------------------------------------------------------------
 // Slice 3: the half that leaves the panel
 // ---------------------------------------------------------------------------------------------
+
 /**
  * The organization's delivery log.
  *
@@ -4437,6 +5626,7 @@ export function fetchNotificationOutbox(filters: {
   const suffix = query.toString();
   return request<NotificationOutbox>(`/api/v1/notifications/outbox${suffix ? `?${suffix}` : ""}`);
 }
+
 /**
  * Requeue one failed delivery.
  *
@@ -4450,10 +5640,12 @@ export function retryNotificationDelivery(id: string): Promise<{ outcome: string
     method: "POST",
   });
 }
+
 /** This person's registered browsers. The endpoint itself is never in the answer. */
 export function fetchNotificationDevices(): Promise<NotificationDevice[]> {
   return request<NotificationDevice[]>("/api/v1/notifications/push-subscriptions");
 }
+
 /** Register (or re-point) this browser. The four outcomes are the answer, not a boolean. */
 export function registerNotificationDevice(input: {
   endpoint: string;
@@ -4465,18 +5657,60 @@ export function registerNotificationDevice(input: {
     body: JSON.stringify(input),
   });
 }
+
 /** Remove one device. `404` for somebody else's, so existence does not leak. */
 export function removeNotificationDevice(id: string): Promise<void> {
   return request<void>(`/api/v1/notifications/push-subscriptions/${id}`, { method: "DELETE" });
 }
+
+/**
+ * The installation's VAPID public key, which is what `applicationServerKey` needs.
+ *
+ * `available: false` is an answer, not an error: the settings screen renders the push block
+ * either way, and a rejected request would put a toast on a panel that is working correctly
+ * and simply has nothing configured yet.
+ */
+export function fetchNotificationPushKey(): Promise<NotificationPushKey> {
+  return request<NotificationPushKey>("/api/v1/notifications/push-key");
+}
+
+/**
+ * Send one test notification through one channel, now, and report what happened.
+ *
+ * **The answer carries the transport's own outcome, not a boolean the client invented.**
+ * `delivered` plus `detail` are separate because the settings screen renders them
+ * differently — the boolean decides the colour of the line, `detail` is the sentence under
+ * it. A failure is a `200`, not an error status: "your SMTP host refused the message" is a
+ * result the reader asked for, and a `502` would tell them their settings screen is broken.
+ */
+export function sendTestNotificationDelivery(input: {
+  channel: string;
+  title?: string;
+  body?: string;
+}): Promise<{
+  channel: string;
+  delivered: boolean;
+  detail: string;
+  response_status: number | null;
+  notification_id: string;
+  delivery_status: string;
+}> {
+  return request("/api/v1/notifications/preferences/test", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 /** What each channel can do on this installation, and the sentence explaining it. */
 export function fetchNotificationChannels(): Promise<NotificationChannelReadiness[]> {
   return request<NotificationChannelReadiness[]>("/api/v1/notifications/channels");
 }
+
 /** Every routing rule, enabled or not. */
 export function fetchNotificationRoutes(): Promise<NotificationRouteRule[]> {
   return request<NotificationRouteRule[]>("/api/v1/notifications/routes");
 }
+
 /**
  * Write one routing rule.
  *
@@ -4497,10 +5731,12 @@ export function createNotificationRoute(input: {
     body: JSON.stringify(input),
   });
 }
+
 /** Remove one rule. */
 export function deleteNotificationRoute(id: string): Promise<void> {
   return request<void>(`/api/v1/notifications/routes/${id}`, { method: "DELETE" });
 }
+
 /**
  * Run one bus event through the router, now.
  *
@@ -4862,6 +6098,598 @@ export function importSecurityReport(
   });
 }
 
+// -------------------------------------------------------------------------------------------
+// The agent runtime (REQ-099, slice 1).
+//
+// The screen is a queue's front end, so the client mirrors the store's own vocabulary rather
+// than inventing labels: a status a human reads is a status the loop wrote. Every call carries
+// the organization through `agentScopeParams`, because a platform-level account has to name one
+// and an organization account passing a different one is refused with `403 cross_organization`.
+// -------------------------------------------------------------------------------------------
+
+/** One agent as the table renders it. */
+export type AiAgent = {
+  id: string;
+  organization_id: string;
+  site_id: string | null;
+  key: string;
+  name: string;
+  description: string;
+  system_prompt: string;
+  model_id: string | null;
+  temperature: number;
+  max_steps: number;
+  deadline_seconds: number;
+  token_budget: number;
+  tools: string[];
+  /** How many of `tools` park the run for a person; the table shows it beside the count. */
+  approvals_count: number;
+  approvals: string[];
+  memory_scope: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  /**
+   * The 30-day roll-up, present on the list and absent on the detail.
+   *
+   * Optional on purpose: the list route fills it from one bulk query, the detail route does not
+   * compute it, and a type that demanded it would make the second one lie. The cell renders an
+   * em dash for `null` rather than a zero, because "no runs yet" and "zero percent" are
+   * different facts.
+   */
+  telemetry?: AiAgentTelemetry | null;
+};
+
+/**
+ * One agent's 30-day roll-up.
+ *
+ * The denominator is **finished** runs, and `cancelled` is published beside it rather than
+ * folded in: a person pressing stop stopped the run, and counting that against the agent's
+ * reliability is the definition of a metric that gets gamed by impatience. A reader who wants
+ * the other denominator subtracts `cancelled` from `runs`.
+ */
+export type AiAgentTelemetry = {
+  /** Finished runs in the window. */
+  runs: number;
+  /** Of those, the ones that produced an answer. */
+  completed: number;
+  /** Of those, the ones a person stopped. */
+  cancelled: number;
+  /** Of those, the ones that failed. */
+  failed: number;
+  /** Total tokens in the window. */
+  total_tokens: number;
+  /** Cost in millionths in the window. */
+  cost_micros: number;
+  /** Steps in the window. */
+  steps: number;
+  /**
+   * Completed as a percentage of finished runs, or `null` when nothing has finished.
+   *
+   * `null` is the honest answer for a brand-new agent: `0%` is a claim about a division that
+   * never happened, and a cell reading "0%" on an agent nobody has run yet is a defect.
+   */
+  success_rate: number | null;
+  /** When the window starts, so the client does not have to guess its own. */
+  since: string;
+};
+
+/** How often each tool was called in the window, tenant-wide. */
+export type AiToolUsage = {
+  since: string;
+  /** Call counts by tool key. */
+  tools: Record<string, number>;
+};
+
+/** One run as the history list renders it. */
+export type AiRun = {
+  id: string;
+  agent_id: string | null;
+  user_id: string | null;
+  /** `chat`, `agent`, `workflow` or `schedule` — who started it, not just that it started. */
+  trigger: string;
+  goal: string;
+  status: string;
+  stop_reason: string | null;
+  model_id: string | null;
+  current_step: number;
+  resume_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_micros: number;
+  started_at: string | null;
+  finished_at: string | null;
+  error: string | null;
+};
+
+/** One step of a run's trace. `arguments` is the **redacted** form the store wrote. */
+export type AiRunStep = {
+  step_no: number;
+  kind: string;
+  tool: string | null;
+  arguments: Record<string, unknown> | null;
+  result: unknown;
+  status: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_micros: number;
+  duration_ms: number | null;
+  error: string | null;
+};
+
+/**
+ * One workspace reference a run was told to read.
+ *
+ * `resolved: false` is the state that explains a failed run: the sheet named `q3.csv`, and the
+ * file was deleted before the runner claimed the run. The reference survives the delete on
+ * purpose, so the trace can name the path rather than showing a run that had no inputs.
+ */
+export type AiRunInput = {
+  id: string;
+  path: string;
+  resolved: boolean;
+  size_bytes: number;
+};
+
+/** One run with its trace and its named inputs — the run detail screen's whole payload. */
+/**
+ * One run's recomputed telemetry, as the run detail's header renders it.
+ *
+ * A separate block rather than more columns on `AiRun` because the run's own columns are the
+ * *stored* totals and this is the *recomputed* one. Shipping both side by side turns "telemetry
+ * equals the underlying rows" from a test into something an operator can check by eye: a drift
+ * shows up as two different numbers in the same header instead of as one wrong number.
+ */
+export type AiRunTelemetry = {
+  completed_steps: number;
+  failed_steps: number;
+  tool_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_micros: number;
+  duration_ms: number;
+  total_tokens: number;
+};
+
+export type AiRunDetail = AiRun & {
+  steps: AiRunStep[];
+  inputs: AiRunInput[];
+  telemetry: AiRunTelemetry;
+};
+
+/**
+ * One agent's 30-day roll-up, on its own.
+ *
+ * The list already carries this number, so the call exists for the detail screen and for
+ * anything that wants the roll-up without the whole agent list.
+ */
+export function fetchAiAgentTelemetry(
+  agentId: string,
+  organizationId?: string | null,
+): Promise<AiAgentTelemetry> {
+  return request<AiAgentTelemetry>(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/telemetry${agentScopeParams(organizationId)}`,
+  );
+}
+
+/**
+ * How often each tool was called in the window, tenant-wide.
+ *
+ * **`/ai/agents/tool-usage`, NOT `/ai/telemetry/tools`.** Both are real reads and both are
+ * mounted: this one is the raw call-count table (`ai.agents.read`), and REQ-107's
+ * `/ai/telemetry/tools` is the success/denial/latency roll-up behind its own `ai.telemetry.read`
+ * key. They were briefly registered on the same path, which axum rejects at router
+ * *construction* — the API panicked at boot while `cargo build` stayed green.
+ */
+export function fetchAiToolUsage(organizationId?: string | null): Promise<AiToolUsage> {
+  return request<AiToolUsage>(
+    `/api/v1/ai/agents/tool-usage${agentScopeParams(organizationId)}`,
+  );
+}
+
+/** The organization selector the agent and run routes accept. */
+function agentScopeParams(organizationId?: string | null): string {
+  if (!organizationId) return "";
+  return `?organization_id=${encodeURIComponent(organizationId)}`;
+}
+
+/** The agents table. */
+export function fetchAiAgents(organizationId?: string | null): Promise<AiAgent[]> {
+  return request<AiAgent[]>(`/api/v1/ai/agents${agentScopeParams(organizationId)}`);
+}
+
+/** The run history, narrowed by whichever filters the list sets. */
+export function fetchAiRuns(input: {
+  organizationId?: string | null;
+  agentId?: string;
+  status?: string;
+  stopReason?: string;
+  limit?: number;
+}): Promise<AiRun[]> {
+  const params = new URLSearchParams();
+  if (input.organizationId) params.set("organization_id", input.organizationId);
+  if (input.agentId) params.set("agent_id", input.agentId);
+  if (input.status) params.set("status", input.status);
+  if (input.stopReason) params.set("stop_reason", input.stopReason);
+  if (input.limit) params.set("limit", String(input.limit));
+  const query = params.toString();
+  return request<AiRun[]>(`/api/v1/ai/runs${query ? `?${query}` : ""}`);
+}
+
+/** One run with its trace. */
+export function fetchAiRun(id: string, organizationId?: string | null): Promise<AiRunDetail> {
+  return request<AiRunDetail>(
+    `/api/v1/ai/runs/${encodeURIComponent(id)}${agentScopeParams(organizationId)}`,
+  );
+}
+
+/** One agent in full — the config form's load. */
+export function fetchAiAgent(id: string, organizationId?: string | null): Promise<AiAgent> {
+  return request<AiAgent>(
+    `/api/v1/ai/agents/${encodeURIComponent(id)}${agentScopeParams(organizationId)}`,
+  );
+}
+
+/**
+ * Create an agent.
+ *
+ * `tools` and `approvals` are the agent's own ordered lists rather than a catalogue pick, so a
+ * form that drops an approval-gated tool is refused by the API with `agent.approval_not_allowed`
+ * instead of silently losing the gate.
+ */
+export function createAiAgent(input: {
+  organizationId?: string | null;
+  key: string;
+  name: string;
+  description?: string;
+  system_prompt?: string;
+  model_id?: string | null;
+  temperature?: number;
+  max_steps?: number;
+  deadline_seconds?: number;
+  token_budget?: number;
+  tools?: string[];
+  approvals?: string[];
+  memory_scope?: string;
+  enabled?: boolean;
+}): Promise<AiAgent> {
+  return request<AiAgent>(`/api/v1/ai/agents${agentScopeParams(input.organizationId)}`, {
+    method: "POST",
+    body: JSON.stringify({
+      key: input.key,
+      name: input.name,
+      description: input.description ?? "",
+      system_prompt: input.system_prompt ?? "",
+      model_id: input.model_id ?? null,
+      temperature: input.temperature,
+      max_steps: input.max_steps,
+      deadline_seconds: input.deadline_seconds,
+      token_budget: input.token_budget,
+      tools: input.tools ?? [],
+      approvals: input.approvals ?? [],
+      memory_scope: input.memory_scope,
+      enabled: input.enabled,
+    }),
+  });
+}
+
+/**
+ * Change an agent.
+ *
+ * `model_id` is a double option on purpose: `null` un-pins the agent (let the router choose),
+ * while omitting the key leaves the current pin alone. A single nullable field cannot express
+ * the difference, and the difference is the difference between a pinned agent and a routed one.
+ */
+export function updateAiAgent(
+  id: string,
+  input: {
+    organizationId?: string | null;
+    name?: string;
+    description?: string;
+    system_prompt?: string;
+    model_id?: string | null;
+    temperature?: number;
+    max_steps?: number;
+    deadline_seconds?: number;
+    token_budget?: number;
+    tools?: string[];
+    approvals?: string[];
+    memory_scope?: string;
+    enabled?: boolean;
+  },
+): Promise<AiAgent> {
+  return request<AiAgent>(
+    `/api/v1/ai/agents/${encodeURIComponent(id)}${agentScopeParams(input.organizationId)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+}
+
+/** Remove an agent. The API answers 409 while a run is still active for it. */
+export function deleteAiAgent(id: string, organizationId?: string | null): Promise<null> {
+  return request<null>(
+    `/api/v1/ai/agents/${encodeURIComponent(id)}${agentScopeParams(organizationId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** Ask a run to stop at its next step boundary. */
+export function cancelAiRun(id: string, organizationId?: string | null): Promise<AiRun> {
+  return request<AiRun>(
+    `/api/v1/ai/runs/${encodeURIComponent(id)}/cancel${agentScopeParams(organizationId)}`,
+    { method: "POST" },
+  );
+}
+
+/** Requeue an interrupted or approval-parked run. */
+export function resumeAiRun(id: string, organizationId?: string | null): Promise<AiRun> {
+  return request<AiRun>(
+    `/api/v1/ai/runs/${encodeURIComponent(id)}/resume${agentScopeParams(organizationId)}`,
+    { method: "POST" },
+  );
+}
+
+/** The run's agent, for the history table's link column. */
+export function fetchAiRunAgent(
+  id: string,
+  organizationId?: string | null,
+): Promise<AiAgent | null> {
+  return request<AiAgent | null>(
+    `/api/v1/ai/runs/${encodeURIComponent(id)}/agent${agentScopeParams(organizationId)}`,
+  );
+}
+
+/** One file in an agent's workspace (REQ-099 slice 2). */
+export type AiAgentFile = {
+  /** Row identity — what Download and Delete address. */
+  id: string;
+  /** The path inside the workspace, relative to the agent. */
+  path: string;
+  /** Size in bytes. */
+  size_bytes: number;
+  /** The declared content type. */
+  content_type: string;
+  /** Hex SHA-256 of the bytes, so two versions of a path are tellable apart. */
+  checksum: string;
+  /** The run that wrote it, when a run wrote it. */
+  run_id: string | null;
+  /** When it was added. */
+  created_at: string;
+  /** When a run last named it. */
+  last_used_at: string | null;
+};
+
+/**
+ * How full a workspace is, as the usage bar reads it.
+ *
+ * `percent` is already clamped by the API rather than computed here: the bar's width is a
+ * percentage of a number the server owns, and a client that recomputes it can disagree with the
+ * quota that produced the refusal.
+ */
+export type AiAgentFileUsage = {
+  /** Bytes stored across the agent's files. */
+  used_bytes: number;
+  /** The per-agent ceiling (100 MB). */
+  limit_bytes: number;
+  /** How many files count against it. */
+  file_count: number;
+  /** Whole percent, 0–100. */
+  percent: number;
+  /** The per-file ceiling (10 MB), so the upload hint names the same number. */
+  max_file_bytes: number;
+};
+
+/** The workspace listing and its quota, in one answer. */
+export type AiAgentWorkspace = {
+  /** The agent whose workspace this is. */
+  agent_id: string;
+  /** Its files, newest first. */
+  files: AiAgentFile[];
+  /** The quota, so the bar cannot disagree with the table above it. */
+  usage: AiAgentFileUsage;
+};
+
+/** The agent's workspace. */
+export function fetchAiAgentWorkspace(
+  agentId: string,
+  organizationId?: string | null,
+): Promise<AiAgentWorkspace> {
+  return request<AiAgentWorkspace>(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/files${agentScopeParams(organizationId)}`,
+  );
+}
+
+/**
+ * Add or replace one workspace file.
+ *
+ * The path is sent as its own form part rather than being taken from the picked file's name: a
+ * filename is the browser's opinion about the user's disk, and the API deliberately refuses a
+ * request that omits the path so a name it did not choose cannot reach a namespace it does not
+ * validate.
+ */
+export async function uploadAiAgentFile(input: {
+  agentId: string;
+  path: string;
+  file: File;
+  organizationId?: string | null;
+}): Promise<AiAgentFile> {
+  const form = new FormData();
+  form.append("path", input.path);
+  form.append("file", input.file);
+  return request<AiAgentFile>(
+    `/api/v1/ai/agents/${encodeURIComponent(input.agentId)}/files${agentScopeParams(input.organizationId)}`,
+    { method: "POST", body: form },
+  );
+}
+
+/** Remove one workspace file. */
+export function deleteAiAgentFile(input: {
+  agentId: string;
+  path: string;
+  organizationId?: string | null;
+}): Promise<null> {
+  return request<null>(
+    `/api/v1/ai/agents/${encodeURIComponent(input.agentId)}/files/${encodeWorkspacePath(input.path)}${agentScopeParams(input.organizationId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/**
+ * The download address for one workspace file.
+ *
+ * Built rather than fetched, because the route answers the bytes directly and a download that
+ * had to round-trip a `blob` first would hold a copy of a 10 MB file in the tab's memory. The
+ * path is encoded **once**, segment by segment: encoding the whole string turns the separators
+ * into `%2F`, which is a file named `data%2Fq3.csv` rather than the file at `data/q3.csv`.
+ */
+export function aiAgentFileHref(input: {
+  agentId: string;
+  path: string;
+  organizationId?: string | null;
+}): string {
+  return `/api/v1/ai/agents/${encodeURIComponent(input.agentId)}/files/${encodeWorkspacePath(input.path)}${agentScopeParams(input.organizationId)}`;
+}
+
+/** Percent-encode each segment of a workspace path and keep the separators. */
+function encodeWorkspacePath(path: string): string {
+  return path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
+/** One frame of a run's event stream, as the Run sheet and the live trace read it. */
+export type AiRunFrame = {
+  /**
+   * `run`, `step_started`, `text`, `tool_call`, `tool_result`, `usage`, `awaiting_approval`,
+   * `loop_done`, `error` or `done`.
+   */
+  event: string;
+  data: Record<string, unknown>;
+};
+
+/** A consumer the stream calls as frames arrive. */
+export type AiRunStreamHandlers = {
+  onFrame?: (frame: AiRunFrame) => void;
+};
+
+/**
+ * Read an SSE response the one way.
+ *
+ * The chat stream and the run stream are the same protocol in two places, so the frame parser
+ * lives here once: a client that re-implemented it per screen is a client that will eventually
+ * read a frame boundary differently from the writer. Split on the blank line, take the `event:`
+ * and `data:` lines, hand the pair over — the caller branches on the *event name*, which is the
+ * loop's own vocabulary rather than a transport word.
+ */
+async function readEventStream(
+  response: Response,
+  handlers: AiRunStreamHandlers,
+): Promise<void> {
+  if (!response.body) {
+    return;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const chunk = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+
+      let event = "message";
+      let data = "";
+      for (const line of chunk.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(data) as Record<string, unknown>;
+      } catch {
+        // A frame that is not JSON is a transport frame (a comment, a keep-alive), not a
+        // lifecycle event. Dropping it is correct; throwing would kill a live run over a
+        // keep-alive, which is the worst possible trade.
+        continue;
+      }
+      handlers.onFrame?.({ event, data: parsed });
+    }
+  }
+}
+
+/**
+ * Start a run and stream its steps.
+ *
+ * Everything decidable before the first byte arrives as a normal HTTP status: a disabled agent,
+ * an empty goal, a runner that is switched off (`503 runner_disabled`), or a run already in
+ * progress (`409 run_in_progress`, whose details carry the existing run's id so the client
+ * attaches to it rather than pressing Run again). After the stream opens the frames are the
+ * run's own lifecycle.
+ */
+export async function startAiRun(
+  agentId: string,
+  input: { goal: string; files?: string[]; organizationId?: string | null },
+  handlers: AiRunStreamHandlers = {},
+): Promise<void> {
+  const response = await fetch(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/runs${agentScopeParams(input.organizationId)}`,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json", accept: "text/event-stream" },
+      body: JSON.stringify({ goal: input.goal, files: input.files ?? [] }),
+    },
+  );
+
+  if (!response.ok || !response.body) {
+    const payload = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? "unknown_error",
+      payload?.error?.message ?? `The API answered with status ${response.status}.`,
+      payload?.error?.details ?? null,
+    );
+  }
+
+  await readEventStream(response, handlers);
+}
+
+/**
+ * Re-attach to a run that is still going.
+ *
+ * A replay, not a subscription: the API has nothing to publish to on a request that is not the
+ * one running the loop, so the frames come from the step rows. That is the property the spec's
+ * "replay matches SSE" box asks for — the same rows produce both.
+ */
+export async function attachAiRun(
+  runId: string,
+  handlers: AiRunStreamHandlers = {},
+  organizationId?: string | null,
+): Promise<void> {
+  const response = await fetch(
+    `/api/v1/ai/runs/${encodeURIComponent(runId)}/events${agentScopeParams(organizationId)}`,
+    { credentials: "same-origin", headers: { accept: "text/event-stream" } },
+  );
+  if (!response.ok || !response.body) {
+    const payload = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? "unknown_error",
+      payload?.error?.message ?? `The API answered with status ${response.status}.`,
+      payload?.error?.details ?? null,
+    );
+  }
+  await readEventStream(response, handlers);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Security centre (REQ-012, slice 2) — the header policy
 // ---------------------------------------------------------------------------------------------
@@ -4890,113 +6718,6 @@ export function saveHeaderPolicy(save: HeaderPolicySave): Promise<HeaderPolicySa
     method: "PUT",
     body: JSON.stringify(save),
   });
-}
-
-/* ------------------------------------------------------------------ *
- * The visual graph (REQ-086)
- * ------------------------------------------------------------------ */
-
-/**
- * Read a workflow's graph, with the revision it was read at.
- *
- * The revision is not metadata: the canvas holds it for the life of the session and sends it
- * back on every save, and a save carrying a revision the server does not have is a `409` rather
- * than an overwrite. A read that dropped the number would make the editor's conflict path
- * unreachable.
- */
-export function fetchGraph(workflowId: string): Promise<GraphRead> {
-  return request<GraphRead>(
-    `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph`,
-    { cache: "no-store" },
-  );
-}
-
-/**
- * Save the whole graph. The compiled steps are written with it, in one request.
- *
- * `revision` is the one the editor loaded. On a `409` the thrown `ApiError` carries
- * `details.current_revision`, which is what the compare-and-reload prompt shows; this function
- * does not retry, because a silent retry is an overwrite wearing a retry's name.
- */
-export function saveGraph(
-  workflowId: string,
-  graph: GraphDocument,
-  revision: number,
-): Promise<GraphSaved> {
-  return request<GraphSaved>(`/api/v1/workflows/${encodeURIComponent(workflowId)}/graph`, {
-    method: "PUT",
-    body: JSON.stringify({ graph, revision }),
-  });
-}
-
-/**
- * Compile and report without saving, so a person typing a node parameter can be told it is wrong
- * before anything is stored. The server owns every rule; the canvas never pre-validates.
- */
-export function validateGraph(
-  workflowId: string,
-  graph: GraphDocument,
-  revision: number,
-): Promise<GraphValidated> {
-  return request<GraphValidated>(
-    `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph/validate`,
-    { method: "POST", body: JSON.stringify({ graph, revision }) },
-  );
-}
-
-/**
- * Evaluate one node's parameters against pinned sample data, storing nothing.
- *
- * A **server** call, and the REQ is explicit that it has to be: a client that reimplemented
- * the expression rules would agree with the server on the day it was written and drift the
- * first time a rule changed — which is the day somebody is relying on the preview to decide
- * whether a step will do what they meant. The sample travels in the body rather than being
- * fetched for the same reason: a preview that could reach live data would answer differently
- * on every keystroke, and could read a row the person editing has no permission to see.
- *
- * A field whose expression cannot be resolved is a `422` whose message names the field, and
- * this function does not swallow it — the inspector needs that sentence on the row, not a
- * rejected promise with nothing on it.
- */
-export function previewExpressions(
-  workflowId: string,
-  params: Record<string, unknown>,
-  namespaces: Record<string, unknown>,
-): Promise<ExpressionPreviewed> {
-  return request<ExpressionPreviewed>(
-    `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph/expressions/preview`,
-    { method: "POST", body: JSON.stringify({ params, namespaces }) },
-  );
-}
-
-/**
- * Ask the server which expressions are legal in the field being typed.
- *
- * The **graph travels in the body**, and that is the part worth arguing for. "Upstream
- * outputs" is a fact about the graph as it is on screen — including wires drawn but not yet
- * saved — so reading the stored graph would complete against a topology the person has
- * already changed, at exactly the moment they are most likely to trust the list.
- *
- * The candidate grammar is the server's for the same reason the preview's is: a client that
- * reimplemented the rules would offer `{{node.count + 1}}`, which previews as a refusal.
- *
- * `prefix` may be the path inside the braces or the whole expression; the server accepts both,
- * so the seam between them cannot become a bug where typing `{{` empties the menu.
- */
-export function completeExpressions(
-  workflowId: string,
-  nodeKey: string,
-  prefix: string,
-  graph: GraphDocument,
-  namespaces: Record<string, unknown>,
-): Promise<ExpressionCompleted> {
-  return request<ExpressionCompleted>(
-    `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph/expressions/complete`,
-    {
-      method: "POST",
-      body: JSON.stringify({ node_key: nodeKey, prefix, graph, namespaces }),
-    },
-  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5073,9 +6794,1376 @@ export function fetchLockedAccounts(): Promise<LockedAccountsPage> {
  * it is audited server-side with the actor. The remaining `lockout_minutes` is the thing a
  * cautious operator narrows, not this button.
  */
+// -- REQ-012 slice 4: the IP access lists ----------------------------------------------------
+
+/**
+ * Both access lists and their counts.
+ *
+ * One call rather than two: the screen renders the two tables side by side and a summary line,
+ * and reading them separately would let the counts describe a different moment than the rows.
+ */
+export function fetchIpRules(): Promise<IpRulesPage> {
+  return request<IpRulesPage>("/api/v1/security/ip-rules", { cache: "no-store" });
+}
+
+/**
+ * Add one access rule.
+ *
+ * The response carries `blocks_you` — whether the new rule covers the address this request came
+ * from — and the screen surfaces it as a warning rather than hiding it. The rule is saved either
+ * way: refusing it would leave the platform unable to express a legitimate self-lockout, and the
+ * operator would only learn which input avoids the check.
+ */
+export function createIpRule(input: CreateIpRuleInput): Promise<CreateIpRuleResult> {
+  return request<CreateIpRuleResult>("/api/v1/security/ip-rules", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Remove one rule by id. */
+export function deleteIpRule(id: string): Promise<void> {
+  return request<void>(`/api/v1/security/ip-rules/${id}`, { method: "DELETE" });
+}
+
+/**
+ * Ask what one address would do.
+ *
+ * The same evaluator the request path runs, so the verdict is the platform's verdict rather than
+ * a second implementation's. Takes a single address, not a network — listing a network is what
+ * the form above is for, and the error message says so.
+ */
+export function testIpAddress(address: string): Promise<IpTestResult> {
+  return request<IpTestResult>("/api/v1/security/ip-rules/test", {
+    method: "POST",
+    body: JSON.stringify({ address }),
+  });
+}
+
+/**
+ * The security-event timeline (REQ-012 slice 4).
+ *
+ * **Two sources, and that is the point.** The audit trail holds privileged actions somebody took;
+ * it holds no sign-ins at all, because a failed sign-in happens before there is a session and so
+ * before there is an actor to write an audit entry for. The server merges both tables and every row
+ * names which one it came from, so this client does not choose — it cannot, and a screen that
+ * could only read one of them would show an operator an empty sign-in list on a platform where
+ * nothing is wrong.
+ *
+ * The filter is sent as a query string built here rather than assembled by the screen, so the
+ * export and the table are guaranteed to be asking the server the same question.
+ */
+export function fetchSecurityEvents(
+  filter: SecurityEventsFilter = {},
+): Promise<SecurityEventsPage> {
+  const params = new URLSearchParams();
+  if (filter.q) params.set("q", filter.q);
+  if (filter.category) params.set("category", filter.category);
+  if (filter.source) params.set("source", filter.source);
+  if (filter.since) params.set("since", filter.since);
+  if (filter.until) params.set("until", filter.until);
+  if (filter.limit) params.set("limit", String(filter.limit));
+  const query = params.toString();
+  return request<SecurityEventsPage>(
+    `/api/v1/security/events${query ? `?${query}` : ""}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * The same filter as a CSV download.
+ *
+ * A browser navigation rather than a fetch, because the response is a file with
+ * `Content-Disposition: attachment` and the panel's own `request()` wrapper is built for JSON —
+ * reading it as text would hand the operator the CSV body instead of saving it.
+ */
+/**
+ * The secret inventory. Read-only, and the client has no mutation to offer.
+ *
+ * No filter parameter, deliberately: the inventory is small enough to render whole, and a filter
+ * over a list whose point is "what does this platform hold" invites the reading that the screen
+ * is hiding something rather than that it is complete.
+ */
+export function fetchSecretInventory(): Promise<SecretInventory> {
+  return request<SecretInventory>("/api/v1/security/secrets");
+}
+
+export function securityEventsExportUrl(filter: SecurityEventsFilter = {}): string {
+  const params = new URLSearchParams();
+  if (filter.q) params.set("q", filter.q);
+  if (filter.category) params.set("category", filter.category);
+  if (filter.source) params.set("source", filter.source);
+  if (filter.since) params.set("since", filter.since);
+  if (filter.until) params.set("until", filter.until);
+  // Deliberately NOT sent: the server drops the page size for the export, because an operator
+  // who filters to "denials" and exports 50 of 300 has produced a document that reads as a
+  // complete list and is not one.
+  const query = params.toString();
+  return `/api/v1/security/events.csv${query ? `?${query}` : ""}`;
+}
+
 export function unlockAccount(userId: string): Promise<LockedAccountsPage> {
   return request<LockedAccountsPage>(
     `/api/v1/security/locked-accounts/${encodeURIComponent(userId)}/unlock`,
     { method: "POST" },
   );
+}
+
+/**
+ * The skills registry (REQ-099, slice 3).
+ *
+ * The client mirrors the server's distinction between *attached* and *injected* rather than
+ * collapsing them: a row can be attached and still contribute nothing to a prompt, and a tab
+ * that renders "3 skills" above a prompt that carries one is the exact failure this API shape
+ * exists to make impossible.
+ */
+
+/** One registry row, as the table renders it. */
+export type AiSkill = {
+  /** The stable identifier. */
+  key: string;
+  /** Display name. */
+  name: string;
+  /** One line about what it is for. */
+  description: string;
+  /** When the model should reach for it. */
+  when_to_use: string;
+  /** The instruction body — data, never code. */
+  instructions: string;
+  /** Tool keys this skill is relevant to. **Not** a grant. */
+  tools: string[];
+  /** The manual version. */
+  version: number;
+  /** The digest of the definition, shown in the drawer. */
+  checksum: string;
+  /** `built_in` or `custom` — which decides whether Delete is offered. */
+  source: string;
+  /** Whether the runtime will inject it. */
+  enabled: boolean;
+  /** How many agents hold it. */
+  used_by: number;
+  /** Whether the definition is read-only. */
+  built_in: boolean;
+  /** When it last changed. */
+  updated_at: string;
+};
+
+/** One attachment, with the runtime's verdict on it. */
+export type AiAgentSkill = {
+  /** The registry key. */
+  key: string;
+  /** Display name, or the bare key when the row is gone. */
+  name: string;
+  /** Description, empty when stale. */
+  description: string;
+  /** When to use it, empty when stale. */
+  when_to_use: string;
+  /** Version, 0 when stale. */
+  version: number;
+  /** The tools it names. */
+  tools: string[];
+  /** `built_in` / `custom`, empty when stale. */
+  source: string;
+  /** The attachment order. */
+  position: number;
+  /** Whether the runtime would inject it. */
+  injected: boolean;
+  /** Why not, when it would not. */
+  withheld_reason: string | null;
+  /** A stable code for the reason. */
+  withheld_code: string | null;
+  /** Whether the row's own checksum still describes its body. */
+  checksum_ok: boolean;
+};
+
+/**
+ * The Skills tab payload.
+ *
+ * `prompt_block` is the *assembled* text the runtime would add, returned rather than
+ * reconstructed: a panel that shows each skill separately can be right about all of them and
+ * still display an order the runtime does not use.
+ */
+export type AiAgentSkills = {
+  /** The agent. */
+  agent_id: string;
+  /** Every attachment, in runtime order. */
+  skills: AiAgentSkill[];
+  /** The prompt text, or null when nothing is injected. */
+  prompt_block: string | null;
+  /** Keys that are attached but withheld. */
+  withheld: string[];
+};
+
+/** The registry list. */
+export type AiSkillList = {
+  /** This organization's skills plus the built-ins. */
+  skills: AiSkill[];
+};
+
+/** What `POST /ai/skills/{key}/validate` answers. */
+export type AiSkillValidation = {
+  /** Whether the definition would be accepted. */
+  valid: boolean;
+  /** Every problem, in check order. */
+  problems: string[];
+  /** The digest the body currently has. */
+  checksum: string;
+  /** Whether it matched a supplied expectation. */
+  checksum_matched: boolean;
+};
+
+/** The scope query every skills route shares. */
+function skillScopeParams(organizationId?: string | null): string {
+  return organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+}
+
+// ---- The AI tool registry (REQ-100) ------------------------------------------------------
+//
+// `ungated_high_risk` and `used_by_agents` are computed by the API on purpose. The stripe and the
+// disable confirmation are the two places this screen can quietly lie — a client that derived
+// "is this high risk and ungated" from `risk === "high" && !requires_approval` would have to
+// re-implement the disabled-wins rule to get the same answer, and one that derived the agent list
+// from its own copy of the agents table would name agents from another organization.
+
+/** One registry row. */
+export type AiTool = {
+  key: string;
+  class: string;
+  /** The single permission this tool needs. Never a list. */
+  permission: string;
+  risk: "low" | "medium" | "high";
+  description: string;
+  idempotent: boolean;
+  requires_approval: boolean;
+  enabled: boolean;
+  timeout_ms: number;
+  max_calls_per_run: number;
+  /** Set once the tool has left the compiled catalogue. */
+  retired_note: string | null;
+  /** Enabled, high risk, no approval gate — the row that gets a warning stripe. */
+  ungated_high_risk: boolean;
+  calls_30d: number;
+  /** `null` when the tool was never called, which is not the same as 0 %. */
+  error_rate_30d: number | null;
+  last_used: string | null;
+  used_by_agents: { id: string; name: string }[];
+};
+
+/** The list body. `seeded: false` renders the "seeding has not run" banner. */
+export type AiToolList = { tools: AiTool[]; seeded: boolean };
+
+/** One row of a tool's Recent calls. Arguments are never returned. */
+export type AiToolCall = {
+  id: number;
+  created_at: string;
+  agent_id: string | null;
+  agent_name: string | null;
+  run_id: string | null;
+  status: "ok" | "denied" | "failed" | "timeout" | "limited";
+  error_code: string | null;
+  duration_ms: number | null;
+  args_bytes: number | null;
+  result_bytes: number | null;
+};
+
+/** One tool with its schema, limits and recent calls. */
+export type AiToolDetail = AiTool & {
+  input_schema: unknown;
+  example: unknown;
+  /** `false` for a row whose tool has left the compiled catalogue. */
+  compiled: boolean;
+  recent_calls: AiToolCall[];
+};
+
+/** The class metadata the filters and grouping read. */
+export type AiToolClass = { key: string; label: string; order: number; default_risk: string };
+
+/** One tool's usage chart: totals plus the per-day series.
+ *
+ *  NOT `AiToolUsage` — REQ-099's agent telemetry already owns that name at line ~5507, and a
+ *  second export under it would make the telemetry's `tools: Record<string, number>` shadow the
+ *  registry's per-day series depending on import order. `AiToolUsageChart` says which of the two
+ *  is meant at the call site. */
+export type AiToolUsageChart = {
+  key: string;
+  days: number;
+  calls: number;
+  errors: number;
+  error_rate: number | null;
+  avg_duration_ms: number | null;
+  series: { day: string; calls: number; errors: number; avg_duration_ms: number | null }[];
+};
+
+// ---- AI identities and the permission matrix (REQ-100 slice 2) ----------------------------
+//
+// The tri-state is a *string union*, not a boolean and not `boolean | null`. A cell that a
+// client cannot distinguish from "unset" is a cell a client will guess about, and the guess is
+// always "allow" — which for a permission matrix is the dangerous direction. The API sends
+// `"inherit"` explicitly so a toggle back to the default state is a value, not an omission.
+
+/** The three states one matrix cell can be in. Inherit writes no row. */
+export type AiGrantEffect = "allow" | "deny" | "inherit";
+
+/** One identity, as the list and the detail render it. */
+export type AiIdentity = {
+  id: string;
+  /** `null` is the platform-level identity, shared by every organization. */
+  organization_id: string | null;
+  key: string;
+  name: string;
+  description: string;
+  is_default: boolean;
+  platform_level: boolean;
+  /** Decided allow cells. Inherit is not counted: it is the absence of a decision. */
+  allowed: number;
+  denied: number;
+  agents_using: number;
+  updated_at: string;
+};
+
+/** The identity table's body. */
+export type AiIdentityList = { identities: AiIdentity[]; own: number };
+
+/** One row of the identity's grant editor — every tool, not only the decided ones. */
+export type AiIdentityToolCell = {
+  tool_key: string;
+  class: string;
+  risk: string;
+  /** The permission the tool itself needs, shown so a cell's sensitivity is legible. */
+  permission: string;
+  enabled: boolean;
+  requires_approval: boolean;
+  effect: AiGrantEffect;
+};
+
+/** One identity with its whole grant editor. */
+export type AiIdentityDetail = AiIdentity & { tools: AiIdentityToolCell[] };
+
+/** A grant map: `tool_key → effect`. Inherit is present in the map and writes no row. */
+export type AiIdentityGrants = { grants: Record<string, AiGrantEffect> };
+
+/** One row of the matrix. */
+export type AiMatrixTool = {
+  key: string;
+  class: string;
+  risk: string;
+  description: string;
+  permission: string;
+  enabled: boolean;
+  requires_approval: boolean;
+  ungated_high_risk: boolean;
+};
+
+/** One agent's column. A tool absent from `tools` is "not in the agent's list". */
+export type AiMatrixAgentColumn = {
+  id: string;
+  key: string;
+  name: string;
+  enabled: boolean;
+  tools: string[];
+  approvals: string[];
+};
+
+/** One identity's column — the cells that actually carry a real tri-state. */
+export type AiMatrixIdentityColumn = {
+  id: string;
+  key: string;
+  name: string;
+  is_default: boolean;
+  platform_level: boolean;
+  /** Decided cells only; anything else is inherit. */
+  grants: Record<string, AiGrantEffect>;
+};
+
+/** The whole grid, with the viewer's own permissions so disabled cells can be explained. */
+export type AiPermissionMatrix = {
+  tools: AiMatrixTool[];
+  agents: AiMatrixAgentColumn[];
+  identities: AiMatrixIdentityColumn[];
+  /** The tool permissions the caller holds. */
+  viewer_permissions: string[];
+  /** `tool_key → the permissions the caller is missing`, named so the cell can say which. */
+  viewer_missing: Record<string, string[]>;
+};
+
+/** The identities table. */
+export function fetchAiIdentities(
+  organizationId?: string | null,
+): Promise<AiIdentityList> {
+  return request<AiIdentityList>(
+    `/api/v1/ai/identities${toolScopeParams(organizationId)}`,
+  );
+}
+
+/** One identity with its whole grant editor. */
+export function fetchAiIdentity(
+  id: string,
+  organizationId?: string | null,
+): Promise<AiIdentityDetail> {
+  return request<AiIdentityDetail>(
+    `/api/v1/ai/identities/${encodeURIComponent(id)}${toolScopeParams(organizationId)}`,
+  );
+}
+
+/** Create an identity. */
+export function createAiIdentity(
+  body: { key: string; name: string; description?: string; is_default?: boolean },
+  organizationId?: string | null,
+): Promise<AiIdentity> {
+  return request<AiIdentity>(`/api/v1/ai/identities${toolScopeParams(organizationId)}`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Rename, re-describe or promote an identity. An absent field is left as it is. */
+export function updateAiIdentity(
+  id: string,
+  changes: { name?: string; description?: string; is_default?: boolean },
+  organizationId?: string | null,
+): Promise<AiIdentity> {
+  return request<AiIdentity>(
+    `/api/v1/ai/identities/${encodeURIComponent(id)}${toolScopeParams(organizationId)}`,
+    { method: "PATCH", body: JSON.stringify(changes) },
+  );
+}
+
+/** Remove an identity and, with it, its grants. */
+export function deleteAiIdentity(
+  id: string,
+  organizationId?: string | null,
+): Promise<void> {
+  return request<void>(
+    `/api/v1/ai/identities/${encodeURIComponent(id)}${toolScopeParams(organizationId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** One identity's decided grants. */
+export function fetchAiIdentityGrants(
+  id: string,
+  organizationId?: string | null,
+): Promise<AiIdentityGrants> {
+  return request<AiIdentityGrants>(
+    `/api/v1/ai/identities/${encodeURIComponent(id)}/tools${toolScopeParams(organizationId)}`,
+  );
+}
+
+/** Replace one identity's whole grant map. Inherit in the map writes no row. */
+export function saveAiIdentityGrants(
+  id: string,
+  grants: Record<string, AiGrantEffect>,
+  organizationId?: string | null,
+): Promise<AiIdentityGrants> {
+  return request<AiIdentityGrants>(
+    `/api/v1/ai/identities/${encodeURIComponent(id)}/tools${toolScopeParams(organizationId)}`,
+    { method: "PUT", body: JSON.stringify({ grants }) },
+  );
+}
+
+/** The full tool × (agents, identities) grid. */
+export function fetchAiPermissionMatrix(
+  organizationId?: string | null,
+): Promise<AiPermissionMatrix> {
+  return request<AiPermissionMatrix>(
+    `/api/v1/ai/permissions/matrix${toolScopeParams(organizationId)}`,
+  );
+}
+
+
+function toolScopeParams(organizationId?: string | null): string {
+  return organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+}
+
+/** The registry, with every filter the spec's table lists. */
+export function fetchAiTools(options?: {
+  organizationId?: string | null;
+  q?: string;
+  class?: string;
+  risk?: string;
+  gated?: boolean;
+  enabled?: boolean;
+}): Promise<AiToolList> {
+  const params = new URLSearchParams();
+  if (options?.organizationId) params.set("organization_id", options.organizationId);
+  if (options?.q) params.set("q", options.q);
+  if (options?.class) params.set("class", options.class);
+  if (options?.risk) params.set("risk", options.risk);
+  if (options?.gated !== undefined) params.set("gated", String(options.gated));
+  if (options?.enabled !== undefined) params.set("enabled", String(options.enabled));
+  const query = params.toString();
+  return request<AiToolList>(`/api/v1/ai/tools${query ? `?${query}` : ""}`);
+}
+
+/** One tool. */
+export function fetchAiTool(
+  key: string,
+  organizationId?: string | null,
+): Promise<AiToolDetail> {
+  return request<AiToolDetail>(
+    `/api/v1/ai/tools/${encodeURIComponent(key)}${toolScopeParams(organizationId)}`,
+  );
+}
+
+/** The class list, for the filter chips and the grouping order. */
+export function fetchAiToolClasses(organizationId?: string | null): Promise<AiToolClass[]> {
+  return request<AiToolClass[]>(
+    `/api/v1/ai/tools/classes${toolScopeParams(organizationId)}`,
+  );
+}
+
+/** The four operator-owned decisions. An absent field is left as it is. */
+export async function updateAiTool(
+  key: string,
+  changes: {
+    enabled?: boolean;
+    requires_approval?: boolean;
+    timeout_ms?: number;
+    max_calls_per_run?: number;
+  },
+  organizationId?: string | null,
+): Promise<AiTool> {
+  return request<AiTool>(`/api/v1/ai/tools/${encodeURIComponent(key)}${toolScopeParams(organizationId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+  });
+}
+
+/** One tool's usage chart over a window.
+ *
+ *  NOT `fetchAiToolUsage` — REQ-099's agent telemetry already exports that name for the
+ *  tenant-wide `{ since, tools: Record<string, number> }` shape. Two exports under one name in a
+ *  6700-line module is a duplicate-implementation error, and the *right* fix is the more specific
+ *  name rather than renaming the one three other files already import. */
+export function fetchAiToolUsageChart(
+  key: string,
+  options?: { organizationId?: string | null; days?: number },
+): Promise<AiToolUsageChart> {
+  const params = new URLSearchParams();
+  if (options?.organizationId) params.set("organization_id", options.organizationId);
+  if (options?.days) params.set("days", String(options.days));
+  const query = params.toString();
+  return request<AiToolUsageChart>(
+    `/api/v1/ai/tools/${encodeURIComponent(key)}/usage${query ? `?${query}` : ""}`,
+  );
+}
+
+/** The registry, optionally filtered to the rows that are enabled. */
+export function fetchAiSkills(options?: {
+  organizationId?: string | null;
+  enabledOnly?: boolean;
+}): Promise<AiSkillList> {
+  const params = new URLSearchParams();
+  if (options?.organizationId) params.set("organization_id", options.organizationId);
+  if (options?.enabledOnly) params.set("enabled_only", "true");
+  const query = params.toString();
+  return request<AiSkillList>(`/api/v1/ai/skills${query ? `?${query}` : ""}`);
+}
+
+/** One definition. */
+export function fetchAiSkill(
+  key: string,
+  organizationId?: string | null,
+): Promise<AiSkill> {
+  return request<AiSkill>(
+    `/api/v1/ai/skills/${encodeURIComponent(key)}${skillScopeParams(organizationId)}`,
+  );
+}
+
+/** Register a custom definition. */
+export async function createAiSkill(input: {
+  key: string;
+  name: string;
+  description?: string;
+  when_to_use?: string;
+  instructions: string;
+  tools?: string[];
+  enabled?: boolean;
+  organizationId?: string | null;
+}): Promise<AiSkill> {
+  return request<AiSkill>("/api/v1/ai/skills", {
+    method: "POST",
+    body: JSON.stringify({
+      key: input.key,
+      name: input.name,
+      description: input.description ?? "",
+      when_to_use: input.when_to_use ?? "",
+      instructions: input.instructions,
+      tools: input.tools ?? [],
+      enabled: input.enabled ?? true,
+    }),
+  });
+}
+
+/** Change a definition, or enable/disable a built-in. */
+export async function updateAiSkill(
+  key: string,
+  changes: {
+    name?: string;
+    description?: string;
+    when_to_use?: string;
+    instructions?: string;
+    tools?: string[];
+    version?: number;
+    enabled?: boolean;
+  },
+  organizationId?: string | null,
+): Promise<AiSkill> {
+  return request<AiSkill>(`/api/v1/ai/skills/${encodeURIComponent(key)}${skillScopeParams(organizationId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+  });
+}
+
+/** Remove a custom skill. A built-in answers 403. */
+export async function deleteAiSkill(
+  key: string,
+  organizationId?: string | null,
+): Promise<void> {
+  await request<null>(
+    `/api/v1/ai/skills/${encodeURIComponent(key)}${skillScopeParams(organizationId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** "Would this definition be accepted?" — writes nothing. */
+export function validateAiSkill(
+  key: string,
+  draft: {
+    name?: string;
+    description?: string;
+    when_to_use?: string;
+    instructions?: string;
+    tools?: string[];
+    expected_checksum?: string | null;
+  },
+  organizationId?: string | null,
+): Promise<AiSkillValidation> {
+  return request<AiSkillValidation>(
+    `/api/v1/ai/skills/${encodeURIComponent(key)}/validate${skillScopeParams(organizationId)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        key,
+        name: draft.name ?? "",
+        description: draft.description ?? "",
+        when_to_use: draft.when_to_use ?? "",
+        instructions: draft.instructions ?? "",
+        tools: draft.tools ?? [],
+        expected_checksum: draft.expected_checksum ?? null,
+      }),
+    },
+  );
+}
+
+/** The Skills tab payload for one agent. */
+export function fetchAiAgentSkills(
+  agentId: string,
+  organizationId?: string | null,
+): Promise<AiAgentSkills> {
+  return request<AiAgentSkills>(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills${skillScopeParams(organizationId)}`,
+  );
+}
+
+/**
+ * Attach one skill.
+ *
+ * The response reports `tools_not_in_agent`: the skill names a tool this agent cannot call. That
+ * is a *warning*, not a refusal — the operator may be about to grant it — but it has to be
+ * sayable out loud, because the alternative is a run that mysteriously ignores half its
+ * instructions.
+ */
+export function attachAiAgentSkill(
+  agentId: string,
+  skillKey: string,
+  organizationId?: string | null,
+): Promise<{ skill: AiAgentSkill; tools_not_in_agent: string[] }> {
+  return request<{ skill: AiAgentSkill; tools_not_in_agent: string[] }>(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills${skillScopeParams(organizationId)}`,
+    { method: "POST", body: JSON.stringify({ skill_key: skillKey }) },
+  );
+}
+
+/** Replace the whole order — a drag produces a list, so the whole list goes. */
+export function setAiAgentSkills(
+  agentId: string,
+  skills: string[],
+  organizationId?: string | null,
+): Promise<AiAgentSkills> {
+  return request<AiAgentSkills>(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills${skillScopeParams(organizationId)}`,
+    { method: "PUT", body: JSON.stringify({ skills }) },
+  );
+}
+
+/** Detach one skill. */
+export async function detachAiAgentSkill(
+  agentId: string,
+  skillKey: string,
+  organizationId?: string | null,
+): Promise<void> {
+  await request<null>(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills/${encodeURIComponent(skillKey)}${skillScopeParams(organizationId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Backups (REQ-013)
+ *
+ * Six functions for the overview, the detail, the create drawer, the verify action and the
+ * settings screen. The schedules' writes arrive with slice 3, which is also where the worker
+ * that produces them arrives; a "Run now" button with no worker behind it is a dead button,
+ * and this file does not grow one.
+ * ------------------------------------------------------------------------------------------- */
+
+/** The query the list screen sends. Every field is optional and every one is a filter. */
+export interface BackupListQuery {
+  /** Restrict to one terminal state. */
+  status?: string;
+  /** Restrict to one kind. */
+  kind?: string;
+  /** Restrict to runs that included this part. */
+  scope?: string;
+  /** Restrict to one destination. */
+  destination?: string;
+  /** Only runs created at or after this. */
+  created_after?: string;
+  /** Only runs created at or before this. */
+  created_before?: string;
+  /** Page size. */
+  limit?: number;
+  /** Page offset. */
+  offset?: number;
+}
+
+/** The list, filtered and paged. */
+export function fetchBackups(query: BackupListQuery = {}): Promise<BackupList> {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null || value === "") continue;
+    search.set(key, String(value));
+  }
+  const suffix = search.toString();
+  return request<BackupList>(`/api/v1/backups${suffix ? `?${suffix}` : ""}`);
+}
+
+/** The four cards at the top of the overview. */
+export function fetchBackupStatus(): Promise<BackupStatus> {
+  return request<BackupStatus>("/api/v1/backups/status");
+}
+
+/** One run with its parts and its manifest. */
+export function fetchBackup(id: string): Promise<BackupDetail> {
+  return request<BackupDetail>(`/api/v1/backups/${id}`);
+}
+
+/** The manifest on its own, for the copy button. */
+export function fetchBackupManifest(id: string): Promise<unknown> {
+  return request<unknown>(`/api/v1/backups/${id}/manifest`);
+}
+
+/** Take a backup now. The response is the FINISHED run, not a queued one. */
+export function createBackup(input: {
+  label?: string;
+  scopes?: string[];
+  destination?: string;
+  protected?: boolean;
+  retain_days?: number | null;
+}): Promise<BackupCreateResult> {
+  return request<BackupCreateResult>("/api/v1/backups", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Re-read a run's artifacts and compare them with its manifest.
+ *
+ * A `200` with `clean: false` is a successful verification that found a problem, so this
+ * returns normally in that case — the caller renders the verdict, it does not catch it.
+ */
+export function verifyBackup(id: string): Promise<BackupVerification> {
+  return request<BackupVerification>(`/api/v1/backups/${id}/verify`, { method: "POST" });
+}
+
+/**
+ * What a restore of this run would do — without doing it.
+ *
+ * A `GET` on purpose: the preview re-reads every artifact off the destination and counts the
+ * live side, and neither of those writes anything. Putting it behind the destructive
+ * permission would mean the first time an operator meets this screen is a 403 that never
+ * showed them what they were agreeing to.
+ */
+export function previewRestore(id: string): Promise<RestorePreview> {
+  return request<RestorePreview>(`/api/v1/backups/${id}/restore-preview`, { method: "GET" });
+}
+
+/**
+ * Perform a restore of the ticked parts.
+ *
+ * The API takes the parts the operator **left ticked**, not "everything available": an empty
+ * array is a refusal naming the parts on offer, because a panel that posted nothing and got
+ * the whole archive back would be a panel that restored more than it showed.
+ */
+export function restoreBackup(
+  id: string,
+  parts: string[],
+  confirmation: string,
+): Promise<RestoreOutcome> {
+  return request<RestoreOutcome>(`/api/v1/backups/${id}/restore`, {
+    method: "POST",
+    body: JSON.stringify({ parts, confirmation }),
+  });
+}
+
+/**
+ * Queue a restore instead of performing it — the one that can still be stopped (REQ-013
+ * slice 2c).
+ *
+ * The distinction is the whole point and the panel is careful about it: `restoreBackup` runs
+ * inside the request and has no cancel, because a `POST` in flight cannot be un-pressed. This
+ * one answers `202` with the queued job, and the job can be stopped until its worker claims
+ * it. Offering the cancellable one by default and the immediate one behind a named choice is
+ * the honest arrangement; offering only the immediate one is a screen with no way back.
+ */
+export function queueRestore(
+  id: string,
+  parts: string[],
+  confirmation: string,
+): Promise<RestoreJob> {
+  return request<RestoreJob>(`/api/v1/backups/${id}/restore-queue`, {
+    method: "POST",
+    body: JSON.stringify({ parts, confirmation }),
+  });
+}
+
+/**
+ * This run's queued and finished restores, newest first.
+ *
+ * `backup.read`, not `backup.restore`: reading that a restore is queued changes nothing, and
+ * hiding it behind the destructive key means the first time an operator looks for the thing
+ * they are waiting for is a 403.
+ */
+export function listRestoreJobs(id: string): Promise<RestoreJob[]> {
+  return request<RestoreJob[]>(`/api/v1/backups/${id}/restore-jobs`, { method: "GET" });
+}
+
+/**
+ * Stop a queued restore.
+ *
+ * Addressed by the JOB's id and not the run's, because they are different resources: a route
+ * that accepted either would let a cancel for one run's job stop another run's restore.
+ *
+ * The response is the job as it now reads, so a call that lost the race to the worker comes
+ * back `running` rather than a `200` claiming a cancellation that did not happen.
+ */
+export function cancelRestoreJob(jobId: string): Promise<RestoreJob> {
+  return request<RestoreJob>(`/api/v1/restore-jobs/${jobId}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+/**
+ * Remove a run **and the artifacts it left on the destination**.
+ *
+ * The returned report is the point of this call: "the row is gone" and "the bytes are gone"
+ * are two facts, and a `204` collapsed them. A partial removal comes back with
+ * `failed_entries > 0` and the paths that are still on disk, so the screen can say which
+ * files an operator has to clear by hand instead of rendering "removed" over a directory
+ * that is still full of the media library.
+ */
+export function deleteBackup(id: string): Promise<BackupPurge> {
+  return request<BackupPurge>(`/api/v1/backups/${id}`, { method: "DELETE" });
+}
+
+/**
+ * Run the retention sweep now, for this tenant.
+ *
+ * The background sweep runs every six hours, and a six hour wait is not an answer an
+ * operator can act on when the disk is filling. The full report comes back rather than a
+ * count, because "pruned 4" and "1 of those 4 left a stuck file" are two different facts and
+ * the screen renders both.
+ */
+export function sweepBackups(): Promise<BackupSweepReport> {
+  return request<BackupSweepReport>("/api/v1/backups/sweep", { method: "POST" });
+}
+
+/** The schedules table. */
+export function fetchBackupSchedules(): Promise<BackupSchedule[]> {
+  return request<BackupSchedule[]>("/api/v1/backup-schedules");
+}
+
+/**
+ * What the schedule editor sends.
+ *
+ * The conditional fields are sent as `null` rather than omitted, so a schedule changed from
+ * weekly to daily does not keep a `day_of_week` the server has to decide about. The server
+ * refuses a daily schedule that still carries one.
+ */
+export interface BackupScheduleInput {
+  name: string;
+  frequency: "hourly" | "daily" | "weekly" | "monthly";
+  at_time: string | null;
+  day_of_week: number | null;
+  day_of_month: number | null;
+  timezone: string;
+  scopes: string[];
+  retention_count: number;
+  enabled: boolean;
+}
+
+/**
+ * Create a schedule.
+ *
+ * The response carries the **computed** `next_run_at`, not a value the form supplied — the
+ * form never computes one. A schedule whose cadence cannot be computed (an unknown timezone,
+ * a daily row with no time) is refused with a `400` naming the field rather than stored with
+ * a null next run, which would leave a row that looks live and never fires.
+ */
+export function createBackupSchedule(input: BackupScheduleInput): Promise<BackupSchedule> {
+  return request<BackupSchedule>("/api/v1/backup-schedules", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Edit a schedule, and get the recomputed next run back.
+ *
+ * The next run is recomputed on every save rather than left alone. An operator who moves a
+ * schedule from 02:00 to 04:00 and does not see the next run move has been told the change
+ * did not take, when in fact it was stored and the stale column is what the worker reads.
+ */
+export function updateBackupSchedule(
+  id: string,
+  input: BackupScheduleInput,
+): Promise<BackupSchedule> {
+  return request<BackupSchedule>(`/api/v1/backup-schedules/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Remove a schedule.
+ *
+ * Its runs keep their own `kind` and lose only the link: deleting a schedule stops future
+ * backups and does not delete the restore points it produced. The schema is arranged so the
+ * other outcome is not expressible here.
+ */
+export function deleteBackupSchedule(id: string): Promise<void> {
+  return request<void>(`/api/v1/backup-schedules/${id}`, { method: "DELETE" });
+}
+
+/**
+ * Take a backup on a schedule's terms, right now.
+ *
+ * `backup.create`, not `backup.manage`: this produces a backup and changes nothing else. It
+ * does **not** advance the schedule — clicking this at 09:00 to test a 02:00 schedule must
+ * not consume the 02:00 slot, which is the difference between a test and a silent skip.
+ */
+export function runBackupScheduleNow(id: string): Promise<BackupCreateResult> {
+  return request<BackupCreateResult>(`/api/v1/backup-schedules/${id}/run`, { method: "POST" });
+}
+
+/** The settings record. */
+export function fetchBackupSettings(): Promise<BackupSettings> {
+  return request<BackupSettings>("/api/v1/backup-settings");
+}
+
+/**
+ * Save the settings.
+ *
+ * The API probes the destination before it stores anything and refuses an unwritable one, so
+ * a `200` here means the configuration was not only saved but proved writable.
+ */
+export function saveBackupSettings(input: {
+  destination: string;
+  local_root: string;
+  s3_prefix?: string | null;
+  credential_ref?: string | null;
+  encryption: string;
+  default_retention: number;
+  verify_after_backup: boolean;
+}): Promise<BackupSettings> {
+  return request<BackupSettings>("/api/v1/backup-settings", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// System health (REQ-014).
+//
+// The overview is fetched with `cache: "no-store"` and the POST carries the CSRF header
+// `request()` already adds, because both of those are the difference between this screen
+// showing the platform and showing a screenshot of it. A cached overview is a status
+// screen that answers "how were things when this tab was last opened", which is the one
+// question a health screen must never answer.
+// ---------------------------------------------------------------------------------------------
+
+/** Every service's state, the host's metrics and the banner, read live. */
+export function fetchHealthOverview(): Promise<HealthOverview> {
+  return request<HealthOverview>("/api/v1/health/overview", { cache: "no-store" });
+}
+
+/**
+ * Run every probe now and record the samples.
+ *
+ * The answer is a full overview rather than a run id, so the panel replaces what it has
+ * with what the server now believes. A client that merged the new states into the old rows
+ * would keep the last stored `healthy` for a service that has just gone down.
+ */
+export function runHealthChecks(): Promise<HealthOverview> {
+  return request<HealthOverview>("/api/v1/health/checks/run", {
+    method: "POST",
+    cache: "no-store",
+  });
+}
+
+/** One service, with the checks it ran and the metrics it has published. */
+export function fetchHealthService(key: string): Promise<HealthServiceDetail> {
+  return request<HealthServiceDetail>(`/api/v1/health/services/${encodeURIComponent(key)}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * One metric's series, oldest first.
+ *
+ * The window is a **named range** (`1h` / `24h` / `7d`), the same vocabulary
+ * `/health/metrics` uses, and the server refuses anything else with a message naming
+ * what is offered. It used to take `hours` and clamp it, which is the silent-clamp
+ * shape: a caller asking for a month got a week with a `200`, drew the wrong chart,
+ * and had no way to tell from the response. The parameter's *name* is the reason this
+ * was worth changing rather than leaving compatible — `hours=24` and `range=24h` are
+ * the same window with two spellings, and the second one travels into the CSV
+ * filename, so there must be exactly one.
+ */
+export function fetchHealthSamples(
+  service: string,
+  metric: string,
+  range: HealthRangeKey = "24h",
+): Promise<HealthSamplePoint[]> {
+  const query = new URLSearchParams({ service, metric, range });
+  return request<HealthSamplePoint[]>(`/api/v1/health/samples?${query.toString()}`, {
+    cache: "no-store",
+  });
+}
+
+/** The one-line summary the security overview and the operator dashboard embed. */
+export function fetchHealthSummary(): Promise<HealthSummary> {
+  return request<HealthSummary>("/api/v1/health/summary", { cache: "no-store" });
+}
+
+/** The host's raw kernel readings, including the notes for anything unreadable. */
+export function fetchHealthHost(): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>("/api/v1/health/host", { cache: "no-store" });
+}
+
+/** Drop raw samples past the retention window. Destructive, so it is a POST. */
+export function pruneHealthSamples(): Promise<HealthPruneResult> {
+  return request<HealthPruneResult>("/api/v1/health/maintenance/prune", { method: "POST" });
+}
+
+/**
+ * `GET /api/v1/health/metrics` — the aggregated table for a named range.
+ *
+ * The range is a **name** (`1h`, `24h`, `7d`) rather than a number of hours, and the server
+ * refuses anything else. The client cannot quietly ask for a window the panel has no label
+ * for, which is what stops a table headed `7d` from holding a day.
+ */
+export function fetchHealthMetrics(
+  range: HealthRangeKey = "24h",
+): Promise<HealthMetricsReport> {
+  return request<HealthMetricsReport>(
+    `/api/v1/health/metrics?range=${encodeURIComponent(range)}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * `GET /api/v1/health/metrics.csv` — exactly the rows the table is showing.
+ *
+ * The **server** renders the file from the same query the table used, and repeats the window in
+ * `X-Health-Range`. The client never builds CSV from the rows it holds: a client-built export is
+ * a client-chosen file, and "the export matches the range shown" is precisely the property that
+ * a client-built export cannot promise.
+ */
+export async function downloadHealthMetricsCsv(
+  range: HealthRangeKey = "24h",
+): Promise<{ rows: number; blob: Blob; filename: string; range: string }> {
+  const url = `/api/v1/health/metrics.csv?range=${encodeURIComponent(range)}`;
+  let response: Response;
+  try {
+    response = await fetch(url, { credentials: "same-origin", headers: { accept: "text/csv" } });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    let code = "export_failed";
+    let message = `The export answered with status ${response.status}.`;
+    try {
+      const body = JSON.parse(text) as ErrorBody;
+      code = body.error?.code ?? code;
+      message = body.error?.message ?? message;
+    } catch {
+      // A non-JSON error body is still an error; the status stays in the message.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+  const served = response.headers.get("x-health-range") ?? range;
+  const blob = await response.blob();
+
+  // The row count is read from the file itself rather than trusted from a header, because the
+  // header the API sends is the same code path that made the mistake.
+  const text = await blob.text();
+  const rows = Math.max(0, text.split("\n").filter((line) => line.trim() !== "").length - 1);
+
+  return { rows, blob, filename: match?.[1] ?? `omnion-health-${served}.csv`, range: served };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Incidents and threshold policy (REQ-014, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `GET /api/v1/health/incidents` — a page of the timeline.
+ *
+ * The filters go out as query parameters and the server **refuses** a malformed instant rather
+ * than ignoring it: a `from=` that silently widens to "no lower bound" is the kind of filter
+ * that makes an incident screen agree with itself while showing the wrong week.
+ */
+export function fetchHealthIncidents(
+  filter: {
+    service?: string | null;
+    state?: string | null;
+    from?: string | null;
+    to?: string | null;
+    limit?: number;
+    offset?: number;
+  } = {},
+): Promise<HealthIncidentPage> {
+  const query = new URLSearchParams();
+  if (filter.service) query.set("service", filter.service);
+  if (filter.state) query.set("state", filter.state);
+  if (filter.from) query.set("from", filter.from);
+  if (filter.to) query.set("to", filter.to);
+  if (filter.limit !== undefined) query.set("limit", String(filter.limit));
+  if (filter.offset !== undefined) query.set("offset", String(filter.offset));
+  const suffix = query.toString();
+  return request<HealthIncidentPage>(
+    `/api/v1/health/incidents${suffix ? `?${suffix}` : ""}`,
+    { cache: "no-store" },
+  );
+}
+
+/** `GET /api/v1/health/incidents/{id}` — one incident with its own detail. */
+export function fetchHealthIncident(id: string): Promise<HealthIncident> {
+  return request<HealthIncident>(`/api/v1/health/incidents/${encodeURIComponent(id)}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * `PATCH /api/v1/health/incidents/{id}` — acknowledge with a note, or resolve by hand.
+ *
+ * One endpoint for both, because they are one decision: an operator looking at an incident
+ * either claims it or closes it.
+ */
+export function patchHealthIncident(
+  id: string,
+  action: HealthIncidentAction,
+  note?: string,
+): Promise<HealthIncident> {
+  return request<HealthIncident>(`/api/v1/health/incidents/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ action, note: note ?? "" }),
+  });
+}
+
+/** `GET /api/v1/health/settings` — the policy, its bounds and its suggestions. */
+export function fetchHealthSettings(): Promise<HealthSettings> {
+  return request<HealthSettings>("/api/v1/health/settings", { cache: "no-store" });
+}
+
+/**
+ * `PUT /api/v1/health/settings` — save intervals, pairs and toggles.
+ *
+ * `thresholds` is omitted entirely when the caller did not change a pair, so a save of one
+ * interval cannot silently reset every threshold to whatever the form's placeholders say. That
+ * is why the argument is `null`-able rather than an empty array: an empty array is a request to
+ * erase the policy.
+ */
+export function saveHealthSettings(update: {
+  check_interval_seconds?: number;
+  worker_stale_seconds?: number;
+  thresholds?: HealthThreshold[] | null;
+  notifications?: Record<string, boolean>;
+}): Promise<HealthSettings> {
+  const body: Record<string, unknown> = {};
+  if (update.check_interval_seconds !== undefined) {
+    body.check_interval_seconds = update.check_interval_seconds;
+  }
+  if (update.worker_stale_seconds !== undefined) {
+    body.worker_stale_seconds = update.worker_stale_seconds;
+  }
+  if (update.thresholds !== undefined && update.thresholds !== null) {
+    body.thresholds = update.thresholds.map((row) => ({
+      metric: row.metric,
+      warn: row.warn,
+      crit: row.crit,
+      direction: row.direction,
+    }));
+  }
+  if (update.notifications !== undefined) body.notifications = update.notifications;
+  return request<HealthSettings>("/api/v1/health/settings", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `GET /api/v1/health/maintenance-windows` — the windows, newest first. */
+export function fetchHealthMaintenanceWindows(): Promise<HealthMaintenanceWindow[]> {
+  return request<HealthMaintenanceWindow[]>("/api/v1/health/maintenance-windows", {
+    cache: "no-store",
+  });
+}
+
+/**
+ * `POST /api/v1/health/maintenance-windows` — create one.
+ *
+ * An empty `services` array is the deploy case and covers every service; that is a real choice
+ * the form makes explicitly rather than a default the API invents.
+ */
+export function createHealthMaintenanceWindow(input: {
+  starts_at: string;
+  ends_at: string;
+  services?: string[];
+  note?: string;
+}): Promise<HealthMaintenanceWindow> {
+  return request<HealthMaintenanceWindow>("/api/v1/health/maintenance-windows", {
+    method: "POST",
+    body: JSON.stringify({
+      starts_at: input.starts_at,
+      ends_at: input.ends_at,
+      services: input.services ?? [],
+      note: input.note ?? "",
+    }),
+  });
+}
+
+/** `DELETE /api/v1/health/maintenance-windows/{id}` — withdraw a window. */
+export function deleteHealthMaintenanceWindow(id: string): Promise<void> {
+  return request<void>(`/api/v1/health/maintenance-windows/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Developer portal (REQ-022, slice 2)
+// ---------------------------------------------------------------------------------------------
+//
+// These live here rather than in `lib/developer.ts` because this module owns the session cookie,
+// the CSRF header and the `ApiError` shape; a second file calling `fetch` itself would be a
+// second implementation of all three. The portal's *types* and its CSV builder live in
+// `lib/developer.ts` — a shape and a pure function need neither a cookie nor an error type.
+
+/** `GET /api/v1/developer/overview` — the card row and the recent failures. */
+export function fetchDeveloperOverview(): Promise<DeveloperOverview> {
+  return request<DeveloperOverview>("/api/v1/developer/overview", { cache: "no-store" });
+}
+
+/** `GET /api/v1/developer/api-keys` — the list, with its three optional filters. */
+export function fetchDeveloperKeys(
+  filters: {
+    environment?: string | null;
+    status?: string | null;
+    search?: string | null;
+  } = {},
+): Promise<DeveloperKey[]> {
+  const query = new URLSearchParams();
+  if (filters.environment) query.set("environment", filters.environment);
+  if (filters.status) query.set("status", filters.status);
+  if (filters.search) query.set("search", filters.search);
+  const suffix = query.toString();
+  return request<DeveloperKey[]>(
+    `/api/v1/developer/api-keys${suffix ? `?${suffix}` : ""}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * `POST /api/v1/developer/api-keys` — the only call that returns a token.
+ *
+ * The caller must show it once and let it go; nothing here caches the answer, and the panel
+ * keeps it in component state that is dropped when the reveal dialog closes.
+ */
+export function createDeveloperKey(
+  input: CreateDeveloperKeyInput,
+): Promise<IssuedDeveloperKey> {
+  return request<IssuedDeveloperKey>("/api/v1/developer/api-keys", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** `GET /api/v1/developer/api-keys/{id}`. */
+export function fetchDeveloperKey(id: string): Promise<DeveloperKeyDetail> {
+  return request<DeveloperKeyDetail>(
+    `/api/v1/developer/api-keys/${encodeURIComponent(id)}`,
+    { cache: "no-store" },
+  );
+}
+
+/** `POST /api/v1/developer/api-keys/{id}/rotate` — a new secret, the old one dead at once. */
+export function rotateDeveloperKey(id: string): Promise<IssuedDeveloperKey> {
+  return request<IssuedDeveloperKey>(
+    `/api/v1/developer/api-keys/${encodeURIComponent(id)}/rotate`,
+    { method: "POST" },
+  );
+}
+
+/** `DELETE /api/v1/developer/api-keys/{id}` — a soft revoke; the row and its logs stay. */
+export function revokeDeveloperKey(id: string): Promise<{ revoked: boolean; id: string }> {
+  return request<{ revoked: boolean; id: string }>(
+    `/api/v1/developer/api-keys/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** `GET /api/v1/developer/scopes` — grouped in the API, never re-derived in the panel. */
+export function fetchDeveloperScopes(): Promise<DeveloperScopeCatalogue> {
+  return request<DeveloperScopeCatalogue>("/api/v1/developer/scopes", { cache: "no-store" });
+}
+
+/** `GET /api/v1/developer/logs` — one page, filtered. */
+export function fetchDeveloperLogs(
+  filters: DeveloperLogFilters = {},
+  before?: number | null,
+): Promise<DeveloperLogPage> {
+  const query = new URLSearchParams();
+  if (filters.api_key_id) query.set("api_key_id", filters.api_key_id);
+  if (filters.method) query.set("method", filters.method);
+  if (filters.path_prefix) query.set("path_prefix", filters.path_prefix);
+  if (filters.status_class) query.set("status_class", filters.status_class);
+  if (filters.window_days) query.set("window_days", String(filters.window_days));
+  if (before) query.set("before", String(before));
+  const suffix = query.toString();
+  return request<DeveloperLogPage>(`/api/v1/developer/logs${suffix ? `?${suffix}` : ""}`, {
+    cache: "no-store",
+  });
+}
+
+/** `GET /api/v1/developer/logs/{id}` — the detail drawer. */
+export function fetchDeveloperLog(id: number): Promise<DeveloperLogDetail> {
+  return request<DeveloperLogDetail>(`/api/v1/developer/logs/${id}`, { cache: "no-store" });
 }

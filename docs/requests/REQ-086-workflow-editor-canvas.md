@@ -1,6 +1,6 @@
 # REQ-086 — Workflow Editor Canvas
 
-> **Status:** in-progress (slices 1–2 done — `11bd40a`…`73f0297`; slice 3's preview AND autocomplete built — `6eb9b71` evaluator, `8f3b8c8` the preview endpoint, `c636757` the inspector row, `b5f5de9` completions, `8a67adc` the completion endpoint, `962098a`+`aafb02e` the CodeMirror 6 and expression editors) · **Captured:** 2026-09-26 · **Layer:** admin (`apps/admin`) + `crates/workflows`
+> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** admin (`apps/admin`) + `crates/workflows`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -135,28 +135,18 @@ Consumed: `workflows.execution.state_changed`, `workflows.execution.finished` (o
 
 ### Acceptance criteria
 
-- [x] Saving writes graph and compiled steps; a two-node graph runs end to end through the existing engine.
-- [x] A stale-revision save returns a conflict and the editor offers compare-and-reload, never overwriting.
-      *(API half: the 409 carries the current revision and the refused save changed nothing. The
-      editor's compare-and-reload button is slice 2, with the canvas.)*
+- [ ] Saving writes graph and compiled steps; a two-node graph runs end to end through the existing engine.
+- [ ] A stale-revision save returns a conflict and the editor offers compare-and-reload, never overwriting.
 - [ ] Pan, zoom, fit and zoom-to-selection work with mouse, trackpad and keyboard; grid snap off changes nothing stored.
-      *(implemented + positions proved to survive a save/reload; the gestures need the browser pass)*
 - [ ] Auto-layout arranges a 25-node graph without overlaps, and manually moved nodes keep positions after reload.
-      *(manual positions proved across a reload by `scripts/qa/graph-canvas.cjs`; the layout
-      button's own arrangement is browser-proved or not proved at all)*
 - [ ] Copy/paste duplicates a multi-node selection with new keys and internal rewiring, dropping outside edges.
 - [ ] Undo/redo restores 100+ operations including a drag, a connection deletion and a param edit.
 - [ ] A data output to a control input is refused with `connection_type_mismatch`; self-loops and control cycles with `connection_cycle`.
-      *(the self-loop refusal is proved live, and the refusal is *named*; the type-mismatch half
-      belongs to REQ-088, which owes the ports their kinds)*
 - [ ] Branch labels survive save/reload and appear on the canvas and in the run overlay.
 - [ ] The palette searches, groups by category, opens on `/`, and disables nodes with the missing cause named.
-      *(every disabled row carries its reason on the button, asserted in the walkthrough pass)*
 - [ ] The code node highlights javascript and python, shows validator diagnostics, and never runs code in the browser (network trace checked).
-      *(built — `962098a` CodeMirror 6 with line numbers, bracket matching, close-brackets and in-editor search; the language is read from the parameter's placeholder and an unrecognised one falls back to plain text rather than to a wrong grammar. Diagnostics ride CodeMirror's own linter pipeline so the gutter marks are navigable, fed by a **new** `Issue.param` field added in `8a67adc` — scraping the parameter name out of the message sentence would be a convention, not a contract. Every line is line 0, and that is deliberate and honest: the server validates a parameter's *value*, not its contents, so inventing a line number would mark a line nobody got wrong. NOT TICKED: the browser pass has never run, and "never runs code in the browser" is a network-trace claim only a real pass can make.)*
 - [ ] Expression autocomplete lists upstream outputs, variables and the current item; preview returns real pinned values or a positional error.
-      *(both halves are built and proved. Preview: `6eb9b71` (16 unit), `8f3b8c8` (5 integration), `c636757`, `graph-expressions.cjs` 19/19 live. Autocomplete: `b5f5de9` (`omnion_workflows::completion`, 13 unit — the candidate list is the **server's** grammar, so a client cannot offer `{{node.count + 1}}` which previews as a refusal), `8a67adc` (`POST …/graph/expressions/complete`, workflows.read, 6 integration), `962098a`/`aafb02e` (`ExpressionField`, ↑↓/Enter/Tab/Esc, grouped by source), `expression-completion.cjs` **19/19 live**. Upstream is **direct** only: a grandparent is not in the step's namespace today, so offering it suggests an expression that stops resolving the day the middle wire is deleted. The probe's last check feeds **every offered candidate into the preview endpoint and requires none to be refused** — an offered candidate is a promise, and that is what stops the two halves from drifting into a menu of paths that preview as errors. STILL UNTICKED only because the browser pass has never run.)*
-- [x] Sticky notes and comments persist, do not appear as steps and never execute.
+- [ ] Sticky notes and comments persist, do not appear as steps and never execute.
 - [ ] A real completed run colours nodes with status, duration and item counts; failed and skipped look distinct.
 - [ ] `⌘S` and the autosave debounce both persist; a blocked save keeps state and offers retry with no loss.
 - [ ] The canvas is operable end to end from the keyboard and the shortcut sheet matches the implemented bindings.
@@ -178,17 +168,9 @@ visible selection and focus, legible badges, working minimap, overlay colours ma
 1. **Graph model, save, compile** — column, revision check, compiler, validation codes, events.
    Done: a saved graph runs on the existing engine and an unreachable node is rejected.
 2. **Canvas interactions** — pan/zoom, selection, clipboard, undo, auto-layout, minimap, palette, node chrome.
-   Done: the walkthrough passes visually and by keyboard. *Built (`b5356e0`); the browser pass is
-   written (`runGraphCanvasDepth`) and has not yet run — the QA slot was held by a live sibling
-   pass for this whole tick.*
+   Done: the walkthrough passes visually and by keyboard.
 3. **Connections and editors** — type-aware connects with labels, CodeMirror, expression field with preview.
-   *Built: `omnion_workflows::expression` (server-side only, pinned sample data, typed refusals) and
-   `omnion_workflows::completion` (the candidate grammar, also server-owned), `POST …/graph/expressions/preview`
-   and `POST …/graph/expressions/complete`, and in the inspector `ExpressionField` plus a real CodeMirror 6
-   editor for `ui:"code"` parameters. Still owed: the type-aware half of connects (`connection_type_mismatch`
-   belongs to REQ-088, which owes the ports their kinds) and the browser pass for all of it — `runGraphCanvasDepth`
-   has been written for several ticks and has never once run, because the single QA slot was held by a live
-   sibling pass in every one of them.*
+   Done: mismatched connects refuse, both languages highlight, preview returns real values.
 4. **Run overlay and polish** — per-node states, run bar, partial-run entry points, responsive and a11y pass.
    Done: a real run colours the canvas correctly and the accessibility checklist passes.
 

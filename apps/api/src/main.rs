@@ -11,7 +11,9 @@ use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, event_retention_runner, event_runner, search_runner,
+    ai_agent_runner, ai_eval_runner, ai_health_runner, ai_log_runner, ai_telemetry_runner,
+    analytics_runner, automation_runner, backup_schedule_runner, backup_sweep_runner,
+    restore_job_runner, event_retention_runner, event_runner, notification_runner, search_runner,
     workflow_runner,
 };
 use omnion_core::config::Config;
@@ -52,6 +54,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     bootstrap_admin(&config, &db).await?;
     seed_iam(&db).await?;
+    seed_ai_tools(&db).await?;
 
     let redis = RedisClient::new(&config.redis.url)?;
     if let Err(err) = redis.ping().await {
@@ -99,6 +102,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("the webhook delivery runner is disabled (OMNION_EVENTS_RUNNER=false)");
     }
 
+    // The notification delivery runner ticks here for the same reason and under the same flag
+    // (REQ-021, slice 4): `notification_deliveries` is a durable queue with a claim lease, so a
+    // tick that cannot reach the database is logged and the next one picks the work up. It
+    // shares the events cadence rather than growing a second set of knobs, because the two
+    // queues are drained by the same kind of work at the same kind of rate — and a second
+    // `*_POLL_MS` variable would be one more thing an operator has to match between a
+    // web node and a dedicated worker.
+    if state.config().events.runner_enabled {
+        if notification_runner::spawn(state.clone()).is_none() {
+            tracing::warn!("the notification delivery runner is not running");
+        }
+    } else {
+        tracing::info!("the notification delivery runner is disabled (OMNION_EVENTS_RUNNER=false)");
+    }
+
     // The event-retention sweeper ticks in this process too (REQ-016, slice 3), under its own
     // flag: it deletes history rather than sending it, so an installation that drains the
     // queue from a dedicated worker and not at all from the web nodes still wants retention
@@ -143,12 +161,112 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("the retention worker is disabled (OMNION_RETENTION_RUNNER=false)");
     }
 
+    // The health runner publishes this process's heartbeat and runs the scheduled probes
+    // (REQ-014, slice 4). Both halves of it were missing before: `worker_heartbeats` had a
+    // reader and no writer, so the `n/m` worker card could only ever say "no worker has
+    // registered a heartbeat", and `run_and_record` was reached from the four route handlers
+    // and nowhere else, so samples existed only while somebody was looking at the panel.
+    let _health = omnion_api::health_runner::spawn(state.clone());
+
+    // The backup retention sweep removes expired runs from the destination, artifacts first
+    // (REQ-013, slice 3). It is gated by its own flag rather than by `OMNION_RETENTION_RUNNER`
+    // because the two sweep different things: an installation that keeps every backup for
+    // ever must be able to keep its media sweeper. `prune_candidates` shipped in slice 1 and
+    // had no caller at all, so this is the tick that gives it one.
+    // The schedule worker takes the backups a `backup_schedules` row asked for. The table,
+    // the `next_due_schedules` query and the `cadence` sentence in the API all shipped in
+    // slice 1 and slice 2a; nothing wrote `next_run_at` and nothing called that query, so a
+    // schedule could be created, listed and rendered with an empty next-run cell for ever.
+    // This is the tick that gives both a writer and a reader.
+    let _backup_schedules = backup_schedule_runner::spawn(state.clone());
+    // The queued-restore worker. Deliberately ungated: a restore queued by an operator is a
+    // person watching a screen, and a feature that only runs when a flag is set is a restore
+    // that silently never happens on the installation that forgot to set it. It is cheap —
+    // one indexed query per poll, and a tick that finds nothing costs nothing.
+    let _restore_jobs = restore_job_runner::spawn(state.clone());
+
+    if state.config().retention.backup_sweep_enabled {
+        let _backup_sweep = backup_sweep_runner::spawn(state.clone());
+    } else {
+        tracing::info!(
+            "the backup retention sweep is disabled (OMNION_BACKUP_SWEEP=false) — expired runs \
+             and their artifacts stay on the destination"
+        );
+    }
+
     if state.config().analytics.runner_enabled {
         let _rollups = analytics_runner::spawn(state.clone());
     } else {
         tracing::info!("the analytics rollup worker is disabled (OMNION_ANALYTICS_RUNNER=false)");
     }
 
+    // The AI health probe runner samples every enabled provider on its own cadence (REQ-097,
+    // slice 3). It calls the same `probe_now` the "Probe now" button calls, so the background
+    // sample and the manual one are the same measurement rather than two implementations of it.
+    if state.config().ai_hub.runner_enabled {
+        let _probes = ai_health_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the AI health probe runner is disabled (OMNION_AI_HEALTH_RUNNER=false)");
+    }
+
+    // The agent runner (REQ-099, slice 1) claims queued agent runs and executes the loop. It has
+    // its **own** switch, not a reading of the health probe's, because it is the one background
+    // task that spends money: an installation that wants its providers probed but refuses to let
+    // an agent act on its own says `OMNION_AI_RUNNER=false`, and the run-start endpoint then
+    // answers `503 runner_disabled` rather than queueing work nothing will pick up.
+    if state.config().ai_hub.agent_runner_enabled {
+        let _agents = ai_agent_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the agent runner is disabled (OMNION_AI_RUNNER=false)");
+    }
+
+    // The eval runner (REQ-107, slice 3) claims queued eval runs, scores each enabled case and
+    // settles the verdict; a second task sweeps for due schedules and a third fails runs the
+    // timeout caught. It has its own switch (`OMNION_AI_EVAL_RUNNER`) because it is the second
+    // background task that spends money — a rubric case costs a judge call on top of the one
+    // under test — and an installation that wants agent autonomy but no eval budget must be able
+    // to say exactly that. With it off, the run-start route answers `503 runner_disabled`
+    // instead of queueing runs nothing would ever claim.
+    if state.config().ai_hub.eval_runner_enabled {
+        let _evals = ai_eval_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the eval runner is disabled (OMNION_AI_EVAL_RUNNER=false)");
+    }
+
+    // The route decision pruner (REQ-098, slice 3) drops decisions past the 90-day window once
+    // a day. It is behind its own switch (`OMNION_AI_LOG_RUNNER`) because it has nothing to do
+    // with the health probe: one dials providers, the other issues a bulk delete, and an
+    // installation that disables one almost never wants to disable the other.
+    if state.config().ai_hub.log_runner_enabled {
+        let _pruner = ai_log_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the AI decision pruner is disabled (OMNION_AI_LOG_RUNNER=false)");
+    }
+
+    // The per-tool telemetry roll-up (REQ-107, slice 4). It sits after the pruner rather than
+    // beside the eval runner because it is the only one of the four that is neither a spender nor
+    // a deleter: it re-reads the tool-call log and upserts a row per tool per day, which is what
+    // `/ai/telemetry` renders. Without it the roll-up table has no writer and the screen reads
+    // "this tool was never called, forever" — so the runner is not optional polish for the
+    // screen, it is the screen's data source. With it off the screen still answers, from whatever
+    // the runner last wrote, because a reader must not fail closed on a background switch.
+    if state.config().ai_hub.telemetry_runner_enabled {
+        let _telemetry = ai_telemetry_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the tool-telemetry roll-up is disabled (OMNION_AI_TELEMETRY_RUNNER=false)");
+    }
+
+    // The rate-limit document is read here, once, and handed to the layer the router is about to
+    // install (REQ-012, slice 3). Reading it per request would make every request's cost depend on
+    // the database, which is how a settings screen turns into an outage; reading it here and
+    // failing open on the shipped defaults means a platform whose database is briefly unreachable
+    // still limits, instead of answering every caller in the world.
+    let limiter = omnion_api::rate_limit_middleware::RateLimiter::from_store(&state).await;
+    let _ = omnion_api::rate_limit_middleware::install(limiter);
+
+    // The runner spawns each got a clone; this one is kept so the shutdown path can still
+    // reach `state` after `router(state)` has taken the original by value.
+    let state_for_runners = state.clone();
     let app = routes::router(state);
     axum::serve(
         listener,
@@ -156,6 +274,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    // Mark this worker's heartbeat stopped on the way out, so a clean stop is distinguishable
+    // from a crash. Without it the panel says "stale" for a worker that was deliberately
+    // restarted, and those are the two answers an operator needs apart.
+    omnion_api::health_runner::stopped(&state_for_runners).await;
 
     tracing::info!("shutdown complete");
     telemetry.shutdown();
@@ -220,6 +343,39 @@ async fn seed_iam(db: &Db) -> Result<(), Box<dyn std::error::Error + Send + Sync
         tracing::info!(%user_id, "owner role assigned to the earliest active account");
     }
 
+    Ok(())
+}
+
+/// Seed the AI tool registry from the compiled catalogue (REQ-100 slice 1).
+///
+/// **A seeding failure is logged, not fatal.** The registry is a screen an operator configures;
+/// refusing to boot the whole platform because a row could not be written would mean one failed
+/// upsert takes down publishing, media and the public renderer with it. The registry screen
+/// answers `seeded: false` and shows its banner, which is the diagnosis the spec asks for, and the
+/// next boot retries.
+///
+/// The log line carries `decisions_preserved` deliberately: it is the number that makes "seeding
+/// does not overwrite operator edits" visible in production rather than only in a test, because a
+/// pass that refreshed 23 rows and preserved 23 decisions is the expected line, and one that
+/// reports 0 preserved is the one somebody needs to look at.
+async fn seed_ai_tools(db: &Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match omnion_ai_hub::registry::seed(db.pool()).await {
+        Ok(outcome) => {
+            tracing::info!(
+                tools_inserted = outcome.inserted,
+                tools_refreshed = outcome.refreshed,
+                tools_retired = outcome.retired,
+                decisions_preserved = outcome.decisions_preserved,
+                "AI tool registry seeded from the compiled catalogue"
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "the AI tool registry could not be seeded; /ai/tools will show its banner"
+            );
+        }
+    }
     Ok(())
 }
 

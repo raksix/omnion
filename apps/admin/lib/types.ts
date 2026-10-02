@@ -768,12 +768,32 @@ export type MediaFilters = {
   min_bytes?: number;
   max_bytes?: number;
   uploaded_by?: string;
+  /**
+   * Upload window, as `YYYY-MM-DD` — a day, not a timestamp.
+   *
+   * A date input can only offer a day, and "uploaded on 3 October" is the question an operator is
+   * asking. `mediaQuery` turns it into the two instants the store takes: `created_after` is the
+   * start of that day **in the operator's own timezone** (so a file uploaded at 23:00 on the 3rd
+   * is inside the window, and a file uploaded at 01:00 on the 4th is not), and `created_before`
+   * is the start of the *next* day — which is what makes the last day inclusive.
+   */
+  created_after?: string;
+  /** The last day of the window, inclusive; expanded to the start of the following day. */
+  created_before?: string;
   tag?: string;
+  metadata?: string;
   scan_status?: string;
   has_versions?: boolean;
   sort?: string;
   limit?: number;
   offset?: number;
+};
+
+/** One account the uploader filter offers, from `GET /api/v1/media/uploaders`. */
+export type MediaUploader = {
+  id: string;
+  label: string;
+  files: number;
 };
 
 /** One trashed file. */
@@ -872,6 +892,37 @@ export type NotificationRow = {
   read_at: string | null;
   archived_at: string | null;
   created_at: string;
+  /**
+   * One row per channel the notification was tried on, oldest first. Empty means nothing has
+   * been attempted yet — which is a real state, not a failure to load.
+   *
+   * **Only the detail route fills this.** The list is a page of rows the reader has not opened,
+   * so carrying deliveries there would cost one query per row to say "nothing was sent" about
+   * notifications nobody has clicked.
+   */
+  deliveries: NotificationDeliveryRow[];
+};
+
+/**
+ * What became of one channel, as the reader is shown it.
+ *
+ * The drawer exists so that "it is in my panel but the e-mail never arrived" is a row somebody
+ * can read rather than an absence they have to interpret. `attempts`/`max_attempts` are carried
+ * together for that reason: "failed" on its own does not say whether the platform tried once or
+ * gave up.
+ */
+export type NotificationDeliveryRow = {
+  channel: NotificationChannel;
+  status: NotificationDeliveryStatus;
+  attempts: number;
+  max_attempts: number;
+  /** The transport's own status code, when it answered with one. */
+  response_status: number | null;
+  /** Why it did not go out, in the platform's words. */
+  error: string | null;
+  sent_at: string | null;
+  /** When the next attempt is due; `null` once the row is no longer retryable. */
+  next_attempt_at: string | null;
 };
 
 /** One grouped line of the bell. */
@@ -931,287 +982,21 @@ export const NOTIFICATION_CHANNELS = [
   "webhook",
   "chat",
 ] as const;
-// ------------------------------------------------------------------------------------------
-// Node library and credential catalogue (REQ-087 slice 1)
-// ------------------------------------------------------------------------------------------
-/** The filters the node library takes. */
-export type NodeTypeFilters = {
-  search?: string;
-  category?: string;
-  capability?: string;
-  include_deprecated?: boolean;
-  credential?: boolean;
-};
-/** One port of a node, as the palette draws it. */
-export type NodePort = {
-  name: string;
-  kind: "main" | "error" | "ai_tool";
-  /** Data kinds the port accepts; empty means "anything". */
-  accepts: string[];
-  open: boolean;
-};
-/** How the inspector renders one parameter. */
-export type ParamUi = "text" | "textarea" | "code" | "select" | "number" | "boolean";
-/** One parameter of a node's inspector form. */
-export type NodeParam = {
-  name: string;
-  kind: string;
-  label: string;
-  required: boolean;
-  ui: ParamUi;
-  options: string[];
-  /** Where a select's options come from when they are not an enum. */
-  options_source: string | null;
-  placeholder: string | null;
-  help: string | null;
-  default: unknown;
-  /** Whether this field holds a credential *key* rather than a value. */
-  secret_field: boolean;
-};
-/** What a library row shows as its state. */
-export type NodeLibraryState = "available" | "deprecated" | "node_package_missing";
-/** One node in the library. */
-export type NodeType = {
-  key: string;
-  version: string;
-  label: string;
-  description: string;
-  category: string;
-  icon: string;
-  docs_url: string;
-  inputs: NodePort[];
-  outputs: NodePort[];
-  params: NodeParam[];
-  credential_types: string[];
-  capabilities: string[];
-  sandbox: "none" | "required";
-  default_max_attempts: number;
-  deprecated: boolean;
-  superseded_by: string | null;
-  state: NodeLibraryState;
-  /** Why the node is in that state, in words the row can show next to the chip. */
-  state_reason: string | null;
-};
-/** The node filters, as the server applied them. */
-export type AppliedNodeFilters = {
-  search: string | null;
-  category: string | null;
-  capability: string | null;
-  include_deprecated: boolean;
-  credential: boolean | null;
-  /** How many nodes ship with the release. */
-  bundled_count: number;
-};
-/** The library list payload. */
-export type NodeTypePage = {
-  nodes: NodeType[];
-  matched: number;
-  total: number;
-  filters: AppliedNodeFilters;
-};
-/** One field of a credential type's form. */
-export type CredentialTypeField = {
-  name: string;
-  label: string;
-  kind: "string" | "secret" | "url" | "number" | "boolean" | "select";
-  required: boolean;
-  options: string[];
-  help: string | null;
-  never_log: boolean;
-  /** `true` when the API will never return a value for this field. */
-  write_only: boolean;
-};
-/** One credential type in the catalogue. */
-export type CredentialType = {
-  key: string;
-  kind: string;
-  label: string;
-  description: string;
-  icon: string;
-  docs_url: string;
-  fields: CredentialTypeField[];
-  /** The nodes that accept this type, so the picker can say what it is for. */
-  used_by: string[];
-  oauth: boolean;
-  oauth_pkce: boolean | null;
-  oauth_scopes: string | null;
-  test_timeout_seconds: number;
-};
-/** The credential catalogue payload. */
-export type CredentialTypePage = {
-  types: CredentialType[];
-  total: number;
-};
-/** One group of the palette's category tree. */
-export type NodeCategory = {
-  key: string;
-  label: string;
-  count: number;
-  node_keys: string[];
-};
-/** The registry's own lint, as the running server sees it. */
-export type RegistryLint = {
-  ok: boolean;
-  findings: { code: string; subject: string; message: string }[];
-  node_count: number;
-  credential_type_count: number;
-};
-/** The three port kinds and what each means. */
-export type PortKindCatalogue = {
-  kinds: string[];
-  descriptions: Record<string, string>;
-};
-/* ------------------------------------------------------------------ *
- * Credential instances (REQ-087, slice 2)
- * ------------------------------------------------------------------ */
+
 /**
- * One credential, as the API reads it.
+ * One of the five channels, as a type.
  *
- * There is no field here for a secret value and there never will be: the API answers with
- * `has_secret` and a list of which fields to mask. A type that grew a `secret` field would
- * mean the API grew one too, and that is the review you want.
+ * Derived from the const rather than written out, so a channel added to the list is a channel
+ * the delivery rows can be typed with. A hand-written union is one more list to keep in step,
+ * and a channel in the database that the union does not name is a `type` error rather than a
+ * runtime surprise — which is the direction that catches it.
  */
-export type Credential = {
-  id: string;
-  key: string;
-  name: string;
-  type: string;
-  type_label: string;
-  scope: string;
-  sharing: string;
-  has_secret: boolean;
-  settings: Record<string, unknown>;
-  secret_fields: string[];
-  health: string;
-  effective_health: string;
-  expired: boolean;
-  health_checked_at: string | null;
-  health_detail: string | null;
-  oauth_subject: string | null;
-  oauth_expires_at: string | null;
-  oauth_scopes: string | null;
-  last_used_at: string | null;
-  owner_user_id: string | null;
-  created_at: string;
-  updated_at: string;
-  /**
-   * Set only on a create whose secret could not be written, and never on a read.
-   *
-   * The credential exists; the secret did not attach. The panel says so on the row it is
-   * about, because a reader who pasted a key and was redirected to a detail screen with no
-   * mention of it will assume the key is there.
-   */
-  secret_write_warning?: string | null;
-};
-/** The credential list filters. */
-export type CredentialFilters = {
-  search?: string;
-  type?: string;
-  scope?: string;
-  health?: string;
-  sharing?: string;
-};
-/** The credential list payload. */
-export type CredentialPage = {
-  credentials: Credential[];
-  total: number;
-  needs_attention: number;
-  filters: {
-    search: string | null;
-    type: string | null;
-    scope: string | null;
-    health: string | null;
-    sharing: string | null;
-  };
-};
-/** One reference from a workflow graph to a credential. */
-export type CredentialUsageRef = {
-  workflow_id: string;
-  workflow_name: string;
-  node_id: string;
-  node_label: string | null;
-  node_type: string | null;
-};
-/** The usage view of one credential. */
-export type CredentialUsage = {
-  references: CredentialUsageRef[];
-  workflow_count: number;
-  node_type_count: number;
-  in_use: boolean;
-  key: string;
-};
-/** What a delete did, and what it broke. */
-export type CredentialDeleteResult = {
-  deleted: boolean;
-  references: CredentialUsageRef[];
-  workflow_count: number;
-};
-/** The result of a test hook run. */
-export type CredentialTestResult = {
-  ok: boolean;
-  duration_ms: number;
-  detail: string;
-  health: string;
-  credential: Credential;
-};
-/** One installed node package. */
-export type NodePackage = {
-  key: string;
-  version: string;
-  source: string;
-  checksum: string;
-  permissions: string[];
-  /** The *namespaced* node keys the package installed (`package.node`, 0055). */
-  node_keys: string[];
-  enabled: boolean;
-  installed_at: string;
-};
-/** The package ledger payload. */
-export type NodePackagePage = {
-  packages: NodePackage[];
-  total: number;
-};
-/** One validator finding, as an install refusal reports it. */
-export type PackageFinding = {
-  code: string;
-  subject: string;
-  message: string;
-};
-/** The answer to an install: the row, the checksum the server computed, and what moved. */
-export type NodePackageInstall = NodePackage & {
-  checksum: string;
-  node_keys: string[];
-  /** Nodes the previous install had and this one no longer ships. */
-  replaced_node_keys: string[];
-  enabled: boolean;
-};
-/** The answer to an enable/disable. */
-export type NodePackageToggle = {
-  package: NodePackage;
-  node_keys: string[];
-  message: string;
-};
-/** The answer to a removal: what it broke, named. */
-export type NodePackageRemoval = {
-  key: string;
-  removed: boolean;
-  node_keys: string[];
-  affected_workflows: { workflow_id: string; workflow_name: string; node_keys: string[] }[];
-  message: string;
-};
-/** The body of a create. Secrets ride in `secrets[]`, never in `settings`. */
-export type NewCredential = {
-  key?: string;
-  name: string;
-  type: string;
-  scope?: string;
-  sharing?: string;
-  settings?: Record<string, unknown>;
-  secrets?: { field: string; value: string }[];
-};
+export type NotificationChannel = (typeof NOTIFICATION_CHANNELS)[number];
+
 // ---------------------------------------------------------------------------------------------
 // Slice 2: the reader's own channel configuration
 // ---------------------------------------------------------------------------------------------
+
 /**
  * One cell of the matrix: "does category *C* reach me over *channel*?".
  *
@@ -1223,6 +1008,7 @@ export type NotificationPreferenceCell = {
   channel: string;
   enabled: boolean;
 };
+
 /** Quiet hours, the timezone and the digest cadence. */
 export type NotificationSettingsRow = {
   /** `HH:MM` in the reader's own timezone, or `null` for no window. */
@@ -1237,6 +1023,7 @@ export type NotificationSettingsRow = {
   /** Which hour a digest goes out in. */
   digest_hour: number;
 };
+
 /**
  * The whole preferences answer.
  *
@@ -1249,6 +1036,7 @@ export type NotificationPreferences = {
   settings: NotificationSettingsRow;
   locked_channel: string;
 };
+
 /** What a save changed, and the authoritative state to render from. */
 export type NotificationPreferencesSaved = {
   /** How many cells actually changed value — zero is a legitimate answer. */
@@ -1257,7 +1045,9 @@ export type NotificationPreferencesSaved = {
   settings: NotificationSettingsRow;
   locked_channel: string;
 };
+
 export const DIGEST_CADENCES = ["off", "daily", "weekly"] as const;
+
 /** 0 = Monday, which is the numbering the server's `extract(dow) - 1` uses. */
 export const DIGEST_WEEKDAYS = [
   "Monday",
@@ -1268,6 +1058,7 @@ export const DIGEST_WEEKDAYS = [
   "Saturday",
   "Sunday",
 ] as const;
+
 /**
  * The zones the form offers.
  *
@@ -1291,9 +1082,11 @@ export const NOTIFICATION_TIMEZONES = [
   "Asia/Tokyo",
   "Australia/Sydney",
 ] as const;
+
 // ---------------------------------------------------------------------------------------------
 // Slice 3: the half that leaves the panel
 // ---------------------------------------------------------------------------------------------
+
 /** The four states a delivery can be in. A closed list, so the filter chips are exhaustive. */
 export const NOTIFICATION_DELIVERY_STATUSES = [
   "pending",
@@ -1301,7 +1094,9 @@ export const NOTIFICATION_DELIVERY_STATUSES = [
   "failed",
   "skipped",
 ] as const;
+
 export type NotificationDeliveryStatus = (typeof NOTIFICATION_DELIVERY_STATUSES)[number];
+
 /**
  * One row of the organization's delivery log.
  *
@@ -1326,6 +1121,7 @@ export type NotificationOutboxRow = {
   sent_at: string | null;
   created_at: string;
 };
+
 /** The counts behind the filter chips, plus the total so a chip need not add them up itself. */
 export type NotificationOutboxCounts = {
   pending: number;
@@ -1334,12 +1130,14 @@ export type NotificationOutboxCounts = {
   skipped: number;
   total: number;
 };
+
 /** The outbox answer: a page, the counts, and how far back the log reaches. */
 export type NotificationOutbox = {
   rows: NotificationOutboxRow[];
   counts: NotificationOutboxCounts;
   retention_days: number;
 };
+
 /**
  * One registered browser, as the devices list shows it.
  *
@@ -1354,8 +1152,10 @@ export type NotificationDevice = {
   created_at: string;
   last_seen_at: string;
 };
+
 /** What registering a browser did — the four outcomes, not a boolean. */
 export type NotificationPushOutcome = "created" | "refreshed" | "reassigned" | "re-keyed";
+
 /** What a channel can do on this installation, and why. */
 export type NotificationChannelReadiness = {
   channel: string;
@@ -1363,6 +1163,21 @@ export type NotificationChannelReadiness = {
   locked: boolean;
   detail: string;
 };
+
+/**
+ * The installation's push key, and whether a browser can subscribe with it.
+ *
+ * `public_key` is `null` rather than `""` on purpose: it goes straight into
+ * `applicationServerKey`, and an empty string there makes `pushManager.subscribe`
+ * reject the call. `available` is false in the half-configured case too — a key with
+ * no contact address can be used to subscribe but never to send.
+ */
+export type NotificationPushKey = {
+  public_key: string | null;
+  available: boolean;
+  reason: string;
+};
+
 /** The four shapes a routing rule can address. Kept as data for the form's select. */
 export const NOTIFICATION_RECIPIENT_SHAPES = [
   { value: "actor", label: "The actor who caused it", needsTarget: false },
@@ -1370,6 +1185,7 @@ export const NOTIFICATION_RECIPIENT_SHAPES = [
   { value: "role:", label: "Everybody with a role", needsTarget: true },
   { value: "payload_user:", label: "The user named in the payload", needsTarget: true },
 ] as const;
+
 /** One rule of the router: an event name, a category, and who hears about it. */
 export type NotificationRouteRule = {
   id: string;
@@ -1383,6 +1199,7 @@ export type NotificationRouteRule = {
   created_by: string | null;
   created_at: string;
 };
+
 /** What one routing pass did — the counts are the whole point of the answer. */
 export type NotificationRouteReport = {
   created: number;
@@ -1928,6 +1745,175 @@ export type LockedAccountsPage = {
   total: number;
 };
 
+// -- REQ-012 slice 4: the IP access lists -------------------------------------------------
+
+/** One row of `/security/ip-access`, as the server sends it. */
+export type IpRule = {
+  id: string;
+  kind: "allow" | "deny";
+  cidr: string;
+  note: string;
+  created_by: string | null;
+  created_at: string;
+  expires_at: string | null;
+  /** Whether the rule is past its expiry right now. Expired rules stay visible rather than
+   *  disappearing: a rule that vanishes is a rule nobody knows they have. */
+  expired: boolean;
+};
+
+/** Both lists and the two counts the summary line shows. */
+export type IpRulesPage = {
+  rules: IpRule[];
+  deny_count: number;
+  allow_count: number;
+};
+
+/** The create form's payload. `expires_at` is RFC 3339 or null. */
+export type CreateIpRuleInput = {
+  kind: "allow" | "deny";
+  cidr: string;
+  note: string;
+  expires_at: string | null;
+};
+
+/** The created rule, plus the self-lockout warning when it applies. */
+export type CreateIpRuleResult = {
+  rule: IpRule;
+  /** Whether the rule covers the caller's own address. */
+  blocks_you: boolean;
+  /** The same sentence, ready to render. Null when `blocks_you` is false. */
+  warning: string | null;
+};
+
+/** The tester's verdict for one address. */
+export type IpTestResult = {
+  blocked: boolean;
+  decision: "allow" | "deny" | null;
+  matched_rule: IpRule | null;
+  /** A rule that would have matched but has expired — the explanation for a deny that stopped
+   *  applying. Never decisive, and the screen says so where it renders it. */
+  expired_rule: IpRule | null;
+  reason: string;
+  normalised: string;
+};
+
+// -- REQ-012 slice 4: the security-event timeline -----------------------------------------
+
+/** One row of `/security/events`, as the server sends it. */
+export type SecurityEvent = {
+  /** `"<source>:<id>"` — unique across both source tables. */
+  id: string;
+  /**
+   * Which table the row came from. Rendered rather than hidden: a merged list whose rows do not
+   * say where they came from is a list nobody can reason about during an incident.
+   */
+  source: "audit" | "sign_in";
+  occurred_at: string;
+  /** The stable action name, or the sign-in outcome word. */
+  action: string;
+  /** The screen's category. Served by the API rather than hard-coded in the panel. */
+  category: string;
+  /**
+   * Who acted — **null on a sign-in attempt**, and null there is a fact: nobody was
+   * authenticated. Rendering it as a blank cell would read as a rendering fault.
+   */
+  actor: string | null;
+  /** The account an action was *about*. Not the actor: a lockout names its subject. */
+  subject_user_id: string | null;
+  client_ip: string | null;
+  user_agent: string | null;
+  /** One line an operator reads instead of parsing the action name. */
+  outcome: string;
+  /**
+   * A key-level digest of the audit metadata — `csp_mode=set, directive_count=2` — never the
+   * metadata itself, because a security event is the row most likely to be forwarded out of the
+   * platform.
+   */
+  detail: string | null;
+  /** Whether this row is a refusal worth looking at. */
+  refused: boolean;
+};
+
+/** One page of the timeline, plus the counters the header shows. */
+export type SecurityEventsPage = {
+  events: SecurityEvent[];
+  /** How many rows the filter matched in total — the screen says "50 of 312" with this. */
+  total: number;
+  audit_count: number;
+  sign_in_count: number;
+  /** Whether the returned page is shorter than the total. */
+  truncated: boolean;
+  /** The categories the filter offers, served from the server's own registry. */
+  categories: string[];
+};
+
+/**
+ * One row of the secret inventory.
+ *
+ * There is deliberately no `value`, `secret`, `ciphertext`, `hash` or `preview` field, and the
+ * API is walked to keep it that way. The screen shows a *name* and what the platform can say
+ * about it; an operator who needs the value is rotating it in the environment, not reading it
+ * here. A type that could hold one would make "the panel shows no secrets" a rendering promise
+ * rather than a structural fact.
+ */
+export type SecretReference = {
+  /** `source:name` — unique across sources, because two sources may name the same thing. */
+  key: string;
+  /** The reference: an environment variable name or a secret-store key. */
+  name: string;
+  /** Which of the sources it came from. */
+  source: string;
+  /** What the reference is scoped to — a provider slug, an endpoint, or the platform. */
+  scope: string;
+  /**
+   * The best rotation timestamp the platform can observe, which is the reference row's own
+   * timestamp. `evidence` says whether it was edited or merely created, because a date an
+   * operator reads as "rotated on" when it only means "registered on" is worse than no date.
+   */
+  rotated_at: string | null;
+  evidence: "reference_changed" | "reference_created" | "unknown";
+  /** Days since `rotated_at`, when there is one. */
+  age_days: number | null;
+  /**
+   * How many rows hold real material behind this reference. A **count**, never the material —
+   * this number is what replaced the value.
+   */
+  material_count: number;
+  expired: boolean;
+  /**
+   * What the platform can honestly say. There is no `healthy`: the platform can see that a
+   * reference exists and can read nothing about the value behind it.
+   */
+  state: "unverifiable" | "missing" | "expired";
+  /** The reason behind the state, shown in the row. */
+  note: string;
+};
+
+/** The inventory as the screen receives it. */
+export type SecretInventory = {
+  secrets: SecretReference[];
+  total: number;
+  missing: number;
+  unverifiable: number;
+  /** The source vocabulary, served rather than hard-coded so a dead filter cannot appear. */
+  sources: string[];
+  /** Every state the vocabulary can produce — the screen's legend, served from the server. */
+  states: string[];
+  /** What this screen cannot see. Rendered as a permanent note. */
+  limitation: string;
+};
+
+/** The security-event filter, as the screen holds it. Every field is sent only when set. */
+export type SecurityEventsFilter = {
+  /** Free text over the action, the outcome or the account an attempt was made against. */
+  q?: string;
+  category?: string;
+  source?: "audit" | "sign_in";
+  since?: string;
+  until?: string;
+  limit?: number;
+};
+
 /** The directives this build recognises, in render order — the form's own dropdown. */
 export const CSP_DIRECTIVE_NAMES = [
   "default-src",
@@ -1971,139 +1957,672 @@ export const REFERRER_POLICIES = [
  */
 export const MIN_HSTS_MAX_AGE = 15_768_000;
 
-/* ------------------------------------------------------------------ *
- * The visual graph (REQ-086)
- *
- * These mirror `crates/workflows/src/graph.rs` field for field, and the server's structs are
- * `deny_unknown_fields`. That is not pedantry: a canvas that sends a `notes` field a node does
- * not have gets a `400` on every save, and the failure reads as "the graph is broken" rather
- * than as "the client and the server disagree about the shape". A field that is not in the
- * Rust struct does not belong here either.
- * ------------------------------------------------------------------ */
+/* ---------------------------------------------------------------------------------------------
+ * Backups (REQ-013)
+ * ------------------------------------------------------------------------------------------- */
 
-/** Where a node sits on the canvas. Canvas units; the editor scales them by the zoom. */
-export type GraphPosition = { x: number; y: number };
-/** One node on the canvas. `key` is the stable editor string every connection names. */
-export type GraphNode = {
-  key: string;
-  type: string;
-  label: string;
-  position: GraphPosition;
-  params: Record<string, unknown>;
-  /** A switched-off node compiles to nothing at all — the engine has no "skip" state. */
-  disabled: boolean;
-};
-/** One wire. `label` is the branch name the run overlay shows. */
-export type GraphConnection = {
-  from: string;
-  from_port: string;
-  to: string;
-  to_port: string;
-  label?: string;
-};
-/** A sticky note: a comment on the canvas that never compiles and never executes. */
-export type GraphNote = {
+/** One part of a run, as the detail screen's table reads it. */
+export interface BackupPart {
+  /** Which part: database, media, configuration, themes or plugins. */
+  part: string;
+  /** queued, running, done or failed. */
+  status: string;
+  /** Things accounted for — rows for `database`, objects for `media`. */
+  item_count: number;
+  /** Bytes the artifact occupies. */
+  size_bytes: number;
+  /** Hex SHA-256 of the artifact. */
+  checksum: string | null;
+  /** The artifact's key inside the run's prefix. */
+  storage_path: string | null;
+  /** Why it failed. */
+  error: string | null;
+  /** Whether the restore wizard may offer this part. */
+  restorable: boolean;
+}
+
+/** One run, as the list and the detail screen read it. */
+export interface BackupRun {
+  /** Run id. */
   id: string;
-  position: GraphPosition;
-  color: string;
-  width: number;
-  height: number;
-  text: string;
-};
-/** The document the canvas authors and the server stores. */
-export type GraphDocument = {
-  nodes: GraphNode[];
-  connections: GraphConnection[];
-  notes: GraphNote[];
-};
-/**
- * One problem with a graph.
- *
- * `node_key` and `connection_index` are both optional on the wire, and the difference is
- * meaningful: a node problem can be badged and jumped to, a connection problem can only be
- * listed, because an edge has no element to select.
- */
-export type GraphIssue = {
-  code: string;
-  node_key?: string;
-  /**
-   * The parameter the problem is on, when it is about one.
-   *
-   * Optional on the wire and used by the code editor's gutter to mark a line. Deliberately a
-   * field rather than a convention in `message`: the message is prose, and `"url" must be a
-   * URL` naming the parameter in quotes is a sentence convention, not something a client can
-   * depend on.
-   */
-  param?: string;
-  connection_index?: number;
-  message: string;
-};
-/** `GET /workflows/{id}/graph` — the document plus the revision it was read at. */
-export type GraphRead = {
-  workflow_id: string;
-  graph: GraphDocument;
-  revision: number;
-  node_count: number;
-  connection_count: number;
-  note_count: number;
-  updated_at: string | null;
-  updated_by: string | null;
-};
-/** `PUT /workflows/{id}/graph` — what a successful save reports back. */
-export type GraphSaved = { revision: number; step_count: number; node_order: string[] };
-/** `POST /workflows/{id}/graph/validate` — every problem, in a stable order. */
-export type GraphValidated = {
-  valid: boolean;
-  issues: GraphIssue[];
-  issue_count: number;
-  step_count?: number;
-};
-/**
- * One field's evaluated value. `typed` distinguishes a lone expression — whose `value` keeps
- * its own JSON shape, so a count stays a number — from a field that mixes text, whose `value`
- * is the string it will actually be.
- */
-export type ExpressionPreview = {
-  field: string;
-  value: unknown;
-  expression: string;
-  rendered: string;
-  typed: boolean;
-};
-/** `POST /workflows/{id}/graph/expressions/preview` — the server's answer for one node. */
-export type ExpressionPreviewed = {
-  workflow_id: string;
-  previews: ExpressionPreview[];
-  preview_count: number;
-  /** The namespaces that were available, for autocomplete. */
-  namespaces: string[];
-};
-
-/**
- * Where a completion candidate came from.
- *
- * The value is the contract, not a label: the menu groups on it, so a typo here would not
- * fail a build and would quietly merge the three groups the REQ asks to be distinguishable.
- */
-export type CompletionSource = "upstream" | "runtime" | "sample";
-
-/** One candidate the expression editor can insert. */
-export type CompletionCandidate = {
-  /** The text to insert, e.g. `node_fetch_1.body`. */
+  /** Tenant it belongs to. */
+  organization_id: string | null;
+  /** Operator's label; may be empty. */
   label: string;
-  source: CompletionSource;
-  /** The second line of the menu entry. */
-  detail: string;
+  /** manual or scheduled. */
+  kind: string;
+  /** The schedule that started it. */
+  schedule_id: string | null;
+  /** The parts it was asked for. */
+  scopes: string[];
+  /** queued, running, succeeded, partial or failed. */
+  status: string;
+  /** Sum of its parts' sizes. */
+  size_bytes: number;
+  /** local or s3. */
+  destination: string;
+  /** Prefix its artifacts live under. */
+  storage_prefix: string;
+  /** SHA-256 over its manifest. */
+  checksum: string | null;
+  /** Whether the prune sweep leaves it alone. */
+  protected: boolean;
+  /** When the prune sweep may remove it. */
+  retain_until: string | null;
+  /** Why it failed. */
+  error: string | null;
+  /** Who started it. */
+  created_by: string | null;
+  /** When it was asked for. */
+  created_at: string;
+  /** When it began producing. */
+  started_at: string | null;
+  /** When it stopped producing. */
+  finished_at: string | null;
+  /** The label, or the created instant when there is no label. */
+  title: string;
+}
+
+/** How many runs are in each state — the filter chips and the status cards read the same object. */
+export interface BackupStatusCounts {
+  /** Waiting to start. */
+  queued: number;
+  /** In flight. */
+  running: number;
+  /** Every part produced its artifact. */
+  succeeded: number;
+  /** Some parts produced theirs, some did not. */
+  partial: number;
+  /** No part produced its artifact. */
+  failed: number;
+}
+
+/** A destination's state, with the probe's verdict. */
+export interface BackupDestination {
+  /** local or s3. */
+  kind: string;
+  /** The absolute root, for a local destination. */
+  local_root: string;
+  /** The bucket prefix, for an s3 destination. */
+  s3_prefix: string | null;
+  /** A secret-store reference — never a value. */
+  credential_ref: string | null;
+  /** Whether the last probe passed. */
+  writable: boolean;
+  /** The operating system's reason when it did not. */
+  reason: string;
+  /** The line the screen shows under the probe result. */
+  message: string;
+  /** none or passphrase. */
+  encryption: string;
+  /** Room left on the destination — a different fact from `writable`. */
+  headroom: BackupHeadroom;
+}
+
+/**
+ * Whether the next backup fits on the destination.
+ *
+ * `healthy` | `tight` | `full` | `unknown`. `unknown` is a real state, not an absence: a
+ * destination nobody has measured yet has a free-space number but no yardstick to judge it
+ * against, and printing `0 B` there would be a number the operator enlarges a disk over.
+ */
+export type BackupHeadroomLevel = "healthy" | "tight" | "full" | "unknown";
+
+/** A destination's room, and the two numbers its verdict was judged from. */
+export interface BackupHeadroom {
+  /** The verdict. */
+  level: BackupHeadroomLevel;
+  /** Free bytes on the destination's filesystem, or null when the kernel would not say. */
+  free_bytes: number | null;
+  /** The largest backup this tenant holds there — the yardstick. */
+  largest_backup_bytes: number | null;
+  /** The sentence the card shows under the numbers. */
+  message: string;
+}
+
+/** The four cards at the top of the overview. */
+export interface BackupStatus {
+  /** When the last run that produced artifacts finished. */
+  last_successful_at: string | null;
+  /** That run's id, so the card links to a specific row. */
+  last_successful_id: string | null;
+  /** How long ago that was, in seconds. */
+  last_successful_age_seconds: number | null;
+  /** Total bytes this tenant's backups occupy. */
+  total_size_bytes: number;
+  /** The counts behind the filter chips. */
+  counts: BackupStatusCounts;
+  /** How many backups the prune sweep will never remove. */
+  protected: number;
+  /** The nearest schedule that is due. */
+  next_scheduled_at: string | null;
+  /** The destination's health. */
+  destination: BackupDestination;
+}
+
+/** A page of runs. */
+export interface BackupList {
+  /** The page's rows. */
+  items: BackupRun[];
+  /** How many rows the filters match in total. */
+  total: number;
+  /** The counts behind the chips. */
+  counts: BackupStatusCounts;
+}
+
+/** A run's detail: the row, its parts and its manifest. */
+export interface BackupDetail {
+  /** The run. */
+  backup: BackupRun;
+  /** Its parts, in execution order. */
+  parts: BackupPart[];
+  /** Its manifest, as stored. */
+  manifest: unknown;
+}
+
+/** What a verification pass found. */
+export interface BackupVerification {
+  /** The run that was verified. */
+  backup_id: string;
+  /** Whether every part matched. */
+  clean: boolean;
+  /** Parts whose recorded checksum and size both match. */
+  matched: string[];
+  /** Parts whose recorded checksum does not match. */
+  mismatched: string[];
+  /** Parts that could not be read back at all. */
+  unreadable: string[];
+  /** Artifacts the run never asked for. */
+  unexpected: string[];
+  /** One sentence naming what is wrong rather than only that something is. */
+  summary: string;
+}
+
+/** One destination entry a delete could not remove. */
+export interface BackupPurgeFailure {
+  /** The path as the operating system named it. */
+  path: string;
+  /** The operating system's own words — `permission denied (os error 13)`. */
+  reason: string;
+}
+
+/**
+ * What removing a run actually did on the destination.
+ *
+ * The row being gone and the bytes being gone are two separate facts, and the screen says so
+ * rather than collapsing them: a `204` would render "removed" over a directory that is still
+ * full of the platform's media library.
+ */
+export interface BackupPurge {
+  /** The directory that was targeted, in full. */
+  root: string;
+  /** Whether the run's directory existed at all before the delete. */
+  existed: boolean;
+  /** How many filesystem entries were removed, at any depth. */
+  removed_entries: number;
+  /** How many could not be removed and are still on the destination. */
+  failed_entries: number;
+  /** The first few failures, with the operating system's own words. */
+  failures: BackupPurgeFailure[];
+}
+
+/**
+ * One artifact the retention sweep could not remove.
+ *
+ * Its own type rather than a formatted string because the screen shows the path and the
+ * operating system's reason in two different places, and a string that gets split back into
+ * two is a string that will be split wrong.
+ */
+export interface BackupStrandedArtifact {
+  /** The run whose bytes are still on the destination. */
+  backup_id: string;
+  /** Where the run's directory is. */
+  path: string;
+  /** The operating system's own words. */
+  reason: string;
+}
+
+/** How loudly a restore warning is. `danger` is drawn as a refusal, not a decoration. */
+export type RestoreWarningSeverity = "notice" | "caution" | "danger";
+
+/** The machine-readable warning kinds, so the UI can react to one and the audit can query it. */
+export type RestoreWarningCode =
+  | "stale_archive"
+  | "not_the_newest"
+  | "data_loss"
+  | "part_unavailable"
+  | "run_incomplete"
+  | "manifest_version"
+  | "passphrase_required";
+
+/** One thing an operator must know before restoring. */
+export interface RestoreWarning {
+  severity: RestoreWarningSeverity;
+  code: RestoreWarningCode;
+  message: string;
+}
+
+/** What one archived part does to live data when it is restored. */
+export type RestoreMode = "replace" | "merge" | "advisory";
+
+/** One part of an archive, as the wizard renders it. */
+export interface RestorablePart {
+  part: string;
+  /** Whether the artifact was re-read and agrees with the manifest. */
+  available: boolean;
+  /** Why it is not available, in the store's words, when it is not. */
+  reason: string | null;
+  item_count: number;
+  size_bytes: number;
+  checksum: string | null;
+  /** Live rows or objects this part would overwrite. */
+  live_matches: number;
+  /** Live rows or objects this part would drop, because they are not in the archive. */
+  live_dropped: number;
+  mode: RestoreMode;
+}
+
+/**
+ * What a restore of one run would do.
+ *
+ * `total_live_dropped` is the number the whole screen exists to show: how much the operator
+ * loses by choosing this restore point. It is not derivable from the manifest, which is why
+ * the preview re-reads the destination and counts the live side rather than rendering the
+ * archive's own numbers.
+ */
+export interface RestorePreview {
+  backup_id: string;
+  label: string;
+  finished_at: string | null;
+  age_days: number;
+  parts: RestorablePart[];
+  warnings: RestoreWarning[];
+  restorable_bytes: number;
+  total_live_dropped: number;
+  total_live_matches: number;
+  /** The phrase the operator must type; empty when nothing is restorable. */
+  confirm_phrase: string;
+  restorable: boolean;
+}
+
+/** One object a media restore could not write back. */
+export interface RestoreFailure {
+  storage_key: string;
+  /** The key inside the archive, for a hand-check on the destination. */
+  archive_key: string;
+  /** What went wrong, in the store's own words. */
+  reason: string;
+}
+
+/**
+ * What the media half of a restore did.
+ *
+ * `objects_failed` is a separate field from `objects_restored` and not a derived state: a
+ * restore that wrote three of four objects is neither a success nor a failure, and the screen
+ * has to say which four.
+ */
+export interface MediaRestoreReport {
+  objects_restored: number;
+  rows_touched: number;
+  bytes_restored: number;
+  objects_failed: number;
+  /** The named failures; the list is capped and the count is not. */
+  failures: RestoreFailure[];
+  /** Live items the restore removed. Always zero — the preview priced that separately. */
+  dropped: number;
+}
+
+/** What a restore did, as the result panel renders it. */
+/**
+ * A queued restore (REQ-013, slice 2c).
+ *
+ * `cancellable` is a field rather than a `status === "queued"` derivation the panel makes.
+ * "Can I still stop this" is the only question an operator is asking when they look at a
+ * restore, and a panel that re-derives it from a status list is one edit away from offering a
+ * "stop" button on a restore that has already taken its safety backup — which would discard
+ * the one thing the operator was told they had.
+ */
+export interface RestoreJob {
+  id: string;
+  backup_id: string;
+  parts: string[];
+  status: "queued" | "running" | "succeeded" | "failed" | "aborted";
+  /** Whether an abort is still possible. Only ever true while `status` is `queued`. */
+  cancellable: boolean;
+  cancel_requested: boolean;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  /** The protected run to go back to. Present on every `succeeded` job. */
+  safety_backup_id: string | null;
+  /** The loss the operator agreed to, carried from the preview they read. */
+  live_dropped: number;
+  live_matches: number;
+  result: RestoreOutcome | null;
+  error: string | null;
+}
+
+export interface RestoreOutcome {
+  backup_id: string;
+  /** The parts considered, in manifest order. */
+  parts: string[];
+  /** The parts actually performed. A part in `parts` and not here was recorded, not applied. */
+  restored: string[];
+  media: MediaRestoreReport;
+  /** The protected run to go back to. Always present. */
+  safety_backup_id: string;
+  live_dropped: number;
+  live_matches: number;
+  summary: string;
+}
+
+/**
+ * What one retention sweep did.
+ *
+ * `removed`, `partial` and `stranded` are three different facts and the screen says all
+ * three: "pruned 4" and "3 of those 4 had a stuck file" are not the same sentence, and a
+ * screen that renders only the first one is the sentence the delete route stopped saying a
+ * tick ago — over a destination nobody is watching.
+ */
+export interface BackupSweepReport {
+  /** Tenants the sweep walked. */
+  walked: number;
+  /** Runs the exemptions offered to the sweep. */
+  candidates: number;
+  /** Runs whose artifacts were completely removed. */
+  removed: number;
+  /** Runs whose row is gone but whose artifacts could not all be removed. */
+  partial: number;
+  /** Tenants whose sweep failed outright. */
+  failed: number;
+  /** Every artifact the sweep could not take, in the store's own words. */
+  stranded: BackupStrandedArtifact[];
+  /** When the sweep ran, in UTC. */
+  at: string;
+}
+
+/** The result of taking a backup. */
+export interface BackupCreateResult {
+  /** The finished run. */
+  backup: BackupRun;
+  /** Its parts, with the state each reached. */
+  parts: BackupPart[];
+}
+
+/** The settings record. */
+export interface BackupSettings {
+  /** local or s3. */
+  destination: string;
+  /** Absolute root. */
+  local_root: string;
+  /** Bucket prefix. */
+  s3_prefix: string | null;
+  /** A secret-store reference — never a value. */
+  credential_ref: string | null;
+  /** none or passphrase. */
+  encryption: string;
+  /** Default retention for a new schedule. */
+  default_retention: number;
+  /** Whether a run re-reads its own artifacts. */
+  verify_after_backup: boolean;
+  /** When it was last saved. */
+  updated_at: string;
+}
+
+/** A recurring backup definition. */
+export interface BackupSchedule {
+  /** Row id. */
+  id: string;
+  /** Tenant it belongs to. */
+  organization_id: string | null;
+  /** Display name. */
+  name: string;
+  /** hourly, daily, weekly or monthly. */
+  frequency: string;
+  /** Time of day, for everything but hourly. */
+  at_time: string | null;
+  /** Weekday, for weekly only. */
+  day_of_week: number | null;
+  /** Day of the month, for monthly only. */
+  day_of_month: number | null;
+  /** Timezone the schedule is computed in. */
+  timezone: string;
+  /** The parts it produces. */
+  scopes: string[];
+  /** How many of its own runs it keeps. */
+  retention_count: number;
+  /** Destination. */
+  destination: string;
+  /** Whether the worker acts on it. */
+  enabled: boolean;
+  /** When it last ran. */
+  last_run_at: string | null;
+  /** When it next runs. */
+  next_run_at: string | null;
+  /** The run it produced last. */
+  last_backup_id: string | null;
+  /** What the screen says the frequency means, in one sentence. */
+  cadence: string;
+}
+
+// -------------------------------------------------------------------------------------------
+// System health (REQ-014).
+//
+// The four states are a closed set on the server and here, and the reason the client
+// repeats the list instead of typing `state: string` is the same one the server closes it
+// for: a colour map keyed by a string is a map that renders `undefined` in a class
+// attribute the first time a probe learns a fifth word. The badge, the label and the icon
+// all come out of one record, so a state can never have a colour and no label.
+// -------------------------------------------------------------------------------------------
+
+/** The four words a service state can be. `unknown` is NOT "fine". */
+export type HealthState = "healthy" | "degraded" | "down" | "unknown";
+
+/** One check inside a service row. */
+export type HealthCheck = {
+  check: string;
+  state: string;
+  message: string;
+  latency_ms: number;
 };
 
-/** `POST /workflows/{id}/graph/expressions/complete` — the server's candidate list. */
-export type ExpressionCompleted = {
-  node_key: string;
-  candidates: CompletionCandidate[];
-  candidate_count: number;
-  /** Upstream node keys, sorted. */
-  upstream_nodes: string[];
-  /** How many upstream namespaces were left out because the answer was capped. */
-  truncated_namespaces: number;
-  truncated_paths: boolean;
+/** One service row. Always present for every registered service, probed or not. */
+export type HealthService = {
+  service: string;
+  state: HealthState;
+  description: string;
+  latency_ms: number | null;
+  checked_at: string | null;
+  message: string;
+  detail: Record<string, unknown>;
+  checks: HealthCheck[];
+  href: string;
 };
+
+/** One host metric card. `threshold: null` means no opinion is configured. */
+export type HealthHostMetric = {
+  metric: string;
+  value: number;
+  unit: string;
+  state: string;
+  threshold: number | null;
+};
+
+/** The overview's verdict, as a word and as a sentence. */
+export type HealthBanner = {
+  state: HealthState;
+  headline: string;
+  worst_service: string | null;
+};
+
+/** `GET /api/v1/health/overview`. */
+export type HealthOverview = {
+  services: HealthService[];
+  host: HealthHostMetric[];
+  banner: HealthBanner;
+  counts: Record<HealthState, number>;
+  last_checked_at: string | null;
+  registry: string[];
+  sample_count: number;
+};
+
+/** One metric of one service, with the newest value it published and its 24 h trend. */
+export type HealthServiceMetric = {
+  metric: string;
+  value: number;
+  unit: string;
+  sampled_at: string;
+  /**
+   * The metric's values over the last 24 h, oldest first.
+   *
+   * Empty when the window holds no samples — and empty is a real answer here, because
+   * a platform whose history was pruned or never recorded is genuinely unknown, not zero.
+   * The screen draws a dot for one point and a line for two or more, so this array is the
+   * only thing separating a real trend from an empty box.
+   */
+  series: number[];
+};
+
+/** `GET /api/v1/health/services/{key}`. */
+export type HealthServiceDetail = HealthService & { metrics: HealthServiceMetric[] };
+
+/** `GET /api/v1/health/summary` — the one line other centres embed. */
+export type HealthSummary = {
+  state: HealthState;
+  headline: string;
+  worst_service: string | null;
+  /** `true` only when every registered service is healthy. Never true while any is unprobed. */
+  operational: boolean;
+  counts: Record<HealthState, number>;
+};
+
+/** One point of a metric's series, oldest first. */
+export type HealthSamplePoint = {
+  value: number;
+  unit: string;
+  state: string;
+  sampled_at: string;
+};
+
+/** What the retention prune deleted. */
+export type HealthPruneResult = { deleted: number; retention_days: number };
+
+/**
+ * The three windows the metric table offers.
+ *
+ * A name rather than an hour count, so the label on screen, the label in the CSV filename and
+ * the window the server queried are the same string. Anything else is refused server-side.
+ */
+export type HealthRangeKey = "1h" | "24h" | "7d";
+
+/** One row of `GET /api/v1/health/metrics`. */
+export type HealthMetricRow = {
+  service: string;
+  metric: string;
+  unit: string;
+  samples: number;
+  /** `null` on a window with no samples — never `0`, which is a value. */
+  current: number | null;
+  min: number | null;
+  avg: number | null;
+  max: number | null;
+  state: string;
+  last_sample_at: string | null;
+  /** The window's values, oldest first. Empty when there are no samples. */
+  series: number[];
+};
+
+/** `GET /api/v1/health/metrics` — the aggregated table for one range. */
+export type HealthMetricsReport = {
+  range: string;
+  ranges: string[];
+  metrics: HealthMetricRow[];
+  total_samples: number;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Incidents and threshold policy (REQ-014, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** One row of `GET /api/v1/health/incidents`. */
+export type HealthIncident = {
+  id: string;
+  service: string;
+  from_state: string;
+  to_state: string;
+  summary: string;
+  detail: Record<string, unknown>;
+  started_at: string;
+  /** `null` while the incident is open. */
+  resolved_at: string | null;
+  /** Seconds between open and resolve, or `null` while it is still open. */
+  duration_seconds: number | null;
+  /** True when a maintenance window covered the moment it opened. */
+  suppressed: boolean;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  note: string | null;
+};
+
+/** `GET /api/v1/health/incidents` — a page plus the count behind the filter. */
+export type HealthIncidentPage = {
+  incidents: HealthIncident[];
+  total: number;
+  /**
+   * Every service the platform probes.
+   *
+   * Sent with the list rather than fetched separately so the filter dropdown cannot offer a
+   * value the server would answer `unknown_service` for — the vocabulary and the filter
+   * options are the same read.
+   */
+  services: string[];
+};
+
+/** One threshold row on the settings form. */
+export type HealthThreshold = {
+  metric: string;
+  warn: number;
+  crit: number;
+  direction: "above" | "below";
+  unit: string;
+  /**
+   * False when the numbers are the **suggestion** rather than something an operator saved.
+   *
+   * The form marks these, because a placeholder that looks like a saved value is a limit
+   * nobody chose being read as a limit they chose.
+   */
+  configured: boolean;
+};
+
+/** One maintenance window. */
+export type HealthMaintenanceWindow = {
+  id: string;
+  starts_at: string;
+  ends_at: string;
+  services: string[];
+  note: string;
+  created_by: string | null;
+  created_at: string;
+  /** True when `now` is inside the window — the only flag a row can have. */
+  active: boolean;
+};
+
+/** `GET`/`PUT /api/v1/health/settings`. */
+export type HealthSettings = {
+  check_interval_seconds: number;
+  worker_stale_seconds: number;
+  thresholds: HealthThreshold[];
+  notifications: Record<string, boolean>;
+  updated_by: string | null;
+  updated_at: string;
+  /** The inclusive bounds the form enforces, so the UI and the API agree. */
+  bounds: {
+    check_interval_seconds: [number, number];
+    worker_stale_seconds: [number, number];
+  };
+  /** How many breaches the ledger holds, resolved ones included. */
+  breaches: number;
+};
+
+/** What `PATCH /health/incidents/{id}` accepts. */
+export type HealthIncidentAction = "acknowledge" | "resolve";

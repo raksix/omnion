@@ -19,7 +19,6 @@
 mod args;
 mod doctor;
 mod migrate;
-mod node;
 mod output;
 mod prompt;
 mod setup;
@@ -43,7 +42,6 @@ async fn main() -> ExitCode {
         }
         Ok(Command::Doctor { json }) => doctor::run(json).await,
         Ok(Command::Migrate) => migrate::run().await,
-        Ok(Command::Node(command)) => node::run(*command),
         Ok(Command::Setup(options)) => setup::run(*options).await,
         Err(message) => {
             eprintln!("omnion: {message}");

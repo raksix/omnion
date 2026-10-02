@@ -85,14 +85,33 @@ const BASE_ROLES: &[BaseRole] = &[
             "media.settings.manage",
             "media.scan.manage",
             "ai.providers.read",
+            // A manager may read what the AI hub spent and which model served what — the cost
+            // screens are a reporting surface, not a control one. They deliberately do NOT get
+            // `ai.settings.manage`: rewriting the task map is a platform-wide change that
+            // silently re-points every copilot on every site, which is an owner's decision.
+            "ai.usage.read",
             "ai.chat",
+            // An agent manager configures the installation's AI operators: read them, change
+            // them. It does NOT get `ai.agents.run` — running spends tokens and acts through
+            // tools, which is a separate decision from configuring what an agent may do.
+            "ai.agents.read",
+            "ai.agents.manage",
+            // The tool registry, read-only. An agent manager configures what agents may do, so
+            // they need to SEE which tools exist and what each costs — but granting a tool, or
+            // un-gating `deployment.deploy`, is the owner's call, not the agent manager's. The
+            // read/manage split is what lets this row be honest instead of convenient.
+            "ai.tools.read",
+            "ai.identities.read",
+            // The approval inbox, read-only. A manager is exactly the person who needs to know
+            // an agent wants to publish or delete, and is deliberately NOT the person who
+            // releases it: `ai.approvals.act` and `ai.policies.manage` stay with the roles that
+            // own the installation. This row is what makes the acceptance criterion's "viewer
+            // sees Approve disabled, with the missing permission named" a real configuration
+            // rather than a hypothetical one.
+            "ai.approvals.read",
             "workflows.read",
             "workflows.manage",
             "workflows.run",
-            // A manager can see which integrations the installation has and can add one; that
-            // is the same person who wires up the workflows that use them (REQ-087 slice 2).
-            "workflows.credentials.read",
-            "workflows.credentials.manage",
             "users.read",
             "users.update",
             "iam.permissions.read",
@@ -147,10 +166,6 @@ const BASE_ROLES: &[BaseRole] = &[
             "ai.chat",
             "workflows.read",
             "workflows.run",
-            // Read-only on credentials: a moderator can see that a workflow needs a
-            // credential and that it is failing, and cannot replace a secret. The two halves
-            // are separate keys for exactly this split.
-            "workflows.credentials.read",
             "users.read",
             "audit.read",
             "sites.read",

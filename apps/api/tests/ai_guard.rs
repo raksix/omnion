@@ -1,0 +1,1441 @@
+//! Walks for the data guard's store and screens (REQ-105, slice 1).
+//!
+//! The unit tests in `guard_data.rs` prove the *rules* — the label lattice, the validators, the
+//! mask map, the exemption narrowing. They run with no database at all, which is the point of
+//! keeping that half pure. Everything below needs a real one, because the claims are claims
+//! about **rows**:
+//!
+//! - **The seeded rules exist and compile.** A migration that seeds nine patterns and one of
+//!   them does not compile would leave `load_guard` returning an error on *every* request, and
+//!   the failure would look like a broken provider rather than a broken seed. The walk loads
+//!   the guard for a fresh tenant and reads the rule count off the detector.
+//! - **A tenant rule and a platform rule are one rule set, and a platform rule is immutable.**
+//!   The walk writes a tenant rule, sees it in the same list as the built-ins, and is refused
+//!   when it tries to edit a built-in.
+//! - **The event row cannot hold the payload.** Not "does not" — *cannot*: the walk greps the
+//!   whole stored row, rendered as text, for the value it just inspected. If a future column
+//!   appears, this fails.
+//! - **The tester is a dry run and files no event row.** A tester that audited every payload an
+//!   operator pasted would fill the log with rows about text that never left the process, and
+//!   the events screen would then be showing decisions that never happened. The *no provider
+//!   call* half of the request's criterion is not asserted here: nothing in this file opens a
+//!   socket, so a counter that stays at zero would be measuring this suite, not the product.
+//!   That claim is `POST /ai/guard/test`'s to earn, and it lands with the checkpoint on the chat
+//!   route, where a stub provider is actually on the other end of a call that could have been
+//!   made.
+//! - **An exemption narrows one label on one feature.** A second feature with the same label
+//!   stays masked, which is the half of the criterion that is easy to leave green by accident.
+//! - **An exemption never releases a block.** The row is accepted and refused at the same
+//!   time, which is the shape that makes the panel's "this will not do what it looks like it
+//!   does" note true rather than decorative.
+//!
+//! The harness is the throwaway-database pattern the other AI suites use, and it **panics**
+//! rather than skipping when PostgreSQL is unreachable: a skipped walk is a walk that proved
+//! nothing, and a loop that cannot tell the difference reports success for a suite it never ran
+//! (the lesson `ai_tool_execution.rs` records after exactly that).
+
+use omnion_ai_hub::guard_data::{Action, Label, MaskStyle};
+use omnion_ai_hub::guard_store::{
+    self, EventFilter, NewEvent, NewExemption, NewRule, PolicyChanges, RuleChanges,
+};
+use omnion_core::config::{Config, DatabaseConfig};
+use omnion_core::Db;
+use sqlx::PgPool;
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+// -------------------------------------------------------------------------------------------
+// The harness
+// -------------------------------------------------------------------------------------------
+
+struct GuardStore {
+    pool: PgPool,
+    organization_id: Uuid,
+    other_organization_id: Uuid,
+    database: String,
+    maintenance: Option<Db>,
+}
+
+impl GuardStore {
+    async fn fresh() -> Option<Self> {
+        let config = Config::from_env().ok()?;
+        if let Err(err) = Db::connect(&DatabaseConfig {
+            url: config.database.url.clone(),
+            max_connections: 1,
+        })
+        .await
+        {
+            eprintln!("PostgreSQL is not reachable at {}: {err}", config.database.url);
+            return None;
+        }
+
+        let database = format!("omnion_guard_{}", Uuid::new_v4().simple());
+        let maintenance = Db::connect(&DatabaseConfig {
+            url: swap_database(&config.database.url, "postgres"),
+            max_connections: 1,
+        })
+        .await
+        .expect("the maintenance connection must work");
+        sqlx::query(&format!("create database \"{database}\""))
+            .execute(maintenance.pool())
+            .await
+            .expect("the temporary database must be created");
+
+        let db = Db::connect(&DatabaseConfig {
+            url: swap_database(&config.database.url, &database),
+            // 4, not the default: seven writer loops share one `max_connections = 100` server on
+            // this box, and the reason is recorded in `ai_tool_execution.rs`.
+            max_connections: 4,
+        })
+        .await
+        .expect("the fresh database must connect");
+        db.migrate().await.expect("migrations must apply");
+
+        let pool = db.pool().clone();
+        let organization_id = seed_organization(&pool, "guardco").await;
+        let other_organization_id = seed_organization(&pool, "otherco").await;
+
+        Some(Self {
+            pool,
+            organization_id,
+            other_organization_id,
+            database,
+            maintenance: Some(maintenance),
+        })
+    }
+
+    /// A tenant rule with the given key, label and pattern; every other field at its default.
+    async fn rule(&self, key: &str, label: Label, pattern: &str) -> NewRule {
+        NewRule {
+            key: key.to_owned(),
+            label: label.as_wire().to_owned(),
+            custom_label: None,
+            pattern: pattern.to_owned(),
+            validator: "none".to_owned(),
+            action: "flag".to_owned(),
+            severity: 3,
+            priority: 100,
+            providers: Vec::new(),
+            features: Vec::new(),
+            enabled: true,
+            sample: None,
+        }
+    }
+
+    /// The whole stored event row as text, for the "no payload" grep.
+    ///
+    /// Rendered with `::text` rather than picked column by column, because the claim is about
+    /// the row and a grep over eleven named columns would pass while a twelfth held the value.
+    async fn event_row_as_text(&self, id: i64) -> String {
+        let text: (String,) = sqlx::query_as("select ai_guard_events::text from ai_guard_events where id = $1")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("the event row must be readable");
+        text.0
+    }
+
+    async fn dispose(mut self) {
+        self.pool.close().await;
+        let database = std::mem::take(&mut self.database);
+        if let Some(maintenance) = self.maintenance.take() {
+            sqlx::query(&format!("drop database if exists \"{database}\" with (force)"))
+                .execute(maintenance.pool())
+                .await
+                .expect("the temporary database must be removed");
+            maintenance.pool().close().await;
+        }
+    }
+}
+
+fn swap_database(url: &str, database: &str) -> String {
+    let (base, _) = url.rsplit_once('/').expect("a database URL has a path");
+    format!("{base}/{database}")
+}
+
+async fn seed_organization(pool: &PgPool, label: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("insert into organizations (id, name, slug) values ($1, $2, $3)")
+        .bind(id)
+        .bind(label)
+        .bind(format!("{label}-{}", Uuid::new_v4().simple()))
+        .execute(pool)
+        .await
+        .expect("the fixture organization must be created");
+    id
+}
+
+/// The harness, or a panic — see the file header.
+macro_rules! guard {
+    () => {
+        match GuardStore::fresh().await {
+            Some(store) => store,
+            None => panic!(
+                "PostgreSQL is not reachable, so every walk in this file would have SKIPPED. \
+                 Set OMNION_DATABASE_URL to an existing database — on this box the QA stack's is \
+                 the w7 database on port 5433. A skip must not read as a pass."
+            ),
+        }
+    };
+}
+
+// -------------------------------------------------------------------------------------------
+// Walks
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_seeded_rules_are_present_and_the_guard_loads_for_a_fresh_tenant() {
+    let store = guard!();
+
+    // A brand-new tenant has no policy row and no rules of its own, and the guard still loads —
+    // reading the platform's nine built-ins. A detector that saw only tenant rows would be empty
+    // here, and an operator would be looking at a full rules screen over a guard that finds
+    // nothing.
+    let loaded = guard_store::load_guard(&store.pool, store.organization_id)
+        .await
+        .expect("the guard must load for a tenant that has configured nothing");
+
+    // `query_scalar` is a **free function** on the executor, not a method on the pool — the
+    // method form (`pool.query_scalar::<_, i64>(…)`) does not exist and the compiler says so
+    // after the call has already been written, which is a confusing way to learn it.
+    let builtins: i64 =
+        sqlx::query_scalar("select count(*) from ai_guard_rules where organization_id is null")
+            .fetch_one(&store.pool)
+            .await
+            .expect("the seeded count must be readable");
+    assert!(
+        builtins >= 9,
+        "the seed installs the nine labels the request names; found {builtins}"
+    );
+    // `Detector::len()` counts the rules that actually **run** — the ones that are enabled —
+    // and `person_name` ships disabled, so nine rows means eight running. Asserting `>= 9` here
+    // would be asserting that a rule nobody supplied a name list for is active, which is the
+    // exact failure the next assertion below forbids.
+    assert!(
+        loaded.detector.len() >= 8,
+        "the detector must compile the platform's enabled rules, not the tenant's empty set \
+         ({} running)",
+        loaded.detector.len()
+    );
+
+    // `person_name` ships **disabled**: a name list is a static data file and none ships, so the
+    // row is visible and fires nothing. Asserting it disabled is the whole point of seeding it.
+    let person_name_enabled: (bool,) = sqlx::query_as(
+        "select enabled from ai_guard_rules where organization_id is null and label = 'person_name'",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .expect("the person_name row must exist");
+    assert!(
+        !person_name_enabled.0,
+        "person_name must ship disabled: no name list ships with the platform, so an enabled \
+         rule that cannot fire is a protection that looks on"
+    );
+
+    // Every seeded pattern compiles — which is the property a migration cannot assert and only
+    // `load_guard` can.
+    let rows = guard_store::list_rules(&store.pool, store.organization_id)
+        .await
+        .expect("the rule list must read");
+    for row in &rows {
+        row.compile()
+            .unwrap_or_else(|error| panic!("seeded rule `{}` does not compile: {error}", row.key));
+    }
+
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_tenant_rule_joins_the_platform_rules_and_a_platform_rule_cannot_be_edited() {
+    let store = guard!();
+
+    let created = guard_store::create_rule(
+        &store.pool,
+        store.organization_id,
+        None,
+        store.rule("customer_code.tenant", Label::Email, r"CUST-[0-9]{6}").await,
+    )
+    .await
+    .expect("a tenant rule must be creatable");
+
+    let rows = guard_store::list_rules(&store.pool, store.organization_id)
+        .await
+        .expect("the rule list must read");
+    assert!(
+        rows.iter().any(|row| row.key == "customer_code.tenant"),
+        "the tenant's own rule must be in the same list as the built-ins"
+    );
+
+    // The immutability is a **store** property, not a route property: the walk calls the store
+    // directly, so a rule that only the HTTP layer protected would be editable here.
+    let platform = rows
+        .iter()
+        .find(|row| row.organization_id.is_none())
+        .expect("a platform rule must be in the list");
+    let refused = guard_store::update_rule(
+        &store.pool,
+        store.organization_id,
+        platform.id,
+        RuleChanges {
+            action: Some("block".to_owned()),
+            ..RuleChanges::default()
+        },
+    )
+    .await;
+    match refused {
+        Err(omnion_ai_hub::AiHubError::InvalidGuardRule(message)) => {
+            assert!(
+                message.contains("Copy it"),
+                "the refusal must tell the operator what to do instead, got: {message}"
+            );
+        }
+        other => panic!("editing a platform rule must be refused as a field error, got: {other:?}"),
+    }
+
+    // The same rule, from another tenant, is not found rather than forbidden.
+    let other = guard_store::find_rule(&store.pool, store.other_organization_id, created.id)
+        .await
+        .expect("the lookup must answer");
+    assert!(
+        other.is_none(),
+        "another tenant's rule must not be readable by id: the rules screen would otherwise be \
+         an existence oracle for the whole installation's detection rules"
+    );
+
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn an_invalid_regex_is_a_field_error_and_stores_nothing() {
+    let store = guard!();
+
+    let before: (i64,) =
+        sqlx::query_as("select count(*) from ai_guard_rules where organization_id = $1")
+            .bind(store.organization_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("the count must be readable");
+
+    let mut bad = store.rule("broken.regex", Label::Email, r"[unclosed").await;
+    bad.label = "custom".to_owned();
+    bad.custom_label = Some("patient_ref".to_owned());
+    let refused = guard_store::create_rule(&store.pool, store.organization_id, None, bad).await;
+
+    match refused {
+        Err(omnion_ai_hub::AiHubError::InvalidGuardRule(message)) => {
+            assert!(
+                message.contains("regular expression"),
+                "the message must name the field's rule, got: {message}"
+            );
+            assert!(
+                message.contains("broken.regex"),
+                "the message must name the rule, got: {message}"
+            );
+        }
+        other => panic!("an uncompilable pattern must be a field error, got: {other:?}"),
+    }
+
+    let after: (i64,) =
+        sqlx::query_as("select count(*) from ai_guard_rules where organization_id = $1")
+            .bind(store.organization_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("the count must be readable");
+    assert_eq!(
+        before.0, after.0,
+        "a refused rule must store nothing: {before:?} before, {after:?} after"
+    );
+
+    store.dispose().await;
+}
+
+/// Every verdict a request can reach must produce a **stored row**, and no other name may.
+///
+/// This is the walk that was missing while the audit trail was broken for three slices. Every
+/// other walk in this file filed an event by hand with a literal it chose, so all of them were
+/// green against a writer whose own output the database rejected — the tests exercised the
+/// store's *capacity* to hold a row, and the one code path that decides which string the column
+/// gets was never asserted. A green suite therefore said nothing about the trail working.
+///
+/// So this one starts from the **verdict**, the way the checkpoint does, and asserts the row
+/// survives to storage: the names the detector produces are the names the table accepts. The
+/// second half then files an action name and requires it to be refused *before* the insert, so
+/// the near-miss vocabulary cannot come back through a new caller.
+#[tokio::test]
+async fn every_verdict_the_guard_reaches_becomes_a_row_and_no_other_name_does() {
+    let store = guard!();
+
+    // A policy that raises all three labels to distinct actions, the way the policy screen does.
+    // **This is the step the first draft of this walk skipped**, and the assertion below caught
+    // it: with no policy row a card number reaches `allowed`, because the default for an absent
+    // label is `Action::Allow` and the seeded `card.builtin` rule's own `block` is only the
+    // action the rule was created with, not what the policy does with it. A walk that asserted
+    // "a card is blocked" without configuring that would have been asserting the author's
+    // assumption rather than the detector's behaviour — the failure mode this file's other walks
+    // were written to avoid.
+    guard_store::save_policy(
+        &store.pool,
+        store.organization_id,
+        None,
+        PolicyChanges {
+            label_defaults: Some(
+                [
+                    ("card".to_owned(), Action::Block),
+                    ("email".to_owned(), Action::Mask),
+                    ("secret_like".to_owned(), Action::Flag),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            mask_style: Some(MaskStyle::Numbered),
+            allow_user_override: Some(false),
+        },
+    )
+    .await
+    .expect("the policy must save");
+
+    let loaded = guard_store::load_guard(&store.pool, store.organization_id)
+        .await
+        .expect("the guard must load");
+
+    // One payload per **reachable** verdict, each exercising a different policy action rather than
+    // four spellings of one: a card (`Block`), an e-mail (`Mask`), a vendor token (`Allow`).
+    //
+    // The third is the one this walk's first draft got wrong, and the assertion below is what
+    // caught it. `Action::Flag` looks like it should produce a `flagged` verdict, and it does not:
+    // the verdict enum has **no** `flagged` variant — flagging means "send it, and record that a
+    // human should know", which is `Allowed` with a rule key attached. So the fileable set is
+    // three names, and two of the five names `0210` allowed (`flagged`, `remapped`) were never
+    // producible by any code path in the build. `allowed` here is filed by a `Flag` policy to
+    // prove that half: a payload a human is asked to look at and an untouched payload produce
+    // **the same row shape**, and the only difference is the rule key beside it.
+    //
+    // `clear` is absent on purpose: the checkpoint returns before filing anything for a payload
+    // with nothing to guard, because one row per ordinary message would drown the events an
+    // operator opens the screen to read — `a_clean_payload…` in the outbound suite pins that.
+    let payloads = [
+        ("blocked", "my card is 4111111111111111"),
+        ("masked", "write to ada@lovelace.com about it"),
+        ("allowed", "my token is sk-abcdefghijklmnopqrstuvwx"),
+    ];
+
+    let mut expected: Vec<&str> = Vec::new();
+    for (name, payload) in payloads {
+        let finding = loaded.detector.inspect(payload, None, Some("chat"), &loaded.policy, "salt");
+        let verdict_name = finding.verdict.as_wire();
+        assert!(
+            verdict_name == name,
+            "this walk's vocabulary table must describe the detector, not the author: \
+             `{payload}` reached `{verdict_name}`, the walk expected `{name}`"
+        );
+
+        let id = guard_store::record_event(
+            &store.pool,
+            NewEvent {
+                organization_id: store.organization_id,
+                site_id: None,
+                user_id: None,
+                request_id: Uuid::new_v4(),
+                run_id: None,
+                provider_id: None,
+                feature: Some("chat".to_owned()),
+                action: verdict_name.to_owned(),
+                rule_keys: finding.matches.iter().map(|m| m.rule_key.clone()).collect(),
+                label_counts: finding.label_counts.clone(),
+                match_count: finding.matches.len() as i32,
+                value_hashes: finding.matches.iter().map(|m| m.value_hash.clone()).collect(),
+                error_code: finding
+                    .verdict
+                    .is_blocked()
+                    .then(|| "ai_guard_blocked".to_owned()),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "the verdict `{verdict_name}` must be storable: {error}. The table's check and \
+                 this writer must speak the SAME vocabulary — if the error names \
+                 `action_known`, the checkpoint is writing the per-rule action name \
+                 (allow/flag/mask/block) where the verdict name belongs."
+            )
+        });
+        assert!(id > 0, "a stored event must have an id: {id}");
+        expected.push(name);
+    }
+
+    // Every row the verdicts produced is really there, read the way the events screen reads.
+    let page = guard_store::list_events(
+        &store.pool,
+        &EventFilter {
+            organization_id: store.organization_id,
+            limit: 50,
+            ..EventFilter::default()
+        },
+    )
+    .await
+    .expect("the events must list");
+    assert_eq!(
+        page.total,
+        expected.len() as i64,
+        "every reached verdict must be on the record: {expected:?} stored {page:?}"
+    );
+    // The `blocked` flag has to agree with the word, or the screen's "blocked only" switch is a
+    // filter that answers a question nobody asked. Derived from the string, so this is the check
+    // that the derivation itself was not re-introduced as a second vocabulary.
+    for row in &page.rows {
+        assert_eq!(
+            row.blocked,
+            row.action == "blocked",
+            "the flag and the word are the same fact: {:?}",
+            row.action
+        );
+    }
+
+    // The names that are **not** event names. A refusal here is the point: it is what
+    // turns "the table rejected it" into "the store says so, and says why", instead of a
+    // constraint violation that names neither vocabulary.
+    //
+    // Two groups, and the second group is why this walk exists. `clear` is a real verdict the
+    // detector produces and the checkpoint deliberately does not record, so a row must not be
+    // able to claim it. The four per-rule action names are the near-misses that broke every
+    // insert: `block` reads as the obvious past tense of `blocked` and is the exact string that
+    // did it. `flagged` and `remapped` are the two names `0210` accepted that **no code path in
+    // the build could ever produce** — included here because a name the database accepts but the
+    // platform cannot emit is an invitation for the next writer to invent it.
+    for action in [
+        "clear",
+        "allow",
+        "flag",
+        "mask",
+        "block",
+        "flagged",
+        "remapped",
+    ] {
+        let error = guard_store::record_event(
+            &store.pool,
+            NewEvent {
+                organization_id: store.organization_id,
+                site_id: None,
+                user_id: None,
+                request_id: Uuid::new_v4(),
+                run_id: None,
+                provider_id: None,
+                feature: Some("chat".to_owned()),
+                action: action.to_owned(),
+                rule_keys: Vec::new(),
+                label_counts: std::collections::BTreeMap::new(),
+                match_count: 1,
+                value_hashes: Vec::new(),
+                error_code: None,
+            },
+        )
+        .await;
+        let error = error.expect_err(&format!("`{action}` is not an event action and must not store"));
+        let message = error.to_string();
+        assert!(
+            message.contains("verdict") && message.contains("allowed"),
+            "the refusal must name the vocabulary it wanted: {message}"
+        );
+    }
+
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn the_event_row_cannot_hold_the_payload() {
+    let store = guard!();
+
+    // A value invented here, and a string that must never appear anywhere in the row.
+    //
+    // The `sk-` prefix is load-bearing: the built-in `secret_like` pattern is deliberately
+    // *prefix-shaped* (`sk|pk|ghp|xox[baprs]`), because a bare high-entropy token is a much
+    // weaker signal than one carrying a known vendor prefix, and a guard that flags every long
+    // base64 blob is a guard that gets switched off. The first draft of this walk used a token
+    // with no prefix, the detector correctly found nothing, and the walk failed — which is the
+    // right outcome: the pattern says what it catches, and `/ai/guard/about` says the rest in
+    // the `misses` column.
+    let secret = "sk-deha9f31c2b7a4e8d6c0b5f3a2e1d9c7b";
+    let payload = format!("write to {secret} about it");
+    let loaded = guard_store::load_guard(&store.pool, store.organization_id)
+        .await
+        .expect("the guard must load");
+
+    let finding = loaded.detector.inspect(
+        &payload,
+        Some("openai"),
+        Some("chat"),
+        &loaded.policy,
+        "a-salt-for-the-walk",
+    );
+    assert!(
+        !finding.matches.is_empty(),
+        "the built-in secret_like rule must match the invented token, or this walk proves \
+         nothing about the row: {finding:?}"
+    );
+
+    let id = guard_store::record_event(
+        &store.pool,
+        NewEvent {
+            organization_id: store.organization_id,
+            site_id: None,
+            user_id: None,
+            request_id: Uuid::new_v4(),
+            run_id: None,
+            provider_id: None,
+            feature: Some("chat".to_owned()),
+            action: finding.verdict.as_wire().to_owned(),
+            rule_keys: finding.matches.iter().map(|m| m.rule_key.clone()).collect(),
+            label_counts: finding.label_counts.clone(),
+            match_count: finding.matches.len() as i32,
+            value_hashes: finding.matches.iter().map(|m| m.value_hash.clone()).collect(),
+            error_code: finding
+                .verdict
+                .is_blocked()
+                .then(|| "ai_guard_blocked".to_owned()),
+        },
+    )
+    .await
+    .expect("the event must be stored");
+
+    let row = store.event_row_as_text(id).await;
+    assert!(
+        !row.contains(secret),
+        "the payload must not appear in the stored event row, by construction:\n{row}"
+    );
+    // …and what *is* there is the hash, which is the whole point of storing one.
+    assert!(
+        row.contains("secret_like"),
+        "the row must name the rule that fired, so an operator can act on it:\n{row}"
+    );
+
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_dry_run_answers_a_verdict_and_files_no_event() {
+    let store = guard!();
+
+    // A card number that passes Luhn, so the built-in `card` rule reaches its `block`.
+    let card = "4111111111111111";
+    let payload = format!("my card is {card}");
+
+    // Raise `card` to `block` through the store, the way the policy screen does.
+    guard_store::save_policy(
+        &store.pool,
+        store.organization_id,
+        None,
+        PolicyChanges {
+            label_defaults: Some(
+                [("card".to_owned(), Action::Block)]
+                    .into_iter()
+                    .collect(),
+            ),
+            mask_style: Some(MaskStyle::Numbered),
+            allow_user_override: Some(false),
+        },
+    )
+    .await
+    .expect("the policy must save");
+
+    let loaded = guard_store::load_guard(&store.pool, store.organization_id)
+        .await
+        .expect("the guard must load");
+    let before_events: (i64,) =
+        sqlx::query_as("select count(*) from ai_guard_events where organization_id = $1")
+            .bind(store.organization_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("the event count must be readable");
+
+    let finding = loaded.detector.inspect(
+        &payload,
+        Some("openai"),
+        Some("chat"),
+        &loaded.policy,
+        "",
+    );
+    assert!(
+        finding.verdict.is_blocked(),
+        "a card under a `block` policy must be refused; the finding was {:?}",
+        finding.verdict
+    );
+
+    let after_events: (i64,) =
+        sqlx::query_as("select count(*) from ai_guard_events where organization_id = $1")
+            .bind(store.organization_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("the event count must be readable");
+    assert_eq!(
+        before_events.0, after_events.0,
+        "a dry run writes no event row. A tester that filed an audit entry for every payload an \
+         operator pasted would fill the log with rows about text that never left the process — \
+         and the events screen would then be showing decisions that never happened."
+    );
+
+    // The refusal names the label and the rule: the request's "naming the label and the rule is
+    // the difference between a support ticket and a five-second fix".
+    match &finding.verdict {
+        omnion_ai_hub::guard_data::GuardVerdict::Blocked {
+            label, rule_key, ..
+        } => {
+            assert_eq!(label, "card", "the refusal names the label");
+            assert!(
+                rule_key.contains("card"),
+                "the refusal names the rule, got `{rule_key}`"
+            );
+        }
+        other => panic!("expected a blocked verdict, got {other:?}"),
+    }
+
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn an_exemption_narrows_one_label_on_one_feature_and_the_other_feature_stays_masked() {
+    let store = guard!();
+
+    // `email` is `mask` everywhere, then exempted for one feature only.
+    guard_store::save_policy(
+        &store.pool,
+        store.organization_id,
+        None,
+        PolicyChanges {
+            label_defaults: Some(
+                [("email".to_owned(), Action::Mask)].into_iter().collect(),
+            ),
+            mask_style: Some(MaskStyle::Numbered),
+            allow_user_override: Some(false),
+        },
+    )
+    .await
+    .expect("the policy must save");
+
+    let exemption = guard_store::create_exemption(
+        &store.pool,
+        store.organization_id,
+        None,
+        NewExemption {
+            label: "email".to_owned(),
+            providers: Vec::new(),
+            features: vec!["support_reply".to_owned()],
+            reason: "the customer's own address is the subject of the reply".to_owned(),
+            expires_at: Some(OffsetDateTime::now_utc() + time::Duration::days(30)),
+        },
+    )
+    .await
+    .expect("the exemption must be created");
+
+    let loaded = guard_store::load_guard(&store.pool, store.organization_id)
+        .await
+        .expect("the guard must load");
+    let payload = "write to someone@example.com please";
+
+    let exempt = loaded.detector.inspect(
+        payload,
+        Some("openai"),
+        Some("support_reply"),
+        &loaded.policy,
+        "salt",
+    );
+    let other = loaded
+        .detector
+        .inspect(payload, Some("openai"), Some("chat"), &loaded.policy, "salt");
+
+    assert_eq!(
+        exempt.action,
+        Action::Allow,
+        "the exempted feature must pass the value through"
+    );
+    assert!(
+        exempt.text.contains("someone@example.com"),
+        "and the text must be unchanged: {}",
+        exempt.text
+    );
+    assert_eq!(
+        other.action,
+        Action::Mask,
+        "another feature with the same label must stay masked — that is the half of the \
+         criterion an over-broad exemption passes by accident"
+    );
+    assert!(
+        other.text.contains("[EMAIL_1]"),
+        "and the other feature's text must carry the placeholder, got: {}",
+        other.text
+    );
+
+    // A blank reason is refused: the request's "every exemption needs a reason", enforced by the
+    // store so a direct caller cannot skip it.
+    let refused = guard_store::create_exemption(
+        &store.pool,
+        store.organization_id,
+        None,
+        NewExemption {
+            label: "email".to_owned(),
+            providers: Vec::new(),
+            features: vec!["anything".to_owned()],
+            reason: "   ".to_owned(),
+            expires_at: None,
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(omnion_ai_hub::AiHubError::InvalidGuardExemption(_))),
+        "a blank reason must be refused, got {refused:?}"
+    );
+
+    // Deleting it takes the exemption out of the policy.
+    guard_store::delete_exemption(&store.pool, store.organization_id, exemption.id)
+        .await
+        .expect("the exemption must be deletable");
+    let after = guard_store::load_guard(&store.pool, store.organization_id)
+        .await
+        .expect("the guard must load");
+    let reread = after
+        .detector
+        .inspect(payload, Some("openai"), Some("support_reply"), &after.policy, "salt");
+    assert_eq!(
+        reread.action,
+        Action::Mask,
+        "with the exemption gone the feature is masked like any other"
+    );
+
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn an_exemption_never_releases_a_block() {
+    let store = guard!();
+
+    guard_store::save_policy(
+        &store.pool,
+        store.organization_id,
+        None,
+        PolicyChanges {
+            label_defaults: Some(
+                [("secret_like".to_owned(), Action::Block)].into_iter().collect(),
+            ),
+            mask_style: Some(MaskStyle::Numbered),
+            allow_user_override: Some(false),
+        },
+    )
+    .await
+    .expect("the policy must save");
+    guard_store::create_exemption(
+        &store.pool,
+        store.organization_id,
+        None,
+        NewExemption {
+            label: "secret_like".to_owned(),
+            providers: Vec::new(),
+            features: Vec::new(),
+            reason: "we would like to let this through for now".to_owned(),
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("the exemption row itself is allowed to exist");
+
+    let loaded = guard_store::load_guard(&store.pool, store.organization_id)
+        .await
+        .expect("the guard must load");
+    let finding = loaded.detector.inspect(
+        "here is sk-abcdefghijklmnopqrstuvwx for you",
+        Some("openai"),
+        Some("chat"),
+        &loaded.policy,
+        "salt",
+    );
+    assert!(
+        finding.verdict.is_blocked(),
+        "an exemption must never switch a `block` off — a refusal an exemption could release \
+         would make the setting a suggestion the policy screen cannot honestly show. The verdict \
+         was {:?}",
+        finding.verdict
+    );
+
+    store.dispose().await;
+}
+
+/// An expired exemption stops applying on the next request and is announced exactly once.
+///
+/// Two claims in one walk, because they are the two halves of one criterion and either alone
+/// would pass against a broken implementation:
+///
+/// 1. **It stops applying.** The policy reads liveness fresh per request, so an exemption whose
+///    `expires_at` is in the past must not exempt anything — the label goes back to whatever the
+///    policy says for it. Asserted by *moving the clock on the row*, not by waiting: the walk
+///    sets the expiry into the past after the row was created, because a test that slept until a
+///    real expiry would be both slow and non-deterministic, and would never catch a predicate
+///    that is right about "now" but wrong about "later".
+/// 2. **It is announced, once.** Read through the real store function (`lapsed_exemptions`) and
+///    the real claim (`claim_exemption_announcement`), then asserted against the `events` table
+///    the announcement actually writes. A walk that only checked the list would pass against a
+///    sweep that computed the right rows and never emitted anything — which is the defect this
+///    criterion was written to catch, so it has to be checked at the event table, not above it.
+///
+/// The "once" half is the part a first implementation gets wrong: a lapse is a permanent fact, so
+/// re-reading it announces it again. The walk therefore calls the sweep path twice and requires
+/// the event count to stay at one.
+#[tokio::test]
+async fn an_expired_exemption_stops_applying_and_is_announced_exactly_once() {
+    let store = guard!();
+
+    guard_store::save_policy(
+        &store.pool,
+        store.organization_id,
+        None,
+        PolicyChanges {
+            label_defaults: Some([("email".to_owned(), Action::Mask)].into_iter().collect()),
+            mask_style: Some(MaskStyle::Numbered),
+            allow_user_override: Some(false),
+        },
+    )
+    .await
+    .expect("the policy must save");
+
+    let exemption = guard_store::create_exemption(
+        &store.pool,
+        store.organization_id,
+        None,
+        NewExemption {
+            label: "email".to_owned(),
+            providers: Vec::new(),
+            features: vec!["support_reply".to_owned()],
+            reason: "the customer's own address is the subject of the reply".to_owned(),
+            // Created in the future, then aged below: the row's own history is a live exemption
+            // that later lapses, which is the only way to get "was live, now is not" without a
+            // clock the test controls.
+            expires_at: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+        },
+    )
+    .await
+    .expect("the exemption must be created");
+
+    let payload = "write to someone@example.com please";
+
+    // While it is live, the exempted feature passes and nothing is announced.
+    let live = guard_store::load_guard(&store.pool, store.organization_id)
+        .await
+        .expect("the guard must load");
+    let live_finding = live.detector.inspect(
+        payload,
+        Some("openai"),
+        Some("support_reply"),
+        &live.policy,
+        "salt",
+    );
+    assert_eq!(
+        live_finding.action,
+        Action::Allow,
+        "a live exemption must still exempt its feature"
+    );
+    let early = guard_store::lapsed_exemptions(
+        &store.pool,
+        store.organization_id,
+        OffsetDateTime::now_utc() - time::Duration::hours(24),
+    )
+    .await
+    .expect("the lapsed read must run");
+    assert!(
+        early.is_empty(),
+        "an exemption that has not lapsed yet must not be reported as lapsed — the original \
+         predicate (`expires_at > $2`) returned exactly this list, so it named every running \
+         exemption as expired. Got {early:?}"
+    );
+
+    // Age the row: the lapse has now happened.
+    //
+    // `created_at` moves with it, and that detail is the whole difference between this setup and
+    // an illegal one. `ai_guard_exemptions` carries a CHECK that `expires_at` is after
+    // `created_at`, which exists for a good reason: an exemption born already expired is a row
+    // that exempts nothing and reads as if it does. So the first version of this walk aged
+    // `expires_at` alone and the database refused it — correctly. Ageing both columns describes
+    // a state the system genuinely reaches on its own, an exemption created two hours ago that
+    // lapsed an hour ago, instead of a row whose history has been rewritten to be impossible.
+    sqlx::query(
+        "update ai_guard_exemptions \
+           set created_at = now() - interval '2 hours', expires_at = now() - interval '1 minute' \
+         where id = $1",
+    )
+    .bind(exemption.id)
+    .execute(&store.pool)
+    .await
+    .expect("the exemption must be aged into a lapsed state that the schema accepts");
+
+    // 1. It stops applying on the next read of the policy.
+    let after = guard_store::load_guard(&store.pool, store.organization_id)
+        .await
+        .expect("the guard must load");
+    let after_finding = after
+        .detector
+        .inspect(payload, Some("openai"), Some("support_reply"), &after.policy, "salt");
+    assert_eq!(
+        after_finding.action,
+        Action::Mask,
+        "a lapsed exemption must stop applying on the next request — the policy reads liveness \
+         fresh, so the same feature that was just allowed is masked again"
+    );
+    assert!(
+        after_finding.text.contains("[EMAIL_1]"),
+        "and the placeholder must be back, got: {}",
+        after_finding.text
+    );
+
+    // 2. It is announced — read through the claim, then observed in the `events` table.
+    let lapsed = guard_store::lapsed_exemptions(
+        &store.pool,
+        store.organization_id,
+        OffsetDateTime::now_utc() - time::Duration::hours(24),
+    )
+    .await
+    .expect("the lapsed read must run");
+    assert_eq!(
+        lapsed.len(),
+        1,
+        "exactly the aged exemption is lapsed, got {lapsed:?}"
+    );
+    assert_eq!(lapsed[0].id, exemption.id, "and it is the one this walk aged");
+
+    let won = guard_store::claim_exemption_announcement(
+        &store.pool,
+        store.organization_id,
+        &lapsed[0],
+    )
+    .await
+    .expect("the claim must run");
+    assert!(
+        won,
+        "the first caller to announce a lapse must win the claim"
+    );
+
+    let event = omnion_events::NewEvent::new("ai.guard.exemption.expired")
+        .organization(store.organization_id)
+        .payload(serde_json::json!({ "exemption_id": exemption.id, "label": "email" }));
+    omnion_events::bus::emit(&store.pool, event)
+        .await
+        .expect("the announcement must publish");
+
+    // The "once" half: a second sweep over the same window finds the row again — the read is a
+    // lookback, not a cursor — and must NOT be able to announce it a second time.
+    let again = guard_store::lapsed_exemptions(
+        &store.pool,
+        store.organization_id,
+        OffsetDateTime::now_utc() - time::Duration::hours(24),
+    )
+    .await
+    .expect("the second lapsed read must run");
+    assert_eq!(
+        again.len(),
+        1,
+        "the read is a lookback, so the same lapse is still returned — that is the case a \
+         duplicate announcement would come from"
+    );
+    let second = guard_store::claim_exemption_announcement(
+        &store.pool,
+        store.organization_id,
+        &again[0],
+    )
+    .await
+    .expect("the second claim must run");
+    assert!(
+        !second,
+        "a lapse that has already been announced must not be claimable again — without this \
+         marker every request after the expiry would re-announce the same event"
+    );
+
+    let announcements: i64 =
+        sqlx::query_scalar("select count(*) from events where name = 'ai.guard.exemption.expired'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("the events table must be readable");
+    assert_eq!(
+        announcements, 1,
+        "exactly one `ai.guard.exemption.expired` event must exist for one lapse"
+    );
+
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn the_events_screen_filters_by_label_and_blocked_without_a_payload_column() {
+    let store = guard!();
+    let request_id = Uuid::new_v4();
+
+    let mut counts = std::collections::BTreeMap::new();
+    counts.insert("email".to_owned(), 2usize);
+    guard_store::record_event(
+        &store.pool,
+        NewEvent {
+            organization_id: store.organization_id,
+            site_id: None,
+            user_id: None,
+            request_id,
+            run_id: None,
+            provider_id: None,
+            feature: Some("chat".to_owned()),
+            action: "masked".to_owned(),
+            rule_keys: vec!["email.builtin".to_owned()],
+            label_counts: counts,
+            match_count: 2,
+            value_hashes: vec!["abc123".to_owned()],
+            error_code: None,
+        },
+    )
+    .await
+    .expect("the masked event must be stored");
+
+    let blocked_id = guard_store::record_event(
+        &store.pool,
+        NewEvent {
+            organization_id: store.organization_id,
+            site_id: None,
+            user_id: None,
+            request_id: Uuid::new_v4(),
+            run_id: None,
+            provider_id: None,
+            feature: Some("chat".to_owned()),
+            action: "blocked".to_owned(),
+            rule_keys: vec!["card.builtin".to_owned()],
+            label_counts: std::collections::BTreeMap::new(),
+            match_count: 1,
+            value_hashes: vec!["def456".to_owned()],
+            error_code: Some("ai_guard_blocked".to_owned()),
+        },
+    )
+    .await
+    .expect("the blocked event must be stored");
+
+    let by_label = guard_store::list_events(
+        &store.pool,
+        &EventFilter {
+            organization_id: store.organization_id,
+            label: Some("email".to_owned()),
+            ..EventFilter::default()
+        },
+    )
+    .await
+    .expect("the label filter must read");
+    assert_eq!(
+        by_label.total, 1,
+        "the label filter is a containment test on label_counts and must find exactly the \
+         email row"
+    );
+    assert_eq!(
+        by_label.rows[0].feature.as_deref(),
+        Some("chat"),
+        "and it must be the chat row, not the blocked one"
+    );
+    assert!(
+        !by_label.rows[0].blocked,
+        "the label filter must not have matched the blocked row: it has no label counts"
+    );
+
+    let blocked_only = guard_store::list_events(
+        &store.pool,
+        &EventFilter {
+            organization_id: store.organization_id,
+            blocked_only: true,
+            ..EventFilter::default()
+        },
+    )
+    .await
+    .expect("the blocked filter must read");
+    assert_eq!(
+        blocked_only.total, 1,
+        "only the refused row matches the blocked filter"
+    );
+    assert_eq!(blocked_only.rows[0].id, blocked_id);
+    assert!(blocked_only.rows[0].blocked);
+
+    // The counts the stat cards sum are the ones the rows carry.
+    let stats = guard_store::label_stats(
+        &store.pool,
+        store.organization_id,
+        OffsetDateTime::now_utc() - time::Duration::days(30),
+    )
+    .await
+    .expect("the label stats must read");
+    assert_eq!(stats.get("email").copied(), Some(2), "the stat card sums the row");
+
+    // Another tenant sees none of it.
+    let other = guard_store::list_events(
+        &store.pool,
+        &EventFilter {
+            organization_id: store.other_organization_id,
+            ..EventFilter::default()
+        },
+    )
+    .await
+    .expect("the read must answer");
+    assert_eq!(
+        other.total, 0,
+        "the events screen must not read across tenants"
+    );
+
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_duplicate_key_is_a_conflict_and_a_bad_key_is_a_field_error() {
+    let store = guard!();
+
+    let _first = guard_store::create_rule(
+        &store.pool,
+        store.organization_id,
+        None,
+        store.rule("dup.key", Label::Email, r"x@example\.com").await,
+    )
+    .await
+    .expect("the first rule must be created");
+
+    let again = guard_store::create_rule(
+        &store.pool,
+        store.organization_id,
+        None,
+        store.rule("dup.key", Label::Email, r"y@example\.com").await,
+    )
+    .await;
+    match again {
+        Err(omnion_ai_hub::AiHubError::GuardRuleConflict(message)) => {
+            assert!(message.contains("dup.key"), "the message names the key: {message}");
+        }
+        other => panic!("a taken key must be a conflict, got {other:?}"),
+    }
+
+    // The same key in *another* tenant is fine — the folded unique index is per organization.
+    let _other = guard_store::create_rule(
+        &store.pool,
+        store.other_organization_id,
+        None,
+        store.rule("dup.key", Label::Email, r"z@example\.com").await,
+    )
+    .await
+    .expect("a key is unique per organization, not globally");
+
+    for bad in ["A", "Has Space", "UPPER", "x".repeat(61).as_str()] {
+        let refused =
+            guard_store::create_rule(&store.pool, store.organization_id, None, {
+                let mut rule = store.rule(bad, Label::Email, r"q@example\.com").await;
+                // The key shape is the thing under test, so the key has to be allowed through
+                // to the validator even where it is illegal to type.
+                rule.key = bad.to_owned();
+                rule
+            })
+            .await;
+        assert!(
+            matches!(refused, Err(omnion_ai_hub::AiHubError::InvalidGuardRule(_))),
+            "the key `{bad}` must be refused as a field error, got {refused:?}"
+        );
+    }
+
+    store.dispose().await;
+}
+
+/// A caller with `ai.guard.read` but not `ai.guard.manage` is named, not guessed.
+///
+/// The criterion has two halves and they are checked against **the real evaluator**: the API's
+/// write paths enforce `ai.guard.manage` through `guards::require`, so the screen's promise is only
+/// worth anything if it is computed the same way the guard computes it. A test that hand-built a
+/// "missing" array would prove the array renders and nothing about the two agreeing.
+///
+/// So this walk builds an actual role holding exactly `ai.guard.read`, binds an actual user to it,
+/// and asks the **real** `effective_permissions` what that user holds. Three states are checked,
+/// because each one is a different bug:
+///   * a reader is missing `manage`      — otherwise every auditor gets a live Save button
+///   * a manager is missing nothing      — otherwise the control is dead for the operator
+///   * `read` is never reported missing  — the screen would then render itself read-only to
+///                                        everybody, including the owner, and look broken
+#[tokio::test]
+async fn a_guard_reader_is_told_the_key_it_is_missing() {
+    let store = guard!();
+
+    // The catalogue has to exist before a grant can reference it: `role_permissions.permission_key`
+    // is a foreign key onto `permissions`, so a walk that inserts a grant without seeding the
+    // catalogue fails on the fixture rather than on the claim. Seeding is idempotent and is what
+    // the API does on boot, so this is the same state the screens run against — not a bespoke
+    // one-row insert of the two keys, which would let the test pass on a build whose catalogue had
+    // lost them.
+    omnion_permissions::seed::ensure(&store.pool)
+        .await
+        .expect("the permission catalogue must seed");
+
+    // The role: exactly one permission, so nothing about the outcome comes from an inherited
+    // grant. `effect` is written explicitly rather than relying on a default.
+    let role_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into roles (id, organization_id, key, name, description, priority, \
+         inherit_permissions, is_system) \
+         values ($1, $2, $3, $4, $5, 0, false, false)",
+    )
+    .bind(role_id)
+    .bind(store.organization_id)
+    .bind(format!("guard-reader-{}", Uuid::new_v4().simple()))
+    .bind("Guard reader")
+    .bind("reads the guard and cannot change it")
+    .execute(&store.pool)
+    .await
+    .expect("the reader role must be created");
+
+    sqlx::query(
+        "insert into role_permissions (role_id, permission_key, effect) values ($1, $2, 'allow')",
+    )
+    .bind(role_id)
+    .bind("ai.guard.read")
+    .execute(&store.pool)
+    .await
+    .expect("the reader grant must be created");
+
+    // The account, bound to that role in this organization only.
+    let user_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into users (id, organization_id, email, display_name, status, mfa_enforced, \
+         failed_sign_in_count, attributes) \
+         values ($1, $2, $3, $4, 'active', false, 0, '{}'::jsonb)",
+    )
+    .bind(user_id)
+    .bind(store.organization_id)
+    .bind(format!("reader-{}@example.test", Uuid::new_v4().simple()))
+    .bind("Guard reader")
+    .execute(&store.pool)
+    .await
+    .expect("the reader account must be created");
+
+    sqlx::query(
+        "insert into role_bindings \
+           (id, role_id, user_id, subject_id, subject_type, scope_type, organization_id) \
+         values ($1, $2, $3, $3, 'user', 'organization', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(role_id)
+    .bind(user_id)
+    .bind(store.organization_id)
+    .execute(&store.pool)
+    .await
+    .expect("the binding must be created");
+
+    let scope = omnion_permissions::model::Scope::Organization {
+        organization_id: store.organization_id,
+    };
+    let effective = omnion_permissions::effective_permissions(&store.pool, user_id, scope.clone())
+        .await
+        .expect("effective permissions must resolve");
+
+    assert!(
+        effective.allows("ai.guard.read"),
+        "the fixture role grants exactly ai.guard.read, so the reader must hold it — otherwise \
+         this walk is measuring a fixture that never bound"
+    );
+    assert!(
+        !effective.allows("ai.guard.manage"),
+        "the fixture role grants nothing else, so manage must be absent; if this fails the role \
+         graph is granting a permission nobody listed, and every read-only assertion below is void"
+    );
+
+    // The **product's own** predicate, not a retyped copy of it. This is the point of the walk:
+    // a filter written out again here would prove the retyped filter, and the screen reads the
+    // real one, so the two could disagree exactly when it matters.
+    let missing = omnion_api::routes::ai_guard::missing_guard_keys(&effective);
+    let missing: Vec<&str> = missing.iter().map(String::as_str).collect();
+    assert_eq!(
+        missing,
+        vec!["ai.guard.manage"],
+        "the screen names the keys it will refuse on, so the list must be exactly the manage key: \
+         naming read as well would render a working screen read-only to its own audience"
+    );
+
+    // And the manager half, because the read-only predicate has two failure modes and a test
+    // that only checks the first cannot see the second. The same predicate over an account holding
+    // BOTH keys must report nothing missing, or every control would be permanently disabled for
+    // the operator who is supposed to have them — a screen that is read-only for everyone reads
+    // as broken, and nobody reports a broken screen as a permission bug.
+    let manager_role = Uuid::new_v4();
+    sqlx::query(
+        "insert into roles (id, organization_id, key, name, description, priority, \
+         inherit_permissions, is_system) \
+         values ($1, $2, $3, $4, $5, 0, false, false)",
+    )
+    .bind(manager_role)
+    .bind(store.organization_id)
+    .bind(format!("guard-manager-{}", Uuid::new_v4().simple()))
+    .bind("Guard manager")
+    .bind("reads and writes the guard")
+    .execute(&store.pool)
+    .await
+    .expect("the manager role must be created");
+    for key in ["ai.guard.read", "ai.guard.manage"] {
+        sqlx::query(
+            "insert into role_permissions (role_id, permission_key, effect) \
+             values ($1, $2, 'allow')",
+        )
+        .bind(manager_role)
+        .bind(key)
+        .execute(&store.pool)
+        .await
+        .expect("the manager grant must be created");
+    }
+
+    let manager_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into users (id, organization_id, email, display_name, status, mfa_enforced, \
+         failed_sign_in_count, attributes) \
+         values ($1, $2, $3, $4, 'active', false, 0, '{}'::jsonb)",
+    )
+    .bind(manager_id)
+    .bind(store.organization_id)
+    .bind(format!("manager-{}@example.test", Uuid::new_v4().simple()))
+    .bind("Guard manager")
+    .execute(&store.pool)
+    .await
+    .expect("the manager account must be created");
+    sqlx::query(
+        "insert into role_bindings \
+           (id, role_id, user_id, subject_id, subject_type, scope_type, organization_id) \
+         values ($1, $2, $3, $3, 'user', 'organization', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(manager_role)
+    .bind(manager_id)
+    .bind(store.organization_id)
+    .execute(&store.pool)
+    .await
+    .expect("the manager binding must be created");
+
+    let manager_effective =
+        omnion_permissions::effective_permissions(&store.pool, manager_id, scope.clone())
+            .await
+            .expect("the manager's effective permissions must resolve");
+    let manager_missing: Vec<String> = omnion_api::routes::ai_guard::missing_guard_keys(&manager_effective)
+        .into_iter()
+        .collect();
+    assert!(
+        manager_missing.is_empty(),
+        "a caller holding both keys must be missing none, or the guard's own administrator sees \
+         every control disabled with no way to say why: {manager_missing:?}"
+    );
+
+    // Clean-up. Bindings first (they reference both), then the roles (they reference the
+    // grants), then the accounts — a throwaway database is dropped anyway, but a walk that leaves
+    // rows behind makes the next run's counts depend on this one.
+    for account in [user_id, manager_id] {
+        sqlx::query("delete from role_bindings where user_id = $1")
+            .bind(account)
+            .execute(&store.pool)
+            .await
+            .expect("binding cleanup must run");
+        sqlx::query("delete from users where id = $1")
+            .bind(account)
+            .execute(&store.pool)
+            .await
+            .expect("account cleanup must run");
+    }
+    for role in [role_id, manager_role] {
+        sqlx::query("delete from roles where id = $1")
+            .bind(role)
+            .execute(&store.pool)
+            .await
+            .expect("role cleanup must run");
+    }
+
+    store.dispose().await;
+}

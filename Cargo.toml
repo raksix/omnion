@@ -44,17 +44,20 @@ rand = "0.8"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
-# Constant-time comparison. Two callers need it and neither is exotic: the identity
-# crate's secret envelope verifies its MAC tag, and the workflows crate's PKCE check
-# compares a derived challenge against a provider's — a timing-variable comparison on
-# either is a guess oracle rather than a bug.
-subtle = "2"
 
 # WebAuthn passkeys (crates/identity): the two signature families a credential can carry —
 # ES256 (P-256 ECDSA) and EdDSA (Ed25519). The COSE key and the ceremony blobs are read by the
 # crate's own small CBOR reader, so no general CBOR dependency is needed.
-p256 = "0.13"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8", "std"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# Web Push (REQ-021 slice 6). Signing a push payload is three primitives the platform did
+# not have: the browser's key agreement (P-256 ECDH), a one-time key derived from it
+# (HKDF-SHA256) and content encryption (AES-128-GCM). They are named here rather than in the
+# crate so the version stays one edit, and so a second reader of the same primitive cannot
+# arrive with a different one.
+hkdf = "0.12"
+aes-gcm = "0.10"
 
 # Enterprise sign-in (crates/identity/src/sso): verifying an OIDC ID token means checking an
 # RSASSA-PKCS1-v1_5 signature over the exact bytes a provider sent, so the verification is the
@@ -68,6 +71,17 @@ hmac = "0.12"
 percent-encoding = "2"
 bytes = "1"
 url = "2"
+
+# Regular expressions (REQ-105 data guard): the rule form compiles a tenant-authored pattern
+# and refuses an invalid one at save time, so the platform needs an engine that can report a
+# compile error rather than approximate one.
+regex = "1"
+
+# IP access rules (REQ-012 slice 4): matching an address against a CIDR is a range comparison,
+# and both families plus the prefix arithmetic are the easy part to get subtly wrong. `ipnet`
+# is already in the lockfile as a transitive dependency of `axum`'s client stack, so pinning it
+# here costs the workspace nothing to resolve.
+ipnet = "2.12"
 
 # The `omnion` command line (tools/cli) reads the first-run password without echoing it.
 rpassword = "7"
