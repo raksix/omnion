@@ -1509,6 +1509,7 @@ dependencies = [
  "aes-gcm",
  "hex",
  "hkdf",
+ "omnion-health",
  "omnion-storage",
  "rand 0.8.8",
  "serde",
