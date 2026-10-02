@@ -1100,15 +1100,33 @@ pub fn manifest_of(backup: &Backup) -> Manifest {
 }
 
 /// Tie a run to the schedule that produced it, and move that schedule's own bookkeeping.
+///
+/// Three columns, and the reason they are written together is that **they answer three
+/// different questions and each one has a different correct answer for a manual run.** The
+/// worker's call sets all three: a scheduled run happened, this is the run, and the slot is
+/// rearmed. A "run now" happens on the same schedule and *is* a run of it, so two of the
+/// three must move — but **the next slot must not**, because an operator pressing a button at
+/// 09:00 to check the schedule works has not consumed tomorrow's 03:00. So this function
+/// takes the new next run as an `Option` and the manual path passes `None`, which leaves
+/// `next_run_at` exactly as the schedule already had it.
+///
+/// It is one function rather than two because the alternative is a second `update` statement
+/// that writes a subset of the columns, and a subset statement is how a schedule ends up with
+/// a `last_run_at` from one path and a `next_run_at` from another.
 pub async fn record_schedule_run(
     pool: &PgPool,
     schedule_id: Uuid,
     backup_id: Uuid,
-    next_run_at: OffsetDateTime,
+    next_run_at: Option<OffsetDateTime>,
 ) -> Result<()> {
+    // `next_run_at = coalesce($3, next_run_at)` rather than a second statement that skips the
+    // column: one statement cannot half-apply, and the expression says out loud what the
+    // `None` means. A schedule whose next run was somehow null stays null here — the manual
+    // path has no cadence to recompute and inventing a slot would be a promise nobody made.
     sqlx::query(
         "update backup_schedules \
-         set last_run_at = now(), last_backup_id = $2, next_run_at = $3, updated_at = now() \
+         set last_run_at = now(), last_backup_id = $2, updated_at = now(), \
+             next_run_at = coalesce($3, next_run_at) \
          where id = $1",
     )
     .bind(schedule_id)
