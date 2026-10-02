@@ -11867,3 +11867,69 @@ my own tree (1.0 G, `lsof` showed no holder) which took it to 1.8 G, and stopped
 unrelated functions — eight files, ~200 lines of churn that had nothing to do with this tick.
 Reverted with `git checkout --` and the export line re-applied by hand. Format the file you
 touched, not the crate.
+
+### tick 64 (wave2) — the block bound counted the outer array, not the page
+
+`MAX_BLOCKS` was enforced against `blocks.len()`. The `block_count` the same function
+reported two lines below was accumulated recursively by the validation loop. One
+function, one word, two definitions — and the validator's own message printed the
+number that disagreed with the rule above it.
+
+The payload that walks straight through it is ordinary: a `columns` container is one
+entry, so a page of *one block* holding four hundred and one texts passes a bound of
+four hundred, publishes, and reports itself as 404 blocks. The author's outline lists
+404 rows and the editor's bar — fed by the same validator — says the page holds a
+handful. Nothing under the top level was ever counted against the limit, so the bound
+only ever governed flat pages.
+
+The preview route was worse, because it answered a question of its own: `block_count`
+and `visible_count` were `parsed.len()` and `degraded.len()`, so the frame's own
+arithmetic (`block_count - visible_count`, the "how many did I hide?" figure) named
+zero for every nested page, and the banner read **1 of 1 blocks render on mobile**
+directly above an outline listing seven.
+
+Fixed by making `count_tree` the single definition and using it in all three places —
+the bound, the reported count and the route. `count_tree` is public precisely so the
+route cannot grow a fourth.
+
+| Gate | Command | Result |
+|---|---|---|
+| unit | `cargo test -p omnion-content --lib --quiet` | **348 passed, 0 failed** (was 346) |
+| walk | `cargo test -p omnion-api --test content_blocks` | **22 passed** in 192 s against PostgreSQL :5449 (was 21) |
+| proven to fail (unit) | revert only the bound to `blocks.len()` | **FAILED** — "a tree of 404 blocks was accepted; issues: []" |
+| proven to fail (walk) | revert only the route counts to `.len()` | **FAILED** — `left: Some(1)`, `right: Some(7)`, payload printed |
+| types | `cargo check -p omnion-api` · `tsc --noEmit` (apps/admin) | clean · exit 0 |
+
+**The walk asserts the payload, not just the number.** The failing message carries the
+whole `visible_blocks` tree beside the assertion, so a reader of the failure can see
+*which* tree disagrees with the number rather than being told two integers differ. It
+reads the state BEFORE the block is hidden — a count that only becomes correct after
+the removal is a count that was measuring something else — and its last assertion is
+the frame's own subtraction, so the test fails if the two numbers stop being comparable
+rather than restating them.
+
+**A bound needs its edges.** The fix could have been `total > MAX_BLOCKS` on any
+number, so the companion test pins a tree of *exactly* `MAX_BLOCKS` and requires it to
+publish. Without it, "refuse anything nested enough to notice" passes the same test
+that the defect did.
+
+**The editor's `MAX_BLOCKS` mirror is a fourth copy.** `block-tree.ts` carries
+`export const MAX_BLOCKS = 400` with the comment "mirrors the server's `MAX_BLOCKS`",
+and nothing in either language enforces that they stay equal — the same shape as the
+`degrade_tree`/`filter_for_viewport` drift from tick 55, still open.
+
+**Browser pass: attempted, not run.** The owed `--only=block-editor,theme-customize`
+took the slot after 8m29s of `cargo build`, started all three servers, and died at its
+**first** browser action: `page.waitForTimeout: Page crashed`, `summary.json` =
+`{"fatal": …, "fatalAfter": []}` and no counters whatsoever. Not a product verdict —
+the box was at 24.4 G of 32 G swap with 15 Chromium processes alive from sibling
+passes, and the crash preceded the first screenshot. Criterion 17 stays unticked; a
+pass that produced no counts cannot tick it in either direction.
+
+**Disk:** reclaimed this worktree's own `omnion-w2-target` intermediates (nothing maps
+them — checked `/proc/*/maps`), keeping the `omnion-api` binary the QA stack runs.
+96% → 85%, ~8.5 G free. Four orphaned `qa-slot.sh` waiters reparented to init in this
+worktree were cleared; `w5`'s live holder was left alone.
+
+**Next:** criterion 17's pass on a box with swap headroom, then REQ-064's `--only=forms`.
+
