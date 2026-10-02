@@ -321,6 +321,20 @@ step "ensure the QA organization exists"
 node scripts/qa/ensure-organization.mjs --url "http://127.0.0.1:$API_PORT" --admin "http://127.0.0.1:$ADMIN_PORT" \
   || echo "[qa] the organization could not be created; the rule screens will report an empty tenant"
 
+# The two static sweeps run BEFORE the browser, and they are cheap. Both answer a question the
+# walkthrough's own notes keep re-deriving by hand: is every path the rows fetch a path the router
+# mounts (`probe-api-routes.mjs`), and is every field they read a field the handler actually sends
+# (`probe-api-fields.mjs`). Tick 89's defect — `/api/v1/workflows/{id}/runs`, `body.runs`,
+# `trigger_kind` — is the second sweep's whole reason to exist, and both were run by hand for two
+# ticks before anyone noticed they were not in this file, which is exactly how a gate stops being run.
+#
+# They are wired HERE rather than left in the tick's prose because a gate nobody invokes is a
+# paragraph. Neither starts a server, neither needs the database, and together they take about a
+# second — so there is no honest reason for a pass to reach the browser with a defect in it.
+step "static sweeps — every walkthrough path and field the server actually has"
+node scripts/qa/probe-api-routes.mjs
+node scripts/qa/probe-api-fields.mjs
+
 # The banner reads `QA_ONLY_FILTER`, not `QA_ONLY`. With the flag arriving on the command line
 # the env var is empty, so the old line announced a full pass over every route while a narrow
 # one ran -- a report that misstates its own scope is worse than no report, because it is the

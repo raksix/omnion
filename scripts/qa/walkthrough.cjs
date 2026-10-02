@@ -14297,11 +14297,23 @@ note({
           });
           if (!detail.ok) return null;
           const run = await detail.json();
+          // `ExecutionDetail` nests the summary under `execution` (`execution`, `steps`,
+          // `event_payload`, `can_retry`) — there is NO top-level `id`, `status` or
+          // `started_from_node`. The previous read of those three was `undefined` on a 200, and the
+          // `?? latest.id` / `?? null` fallbacks hid it: `executionId` was right by luck and
+          // `status` and `startedFrom` were permanently `null`, which is indistinguishable from a
+          // run that never started. Found by `probe-api-fields.mjs`, the sweep that settles
+          // "a field name that is plausible, and that appears somewhere in the server".
+          const summary = run?.execution ?? null;
           return {
-            executionId: run.id ?? latest.id ?? null,
-            status: run.status ?? null,
-            startedFrom: run.started_from_node ?? null,
-            steps: (run.steps ?? []).map((step) => ({
+            // A nested summary that did not arrive is not the list's summary: keeping the fallback
+            // would report the row above as though the detail fetch had confirmed it.
+            executionId: summary?.id ?? null,
+            status: summary?.status ?? null,
+            startedFrom: summary?.started_from_node ?? null,
+            // The fallback that made this row unmeasurable, named so a reader knows it was dropped.
+            detailSendsExecution: Boolean(summary),
+            steps: (run?.steps ?? []).map((step) => ({
               step_no: step.step_no,
               status: step.status,
               skip_reason: step.skip_reason ?? null,
@@ -16444,8 +16456,14 @@ async function runWorkflowTableDepth(page, report) {
     const after = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
     return {
       status: response.status,
+      // The run response's error envelope, read off `body` — the RUN response, not the graph read
+      // that follows it in this block. `GraphBody` has no `error` (it carries `validation_error`),
+      // so a read of `after.error` would be `undefined` on a 200 and `probe-api-fields.mjs`
+      // reported it against the graph path. `error` is not optional on the envelope, so `?.` is
+      // here for a refusal that answered with no body at all, which the row already handles.
       code: body?.error?.code ?? null,
       message: (body?.error?.message ?? "").slice(0, 160) || null,
+      // Named so a reader can tell "the graph read has no error field" from "the run was refused".
       stepsKept: Array.isArray(after?.steps) ? after.steps.length : null,
       executions: await (await fetch(`/api/v1/workflows/${id}/executions`, { credentials: "same-origin" }))
         .json()
