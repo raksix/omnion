@@ -369,13 +369,61 @@ pub async fn claim(pool: &PgPool, lead: &Lead, message: &Message) -> Result<bool
 /// re-claiming the lead would mail it twice, which is the duplicate this design exists to
 /// prevent. That is also what makes the two functions safe to run in either order after an
 /// upgrade: whichever observes the send first wins the row, and the other finds it excluded.
+///
+/// ## `not (detail ? 'delivered_at')` is the wrong question, and it is wrong in BOTH directions
+///
+/// The key-existence operator `?` is true for a key whose value is JSON `null`, so every
+/// function in this file that asked "is there a `delivered_at` key?" was asking the wrong
+/// question about migration `0202`'s own output. `0202` stamps its rows with
+/// `jsonb_build_object('sent', true, 'delivered_at', null, 'delivery_unknown', true)` — the key
+/// is *present* and *null*, which is the honest way to record "never claimed as delivered" and
+/// is asserted by `run-crm-autoresponder-claim.sh`. Measured on the server, not reasoned about:
+///
+/// ```text
+///   {"sent":true,"delivered_at":null,"delivery_unknown":true} ? 'delivered_at'  ->  true
+///   not (that)                                                                  ->  false
+/// ```
+///
+/// So the old predicate *excluded* exactly the rows `0202` was written to save. Two
+/// consequences, and they pull in opposite directions, which is why the repair cannot be one
+/// search-and-replace:
+///
+/// * [`mark_sent`] could not complete such a row. The migration's stated purpose — *"an
+///   installation upgrading mid-flight can complete a claim the old code claimed but never
+///   recorded, rather than leaving it permanently uncompletable"* — was **unreachable code**,
+///   written in a comment above a predicate that excluded its subject.
+/// * Fixing that question in [`release_claim`] alone would be **worse than the defect**: the
+///   old predicate had been accidentally shielding a *settled* row from deletion, and a
+///   release is a `delete`. A `0202` row is `sent: true` — the lead IS answered, which is the
+///   one thing `0202` refuses to give up — so a release that can now see it would delete the
+///   evidence and let `prepare` answer "not sent", and the second copy would go out to a
+///   visitor who already has the first.
+///
+/// **So the two functions ask the same question and answer it differently, and that is the
+/// rule rather than an inconsistency:** *completion may proceed on an unknown row, a release
+/// may not.* [`mark_sent`] reads `detail->>'delivered_at' is null` alone, which is what its
+/// own doc comment already promised. This function reads that clause **and** additionally
+/// requires `delivery_unknown` to be absent or false, so the exemption is written down rather
+/// than being an accident of a key-existence test.
+///
+/// ## Why the exemption is safe even though it is not redundant
+///
+/// A `0202` row is `sent: true`, so no send path ever reaches this function with it:
+/// `prepare` answers `AlreadySent` (it reads `sent`), and [`due_reservations`] requires
+/// `sent = 'false'`. The guard is therefore *not* load-bearing for any flow that exists today —
+/// and it is written anyway, because the failure it prevents is silent, permanent and
+/// duplicate-shaped, and because a predicate that happens to be safe is a predicate that is
+/// one refactor away from not being safe. `ClaimState::of` in this file already reads the same
+/// way (`and_then(Value::as_str)`), so the SQL and the reader now agree on one spelling of the
+/// same fact instead of two that disagree only for `0202`'s rows.
 pub async fn release_claim(pool: &PgPool, lead_id: Uuid, to: &str) -> Result<bool> {
     let removed: Option<i64> = sqlx::query_scalar(
         "delete from crm_lead_events \
          where id = ( \
            select id from crm_lead_events \
            where lead_id = $1 and kind = $2 and detail->>'to' = $3 \
-             and detail ? 'sent' and not (detail ? 'delivered_at') \
+             and detail ? 'sent' and detail->>'delivered_at' is null \
+             and coalesce(detail->>'delivery_unknown', 'false') <> 'true' \
            order by id desc limit 1 \
          ) returning id",
     )
@@ -418,7 +466,7 @@ pub async fn mark_sent(pool: &PgPool, lead_id: Uuid, sent_at: OffsetDateTime) ->
          where id = ( \
            select id from crm_lead_events \
            where lead_id = $1 and kind = $3 \
-             and detail ? 'sent' and not (detail ? 'delivered_at') \
+             and detail ? 'sent' and detail->>'delivered_at' is null \
            order by id desc limit 1 \
          ) returning id",
     )
@@ -486,7 +534,7 @@ pub async fn claim_delivery(
          where id = ( \
            select id from crm_lead_events \
            where lead_id = $1 and kind = $2 and detail->>'to' = $3 \
-             and detail ? 'sent' and not (detail ? 'delivered_at') \
+             and detail ? 'sent' and detail->>'delivered_at' is null \
              and (delivery_claimed_at is null \
                   or delivery_claimed_at < $5::timestamptz) \
            order by id desc limit 1 \
@@ -639,7 +687,7 @@ pub async fn due_reservations(
          from crm_lead_events e \
          where e.kind = $1 \
            and e.detail->>'sent' = 'false' \
-           and not (e.detail ? 'delivered_at') \
+           and e.detail->>'delivered_at' is null \
            and ( \
              (nullif(e.detail->>'due_at', '') is not null and e.detail->>'due_at' <= $2) \
              or (nullif(e.detail->>'due_at', '') is null and e.created_at <= $3) \

@@ -1293,3 +1293,150 @@ async fn a_delivered_claim_is_not_offered_again() {
 
     drop_org(&pool, org).await;
 }
+
+
+// -------------------------------------------------------------------------------------------
+// SLICE 48 — `delivered_at` is asked for by VALUE, not by key existence
+// -------------------------------------------------------------------------------------------
+
+/// Stamp one of a lead's claim rows into migration `0202`'s own output shape.
+///
+/// The repair writes `jsonb_build_object('delivered_at', null, 'delivery_unknown', true)` — a
+/// key that is **present** and **null**. That is the honest encoding of "never claimed as
+/// delivered", and `run-crm-autoresponder-claim.sh` asserts exactly this text. The reason it is
+/// spelled out here rather than done inline is that every assertion in these two tests is about
+/// how a *reader* treats that shape, so the shape has to be produced by the production spelling
+/// or the tests prove nothing.
+async fn stamp_as_0202(pool: &PgPool, lead_id: Uuid) {
+    sqlx::query(
+        "update crm_lead_events \
+           set detail = detail || jsonb_build_object('delivered_at', null, 'delivery_unknown', true) \
+         where lead_id = $1 and kind = $2 and detail ? 'sent'",
+    )
+    .bind(lead_id)
+    .bind(ar_store::SENT_KIND)
+    .execute(pool)
+    .await
+    .expect("stamping the claim as never-observed");
+}
+
+#[tokio::test]
+async fn a_0202_shaped_claim_can_still_be_completed() {
+    // The defect, in one line. Every function in this crate asked "is there a `delivered_at`
+    // KEY?" with the `?` operator, and `?` is true for a key whose value is JSON `null`:
+    //
+    //     {"sent":true,"delivered_at":null,"delivery_unknown":true} ? 'delivered_at'  ->  true
+    //     not (that)                                                                  ->  false
+    //
+    // So `mark_sent` carried `and not (detail ? 'delivered_at')` and **refused to complete
+    // exactly the rows migration `0202` was written to rescue.** The migration says so itself:
+    // *"an installation upgrading mid-flight can complete a claim the old code claimed but
+    // never recorded, rather than leaving it permanently uncompletable."* That sentence was
+    // documentation of a code path that could not execute.
+    //
+    // This row is `sent: true`, which is why it is a real upgrade case rather than a synthetic
+    // one: `0202` deliberately leaves `sent` alone, because re-opening an answered lead is the
+    // worse defect. So the lead reads as answered forever and the completion it waits for never
+    // happens — the worst of both: the row says delivered and the column says nothing.
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder 0202 completion").await;
+    let source = source_with_autoresponder(&pool, org, 0).await;
+    let lead = accepted_lead(&pool, org, &source, "upgraded@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("the slot is claimed");
+    stamp_as_0202(&pool, lead.id).await;
+
+    // The pre-state, read back from the row: the key exists AND is null. Asserted rather than
+    // assumed, because a gate that never checks what it is about to repair will go green
+    // against a fixture that was never in the shape it claims to be.
+    let stored = ar_store::existing_claim(&pool, lead.id)
+        .await
+        .expect("reading the claim")
+        .expect("a claim exists");
+    assert!(
+        stored.get("delivered_at").is_some(),
+        "the fixture must carry a PRESENT delivered_at key — that is the whole shape"
+    );
+    assert!(
+        stored["delivered_at"].is_null(),
+        "and its value must be null, which is what 0202 writes and what `?` cannot see past"
+    );
+
+    // THE ASSERTION.
+    assert!(
+        ar_store::mark_sent(&pool, lead.id, now).await.expect("the completion runs"),
+        "an installation upgrading mid-flight must be able to complete a claim the old code \
+         claimed but never recorded — that is 0202's stated purpose, in its own words"
+    );
+
+    // And the row now says the one thing that was missing: an instant.
+    let after = ar_store::existing_claim(&pool, lead.id)
+        .await
+        .expect("reading the claim")
+        .expect("a claim exists");
+    assert!(
+        after["delivered_at"].as_str().is_some(),
+        "the delivery instant is recorded, so a reader can tell delivered from never-observed"
+    );
+
+    drop_org(&pool, org).await;
+}
+
+#[tokio::test]
+async fn a_settled_0202_claim_is_never_released() {
+    // The negative control, and the reason the fix above could not be a search-and-replace.
+    //
+    // `release_claim` is a **delete**. It shares `mark_sent`'s question and has to answer it
+    // differently, because the two operations are not symmetric on a `0202` row:
+    //
+    //   * completion only ADDS a fact, and the row wants it;
+    //   * a release REMOVES the row, and the row is the only evidence the lead was answered.
+    //
+    // A `0202` row is `sent: true` — `0202` sets it that way precisely so the lead is never
+    // re-opened — so deleting it would make `prepare` answer "not sent" and the second copy
+    // would go out to a visitor who already has the first. **A duplicate is a permanent,
+    // invisible defect**, which is the bias this module has taken from the first migration.
+    //
+    // Note the honesty of the guard's own reach: no flow can currently call this function with
+    // such a row, because `prepare` answers `AlreadySent` first and the sweep requires
+    // `sent = 'false'`. The guard is written anyway, because a predicate that happens to be
+    // safe is one refactor away from not being safe, and because "no caller can produce this"
+    // is a claim about the callers rather than about the predicate.
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder 0202 release").await;
+    let source = source_with_autoresponder(&pool, org, 0).await;
+    let lead = accepted_lead(&pool, org, &source, "settled@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("the slot is claimed");
+    stamp_as_0202(&pool, lead.id).await;
+
+    assert!(
+        !ar_store::release_claim(&pool, lead.id, "settled@example.com")
+            .await
+            .expect("the release runs"),
+        "a row migration 0202 settled is the lead's only record of being answered: releasing it \
+         would re-open a lead whose message went out and mail the visitor a second copy"
+    );
+    assert!(
+        ar_store::existing_claim(&pool, lead.id)
+            .await
+            .expect("reading the claim")
+            .is_some(),
+        "the row survives, so `prepare` keeps answering AlreadySent"
+    );
+    assert!(
+        !ar_store::prepare(&pool, &lead, &source, now)
+            .await
+            .expect("prepare")
+            .sent(),
+        "and the lead is not offered a second message, which is the guarantee under test"
+    );
+
+    drop_org(&pool, org).await;
+}
