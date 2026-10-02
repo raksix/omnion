@@ -12694,3 +12694,29 @@ the elapsed time before the error text.**
 
 **Next:** run the full 57 against `omnion_qa_w4` with `OMNION_DATABASE_URL` exported, then the three
 browser-only boxes when the QA slot frees.
+
+### tick 72, continued — the fix is proven, and the next cost is the database
+
+**The reproduction that caught the mistake is the one that proves the fix.** Same two walks, same
+binary family, opposite result:
+
+| run | walk 1 | walk 2 | result |
+|---|---|---|---|
+| before | ok, `pool size=3 idle=2` | `PoolTimedOut` before its first query | `1 passed; 1 failed … 18.48s` |
+| after | ok, `iam seed 6126 ms` | ok, **no seed line at all** | **`2 passed; 0 failed … 17.62s`** |
+
+**Full suite after the fix: 26 consecutive walks pass, 0 failures** — every one of the 38 that
+reported `PoolTimedOut` last tick now passes. The suite is **not** through all 57 and is not claimed
+to be.
+
+**The remaining cost is the QA database, and it is getting worse every tick.** Walk 27
+(`archiving_a_crm_record_removes_it_from_the_palette`) has run ~9 minutes. It calls
+`POST /api/v1/search/reindex`, and `omnion_qa_w4` now holds **996 organizations and 4553 search
+documents** left behind by earlier ticks — five walks in this suite trigger a full reindex, and each
+one rescans every row any previous run wrote. Measured on the stall: **0 CPU over 12 s across every
+thread, `locks not granted = 0`, 8 live PostgreSQL connections.** Not a deadlock, not a leak, and not
+the fixture: a scan over an artifact that no test prunes.
+
+**Next:** reset `omnion_qa_w4`, or scope the search walks' reindex to their own marker, and finish the
+57. Then the three browser-only boxes once the QA slot frees.
+
