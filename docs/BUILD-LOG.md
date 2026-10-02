@@ -10574,3 +10574,65 @@ box) and `/mnt/apopic` fell to **99% with 1.1 G free** during this tick's build 
 `.next` rebuild, so starting one now dies on the box rather than on the product. **Next:** `df`
 first, then the pass when a slot frees; then slice 2 (migrate ledger operations, fixture sets, the
 `doctor` check engine with its four induced-failure scenarios).
+
+## Tick 76 — REQ-131 slice 2 (leg 1): `omnion migrate new`, and the indentation it would have taught wrong
+
+**What.** The queue head was REQ-131 slice 2, and acceptance 4 is the shape `up` / `status` / `new`.
+The first two were already real, so the whole of the unticked line was one missing word. This tick
+adds `omnion migrate new <name>`: allocate the next free version and write the skeleton.
+
+**Proof.**
+
+| Check | Result |
+|---|---|
+| `cargo test -p omnion-cli` | **52 passed, 0 failed** (was 38) |
+| `cargo test -p omnion-migrations --lib` | **103 passed** (the crate this builds on, untouched) |
+| `pnpm typecheck` | 2/2 successful |
+| `cargo clippy -p omnion-cli` dead code | 4 warnings, **all pre-existing** — verified by stashing: HEAD also reports 4 |
+| the union, against a live database | ledger `0004, 0009, 0012` + tree `0001` → allocated **`0013`**, where `max(files)+1` answers `0002` |
+| `migrate up` on a fresh scratch database | applied 46, backfilled 57 ledger rows, exit 0 |
+| `migrate status` after that | `applied 64, pending 0, drift [], lock free`; `--json` one document carrying the same |
+| `new` against the real tree | allocated `0241`; second run refused `code: usage` naming `0241_add_invoices.sql` |
+| the four refusals, exit codes and codes | usage ×3 / config_unreadable ×1; `ok` agrees with exit in all four; stdout is one JSON document in every case |
+| an unwritable directory | refused **by name** (`config_unreadable`), proven against a 0555 directory as uid 65534 |
+
+**Three defects, none of which reading the code would have found.**
+
+1. **The template taught a reversal shape the parser rejects.** `down::extract_down` counts a
+   comment line as a *statement* only when its body is indented two or more spaces. The template
+   said "un-indented", so every migration generated from it would have been silently reported as
+   having no reversal — at apply time, on a different machine, for every author who followed the
+   instruction. Fixing the prose inverted the defect: the template's own hint line became indented,
+   so every generated file *claimed* a reversal nobody wrote and the deployment centre would label
+   an irreversible change `reversible`. The example now lives in the header, outside the block,
+   where nothing is parsed. `the_template_teaches_the_indentation_the_parser_actually_requires`
+   asserts against the **parser**, not the prose — and it went red on both wrong versions, which is
+   the only reason the third one is known to be right.
+
+2. **The typed error code was dead code.** `Refusal::code()` existed, was correct, and was called
+   from nowhere in production — `execute` funnelled every error through a `String` and re-derived
+   the code from the sentence. clippy's `never used` is what named it. Two authorities for one
+   decision is the shape that drifts silently: reword a sentence and the typed path still answers
+   `usage` while the string path answers `internal`, and only the exit is ever exercised. `Outcome`
+   now carries the typed code out; `classify` survives for exactly one caller, the migration
+   runner's sentences, which cross a crate boundary with no vocabulary of their own.
+
+3. **A missing checkout was reported as a database outage.** `the_two_classifications_agree` failed
+   on its first run: the `NoDirectory` sentence contains `database/migrations`, so the `database` arm
+   caught it before the checkout arm, and a developer in the wrong directory was told
+   `database_unreachable`. The checkout arms are checked first now. Worth recording that this test
+   caught it on the run where the table I had written by hand from the same function said the code
+   was right — the table was derived from the implementation, so it could not disagree with it.
+
+**Two claims this tick removed rather than shipped.** The module doc and one test asserted that a
+re-used lower version makes SQLx refuse to apply anything. I could not produce that — the embedded
+migrator is fixed at build time, so a file added to the tree after the build never reaches it — so
+the claim is now stated as what was actually verified (the number is re-issued, and the two files
+collide in a shared namespace) and the live numbers are quoted. A doc comment that asserts an
+unverified failure mode is worse than one that says what was measured.
+
+**Not ticked.** The browser pass. The QA slot is held live by the main writer (holder pid 315364,
+`/proc/315364/cwd` = `/mnt/apopic/omnion`), and `/mnt/apopic` reached **100% with 76 M free** during
+this tick — a box-wide condition affecting every writer, and the same one that killed the previous
+pass. **Next:** `omnion seed` (fixture sets, acceptance 6) and the doctor check engine with stable
+ids (acceptance 7–9), both slot-free; then the pass when a slot frees and the disk has room.
