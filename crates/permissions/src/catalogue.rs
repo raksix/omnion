@@ -243,6 +243,21 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "deployment",
         description: "Configure maintenance windows",
     },
+    // Edge regions (REQ-035 slice 1). Read and manage are separate keys for the same
+    // reason `deployment.cluster.read` is separate from `deployment.manage`: "which regions
+    // exist and how are they doing" is a fact an operator needs during an incident, and
+    // "rename one, move the routing default, drain one" is a control-plane action. Merged,
+    // every person reading a health matrix could also redirect traffic.
+    PermissionDef {
+        key: "platform.regions.read",
+        category: "platform",
+        description: "Read the edge region registry, its health matrix and region latency",
+    },
+    PermissionDef {
+        key: "platform.regions.manage",
+        category: "platform",
+        description: "Rename a region, set its status, activate it or move the routing default",
+    },
     // Identity and access management.
     PermissionDef {
         key: "iam.permissions.read",
@@ -858,6 +873,31 @@ mod tests {
         ] {
             assert!(is_known(family), "{family} must be in the catalogue");
         }
+    }
+
+    #[test]
+    fn the_platform_region_family_is_catalogued() {
+        // REQ-035 slice 1. An uncatalogued key is the worst failure this catalogue has:
+        // `guards::require` resolves a key against it, so a route guarded by a name the
+        // catalogue does not know answers 403 for *everybody* — the owner included — and the
+        // screen reads as a permissions bug rather than a typo.
+        for key in ["platform.regions.read", "platform.regions.manage"] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+            // The category is asserted too, because the role editor groups by it and a key
+            // in the wrong category is invisible where the editor looks.
+            assert_eq!(
+                CATALOGUE
+                    .iter()
+                    .find(|d| d.key == key)
+                    .map(|d| d.category),
+                Some("platform"),
+                "{key} must be in the platform category"
+            );
+        }
+        // The two must stay *different* keys. A later edit that folds the read into the
+        // manage key would keep this test green while removing the whole point of the
+        // split, so the distinction is asserted rather than documented.
+        assert_ne!("platform.regions.read", "platform.regions.manage");
     }
 
     #[test]
