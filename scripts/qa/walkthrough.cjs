@@ -5525,7 +5525,13 @@ async function runAnalyticsDepth(page, report) {
     visitors = (await kpi()).trim();
   }
   steps.visitors = visitors;
-  steps.empty = (await page.locator("[data-analytics-overview-empty]").count()) > 0;
+  // The empty panel renders its marker as an ATTRIBUTE VALUE, not an attribute name:
+  // `EmptyPanel` writes data-analytics-state="analytics-overview-empty" (the
+  // dataAttribute prop reaches parts.tsx:94). Querying [data-analytics-overview-empty]
+  // counts a node that has never existed, so `empty` was false on every run -- including
+  // the runs where the overview was genuinely empty and the pass was supposed to say so.
+  steps.empty =
+    (await page.locator('[data-analytics-state="analytics-overview-empty"]').count()) > 0;
 
   await page.locator("[data-analytics-preset=7d]").click({ timeout: 4000 }).catch(() => {});
   await page.waitForTimeout(900);
@@ -6373,11 +6379,16 @@ async function runNotificationSettingsDepth(page, report) {
         steps.pushErrorIsASentence = text.trim().length > 20;
       }
     } else if (steps.pushEnableOffered) {
+      // The reason renders as an element id (`<span id="push-enable-reason">`), which is
+      // what `aria-describedby` on the button points at. The probe asked for a
+      // [data-push-enable-reason] attribute that the product never wrote, so both fields
+      // below read false on every run of a disabled button -- the exact case they exist
+      // to describe. `#id` and [id=] both match the rendered element.
       steps.pushEnableExplainsItself =
-        (await page.locator("[data-push-enable-reason]").count()) > 0;
+        (await page.locator("#push-enable-reason").count()) > 0;
       steps.pushDisabledReasonNamesAVariable = /OMNION_PUSH_[A-Z_]+/.test(
         await page
-          .locator("[data-push-enable-reason]")
+          .locator("#push-enable-reason")
           .innerText()
           .catch(() => ""),
       );
