@@ -21,6 +21,13 @@
 -- constraint that is already there with the old definition fails, and so does an `alter … check`
 -- that assumes the original shape.
 --
+-- **The `drop` needs its own `alter table`.** Written as a standalone `drop constraint if exists
+-- …;` the file does not parse — Postgres has no such statement, the error is `syntax error at or
+-- near "constraint"` reported against the *migration number* with no statement text, and the
+-- walk that hits it panics at `db.migrate()`, which reads as a broken database rather than a
+-- broken migration. sqlx splits on the semicolon, so the failure is in the second statement of a
+-- two-statement file that looks right on screen.
+--
 -- WHY `mcp_invocations_org_status_created_ix` LEADS WITH THE FILTER
 -- The clients screen reads "this tenant's calls, newest first, optionally narrowed to a status".
 -- The existing `(tool, status, created_at)` index cannot serve the first column of that — it
@@ -38,7 +45,8 @@
 -- `approval_id` is written when the call parks, so "which inbox item is this" is a column rather
 -- than a join back through the tool arguments. The arguments are masked and truncated to keys
 -- on this table, which makes them the wrong place to look for anything at all.
-drop constraint if exists mcp_invocations_status_ck;
+alter table mcp_invocations
+    drop constraint if exists mcp_invocations_status_ck;
 
 alter table mcp_invocations
     add constraint mcp_invocations_status_ck

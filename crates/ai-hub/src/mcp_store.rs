@@ -219,7 +219,7 @@ impl McpStore {
             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             returning id, organization_id, name, description, token_prefix, scopes, sandbox,
                       rate_limit_per_min, enabled, last_used_at, created_by, created_at,
-                      updated_at, revoked_at, 0 as tool_count
+                      updated_at, revoked_at, 0::bigint as tool_count
             "#,
         )
         .bind(id)

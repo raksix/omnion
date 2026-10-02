@@ -522,6 +522,26 @@ pub fn refusal_for(resolution: &Resolution, tool: &str) -> JsonRpcError {
     }
 }
 
+impl JsonRpcError {
+    /// The `mcp_invocations.status` a refusal of this code is recorded as.
+    ///
+    /// **Derived from the code, not chosen at each call site.** A refusal is recorded by the same
+    /// branches that answer it, and a call site that picked its own status would let a
+    /// `blocked_airgap` land as `denied` — a history that says a client was refused for a missing
+    /// permission when the air gap was the reason is a history an operator cannot act on. The one
+    /// rate-limited refusal is `error` rather than `denied`, and that is the only exception the
+    /// table needs: nothing was refused on the client's merits, the call simply did not happen.
+    #[must_use]
+    pub fn code_name(&self) -> &'static str {
+        match self.code {
+            CODE_BLOCKED_AIRGAP => "blocked_airgap",
+            CODE_PENDING_APPROVAL => "pending_approval",
+            CODE_PERMISSION_DENIED | CODE_TOOL_NOT_FOUND => "denied",
+            _ => "error",
+        }
+    }
+}
+
 /// Validate a call's arguments against the tool's compiled schema.
 ///
 /// The **compiled** schema, not the registry row's copy: the row is the operator's editable copy

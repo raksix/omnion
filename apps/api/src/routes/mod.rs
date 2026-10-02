@@ -101,6 +101,7 @@ pub mod developer;
 pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
+pub mod mcp;
 pub mod media;
 pub mod media_duplicates;
 pub mod media_files;
@@ -1120,6 +1121,28 @@ pub fn router(state: AppState) -> Router {
             axum::routing::put(ai_tools::put_tool_grants_route)
                 .layer(guards::require(&state, "ai.tools.manage")),
         );
+
+    // The MCP surface (REQ-108 slice 2). `/mcp` is the JSON-RPC endpoint and carries **no**
+    // `guards::require` layer: it authenticates its own bearer token, because `guards` knows about
+    // sessions, machine keys and developer keys and none of them is an MCP client. The panel-side
+    // routes below it are ordinary session routes and are guarded normally.
+    let mcp_rpc = post(mcp::mcp_rpc_route);
+    let mcp_overview = get(mcp::mcp_overview_route).layer(guards::require(&state, "mcp.clients.read"));
+    // `/mcp/tools` is the **whole catalogue** — what the installation can offer — so it is
+    // `mcp.clients.read` and not `ai.tools.read`: the audience is somebody deciding what to grant
+    // an agent, and the two screens are read by different people.
+    let mcp_catalogued_tools =
+        get(mcp::list_catalogued_tools_route).layer(guards::require(&state, "mcp.clients.read"));
+    let mcp_invocations_list =
+        get(mcp::list_invocations_route).layer(guards::require(&state, "mcp.clients.read"));
+    let mcp_invocation = get(mcp::read_invocation_route)
+        .layer(guards::require(&state, "mcp.clients.read"));
+    // The sandbox test panel writes nothing, but it *reads* a client's grants and a tool's
+    // schema, and it is the surface an operator uses to widen a grant — so it is `manage`, not
+    // `read`. A `read` that can tell you what a tool would do is still the first half of the
+    // decision that grants it.
+    let mcp_sandbox_test =
+        post(mcp::sandbox_test_route).layer(guards::require(&state, "mcp.clients.manage"));
 
     // AI identities and the permission matrix (REQ-100 slice 2). The read/manage split is the
     // point: seeing which tools an installation's AI may take is a *fact about the platform*,
@@ -2380,6 +2403,16 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/tools/classes", ai_tool_classes)
         .route("/ai/tools/{key}/usage", ai_tool_registry_usage)
         .route("/ai/tools/{key}/grants", ai_tool_grants)
+        // The MCP routes (REQ-108 slice 2). The static children are registered before nothing
+        // captures them today, but the order is kept explicit for the same reason the AI routes
+        // keep theirs: the day `/mcp/{id}` appears, `/mcp/tools` has to be above it, and an
+        // axum overlap panic at startup is the most expensive way to find out.
+        .route("/mcp", mcp_rpc)
+        .route("/mcp/overview", mcp_overview)
+        .route("/mcp/tools", mcp_catalogued_tools)
+        .route("/mcp/sandbox-test", mcp_sandbox_test)
+        .route("/mcp/invocations", mcp_invocations_list)
+        .route("/mcp/invocations/{id}", mcp_invocation)
         .route("/ai/tools", ai_tools)
         .route("/ai/tools/{key}", ai_tool)
         // The identities and the matrix (REQ-100 slice 2). `/ai/permissions/matrix` is

@@ -11657,3 +11657,73 @@ and the keyboard/mobile box stay open for that reason and no other.
 **Next:** the walkthrough needs its developer routes added to `scripts/qa/walkthrough.cjs` — no
 untested screen is accepted, and a route list that omits `/developer` means a pass that is green
 because it never looked. Then the pass itself, then the state boxes, and only then `done`.
+
+## 2026-10-02 — REQ-108 slice 2: the JSON-RPC surface, the permission intersection and the invocation log
+
+**What.** The MCP endpoint answers `initialize`, `ping`, `tools/list` and `tools/call` over HTTP.
+Authentication is the client's own bearer token, resolved through one indexed hash lookup into
+`grant -> scope -> enabled`; anything the resolution refuses is a `-32003` naming the permission
+that is missing. A gated write parks an approval and returns `pending_approval`. Every call writes
+one `mcp_invocations` row whose arguments are masked by REQ-105 and whose digest is taken over the
+*original* payload, so two identical calls group in the history. Sandbox mode returns the plan and
+writes no domain row. Panel-side: `/mcp/overview`, `/mcp/tools`, `/mcp/invocations`,
+`/mcp/invocations/{id}` and `/mcp/sandbox-test`.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-ai-hub --lib` | 703 passed |
+| `cargo test -p omnion-permissions --lib` | 64 passed |
+| `cargo test -p omnion-api --test mcp -- --test-threads=1` | **10 passed**, 160 s |
+
+**The two product defects the walks found, both invisible to the unit tests.**
+
+1. **`0 as tool_count` was `INT4` and `ClientRow.tool_count` is `i64`.** `create_client`'s
+   `returning` clause answers a literal, and a literal is `int4`; every other query computes
+   `count(*)` over a subquery, which is `int8`. So creating an MCP client — the very first thing
+   anybody does with this table — failed with `mismatched types; Rust type i64 (as SQL type INT8)
+   is not compatible with SQL type INT4`. The store had no walk, which is why slice 1's
+   686 green unit tests never saw it. `0::bigint` is the whole fix.
+2. **The refusal flattened the reason.** `refuse_and_record` answered
+   `with_data(json!({ "tool": tool }))` — its own data — so the `-32602` that
+   `validate_arguments` had carefully built with a `field` and a `reason` arrived as a
+   schema error with `field: null`. A client that sent `content.search` with no `query` was told
+   which tool it called, which is the half of the answer that does not help it repair anything.
+   The extra keys are now merged into the payload rather than replacing it.
+
+**The third failure was the walk's own, and worth keeping.** The masking walk asserted that the
+preview did *not* contain `[EMAIL`, which is how it passed while the mask was broken: an unmasked
+preview contains no placeholder either. The pair that actually discriminates is *address gone AND
+placeholder present*, and the placeholder has to be the guard's `[EMAIL_1]` rather than a string
+this route invented — proving the mask is the tenant's policy rather than a regex in the handler.
+
+**A rule is not a policy.** REQ-105's mask did nothing until the walk also saved
+`label_defaults: { email: mask }`: `Detector::effective_action` reads the action from
+`policy.action_for(label)` and never from the rule row, so a rule carrying `action: "mask"` with no
+policy entry for `email` resolves to `Allow` and the address goes through in clear. The preview
+reported `masked: true` beside a value that was not masked.
+
+**Harness lessons (four, all of them products of a "helpful" assumption).**
+- The first owner is **platform-level**; `users.organization_id` is NULL. Reading it into a `Uuid`
+  fails with `UnexpectedNullError`, which names the decoder and not the shape of the account.
+- The platform account and a tenanted account are **mutually exclusive**: the tenancy route answers
+  `403 platform_only` to a tenanted account, and the wizard — the only thing that puts an account
+  inside a tenant — answers `409 already_installed` the second time. One walk cannot have both;
+  `two_tenants` builds both members itself, and a second owner is never mintable.
+- `headers().get(SET_COOKIE)` returns the *first* cookie. A sign-in sets two, and the CSRF cookie
+  is the one the header is checked against, so a harness that reads the first reports a working
+  session while every write is refused with `403 csrf_unavailable` — the same status a missing
+  permission answers. The harness now carries **all** of them and passes session + CSRF through
+  one `Session` type, so a call site cannot send half the pair.
+- A cookie alone against `/api/v1/mcp` is refused by the CSRF layer first, with the same code
+  `-32001` from a layer above. The walk was measuring the middleware.
+
+**Not run: the browser pass.** The shared QA slot was held live by `w4` for the whole tick, and
+`/mnt/apopic` sat at 81%, where a pass that rebuilds `.next` (~1.5 G) is not safe. There is also no
+screen yet — this slice is API and walks, so there is nothing for a pass to look at. The screen
+half is the next slice and the pass follows it.
+
+**Next:** slice 2's panel half — `/settings/mcp-clients` with the clients table, the one-time token
+reveal, the grant picker, the sandbox test panel and the invocation log, plus the walkthrough route
+entry (no untested screen). Then slice 3 (workflow-builder tools and `/docs/mcp`).
