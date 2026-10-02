@@ -400,7 +400,8 @@ function ScaffoldTab({ kind }: { kind: SdkKind }) {
               {preview.kind} · {preview.target}
             </span>
             <span className="ml-auto text-[12px] text-muted">
-              The hidden files (.env.example, .gitignore) are in the archive.
+              .env.example is here because the README points at it; .gitignore is in the archive
+              only.
             </span>
           </header>
           <ul className="divide-y divide-line">

@@ -11493,9 +11493,16 @@ async function runDevSdksDepth(page, report) {
     "thePreviewShowsARealTree",
     previewFiles.length > 0 && previewFiles.includes("omnion.manifest.json"),
     );
+  // Only `.gitignore` is kept out of the preview, and the reason is stated in
+  // `ScaffoldFile::shown_in_preview`: a preview full of dotfiles is noise, while `.env.example`
+  // is the file the generated README warns about, so hiding *that* would hide the warning's
+  // target. The first version of this claim asserted that BOTH dotfiles were hidden and it failed
+  // against correct code — the assertion, not the screen, was wrong. Asserting the real rule is
+  // stronger anyway: a preview that leaked `.gitignore` would now fail, and one that dropped the
+  // `.env.example` the README names would fail too.
   check(
-    "thePreviewHidesTheDotfilesItAdmitsToHiding",
-    !previewFiles.includes(".env.example") && !previewFiles.includes(".gitignore"),
+    "thePreviewHidesTheGitignoreAndKeepsTheEnvExample",
+    !previewFiles.includes(".gitignore") && previewFiles.includes(".env.example"),
   );
 
   // Opening a file must show THAT file's body. Counting `<pre>` elements would pass on a screen
