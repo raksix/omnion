@@ -285,11 +285,40 @@ const consoleLog = [];
  */
 const expectedRefusals = [];
 
+/**
+ * The statuses an allowance is allowed to excuse, and the reason the list is a list.
+ *
+ * It was `[401, 403]`, which is the shape an **authorisation** gate refuses with — and the file's
+ * most-registered deliberate refusals are not authorisation at all. A two-tab conflict is a 409, a
+ * body the server is right to reject is a 422, a loop the pass left open on purpose is a 400, and
+ * a read of a collection that is legitimately empty is a 404. None of them could be excused by
+ * the allowance the pass had registered for them, so every one arrived as a **high finding**: tick
+ * 78 read "19 high findings" and correctly guessed "the probe's own refusals" — with
+ * `expectedRefusals` empty beside them, so nothing in the report contradicted it and nothing
+ * would have, in any of the three ticks that ran afterwards.
+ *
+ * **A 500 is the one status that stays out, and it is the one that makes the list a list rather
+ * than "any error".** An allowance is a licence to explain away a refusal the pass *asked for*; a
+ * crash is the product failing and no act the pass performed can make it expected. Excluding it is
+ * what keeps this from becoming a switch that turns the net roll-up off.
+ *
+ * `400`, `404` and `422` are here because the pass provoked them, `401`/`403` because an
+ * authorisation gate is still the classic case, and `428` because a precondition check belongs to
+ * the same family: the server refusing work it wants the client to do differently first.
+ */
+const REFUSAL_STATUSES = [400, 401, 403, 404, 409, 422, 428];
+
 /** Register one deliberate refusal (a URL fragment for a request, a status shape for a console line). */
-function expectRefusal(match, reason) {
+function expectRefusal(match, reason, consoleMatch) {
   expectedRefusals.push({
     match,
     reason,
+    // The console half needs a fragment of its own in the general case. A caller that registers a
+    // *request* URL (`${URL_ADMIN}/api/v1/workflows/`) is excusing a browser line about that
+    // request, so the request URL is the right default; the parameter exists because a few callers
+    // register a request fragment that is not a URL at all (`"notifications/emit"`), where the
+    // console line's own text is the only handle on it.
+    consoleMatch: consoleMatch ?? (match.startsWith("http") ? match : null),
     consoleFrom: consoleLog.length,
     netFrom: netFailures.length,
     claimedConsole: false,
@@ -9967,9 +9996,30 @@ async function main() {
     if (f.type === "warning") continue;
     // A console line names the status, not the URL: the allowance for one is the window it was
     // registered in, so only a line that arrived after the pass announced the act can be excused.
-    const deliberate = /status of 40[13]/.test(f.text)
-      ? expectedRefusals.find((entry) => !entry.claimedConsole && index >= entry.consoleFrom)
-      : null;
+    //
+    // The URL is part of the match, and it is the half that was missing. A line was excused on the
+    // *status alone* (`/status of 40[13]/`), so whichever allowance happened to be live swallowed
+    // every 401/403/404-shaped line in the rest of the session — including ones about a screen the
+    // allowance had nothing to do with. The failure is the mirror of the one the status list fixes
+    // and it is worse in the way that matters: widening the status list without scoping it by URL
+    // would have turned "charges the pass for its own refusals" into "hides everybody's 403".
+    //
+    // So a line is excused only when it names a status in `REFUSAL_STATUSES` **and** arrives at a
+    // URL the allowance registered for. An allowance with no `match`-like fragment cannot excuse a
+    // console line at all — which is the honest answer, since a console line's only claim to being
+    // *that* refusal is which URL it came from.
+    const statusNamed = String(f.text).match(/status(?: of)?\s+(\d{3})/i)?.[1] ?? null;
+    const deliberate =
+      statusNamed !== null && REFUSAL_STATUSES.includes(Number(statusNamed))
+        ? expectedRefusals.find(
+            (entry) =>
+              !entry.claimedConsole &&
+              index >= entry.consoleFrom &&
+              (entry.consoleMatch
+                ? String(f.url || "").includes(entry.consoleMatch)
+                : String(f.text).includes(entry.match)),
+          )
+        : null;
     if (deliberate) {
       deliberate.claimedConsole = true;
       refusedOnPurpose.push({ kind: "console", detail: `${f.phase} ${f.text.slice(0, 120)}`, reason: deliberate.reason });
@@ -9984,7 +10034,7 @@ async function main() {
         !entry.claimedNet &&
         index >= entry.netFrom &&
         String(n.url || "").includes(entry.match) &&
-        [401, 403].includes(n.status),
+        REFUSAL_STATUSES.includes(n.status),
     );
     if (deliberate) {
       deliberate.claimedNet = true;
@@ -10024,6 +10074,28 @@ async function main() {
   const bySeverity = { high: 0, medium: 0, low: 0 };
   for (const f of findings) bySeverity[f.severity] += 1;
 
+  // **An allowance that matched nothing is reported, not dropped.** `expectedRefusals` in
+  // `summary.json` carried the refusals it *claimed*, so an allowance that never matched left no
+  // trace — and an empty list is exactly what a pass that provoked no deliberate refusals also
+  // writes. That is the bug this report shape was hiding: three ticks read "19 high findings,
+  // expectedRefusals empty" and each concluded the findings were real, because a pass charged for
+  // its own refusals and a pass with no refusals at all produce **the same report**. The empty list
+  // was being read as evidence and it was evidence of nothing.
+  //
+  // So the registered allowances are reported next to the claimed ones, and an allowance that
+  // matched nothing is named as unused with its reason. It is not a finding — an allowance for a
+  // refusal the server never issued is a stale test step, not a defect — but it is **visible**,
+  // because the case it hides is exactly the one where the matcher has stopped matching.
+  const unusedRefusals = expectedRefusals
+    .filter((entry) => !entry.claimedNet && !entry.claimedConsole)
+    .map((entry) => ({ match: entry.match, reason: entry.reason }));
+  if (unusedRefusals.length) {
+    log(
+      `expected refusals: ${refusedOnPurpose.length} claimed, ${unusedRefusals.length} unused` +
+        (unusedRefusals.length ? ` — ${unusedRefusals.map((u) => `${u.match} (${u.reason})`).join("; ").slice(0, 300)}` : ""),
+    );
+  }
+
   const summary = {
     ...report,
     counts: {
@@ -10037,10 +10109,16 @@ async function main() {
       failedRequests: netFailures.length,
       abortedRequests: netAborted.length,
       dialogs: dialogs.length,
+      // The two refusal counters are read together and never alone. `expectedRefusals: 0` beside
+      // `failedRequests: 19` was the number that hid a matcher bug for three ticks; a count that
+      // can be read without its counterpart is a count that will be read alone.
+      refusalsClaimed: refusedOnPurpose.length,
+      refusalsUnused: unusedRefusals.length,
     },
     bySeverity,
     findings,
     expectedRefusals: refusedOnPurpose,
+    unusedRefusals,
     shots,
     consoleLog,
     netFailures,
