@@ -13356,7 +13356,23 @@ async function runWorkflowBuilderDepth(page, report) {
           ),
           cards: document.querySelectorAll("[data-builder-canvas] [data-node-id]").length,
           selectionText: selectionTextEl ? (selectionTextEl.textContent ?? "").trim() : null,
-          inspectorOpen: Boolean(document.querySelector("[data-node-inspector]")),
+          // **THE FIFTH SITE OF THIS SHAPE, AND THE FILE ALREADY HAD THE ANSWER 1000 LINES
+          // ABOVE** (`data-node-inspector`, tick 86). `NodeInspector` renders
+          // `data-inspector={node.id}` — there is no `data-node-inspector` anywhere in the
+          // product, so `inspectorOpen` was structurally **false** on every run, including the
+          // runs where the inspector was wide open. It is the `narrow-lock` defect one row over,
+          // in the same pass, and it survived for the reason the comment three lines above this
+          // already names: *fixing the sites a report names leaves every unnamed site holding
+          // the defect.* Tick 62 fixed four of them; this is the fifth, and the fix for those
+          // four was written from the row that reported them rather than from a search for the
+          // pattern.
+          //
+          // Line 12349 asks the same question with `[data-inspector]` and gets a real answer.
+          // `data-builder-inspector` is the pane's wrapper and `data-inspector` is the selected
+          // node's panel, so the count is taken over the latter: "is an inspector open" is a
+          // claim about a node, and a pane with nothing selected is exactly the case where the
+          // reading must be false.
+          inspectorOpen: document.querySelectorAll("[data-inspector]").length > 0,
         };
       }, undoSelVictim)
       .catch(() => ({ readFailed: true }));

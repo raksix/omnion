@@ -129,9 +129,30 @@ try {
   // Only the row matters, but a whole-file revert is the honest control: it proves the suite is
   // red against the tree as it was, not merely against a string I typed.
   writeFileSync(WALKTHROUGH, head);
-  if (head === original) {
-    // The fix is uncommitted — that is expected mid-tick. Skip rather than report a false red.
-    process.stdout.write("  SKIP · HEAD already contains the fix (nothing committed yet)\n\n");
+
+  // The control is only meaningful while HEAD still carries the DEFECT this suite was written
+  // for. Comparing whole files is the wrong test: a commit that fixed some *other* part of the
+  // walkthrough makes `head !== original` while this fix sits in HEAD too, and the control then
+  // reports "THE GATE IS NOT PROVEN" on a gate that is perfectly proven — a false alarm that
+  // trains the next reader to ignore the one line in this file that matters.
+  //
+  // So the test is on the fix itself: does HEAD still contain the marker the product has never
+  // rendered? If it does not, the control has nothing left to prove and says so.
+  // The test is on the fix's CODE, with comments stripped first: the fix's own comment quotes the
+  // marker verbatim to explain why it went, so a naive substring test matches the explanation and
+  // concludes the defect is still present. That is this file's own documented lesson (the guard
+  // that reads prose and calls it code) arriving one commit later, in the guard for the guard.
+  const headCode = head
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
+  const headStillHasDefect =
+    headCode.includes("data-workflow-table-edit") || /\[\s*data-table-edit\b/.test(headCode);
+
+  if (!headStillHasDefect) {
+    process.stdout.write(
+      "  SKIP · HEAD already carries this fix (committed) — the control has no defect left to catch.\n\n" +
+        "         Mutations below still run, and the unmutated control below must be green.\n\n",
+    );
   } else {
     const control = result();
     if (control.fail > 0) {
