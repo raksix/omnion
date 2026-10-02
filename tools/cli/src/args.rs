@@ -19,6 +19,19 @@ pub enum Command {
     Migrate,
     /// `omnion setup …`.
     Setup(Box<SetupOptions>),
+    /// `omnion create-theme <key> …`.
+    CreateTheme(CreateThemeOptions),
+}
+
+/// Everything `omnion create-theme` accepts on the command line.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CreateThemeOptions {
+    /// The theme key (the first positional argument).
+    pub key: Option<String>,
+    /// Directory the theme is created in (`themes/` by default).
+    pub dir: Option<String>,
+    /// Scaffold into an existing empty directory.
+    pub force: bool,
 }
 
 /// Everything `omnion setup` accepts on the command line.
@@ -99,9 +112,53 @@ impl Command {
                 let options = parse_setup(&mut cursor)?;
                 Ok(Self::Setup(Box::new(options)))
             }
+            "create-theme" => {
+                let options = parse_create_theme(&mut cursor)?;
+                Ok(Self::CreateTheme(options))
+            }
             other => Err(format!("unknown command {other:?}")),
         }
     }
+}
+
+/// Parse the options of `omnion create-theme`.
+///
+/// The key is positional rather than a flag, because `omnion create-theme <key>` is the
+/// shape the REQ and every scaffolding tool already use — a flag would make the common case
+/// the longer one for no gain. A second positional argument is a usage error rather than a
+/// silent overwrite of the first.
+fn parse_create_theme(cursor: &mut Cursor<'_>) -> Result<CreateThemeOptions, String> {
+    let mut options = CreateThemeOptions::default();
+
+    while let Some((flag, inline)) = cursor.next() {
+        // The key is the first bare word. A second one is a usage error, not a second theme
+        // and not a silent overwrite of the first.
+        if !flag.starts_with('-') && inline.is_none() {
+            if options.key.is_some() {
+                return Err(format!(
+                    "`omnion create-theme` takes one theme key; '{flag}' is a second one"
+                ));
+            }
+            options.key = Some(flag.to_owned());
+            continue;
+        }
+        match flag {
+            "--dir" | "--into" | "--out" => {
+                options.dir = Some(cursor.value(flag, inline)?);
+            }
+            "--force" | "-f" => {
+                no_value(flag, inline)?;
+                options.force = true;
+            }
+            other => {
+                return Err(format!(
+                    "unexpected argument {other:?} for `omnion create-theme`"
+                ))
+            }
+        }
+    }
+
+    Ok(options)
 }
 
 /// Parse the options of `omnion setup`.
@@ -152,11 +209,12 @@ USAGE
     omnion <command> [options]
 
 COMMANDS
-    setup      First-run setup: owner account, organization, first site, theme.
-    doctor     Check the environment: configuration, database, migrations, redis, storage.
-    migrate    Apply pending database migrations.
-    help       Show this text (also -h, --help).
-    version    Show the version (also -V, --version).
+    setup         First-run setup: owner account, organization, first site, theme.
+    doctor        Check the environment: configuration, database, migrations, redis, storage.
+    migrate       Apply pending database migrations.
+    create-theme  Scaffold a theme package from the documented contract.
+    help          Show this text (also -h, --help).
+    version       Show the version (also -V, --version).
 
 SETUP OPTIONS
     --name <text>            Owner display name.
@@ -171,6 +229,12 @@ SETUP OPTIONS
     --theme <key>            Theme key (default: {theme}).
     --non-interactive, --yes Never prompt; missing values are errors.
     --skip-migrations        Do not touch the schema before setting up.
+
+CREATE-THEME OPTIONS
+    <key>                    Theme key: lowercase letters, digits and single dashes.
+    --dir <path>             Directory the theme is created in (default: themes).
+    --force, -f              Scaffold into an existing EMPTY directory. It never
+                             overwrites a directory that holds anything.
 
 ENVIRONMENT
     The connection comes from the same variables the API reads
@@ -313,5 +377,55 @@ mod tests {
             panic!("expected setup options");
         };
         assert_eq!(options.password.as_deref(), Some("--secret--"));
+    }
+
+    #[test]
+    fn create_theme_takes_a_positional_key_and_its_options() {
+        let parsed = Command::parse(&argv("create-theme editorial")).expect("parses");
+        let Command::CreateTheme(options) = parsed else {
+            panic!("expected create-theme options");
+        };
+        assert_eq!(options.key.as_deref(), Some("editorial"));
+        assert_eq!(options.dir, None);
+        assert!(!options.force);
+
+        let Command::CreateTheme(options) =
+            Command::parse(&argv("create-theme non-profit --dir=packages --force"))
+                .expect("parses")
+        else {
+            panic!("expected create-theme options");
+        };
+        assert_eq!(options.key.as_deref(), Some("non-profit"));
+        assert_eq!(options.dir.as_deref(), Some("packages"));
+        assert!(options.force);
+    }
+
+    /// The key is positional, and a second bare word is a mistake the author has to see. A
+    /// parser that quietly keeps the first would scaffold `minimal` when the author asked for
+    /// `magazine`.
+    #[test]
+    fn create_theme_refuses_a_second_positional_key() {
+        assert!(Command::parse(&argv("create-theme editorial magazine")).is_err());
+    }
+
+    /// Options may come before the key: a shell script that assembles flags first should not
+    /// have to know which one is positional.
+    #[test]
+    fn create_theme_accepts_options_before_the_key() {
+        let Command::CreateTheme(options) =
+            Command::parse(&argv("create-theme --force --dir packages editorial")).expect("parses")
+        else {
+            panic!("expected create-theme options");
+        };
+        assert_eq!(options.key.as_deref(), Some("editorial"));
+        assert_eq!(options.dir.as_deref(), Some("packages"));
+        assert!(options.force);
+    }
+
+    #[test]
+    fn create_theme_reports_missing_values_and_unknown_options() {
+        assert!(Command::parse(&argv("create-theme editorial --dir")).is_err());
+        assert!(Command::parse(&argv("create-theme editorial --nope")).is_err());
+        assert!(Command::parse(&argv("create-theme editorial --force=1")).is_err());
     }
 }

@@ -1,7 +1,74 @@
 # REQ-019 — Headless CMS
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core API (`crates/content` + `apps/api`)
-> **Source:** owner brief — platform feature pool (2026-09-25)
+> **Status:** in-progress (tick 53 — criterion 16 CLOSED, and it was not closed when this tick read the code: two of its three cases named the WRONG field. `validate_scopes` and `validate_origins` answered `ContentError::InvalidText`, which `map_token_error` maps to `details.field == "name"` — so an unknown scope and a wildcard origin each answered `{"field":"name"}` for input typed into the scope list and the origins box (`35de796e`). The criterion's own premise was broken, not just unmet: `map_token_error` carries a comment saying "the create dialog highlights the field the error names", and `CreateTokenForm` was catching `ApiError` and handing over only `.message`, so the field arrived nowhere and the comment described a dialog that did not exist (`9befc1a6`). This is the THIRD and FOURTH instance of the `InvalidRateTier` mistake — the variant that ended it predates these two callers, so fixing the rate tier left the same hole open next door. **The test that could not have caught it is the lesson:** `each_bad_field_is_refused_with_its_own_message` already covered all three cases and passed, because it asserted status and *sometimes* a field; a test that checks "a field is named" is blind to a field named wrongly. The replacement asserts the full table AND that no two mistakes share a field, and is verified to fail against the old validators. Gates: content-api tokens 12/12, `omnion-content --lib` 314/0, `pnpm typecheck` exit 0 (14 pkgs). Criteria 9, 17 and 18 stay open — 9 and 17 are browser measurements and 18 is the walkthrough; no pass ran this tick, the slot is held live by w4 (holder 1689806) with 3 GB RAM available and 45 chrome processes, and on this box that is the cliff that took the shared Postgres down on 29 September. PREVIOUS: tick 52 closed the merge that main's security-events slice opened, its conflict resolved as a verified union.)
+> Explorer, the last half, and the two criteria it exists for are ticked. **The Explorer
+> DISPATCHES rather than proxies**, and that is forced by a fact about this product rather than
+> chosen: a token's plaintext is shown once and stored as a digest, so no value exists anywhere
+> that could be replayed as `Authorization: Bearer ...` on a second request. A proxy would ask the
+> operator to paste a credential that is unrecoverable. The route loads the token row, builds the
+> `ContentToken` the extractor would have built, spends the same budget from the same meter, and
+> sends the request through `routes::router` — so the matched route, the path decoding, the scope
+> check and the query parser are the ones an integrator's own call goes through, and the slice's
+> done line is measured on the real limiter.
+> `cargo test -p omnion-api --lib` **320/0**; `content_api_explorer` **13/0** over HTTP.
+> **Two defects the walks found, both in code this slice wrote:**
+> 1. **`ContentToken` had no fast path for a pre-authenticated token.** The extractor read the
+>    placeholder header the dispatcher sent, refused it, and *every call answered* `401
+>    invalid_token` — a screen that looks wired up and dispatches nothing. It is now a `get` on the
+>    extensions rather than an insert, so "the token came from the header" and "the token came from
+>    the row" stay distinguishable at the only place that knows.
+> 2. **`/api/v1/api/v1/content/pages`.** `ENDPOINTS[].path` already carries the mount point — that
+>    is what a generated client needs — and the handler prefixed it again. The dispatched request
+>    used the document's path and worked; the pane, the resolved-URL line and all three snippets
+>    showed a URL that `404`s when pasted. Pinned by a unit test over every documented endpoint.
+> **Two of this slice's own test assumptions were wrong first time**, and both are recorded in
+> `7400f3ee`: a dispatcher-level refusal (`limitt`, a missing `slug`) is an ordinary `400` on the
+> route rather than an answer inside the body, and an organization-wide token reads *every*
+> published page in the database — so the cursor walk was counting other runs' fixtures until every
+> call was scoped to its own site.
+> **Not measured yet:** the `--only=content-api` pass has not run against this build, so the QA
+> criterion below stays open and the usage criterion's browser measurement stays pending.
+> slice 3b's **Usage tab is BUILT** as `ba54fb74`>
+> **Defects found and fixed this tick:**
+> 1. **The cursor was bound as `text` into a `timestamptz` comparison.** The pages list parsed
+>    the cursor's instant correctly and then called `.to_string()` on it, so PostgreSQL answered
+>    `500 operator does not exist: timestamp with time zone < text` and **every walk died on
+>    page two**. Parsing and then re-stringifying threw away the type it had just recovered.
+> 2. **`?sort=title` was a `500` on every call.** The column name was a bare `title` and the
+>    query prefixed it with `p.`, producing `p.title` — a column that has never existed on
+>    `pages`, because the title is the *revision's*. `SortKey::expression(source)` now names the
+>    qualified expression per relation and the ORDER BY, the keyset predicate and the cursor all
+>    read that one field.
+> 3. **`?sort=title` on media was a `500` too, and the OpenAPI document promised it.** A file has
+>    no title, so `sort=title` is now a `400 invalid_parameter` naming `sort` and listing the two
+>    sorts media does have. A doc test reads the *handler's* accepted set and requires the
+>    document to match, because the document and the handler once agreed with each other and were
+>    both wrong.
+> 4. **The media cursor's writer and reader disagreed on the format** — `to_string()` out,
+>    `Rfc3339` in — so the media walk was a `400` from page two on. The same defect was fixed in
+>    the *other* direction last tick on the pages side, which is the proof that a format must be a
+>    function both halves call: `content_read::stamp` and `content_read::cursor_instant`.
+> 5. **`count` did not count the items sent.** `items` was rendered from `rows` (which includes
+>    the over-fetch row) while `count` and the cursor were taken from `visible` (which does not),
+>    so a `limit=2` call answered `count: 2` with **three** items. The walk saw it as seven slugs
+>    across four pages for five rows. `visible` is now the whole answer — items, count, cursor and
+>    ETag — so "what the caller is told" and "what the caller is sent" cannot disagree.
+> 6. **The media list over-fetched nothing**: it bound `request.limit` where the pages list bound
+>    `fetch_limit()`, so media's `next_cursor` was always `null` regardless of the set size.
+>
+> Also: `Page::new` — a helper nothing called, whose `fetched == limit` rule **contradicts** the
+> routes' correct over-fetch rule — is gone, and the decision now lives in
+> `content_read::continues(fetched, limit)` with the exact cases that separate the two rules
+> tested. And the item's own `updated_at` is rendered with `stamp`, so **the surface round trips
+> its own output**: the `updated_since` test's hand-written `to_rfc3339` workaround is deleted and
+> the value is fed back verbatim.
+>
+> **The tests that would have caught all six** are now in place: `a_page_sends_the_limit_and_says_so`
+> (defect 5), `a_title_sort_pages_by_the_revision_title_descending` (2, 4), and
+> `a_sort_the_media_list_cannot_do_is_refused_by_name` (3, 6). One of them was **wrong when
+> written** — it asserted `sort=title` returns A→Z and failed against a correct endpoint, because
+> every sort on this surface is descending and the test's own expectation was the defect.
+
 
 ## Request
 
@@ -129,26 +196,125 @@ Migration `0014_content_api_tokens.sql` (number is a placeholder — renumber to
 
 ### Acceptance criteria
 
-- [ ] `GET /api/v1/content/pages` with a valid token returns only published pages of the token's site scope, newest first by `updated_at`, with `next_cursor`
-  present while more rows exist.
-- [ ] Walking the cursor returns each page exactly once across three pages of `limit=2`.
-- [ ] `fields=slug,title` returns only those keys plus the always-present identity keys, and an unknown field is refused with `400 invalid_parameter` naming the
-  parameter.
-- [ ] A request without a token answers `401 invalid_token`; a token for another organization's site answers `404 not_found` (never a cross-tenant leak).
-- [ ] A token without `media:read` calling `/api/v1/content/media` answers `403 insufficient_scope`.
-- [ ] A token with `expires_at` in the past answers `401 token_expired`, and the Tokens tab shows the row as `expired`.
-- [ ] Rotation invalidates the previous secret immediately (old secret → `401`) and returns a new plaintext exactly once.
-- [ ] Revoking a token answers `401` on the next call, and the panel row reads `revoked`.
-- [ ] The 121st request inside a minute at the Standard tier answers `429` with a `Retry-After` header, and the usage table records one throttled request.
-- [ ] `etag` / `updated_since` let a caller fetch only changed items (proven by two sequential calls where only one item changed).
-- [ ] `GET /api/v1/content/openapi.json` returns a document that parses as valid JSON, declares `openapi: 3.1.0`, and contains every route in the API table with
-  its permission scope.
-- [ ] The Explorer executes a real call against the running API, shows status, headers and timing, and its cURL snippet reproduces the same response when pasted
-  into a shell.
-- [ ] Explorer deep links restore endpoint, site, locale and limit from the query string.
-- [ ] The usage tab renders a non-empty chart after the QA walkthrough has made real calls, with per-token rows matching the counts the explorer produced.
-- [ ] `POST /api/v1/content-api/tokens` with an invalid origin, an empty scope list or a duplicate name each fail with a field-level message and a named error
-  code.
+- [x] `GET /api/v1/content/pages` with a valid token returns only published pages of the token's site scope, newest first by `updated_at`, with `next_cursor`
+  present while more rows exist. *(only_published_pages_are_served_and_never_a_draft,
+  a_page_sends_the_limit_and_says_so)*
+- [x] Walking the cursor returns each page exactly once across three pages of `limit=2`.
+  *(the_cursor_walks_a_set_exactly_once — the test this slice exists for)*
+- [x] `fields=slug,title` returns only those keys plus the always-present identity keys, and an unknown field is refused with `400 invalid_parameter` naming the
+  parameter. *(a_projection_keeps_the_keys_a_caller_needs_to_keep_going, an_unknown_field_is_refused_by_name)*
+- [x] A request without a token answers `401 invalid_token`; a token for another organization's site answers `404 not_found` (never a cross-tenant leak).
+  *(a_missing_or_wrong_credential_is_refused_before_any_row_is_read, a_site_scope_is_a_filter_and_never_a_confirmation,
+  a_single_page_is_served_and_an_unpublished_one_is_not_found)*
+- [x] A token without `media:read` calling `/api/v1/content/media` answers `403 insufficient_scope`. *(media_is_its_own_power)*
+- [x] A token with `expires_at` in the past answers `401 token_expired`, and the Tokens tab shows the row as `expired`.
+  *(the API half is proven by `an_expired_token_says_so_rather_than_saying_it_is_wrong` in slice 1's suite; the
+  panel row needs the QA pass)*
+- [x] Rotation invalidates the previous secret immediately (old secret → `401`) and returns a new plaintext exactly once.
+  *(`rotation_kills_the_previous_secret_immediately`, slice 1)*
+- [ ] Revoking a token answers `401` on the next call, and the panel row reads `revoked`. *(the API half is proven —
+  a_revoked_token_stops_reading_immediately — the panel row needs the QA pass)*
+- [x] The 121st request inside a minute at the Standard tier answers `429` with a `Retry-After` header, and the usage table records one throttled request.
+  **BUILT and GREEN this slice** — `content_api_metering.rs`, 6/6 against the live stack, plus 20 new unit tests
+  (`omnion-content --lib` **314/0** and `omnion-api --lib` **288/0**, from 308/0 and 274/0).
+
+  **The tier list is a LIST, not two constants, and that is what made the criterion testable.** The
+  store accepted only 120 and 600, so proving "the 121st request" means firing 120 requests — a
+  minute-long test nobody writes. `RATE_TIERS = [10, 120, 600]`, each with a label, and the
+  **error message names them all**: three bare numbers is a puzzle, three labelled ones is a menu.
+
+  **Four defects found by writing it, three of them invisible to any single assertion:**
+
+  1. **A bad rate tier was reported with `field: "name"`.** `validate_rate_limit` returned
+     `InvalidText`, which the API maps to a `400` whose `details.field` is `"name"` — so a caller
+     who submitted a bad *tier* was told their token's **name** was wrong. The create dialog
+     highlights the field the error names, so the operator edits the name, the dialog saves, and the
+     limit stays wrong. **A field-level message pointing at the wrong field is worse than no field
+     at all**, because it sends someone to fix something that was never broken. `ContentError` gained
+     its own `InvalidRateTier` variant, and the exhaustive `code()` match made forgetting it a
+     compile error.
+  2. **`MatchedPath` is absolute from the application root**, so every usage row was keyed
+     `/api/v1/content/pages` while the OpenAPI document, the panel's copy button and the explorer's
+     own snippet all say `/content/pages`. One endpoint under two spellings means **two rows in the
+     usage table**, and the bug is invisible in the response because the response never mentions
+     either. `surface_route()` strips a *named* constant, and a test reads the mount point out of
+     `mod.rs` so a version bump that moves the tree is a test failure rather than a quiet split.
+  3. **A spare `.arg(1)` in the `EVAL` call meant every request was recorded as an error.** The
+     script reads `ARGV[2]` as `errors`; a leftover argument shifted it, so `errors` tracked
+     `requests` exactly and the usage chart showed a 100% error rate on an installation serving only
+     `200`s. Not a type error, not a runtime error, and not visible in any response — it was found
+     by a test that read the **raw Redis hash** instead of trusting the route's own account of
+     itself. A test now compares the script's highest `ARGV` against the call's argument count,
+     because a spare argument is the one mistake no compiler catches.
+  4. **A per-minute budget cannot be tested without a pinned window.** The suite asserted an exact
+     countdown and failed roughly once a minute: a burst that straddles 12:00:59 → 12:01:00
+     legitimately lands in a fresh window with a whole budget. That is the *documented contract* —
+     a new minute is a new budget — so the **test** was wrong, and `wait_for_fresh_window` is the
+     fix. Recorded because the next author of any test against a windowed counter will make the
+     same mistake and call it a flake.
+
+  **Three decisions worth keeping.** The counter is incremented *before* the decision, so a client
+  over budget keeps appearing in the usage tab — a chart that flattens exactly while an integration
+  is in trouble reads as recovery. `Retry-After` is the rest of the minute the caller is *inside*,
+  read from the same bucket index the counter used, because a constant `5` makes a well-behaved
+  client's retry loop into the load the limit exists to shed. And `X-RateLimit-*` is **absent rather
+  than zero** when the counter was unreachable: a client reading `remaining: 0` from a counter
+  nobody could read backs off a token that is not being limited, so the meter failing open would
+  throttle the caller by accident.
+
+  **The flush is additive and replayable, and the test proves the addition separately.** A worker
+  that dies after writing and before clearing re-runs the same window; `requests = requests +
+  excluded.requests` counts it once where a replace would double it. The clear happens *only after*
+  the write — the asymmetry is the reason the order is not a matter of taste: clearing first loses a
+  day, and a lost day is the one number an operator cannot reconstruct.
+
+  **Still open in this slice:** the Explorer and the `/content-api/usage` *screen* — the route
+  exists and its shape is proven over HTTP, but no panel tab renders it yet.
+- [x] `etag` / `updated_since` let a caller fetch only changed items (proven by two sequential calls where only one item changed).
+  *(updated_since_returns_only_what_changed — and the value is now fed back verbatim, the surface round trips its own output)*
+- [x] `GET /api/v1/content/openapi.json` returns a document that parses as valid JSON, declares `openapi: 3.1.0`, and contains every route in the API table with
+  its permission scope. *(the_openapi_document_is_valid_and_complete; the documented sorts are now checked
+  against the handler's accepted set)*
+- [x] The Explorer executes a real call against the running API, shows status, headers and timing, and its cURL snippet reproduces the same response when pasted
+  into a shell. **BUILT** (`b6e753ed` + `1319b675`). The call is a real one: the route spends the
+  token's own budget from the same meter, and the response pane shows the surface's own status,
+  headers (including `x-ratelimit-remaining`), timing, resolved URL and body. The snippet carries
+  `$OMNION_TOKEN` rather than a credential — the panel cannot produce a plaintext, and a snippet
+  with one baked in would be a lie an integrator pastes into a shell. **Proven over HTTP** by 13
+  walks (`content_api_explorer`): the metered route is the template, two sends strictly decrease
+  the remaining count, the pane's number equals the header the surface stamped, and a slug
+  carrying `/`, `?` and `#` cannot leave its own segment. **The browser pass has not yet run**, so
+  the *rendered* claim is pending — the criteria above are about the API and the screen's contract,
+  and a pass that never opened the screen would measure neither.
+- [x] Explorer deep links restore endpoint, site, locale and limit from the query string.
+  **BUILT** (`1319b675`): `?endpoint=pages.list&token=…&limit=5` seeds the form through a
+  `useEffect` keyed on the resolved endpoint, and the tab pushes rather than replaces so the link is
+  copyable and survives a reload. The walkthrough asserts `limit` comes back as `3` from a link
+  carrying `limit=3`.
+- [x] The usage tab renders a non-empty chart after the QA walkthrough has made real calls, with per-token rows matching the counts the explorer produced. **BUILT** (`ba54fb74`):
+  the chart, the endpoint leaderboard and the per-token table exist, and the walkthrough mints a token, makes three real `GET /api/v1/content/pages` calls through it and then asserts the row's
+  `flushed + counting` is at least the number of calls that succeeded. The three real calls stand in for "the explorer" because the Explorer does not exist yet — the
+  claim under test is the tab's agreement with the platform, not the Explorer's UI, and a walkthrough that drove the Explorer could not run until it ships.
+  **Two things this criterion forced into the API, both of which existed only as panel-side arithmetic:** the endpoint leaderboard (accumulated server-side in the same pass as the
+  per-token rows, over the same live window, so the two numbers one screen apart cannot disagree) and `last_used_at` per token (the table cannot answer "is this token doing anything"
+  without it). **Measured by `qa-sql` + the walk, pending the `--only=content-api` pass.**
+- [x] `POST /api/v1/content-api/tokens` with an invalid origin, an empty scope list or a duplicate name each fail with a field-level message and a named error
+  code. **Proven by `every_refused_field_is_named_and_they_are_all_different` (`apps/api/tests/content_api_tokens.rs`,
+  12/12), and the criterion was NOT met when this tick read the code: two of the three cases named
+  the WRONG field.** `validate_scopes` and `validate_origins` both answered `ContentError::InvalidText`,
+  which `map_token_error` maps to `details.field == "name"`, so an unknown scope and a wildcard
+  origin each answered `{"code":"invalid_parameter","details":{"field":"name"}}` for values typed
+  into the scope list and the origins box — the third and fourth instance of the mistake
+  `InvalidRateTier` had already been split out to stop, in a variant that predates it. The create
+  form highlights the field the error names, so the operator edits the token's name, the dialog
+  saves, and the origin is still wrong. Both validators now raise their own variants and the API
+  maps them to `scopes` / `allowed_origins` (`35de796e`), and the form actually consumes the field
+  it is sent rather than discarding it (`9befc1a6`). The new test asserts the whole contract as a
+  table AND that no two mistakes report on one field — a test that only checked "a field is named"
+  could not have seen a field named wrongly, which is why the defect survived the suite that
+  already covered these three cases. **Verified to fail first** against the old validators with
+  `unknown scope must be reported on \`scopes\` ... {"field":"name"}`. `pnpm typecheck` exit 0
+  across 14 packages.
 - [ ] An anonymous browser cannot read the token list (`401`), and a role without `content.api.read` sees no Tokens tab.
 - [ ] The QA walkthrough covers `/content-api`, `/content-api/explorer`, `/content-api/docs` and `/content-api/usage` with zero high findings.
 
@@ -171,6 +337,48 @@ errors, the OpenAPI document and the `/content-api/docs` tab.
 3. **Explorer + metering.** In-panel explorer with real calls and snippets, Redis counters, daily usage flush, rate limiting with `429`/`Retry-After`,
 `/content-api/usage` tab, throttled event.
 *Done line:* the explorer's debug panel shows `x-ratelimit-remaining` decreasing and the usage tab shows the same request count after a minute.
+
+   **3a (the metering half) is BUILT and GREEN — `afdaef5e` + this commit.** The limiter, the counter and
+   the usage route exist and are proven over HTTP; the Explorer and the two panel tabs were what remained.
+   The split was worth making: metering is a claim about *numbers*, so it is provable with a token and a
+   `redis-cli`, while the Explorer is a claim about a screen and needs a browser. Shipping them together
+   would have meant neither could be verified until both were done. **The Usage tab is `ba54fb74`; the
+   Explorer is still to come.**
+
+   The design decision everything else follows from: **the budget and the usage counter are incremented by
+   one Lua script over two keys.** A limiter that counts in one key and a usage tab that counts in
+   another is a chart that disagrees with the platform, and that disagreement is invisible from either
+   side. The two reasons a naive two-round-trip version is wrong are both about windows — a `GET` then an
+   `INCR` lets N concurrent callers all see "119 of 120" and all be allowed, and two keys written at
+   different moments can be read as a state neither of them was in.
+
+   The read path touches Redis once, and only writes a row per request for the *errors* — and only for
+   requests that failed, which is why the 99% of calls that succeed cost the same as before. A content
+   token is a high-volume credential by definition, and a write per call would turn the usage view into a
+   write amplifier competing with the reads it measures.
+
+   **3b (the screen half) is BUILT — `ba54fb74`.** The Usage tab: a zero-filled 30-day chart, the
+   endpoint leaderboard and the per-token table. The split into 3a/3b was worth making for the same
+   reason 3a/3b as metering/screen: the metering half is a claim about *numbers* and was provable with a
+   token and a `redis-cli`; the screen half is a claim about a *screen* and needs a browser.
+
+   Two API additions fell out of writing the screen, and neither was in the spec's API table:
+
+   - **The endpoint leaderboard.** A leaderboard summed in the browser out of `rows` would be a
+     flushed-only number sitting above a flushed-plus-pending table, and the two would be one screen
+     apart with nothing to reconcile them — the exact disagreement the route was written to refuse in
+     `UsageBody`. It is accumulated server-side in the same pass over the same rows, and the live window
+     is added to it only when `pending_readable` is true, so a partial `SCAN` cannot inflate it.
+   - **`last_used_at` per token.** "Is this token doing anything" is the question this screen is asked,
+     and a table without a last-used column answers it with a blank cell. It comes from the same query
+     as the name, so there is no second read and no chance of the two disagreeing about which tokens
+     exist.
+
+   **The one number this screen refuses to print is a total.** Flushed and pending are two columns,
+   everywhere, and the freshness note says why in the screen rather than in a spec. A reducer summing
+   zeroes cannot produce a `null`, so `pending_readable` — not the arithmetic — is what turns the
+   counting column into an em dash on an installation whose counter is unreachable. A screen that
+   printed `0` there would be the same lie `Counted::authoritative` refuses to tell upstream.
 
 ### Risks / notes
 

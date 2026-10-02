@@ -1,0 +1,456 @@
+/**
+ * Startup — A launch site: a centred canvas, an oversized centred headline and a two-step call to action.
+ *
+ * The tokens are the theme; everything below reads them. A settings revision overrides the
+ * same custom property names, which is why they are declared once and never spelled into a
+ * rule — two code paths computing "the effective colour" is how a preview ends up lying.
+ *
+ * Every element selector is scoped to `html[data-theme="startup"]`. All ten bundled sheets are
+ * loaded by the renderer's static import graph, so an unscoped `body { … }` here would style
+ * every theme's pages with this theme's palette. Block classes are already prefixed and need
+ * no scoping; the resets, the focus ring and the media queries do.
+ */
+
+/* The theme's tokens. A theme is its palette: everything below reads these, and a
+   settings revision overrides them on the same custom property names, which is why they are
+   declared once here rather than spelled into each rule.
+
+   ## Why these rules are scoped to `data-theme`
+
+   All ten bundled stylesheets are loaded by the renderer's single import graph, because a
+   CSS import is static and `resolveTheme()` is a runtime call. Ten sheets declaring `body`
+   would therefore fight, and the winner would be whichever sheet the bundler happened to
+   order last — a site's theme would render with whichever palette sorted highest, which is
+   the "colour-swapped clones" failure in its purest form.
+
+   Scoping to `html[data-theme="<key>"]` is what makes one bundle carry ten themes: only the
+   sheet whose key matches the active theme matches anything. `data-theme` is written by
+   `apps/web/app/layout.tsx` from the same `resolveTheme()` the page is drawn with, so the
+   stylesheet and the markup can never be chosen by different code.
+*/
+html[data-theme="startup"] {
+  --st-startup-canvas: #ffffff;
+  --st-startup-surface: #f7f5ff;
+  --st-startup-ink: #120f1c;
+  --st-startup-muted: #635d75;
+  --st-startup-line: #e6e1f5;
+  --st-startup-accent: #7c3aed;
+  --st-startup-accent_soft: #f1ebff;
+  --st-startup-font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --st-startup-font-title: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  --st-startup-measure: 44rem;
+  --st-startup-title-scale: clamp(2.4rem, 1.3rem + 4.4vw, 4.4rem);
+  --st-startup-title-weight: 800;
+  --st-startup-title-tracking: -0.045em;
+  --st-startup-radius: 14px;
+  --st-startup-base-size: 17px;
+  --st-startup-container: 1120px;
+}
+
+/* Dark mode is a token swap, never a second set of rules: the pair lives in the manifest and
+   the stylesheet only decides which pair the visitor gets. */
+@media (prefers-color-scheme: dark) {
+  html[data-theme="startup"] {
+    --st-startup-canvas: #0d0b14;
+    --st-startup-surface: #191527;
+    --st-startup-ink: #ece7fa;
+    --st-startup-muted: #9a92b0;
+    --st-startup-line: #2a2440;
+    --st-startup-accent: #c4b0ff;
+    --st-startup-accent_soft: #241a45;
+  }
+}
+
+
+/* The reset is scoped to the active theme for the reason the tokens are: all ten sheets ship
+   in one bundle, and an unscoped `body` rule would let every one of them style every page. */
+html[data-theme="startup"] *,
+html[data-theme="startup"] *::before,
+html[data-theme="startup"] *::after {
+  box-sizing: border-box;
+}
+
+html[data-theme="startup"] {
+  background-color: var(--st-startup-canvas);
+  color-scheme: light dark;
+}
+
+html[data-theme="startup"] body {
+  margin: 0;
+  background: var(--st-startup-canvas);
+  color: var(--st-startup-ink);
+  font-family: var(--st-startup-font-body);
+  font-size: var(--st-startup-base-size);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+html[data-theme="startup"] ::selection {
+  background-color: var(--st-startup-accent-soft);
+}
+
+html[data-theme="startup"] a {
+  color: var(--st-startup-accent);
+  text-underline-offset: 3px;
+}
+
+/* The focus ring is the one rule every theme shares unscoped in spirit and scoped in practice:
+   a theme that removed it would fail the accessibility bar rather than look different. */
+html[data-theme="startup"] :focus-visible {
+  outline: 3px solid var(--st-startup-accent);
+  outline-offset: 2px;
+}
+
+html[data-theme="startup"] img {
+  max-width: 100%;
+  height: auto;
+}
+
+
+/* The shell: a full-height column that pins the footer to the bottom on a short page. */
+.st-startup-shell {
+  display: flex;
+  min-height: 100dvh;
+  flex-direction: column;
+}
+
+.st-startup-header,
+.st-startup-footer {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+}
+
+.st-startup-header {
+  border-bottom: 0; justify-content: center;
+}
+
+.st-startup-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--st-startup-line);
+  color: var(--st-startup-muted);
+  font-size: 0.8125rem;
+}
+
+.st-startup-main {
+  width: 100%;
+  max-width: var(--st-startup-container);
+  margin-inline: auto;
+  padding: 3rem 1.5rem 4rem;
+}
+
+.st-startup-article {
+  max-width: var(--st-startup-measure);
+}
+
+.st-startup-title {
+  margin: 0;
+  font-family: var(--st-startup-font-title);
+  font-size: var(--st-startup-title-scale);
+  font-weight: var(--st-startup-title-weight);
+  line-height: 1.1;
+  letter-spacing: var(--st-startup-title-tracking);
+}
+
+.st-startup-eyebrow {
+  margin: 0 0 0.75rem;
+  color: var(--st-startup-accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.st-startup-summary {
+  margin: 1rem 0 0;
+  color: var(--st-startup-muted);
+  font-size: 1.15em;
+}
+
+.st-startup-meta {
+  margin: 1.5rem 0 0;
+  color: var(--st-startup-muted);
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+}
+
+.st-startup-body {
+  margin-top: 2.5rem;
+}
+
+.st-startup-body p {
+  margin: 0 0 1.25rem;
+  white-space: pre-line;
+}
+
+.st-startup-body p:last-child {
+  margin-bottom: 0;
+}
+
+
+.st-startup-header {
+  justify-content: center;
+  padding-block: 2rem;
+}
+
+.st-startup-brand {
+  color: var(--st-startup-ink);
+  font-weight: 800;
+  font-size: 1.25rem;
+  letter-spacing: -0.03em;
+  text-decoration: none;
+}
+
+/* Everything centres: a launch page has one thing to say and one thing to press. */
+.st-startup-main,
+.st-startup-article {
+  text-align: center;
+}
+
+.st-startup-summary {
+  margin-inline: auto;
+  max-width: 34rem;
+}
+
+.st-startup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.75rem;
+  margin-top: 2rem;
+}
+
+.st-startup-action,
+.st-startup-action-ghost {
+  padding: 0.7rem 1.5rem;
+  border-radius: 999px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.st-startup-action {
+  background: var(--st-startup-accent);
+  color: var(--st-startup-canvas);
+}
+
+.st-startup-action-ghost {
+  border: 1px solid var(--st-startup-line);
+  color: var(--st-startup-ink);
+}
+
+.st-startup-meta {
+  margin-top: 2.5rem;
+}
+
+.st-startup-card {
+  border: 0;
+  border-radius: var(--st-startup-radius);
+  background: linear-gradient(160deg, var(--st-startup-accent-soft), var(--st-startup-surface));
+}
+
+
+/* Blocks (REQ-063). The markup is the SDK's; everything here is this theme's styling of it. */
+.st-startup-block {
+  margin: 0 0 1.75rem;
+}
+
+.st-startup-block:last-child {
+  margin-bottom: 0;
+}
+
+.st-startup-heading {
+  margin: 2.5rem 0 0.75rem;
+  font-family: var(--st-startup-font-title);
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+.st-startup-heading:first-child {
+  margin-top: 0;
+}
+
+.st-startup-align-center {
+  text-align: center;
+}
+
+.st-startup-align-right {
+  text-align: right;
+}
+
+.st-startup-figure {
+  margin-inline: 0;
+}
+
+.st-startup-figure figcaption {
+  margin-top: 0.5rem;
+  color: var(--st-startup-muted);
+  font-size: 0.8125rem;
+}
+
+.st-startup-testimonial {
+  margin-inline: 0;
+  padding: 1.25rem 1.5rem;
+  border-left: 3px solid var(--st-startup-accent);
+  background: var(--st-startup-surface);
+  border-radius: var(--st-startup-radius);
+}
+
+.st-startup-testimonial blockquote {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.st-startup-testimonial figcaption {
+  margin-top: 0.5rem;
+  color: var(--st-startup-muted);
+  font-size: 0.8125rem;
+}
+
+.st-startup-gallery {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.st-startup-gallery img {
+  border-radius: var(--st-startup-radius);
+}
+
+.st-startup-columns {
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.st-startup-cta {
+  padding: 1.75rem;
+  border-radius: var(--st-startup-radius);
+  background: var(--st-startup-accent-soft);
+}
+
+.st-startup-cta h2 {
+  margin: 0 0 0.5rem;
+}
+
+.st-startup-cta p {
+  margin: 0 0 1rem;
+  color: var(--st-startup-muted);
+}
+
+.st-startup-cta-link {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: var(--st-startup-radius);
+  background: var(--st-startup-accent);
+  color: var(--st-startup-canvas);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.st-startup-cards {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.st-startup-card {
+  padding: 1.25rem;
+  border: 1px solid var(--st-startup-line);
+  border-radius: var(--st-startup-radius);
+  background: var(--st-startup-surface);
+}
+
+.st-startup-card h3 {
+  margin: 0 0 0.5rem;
+}
+
+.st-startup-card p {
+  margin: 0 0 0.75rem;
+  color: var(--st-startup-muted);
+  font-size: 0.9375rem;
+}
+
+.st-startup-plans {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.st-startup-plans ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.st-startup-plan {
+  padding: 1.25rem;
+  border: 1px solid var(--st-startup-line);
+  border-radius: var(--st-startup-radius);
+}
+
+.st-startup-plan h3 {
+  margin: 0;
+}
+
+.st-startup-price {
+  margin: 0.25rem 0 0.75rem;
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.st-startup-plan ul li {
+  padding: 0.25rem 0;
+  color: var(--st-startup-muted);
+  font-size: 0.9375rem;
+}
+
+.st-startup-faq > div {
+  padding: 0.875rem 0;
+  border-bottom: 1px solid var(--st-startup-line);
+}
+
+.st-startup-faq dt {
+  font-weight: 600;
+}
+
+.st-startup-faq dd {
+  margin: 0.35rem 0 0;
+  color: var(--st-startup-muted);
+}
+
+.st-startup-raw pre {
+  overflow-x: auto;
+  padding: 1rem;
+  border-radius: var(--st-startup-radius);
+  background: var(--st-startup-surface);
+  font-size: 0.875rem;
+}
+
+.st-startup-raw-note {
+  margin: 0 0 0.5rem;
+  color: var(--st-startup-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.st-startup-unknown {
+  padding: 0.75rem 1rem;
+  border: 1px dashed var(--st-startup-line);
+  border-radius: var(--st-startup-radius);
+  color: var(--st-startup-muted);
+  font-size: 0.9375rem;
+}
+
+@media (max-width: 720px) {
+  .st-startup-gallery,
+  .st-startup-columns,
+  .st-startup-cards,
+  .st-startup-plans {
+    grid-template-columns: 1fr;
+  }
+}

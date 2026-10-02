@@ -67,6 +67,9 @@ pub struct PublicRevisionBody {
     pub body: String,
     /// Summary, when the author wrote one.
     pub summary: Option<String>,
+    /// The block tree the theme renders (REQ-063). `[]` when the revision predates the block
+    /// system — the renderer then draws the body, so released content never breaks.
+    pub blocks: serde_json::Value,
     /// When the revision was published, when it ever was.
     #[serde(with = "time::serde::rfc3339::option")]
     pub published_at: Option<OffsetDateTime>,
@@ -81,6 +84,14 @@ pub struct PublishedPageResponse {
     pub page: PublicPageBody,
     /// The revision visitors see.
     pub revision: PublicRevisionBody,
+    /// The page's featured image, or `None` when there is nothing to draw (REQ-064 slice 4d).
+    ///
+    /// `None` covers both "no image" and "the image is in the trash". That is deliberate: the
+    /// renderer's only decision is whether to emit an `<img>`, and both cases answer it the same
+    /// way — while a *panel* that printed a dead URL would ship a broken image to every visitor.
+    /// The store decides that, so the public surface carries the answer rather than re-deriving
+    /// it, and the degradation shows up in the operator's tab instead of in a visitor's page.
+    pub featured_image: Option<omnion_content::featured::FeaturedImage>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -88,11 +99,20 @@ pub struct PublishedPageResponse {
 // ---------------------------------------------------------------------------------------------
 
 /// `GET /api/v1/public/pages/{slug}`.
+///
+/// `?viewport=mobile` asks for the phone render. It is not a display preference the renderer
+/// could apply on the client: the REQ asks for blocks hidden per viewport to be *absent* from
+/// the other viewport's render, and a block that is merely CSS-hidden is still in the HTML the
+/// device downloads, still in the accessibility tree, and still counted by every reader-mode
+/// extractor. So the decision is made here, on the payload, before the page leaves the API.
 #[derive(Debug, Deserialize)]
 pub struct PublicPageQuery {
     /// Site hint: a host when it contains a dot, otherwise a site key.
     #[serde(default)]
     pub site: Option<String>,
+    /// Viewport the caller is rendering for.
+    #[serde(default)]
+    pub viewport: Option<String>,
 }
 
 /// What a `?site=` value addresses.
@@ -145,6 +165,71 @@ pub async fn get_published_page(
         return Err(page_not_found(&slug));
     };
 
+    // The membership gate (REQ-064, slice 4c), enforced HERE rather than left to a theme.
+    //
+    // A theme that forgets to ask the gate is not a broken theme, it is a page served to
+    // everybody, and the REQ's criterion is about what the *API* answers for a signed-out
+    // visitor — not about what a well-behaved template does with the payload. So the rule lives
+    // in the route, and `routes::members::gate` is the same function the theme's own probe calls,
+    // which is what keeps the prompt a visitor is shown and the 404 they get from drifting apart.
+    //
+    // Both refusals answer the SAME 404 as a page that does not exist. A `403` would confirm the
+    // page is there, and a member-only page's existence is itself the thing being hidden.
+    let verdict = crate::routes::members::gate(&state, site.id, &slug, &headers).await?;
+    if !verdict.allowed {
+        // The site's own policy may ask for a sign-in prompt instead of a bare 404, and then the
+        // answer says 401 with the address to go to. That is the SITE disclosing its own page,
+        // which is a decision an operator made, not a leak the platform performed.
+        if verdict.behaviour == "prompt" && verdict.exists {
+            return Err(ApiError::unauthorized(
+                "member_required",
+                "sign in to read this page",
+            ));
+        }
+        return Err(page_not_found(&slug));
+    }
+
+    // The viewport filter runs on the stored payload before it is handed out. A page that
+    // carries blocks the author hid from phones is a different page for a phone, and the only
+    // honest way to serve that is to never build the other one.
+    //
+    // The order is filter, then degrade, and the reason is that a *hidden* block's broken file is
+    // not this reader's problem: a desktop-only image must not be reported to a phone, and the
+    // degradation of a block nobody on this viewport would see is markup they never download. One
+    // order and both questions have one answer.
+    let read_on = read_on_from(query.viewport.as_deref());
+    let blocks = match omnion_content::parse_blocks(&revision.blocks) {
+        Ok(parsed) => {
+            let shown = omnion_content::filter_for_viewport(&parsed, read_on);
+            // A file somebody trashed must not become a broken-image icon on a page that is
+            // otherwise working. The degradation is the platform's, not the theme's: a theme that
+            // forgot to check would serve the dead id to every visitor, and there are ten themes.
+            let degraded = match omnion_content::BlockMediaStore::new(pool.clone())
+                .states(&shown)
+                .await
+            {
+                Ok((states, _)) => omnion_content::degrade_tree(&shown, &states),
+                // A media table that cannot be read must not take a page off the site — the same
+                // rule the block parse above follows. The tree is served as stored, so a reader
+                // sees the dead image and nothing is silently dropped from a working page.
+                Err(_) => shown,
+            };
+            omnion_content::blocks_to_value(&degraded)
+        }
+        // A payload the registry cannot read is served exactly as stored: the renderer's own
+        // fallback is what a visitor gets, and refusing the page over a bad block would take a
+        // working page down for a mistake in one block.
+        Err(_) => revision.blocks.clone(),
+    };
+
+    // The featured image is read AFTER the gate, never before: a refused visitor must not learn
+    // anything about the page's contents from the shape of a 404, and one extra indexed read on
+    // the render path is the cheaper of the two mistakes.
+    let featured_image = omnion_content::FeaturedStore::new(pool.clone())
+        .renderer_image(site.id, page.id)
+        .await
+        .unwrap_or(None);
+
     Ok(Json(PublishedPageResponse {
         site: PublicSiteBody {
             key: site.key,
@@ -156,14 +241,29 @@ pub async fn get_published_page(
             page_type: page.page_type,
             updated_at: page.updated_at,
         },
+        featured_image,
         revision: PublicRevisionBody {
             revision_no: revision.revision_no,
             title: revision.title,
             body: revision.body,
             summary: revision.summary,
+            blocks,
             published_at: revision.published_at,
         },
     }))
+}
+
+/// Read the `?viewport=` value; anything that is not `mobile` is a wide render.
+///
+/// One value is enough. The rule the REQ states is a two-way one (hidden from phones, hidden
+/// from desktops), and a third word for "tablet" would mean the platform guessing which side of
+/// a line a 900px screen falls on — which is the stylesheet's job, and which the author already
+/// controls by choosing a breakpoint in their own theme.
+fn read_on_from(viewport: Option<&str>) -> omnion_content::ReadOn {
+    match viewport.map(str::trim) {
+        Some("mobile") => omnion_content::ReadOn::Mobile,
+        _ => omnion_content::ReadOn::Desktop,
+    }
 }
 
 /// The `404` of the public surface: one shape for "not here", never "not published".

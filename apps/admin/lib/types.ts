@@ -47,9 +47,212 @@ export type Revision = {
   title: string;
   body: string;
   summary: string | null;
+  /** The page's block tree as stored JSON (REQ-063); `[]` renders the body instead. */
+  blocks: unknown[];
   restored_from_id: string | null;
   created_at: string;
   published_at: string | null;
+};
+
+/**
+ * One block of a page (REQ-063).
+ *
+ * The platform's `@omnion/types` package is the single source of truth for these shapes and
+ * the renderer imports it directly; the panel re-exports the two it needs so its own screens
+ * have one import and the shapes can never drift between the two apps.
+ */
+export type {
+  BlockDefinition,
+  BlockIssue,
+  BlockPropSchema,
+  BlockRegistry,
+  BlockValidationResult,
+  ContentBlock,
+  ContentPattern,
+  PageTemplateSummary,
+  PatternBlocksResponse,
+  PatternListResponse,
+  TemplateListResponse,
+} from "@omnion/types";
+
+// ---------------------------------------------------------------------------------------------
+// Featured media (REQ-064, slice 4d)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Whether a page's picture can be drawn.
+ *
+ * The FOUR states rather than a boolean, because the panel's words and the renderer's markup are
+ * different for each: `none` is a page that never had a hero, `trashed` is a page that lost one
+ * and says so, and `missing` is a column pointing at a row that is gone. A boolean collapses the
+ * last three into "no image", which is exactly the message that sends an operator looking in the
+ * wrong place after somebody emptied the trash.
+ */
+export type FeaturedAvailability = "none" | "available" | "trashed" | "missing";
+
+/** A page's featured image, with the file's state folded in. */
+export type FeaturedMedia = {
+  page_id: string;
+  site_id: string;
+  slug: string;
+  media_id: string | null;
+  /** Alt text for THIS page's use — not the file's own `alt_text`. */
+  alt: string;
+  legend: string;
+  /** 0–1 fraction, `null` when the page has never been cropped. */
+  focal_x: number | null;
+  focal_y: number | null;
+  updated_at: string;
+  storage_key: string | null;
+  filename: string | null;
+  content_type: string | null;
+  width: number | null;
+  height: number | null;
+  deleted_at: string | null;
+};
+
+/**
+ * Exactly what a renderer will draw, and nothing else.
+ *
+ * A separate type from `FeaturedMedia` so the panel cannot reach the storage key and build a URL
+ * by hand: a hand-built URL is one base-path setting away from an image that 404s on every page
+ * of the site. A `null` `render` here is a `null` on the public payload, so the preview cannot be
+ * greener than what a visitor gets.
+ */
+export type FeaturedImage = {
+  media_id: string;
+  url: string;
+  alt: string;
+  legend: string;
+  object_position: string | null;
+  width: number | null;
+  height: number | null;
+};
+
+/** One row of the picker's list. */
+export type FeaturedCandidate = {
+  id: string;
+  filename: string;
+  content_type: string;
+  storage_key: string;
+  width: number | null;
+  height: number | null;
+  /**
+   * The file's OWN alt text, offered as a starting point.
+   *
+   * Never written for the page without the editor pressing the button that copies it: the same
+   * file is the hero of several pages with different descriptions, and a store that copied it
+   * would rename the image everywhere on the first save.
+   */
+  alt_text: string;
+  /** How many pages already feature this file — the "reuse" signal, made visible. */
+  used_by_pages: number;
+};
+
+/** `GET`/`PUT /api/v1/pages/{id}/featured-media`. */
+export type FeaturedMediaBody = {
+  media: FeaturedMedia;
+  /** The chip's words, from the server — the panel never invents a state name. */
+  availability_label: string;
+  /** The degradation sentence, `null` when there is nothing wrong. */
+  warning: string | null;
+  render: FeaturedImage | null;
+};
+
+/** A change to one page's featured image. */
+export type FeaturedChanges = {
+  media_id?: string | null;
+  alt?: string | null;
+  legend?: string | null;
+  /**
+   * `undefined` leaves the crop alone; `null` CLEARS it; a number sets it.
+   *
+   * Three states, and the difference between the first two is the whole reason the API reads this
+   * payload by hand — serde cannot tell a missing key from a JSON null, so a plain optional field
+   * would make the *Clear crop* button a silent no-op.
+   */
+  focal_x?: number | null;
+  focal_y?: number | null;
+  clear?: boolean;
+};
+
+/** `GET /api/v1/sites/{site_id}/featured-media/candidates`. */
+export type FeaturedCandidatesBody = {
+  candidates: FeaturedCandidate[];
+  limit: number;
+};
+
+/**
+ * `BlockIssue` again, as a *binding* rather than a re-export.
+ *
+ * `export type { X } from "…"` places nothing in this module's scope, so a type that is also
+ * used inside a declaration here has to be imported in its own right. Two lines, one import —
+ * and the compiler says so the moment one of them goes missing.
+ */
+import type { BlockIssue } from "@omnion/types";
+
+/** One prop-level difference inside a `changed` block row (REQ-063). */
+export type PropChange = {
+  /** Prop name (`text`, `alt`) or `meta.<setting>` for a per-block setting. */
+  path: string;
+  /** The inspector's own name for the prop, when the registry declares one. */
+  label: string | null;
+  /** Value before the change, elided past 160 characters. */
+  before: string;
+  /** Value after the change. */
+  after: string;
+  /** The prop is only in the new revision. */
+  added: boolean;
+  /** The prop is only in the old revision. */
+  removed: boolean;
+};
+
+/** One row of a revision compare (`GET /api/v1/pages/{id}/revisions/{rev}/diff`). */
+export type BlockDiffEntry = {
+  /** The same value in both revisions when the block survived — this is what makes a move
+   * readable instead of a rewrite. */
+  block_id: string;
+  block_type: string;
+  change: "added" | "removed" | "changed" | "moved" | "unchanged";
+  /** Headline naming the block in a word or two, so a row is not a JSON object. */
+  label: string;
+  /** Where the block sat before, as `0.children.1`. */
+  from_path: string;
+  /** Where it sits now; empty for a removal. */
+  to_path: string;
+  /** Prop-level detail, for a `changed` block. */
+  props: PropChange[];
+  /** How many blocks travelled with this one when it was removed. */
+  removed_count?: number;
+};
+
+/** The whole block compare. */
+export type BlockDiff = {
+  entries: BlockDiffEntry[];
+  added: number;
+  removed: number;
+  changed: number;
+  moved: number;
+  /** `true` when at least one block was deleted — the only row that needs an author to look. */
+  has_removals: boolean;
+};
+
+/** One side of a compare, as a pointer rather than a whole revision. */
+export type DiffRevisionRef = {
+  id: string;
+  revision_no: number;
+  state: string;
+  title: string;
+  created_at: string;
+};
+
+/** Two revisions, compared. `body` covers a page that still renders from plain text. */
+export type RevisionDiff = {
+  page_id: string;
+  base: DiffRevisionRef;
+  compared: DiffRevisionRef;
+  blocks: BlockDiff;
+  body: { changed: boolean; before: string; after: string };
 };
 
 /** One page with its working draft and the revision visitors see (`GET /api/v1/pages`). */
@@ -70,6 +273,82 @@ export type Page = {
 export function pageTitle(page: Page): string {
   return page.draft?.title ?? page.published?.title ?? page.slug;
 }
+
+/**
+ * The renderer-frame payload of a page's working draft
+ * (`GET /api/v1/pages/{id}/preview?viewport=`).
+ *
+ * It carries BOTH trees. `blocks` is what is stored; `visible_blocks` is what the requested
+ * viewport actually renders, after the server dropped the blocks the author hid from that
+ * screen. A frame that only received the filtered tree could not tell a hidden block from a
+ * deleted one — and "where did my block go" is the first question an author asks a phone
+ * preview.
+ */
+export type PagePreview = {
+  page_id: string;
+  slug: string;
+  title: string;
+  viewport: "desktop" | "mobile";
+  blocks: unknown[];
+  visible_blocks: unknown[];
+  block_count: number;
+  visible_count: number;
+  body: string;
+  revision_id: string;
+  revision_no: number;
+  /** The revision visitors see, when there is one. */
+  published_revision_no: number | null;
+  can_publish: boolean;
+  issues: BlockIssue[];
+  /** The files this page's blocks name, and what can be done with each (REQ-063, slice 4). */
+  media: BlockMediaReport;
+  /** Files the tree names. */
+  media_file_count: number;
+  /** How many of them cannot be served. */
+  media_broken_count: number;
+  /** The server's one-line summary, or `""` when nothing is broken. */
+  media_warning: string;
+  /** Ids this frame is *pretending* are deleted, and name a file on this page. */
+  simulated_media: number;
+};
+
+/**
+ * One block's relationship with one file.
+ *
+ * Mirrors the server's `BlockMediaRef` rather than importing it, because the panel's own feature
+ * exports already bind server types by hand and `@omnion/types` does not carry the media report
+ * (it is a *content* report, not a block-registry document). The duplication is deliberate and
+ * narrow: a field added here without one on the server is a `undefined` in the panel, and the
+ * panel renders every field it is given.
+ */
+export type BlockMediaRef = {
+  /** Block that names the file. */
+  block_id: string;
+  /** The block's type (`image`, `gallery`). */
+  block_type: string;
+  /** Prop the file came from (`[0].props.src`). */
+  path: string;
+  /** The media id, as stored. */
+  media_id: string;
+  /** `live`, `trashed` or `purged` — see the server's `FileState`. */
+  state: "live" | "trashed" | "purged";
+  /** The viewport this block draws on, as `hide_on` names it. */
+  visible_on: "none" | "mobile" | "desktop";
+  /** A caption the block degrades to, when the file is gone. */
+  caption: string | null;
+  /** What to do about it, in the author's words. */
+  advice: string;
+};
+
+/** Every file a page's blocks name, and what can be done with it. */
+export type BlockMediaReport = {
+  /** One entry per block/prop pair that names a file, in tree order. */
+  refs: BlockMediaRef[];
+  /** Distinct files the tree names. */
+  file_count: number;
+  /** Distinct files that cannot be served. */
+  broken_count: number;
+};
 
 /** One file in a site's media library (`GET /api/v1/media`). */
 export type Media = {
@@ -1208,6 +1487,230 @@ export type NotificationRouteReport = {
   unknown_event: boolean;
 };
 
+// ---------------------------------------------------------------------------------------------
+// Menus and the scheduled publishing queue (REQ-064, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A menu as the list shows it: the name, the theme slots it renders into and the number of items
+ * it holds — nested ones included, because a menu with two rows on screen and eleven entries is
+ * not a menu with two entries.
+ */
+// ---------------------------------------------------------------------------------------------
+// Forms (REQ-064, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One field of a form, as the builder's inspector reads it.
+ *
+ * `rules` and `options` are free-shaped because they are per-field and never queried — the same
+ * reason the store keeps them as JSON inside the field rather than as columns.
+ */
+export type FormField = {
+  id: string;
+  key: string;
+  label: string;
+  field_type: string;
+  required: boolean;
+  placeholder: string | null;
+  help_text: string | null;
+  width: string;
+  rules: Record<string, unknown>;
+  options: unknown;
+};
+
+/** The closed vocabularies the palette and inspector draw from. */
+export type FormsVocabulary = {
+  field_types: string[];
+  statuses: string[];
+  submit_actions: string[];
+  max_fields: number;
+  max_answer_length: number;
+};
+
+/** A form as the list reads it. */
+export type Form = {
+  id: string;
+  site_id: string;
+  site_key: string;
+  key: string;
+  name: string;
+  status: string;
+  /**
+   * The settings travel with the form rather than in a second endpoint: the settings drawer and
+   * the builder's Publish button are one screen, and a drawer that has to fetch before it can
+   * show what the form currently does renders the defaults half the time.
+   */
+  submit_action: string;
+  submit_message: string | null;
+  redirect_url: string | null;
+  notify_emails: string[];
+  honeypot: boolean;
+  min_fill_seconds: number;
+  rate_limit_per_hour: number;
+  retention_days: number;
+  field_count: number;
+  unread_count: number;
+  spam_count: number;
+  updated_at: string;
+};
+
+/** A form with its fields and its settings: the builder's document. */
+export type FormDetail = Form & {
+  fields: FormField[];
+  vocabulary: FormsVocabulary;
+};
+
+/**
+ * A submission as the inbox reads it.
+ *
+ * `summary` is derived by the API from the form's *field keys*, not from the first text field:
+ * a form whose first field is a subject line would otherwise show that subject in the Name
+ * column, which reads as bad data rather than as a guess.
+ */
+export type Submission = {
+  id: string;
+  answers: Record<string, unknown>;
+  consent_text: string | null;
+  source_path: string | null;
+  status: string;
+  spam_score: number;
+  /**
+   * What became of the builder's notification. `null` means "no attempt was ever recorded",
+   * which is NOT the same as "not sent" — a row from before the send existed has no record,
+   * and drawing it as a delivery failure would be a lie about history.
+   */
+  notified_at?: string | null;
+  notify_status?: "sent" | "skipped" | "failed" | null;
+  notify_error?: string | null;
+  created_at: string;
+  summary?: {
+    name?: string;
+    email?: string;
+    text: string;
+  };
+};
+
+/** One page of the inbox. */
+export type Inbox = {
+  submissions: Submission[];
+  total: number;
+  counts: { new: number; read: number; spam: number; archived: number };
+};
+
+export type Menu = {
+  id: string;
+  site_id: string;
+  /**
+   * The site's GLOBAL key. The public routes address a site by key or host, the authenticated
+   * ones by uuid; the audience preview calls a public route, so it needs this and not `site_id`.
+   */
+  site_key: string;
+  key: string;
+  name: string;
+  locations: string[];
+  item_count: number;
+  updated_at: string;
+};
+
+/**
+ * One navigation row.
+ *
+ * `id` is minted by the editor and never rewritten, which is what lets a drag be expressed as a
+ * whole-tree write: the same id moves to a new parent, and the store replaces the whole document
+ * in one transaction instead of applying six partial updates that can half-apply.
+ */
+export type MenuItem = {
+  id: string;
+  parent_id: string | null;
+  position: number;
+  label: string;
+  item_type: string;
+  page_id: string | null;
+  url: string;
+  target: string;
+  rel: string;
+  css_class: string;
+  enabled: boolean;
+  visibility: string;
+  visibility_roles: string[];
+};
+
+/** The closed vocabularies the editor draws its pickers from, sent by the server. */
+export type MenuVocabulary = {
+  locations: string[];
+  item_types: string[];
+  visibilities: string[];
+  max_depth: number;
+};
+
+/** The editor's own document: the menu, its items and the vocabulary. */
+export type MenuDetail = Menu & {
+  items: MenuItem[];
+  vocabulary: MenuVocabulary;
+};
+
+/** What an item can link to, in the editor's own words. */
+export const MENU_ITEM_TYPES = [
+  { value: "page", label: "Page", hint: "A page of this site" },
+  { value: "url", label: "URL", hint: "Any address, absolute or site-relative" },
+  { value: "anchor", label: "Anchor", hint: "A #section on the current page" },
+  { value: "index", label: "Site index", hint: "The front page of the site" },
+] as const;
+
+/** Who may see an item. The server refuses anything outside this list. */
+export const MENU_VISIBILITIES = [
+  { value: "everyone", label: "Everyone" },
+  { value: "members", label: "Signed-in visitors" },
+  { value: "logged_out", label: "Signed-out visitors" },
+  { value: "roles", label: "Visitors with these roles" },
+] as const;
+
+/** One queue row: a promise that a page appears or disappears at an instant. */
+export type PublishingEntry = {
+  id: string;
+  page_id: string;
+  page_slug: string;
+  page_title: string;
+  page_type: string;
+  action: string;
+  /** RFC 3339, UTC. `timezone` beside it is the author's wall clock, not an offset. */
+  scheduled_at: string;
+  timezone: string;
+  status: string;
+  result: string;
+  error: string;
+  claimed_at: string | null;
+};
+
+/** The four states a queue row can be in, and the ones a worker can still act on. */
+export const PUBLISHING_STATUSES = [
+  { value: "", label: "All states" },
+  { value: "pending", label: "Pending" },
+  { value: "done", label: "Done" },
+  { value: "failed", label: "Failed" },
+  { value: "cancelled", label: "Cancelled" },
+] as const;
+
+/** One audience-filtered navigation row, as `GET /api/v1/public/menus/{location}` answers. */
+export type RenderedMenuItem = {
+  id: string;
+  label: string;
+  /** Already resolved: a `page` item's slug became a path, an `anchor` kept its hash. */
+  href: string;
+  external: boolean;
+  rel: string;
+  css_class: string;
+  children: RenderedMenuItem[];
+};
+
+/** What the theme draws for one location. */
+export type RenderedMenu = {
+  key: string;
+  name: string;
+  items: RenderedMenuItem[];
+};
+
 /** One row of the event feed, as `/api/v1/events` answers it. */
 export type EventRow = {
   id: number;
@@ -1533,6 +2036,423 @@ export type SecurityImportReport = {
   created: number;
   refreshed: number;
   rejected: string[];
+};
+
+// ---------------------------------------------------------------------------------------------
+// SEO toolkit (REQ-064, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** The editable SEO fields of one page. */
+export type PageSeo = {
+  seo_title: string | null;
+  seo_description: string | null;
+  canonical_url: string | null;
+  og_title: string | null;
+  og_description: string | null;
+  og_image_media_id: string | null;
+  twitter_card: string;
+  robots: string;
+  structured_data_type: string | null;
+  structured_data: Record<string, unknown>;
+};
+
+/** The `<meta>` set a crawler reads, built by the server's own generator. */
+export type SeoTags = {
+  title: string;
+  description: string | null;
+  canonical: string | null;
+  og_title: string;
+  og_description: string | null;
+  og_image: string | null;
+  og_type: string;
+  twitter_card: string;
+  robots: string;
+  json_ld: string | null;
+  /** Schema fields the chosen type wants and this page cannot supply. */
+  missing_fields: string[];
+};
+
+/** A page's fields plus the tags they produce. */
+export type PageSeoBody = {
+  seo: PageSeo;
+  tags: SeoTags;
+};
+
+/** One redirect rule. */
+export type SeoRedirect = {
+  id: string;
+  from_path: string;
+  to_path: string;
+  status_code: number;
+  pattern: string;
+  enabled: boolean;
+  hits: number;
+  last_hit_at: string | null;
+};
+
+/** What `Test a path` found, including the rules that also answer it. */
+export type SeoRedirectTest = {
+  path: string;
+  matched: SeoRedirect | null;
+  also_matched: SeoRedirect[];
+};
+
+/** One row a redirect file was refused on, with the reason a human can act on. */
+export type SeoRedirectRejection = {
+  /** 1-based line in the uploaded file, or 0 for a refusal about the file as a whole. */
+  line: number;
+  /** The row as it was read. */
+  row: string;
+  /** Why it was refused. */
+  reason: string;
+};
+
+/**
+ * What an import did, or would do on a dry run.
+ *
+ * `imported` and `accepted` are three different numbers and keeping them apart is the point: a
+ * dry run has all the accepted rows and no imported ones, and a refused file has imported none
+ * of the rows it accepted. A single "rows" number would render those two states identically.
+ */
+export type SeoRedirectImport = {
+  clean: boolean;
+  imported: number;
+  accepted: number;
+  summary: string;
+  rejected: SeoRedirectRejection[];
+};
+
+/** One broken internal link. */
+export type SeoBrokenLink = {
+  id: string;
+  source_page_id: string | null;
+  source_slug: string | null;
+  target_url: string;
+  anchor_text: string | null;
+  status: number | null;
+  ignored: boolean;
+};
+
+/** A site's stored settings, with the sitemap the panel previews. */
+export type SeoSettings = {
+  sitemap_types: string[];
+  default_priority: number;
+  default_change_frequency: string;
+  sitemap_xml: string | null;
+  sitemap_last_generated_at: string | null;
+  /** How many URLs the stored sitemap holds, so an empty preview can explain itself. */
+  sitemap_url_count: number;
+  robots_txt: string;
+};
+
+/**
+ * The closed vocabularies the editor offers.
+ *
+ * Served rather than hard-coded: a picker that offers a schema type the server then refuses is a
+ * picker whose rejection arrives as an unexplained 400.
+ */
+export type SeoVocabulary = {
+  structured_data_types: string[];
+  twitter_cards: string[];
+  redirect_patterns: string[];
+  redirect_status_codes: number[];
+  change_frequencies: string[];
+  /** This site's own page types, for the sitemap's inclusion list. */
+  page_types: string[];
+};
+
+/** Everything the SEO screen draws, in one read. */
+export type SeoOverview = {
+  site: { id: string; key: string; name: string; host: string | null };
+  vocabulary: SeoVocabulary;
+  settings: SeoSettings;
+  redirects: SeoRedirect[];
+  broken_links: SeoBrokenLink[];
+  robots_warnings: string[];
+};
+
+// ---------------------------------------------------------------------------------------------
+// Page comments (REQ-064, slice 4a)
+// ---------------------------------------------------------------------------------------------
+
+/** The four moderation states, as the API reports them. */
+export type CommentStatus = "pending" | "approved" | "spam" | "trash";
+
+/** One comment as the inbox draws it. Carries the address and the client fingerprint. */
+export type CommentInboxRow = {
+  id: string;
+  page_id: string;
+  parent_id: string | null;
+  reply_depth: number;
+  author_name: string;
+  author_email: string;
+  ip_hint: string | null;
+  user_agent: string | null;
+  body: string;
+  status: CommentStatus;
+  /** Which heuristic marked it, or a moderator's note. */
+  spam_reason: string | null;
+  approved_at: string | null;
+  approved_by: string | null;
+  is_staff_reply: boolean;
+  created_at: string;
+  updated_at: string;
+  /** The page's title, so a moderator reads "About us" rather than a slug. */
+  page_title: string | null;
+};
+
+/** One tab's count. */
+export type CommentTabCount = { status: string; count: number };
+
+/** The inbox page: the rows and the four tab counts. */
+export type CommentInbox = {
+  comments: CommentInboxRow[];
+  total: number;
+  counts: CommentTabCount[];
+  /** The states the panel offers, generated by the API rather than typed here twice. */
+  statuses: string[];
+};
+
+/** What a bulk moderation did, per comment. */
+export type CommentBulkResult = {
+  updated: string[];
+  missing: string[];
+  refused: string[];
+  complete: boolean;
+  requested: number;
+};
+
+/** The moderation policy. */
+export type CommentSettings = {
+  site_id: string;
+  comments_enabled: boolean;
+  auto_approve_after_comments: number;
+  blocked_words: string[];
+  max_links_per_comment: number;
+  min_fill_seconds: number;
+  per_ip_per_hour: number;
+  notify_on_comment: boolean;
+  updated_at: string;
+};
+
+/** One ban. An `ip` ban's value is a fingerprint, never an address. */
+export type CommentBan = {
+  id: string;
+  kind: "email" | "ip";
+  value: string;
+  reason: string | null;
+  created_at: string;
+  expires_at: string | null;
+  active: boolean;
+};
+
+/** The settings screen in one read. */
+export type CommentSettingsDocument = {
+  settings: CommentSettings;
+  bans: CommentBan[];
+};
+
+/** A reply as the site's own author. */
+export type NewCommentReply = {
+  site_id: string;
+  author_name: string;
+  body: string;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Members (REQ-064, slice 4c) — visitor accounts, their sessions, the site policy
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The three visitor states.
+ *
+ * `pending` is a signup that has not clicked its verification link. It is NOT a failure and the
+ * panel must not render it as one: a row that says "broken" for an account that is merely
+ * waiting teaches an operator that verification is broken.
+ */
+export type MemberStatus = "pending" | "verified" | "blocked";
+
+/**
+ * A visitor account, as the panel may describe them.
+ *
+ * There is deliberately no password field of any kind on this type. The API's own struct omits
+ * `password_hash` structurally rather than with `skip_serializing_if`, and a type that had the
+ * field would let the panel render one the day somebody adds it back.
+ *
+ * `has_password` is a BOOLEAN rather than the hash, and it is the only honest way to say what the
+ * panel needs: "invited, has never claimed the account" and "signed in yesterday" are two
+ * different rows the operator must be able to tell apart, and neither is answered by a hash.
+ */
+export type Member = {
+  id: string;
+  site_id: string;
+  email: string;
+  name: string | null;
+  /** The SITE's own role names. These are not panel roles and resolve to nothing in IAM. */
+  roles: string[];
+  status: MemberStatus;
+  verified_at: string | null;
+  last_signin_at: string | null;
+  has_password: boolean;
+  /** Live member sessions right now. Not panel sessions — `cms_member_sessions` only. */
+  live_sessions: number;
+  signin_note: string | null;
+  created_at: string;
+};
+
+/** One live member session, as the drawer lists them. */
+export type MemberSignin = {
+  id: string;
+  created_at: string;
+  last_seen_at: string;
+  expires_at: string;
+};
+
+/** The members table and its three chips. */
+export type MemberList = {
+  members: Member[];
+  total: number;
+  counts: { pending: number; verified: number; blocked: number };
+};
+
+/** The drawer: the member plus the last ten sign-ins. */
+export type MemberDetail = {
+  member: Member;
+  recent_signins: MemberSignin[];
+};
+
+/**
+ * The site's membership policy.
+ *
+ * `gated_page_behaviour` is the one field the panel has to argue about rather than merely set:
+ * `not_found` answers 404 and discloses nothing, `prompt` answers 401 with a sign-in link and
+ * therefore advertises that the page exists. The default is `not_found` and the REQ's criterion
+ * says so, which is why this is a radio with an explanation and not a checkbox.
+ */
+export type MemberSettings = {
+  site_id: string;
+  signup_enabled: boolean;
+  require_verification: boolean;
+  default_roles: string[];
+  post_signin_redirect: string | null;
+  gated_page_behaviour: "not_found" | "prompt";
+  updated_at: string;
+};
+
+/** The settings screen in one read, with the one number the summary line needs. */
+export type MemberSettingsDocument = {
+  settings: MemberSettings;
+  verified_count: number;
+};
+
+/** What a mail-bound action reports. `unavailable` means no mail transport is configured. */
+export type MemberDelivery = {
+  member_id: string;
+  delivery: "sent" | "unavailable" | string;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Newsletter (REQ-064, slice 4b) — lists, double opt-in subscribers, the sent archive
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The four subscriber states.
+ *
+ * `pending` is the whole point of a double opt-in: the row exists and is NOT deliverable yet.
+ * A UI that renders `pending` as a failure teaches an owner that subscribers are broken; it is
+ * the state a signup is in until somebody clicks the link.
+ */
+export type SubscriberStatus = "pending" | "confirmed" | "unsubscribed" | "bounced";
+
+/** One list. `key` is what a theme's signup form posts to, so the panel always shows it. */
+export type NewsletterList = {
+  id: string;
+  site_id: string;
+  organization_id: string;
+  key: string;
+  name: string;
+  description: string | null;
+  double_opt_in: boolean;
+  created_at: string;
+  updated_at: string;
+  /**
+   * The per-state counts, present on the list read and absent on a single-row read — the row
+   * itself has no such columns. `undefined` means "not in this response", so the panel shows a
+   * placeholder rather than printing zero, which would read as "this list has no subscribers".
+   */
+  counts?: ListCounts;
+};
+
+/** The counts beside a list, from the same read as the list. */
+export type ListCounts = {
+  pending: number;
+  confirmed: number;
+  unsubscribed: number;
+  bounced: number;
+  total: number;
+};
+
+/** A list with its counts — one row of the list screen. */
+export type NewsletterListRow = { list: NewsletterList; counts: ListCounts };
+
+/** One subscriber row. */
+export type NewsletterSubscriber = {
+  id: string;
+  site_id: string;
+  list_id: string;
+  email: string;
+  name: string | null;
+  source: string | null;
+  status: SubscriberStatus;
+  /** The store never returns the token digests — they are not in the panel's vocabulary. */
+  confirmed_at: string | null;
+  unsubscribed_at: string | null;
+  /** Whether the confirmation link is still waiting for a click, and when it stops being one. */
+  confirm_expires_at: string | null;
+  /** Why the row is in the state it is in. The first question an owner asks. */
+  status_reason: string | null;
+  created_at: string;
+  updated_at: string;
+  /** The list's name, so a mixed-list table does not need a join in the browser. */
+  list_name: string | null;
+};
+
+/** A page of subscribers plus its total. */
+export type SubscriberPage = {
+  subscribers: NewsletterSubscriber[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+/** One sent issue in the archive list. */
+export type NewsletterIssue = {
+  id: string;
+  site_id: string;
+  list_id: string;
+  subject: string;
+  /** How many addresses the send reached — what the send knew, not today's count. */
+  recipient_count: number;
+  archive_slug: string;
+  sent_at: string;
+  list_name: string | null;
+};
+
+/** What a CSV import did, and what it refused to do. */
+export type ImportReport = {
+  added: number;
+  blank: number;
+  /** One entry per address already on the list, with the state it is in. */
+  skipped: { email: string; status: string }[];
+};
+
+/** A new list, as the create form sends it. `key` is derived server-side when omitted. */
+export type NewNewsletterList = {
+  site_id: string;
+  name: string;
+  key?: string;
+  description?: string;
+  double_opt_in?: boolean;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -2405,6 +3325,315 @@ export interface BackupSchedule {
   cadence: string;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Content API tokens (REQ-019, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A content API token as the list renders it.
+ *
+ * There is deliberately no field a secret could hide in: the row is the server's `TokenBody`, and
+ * that struct cannot hold one either. A `secret?: string` here would be `undefined` forever and
+ * would teach the next person that this shape is where a secret goes.
+ */
+export type ContentApiToken = {
+  id: string;
+  name: string;
+  /** The copyable `omn_xxxxxxxx` marker — the only part of the credential that is ever shown. */
+  prefix: string;
+  /** `null` means every site of the organization. */
+  site_id: string | null;
+  /** The site's key when scoped, for a column a person can read. */
+  site_key: string | null;
+  scopes: string[];
+  allowed_origins: string[];
+  rate_limit_per_minute: number;
+  expires_at: string | null;
+  revoked_at: string | null;
+  last_used_at: string | null;
+  created_at: string;
+  /** `active`, `expired` or `revoked`. Derived by the server from the two columns above. */
+  status: "active" | "expired" | "revoked";
+};
+
+/** The create/rotate response: the row plus the one copy of the plaintext. */
+export type CreatedContentApiToken = {
+  token: ContentApiToken;
+  /**
+   * `omn_<prefix>_<secret>`, shown exactly once. It is not fetchable afterwards — the API stores
+   * only its digest — so the screen that renders it must not offer a "show again".
+   */
+  plaintext: string;
+  /** Always `true`; the client renders the warning from the payload rather than from a guess. */
+  plaintext_shown_once: boolean;
+};
+
+/** One expiry choice the create dialog offers. */
+export type ExpiryPreset = {
+  label: string;
+  /** `0` means "never". */
+  days: number;
+};
+
+/** One rate-limit tier. */
+export type RateTier = {
+  label: string;
+  per_minute: number;
+  /** Whether the tier needs a permission the other one does not. */
+  elevated: boolean;
+};
+
+/** A scope that exists in the store but is not implemented in v1. */
+export type ReservedScope = {
+  scope: string;
+  /** Why it is not live, in the panel's own voice. */
+  note: string;
+};
+
+/** Everything the create dialog may offer, read from the server rather than hard-coded. */
+export type ContentApiVocabulary = {
+  /** The scopes v1 offers. */
+  scopes: string[];
+  /** Reserved by name, so a future write surface needs no migration. */
+  reserved_scopes: ReservedScope[];
+  expiry_presets: ExpiryPreset[];
+  rate_tiers: RateTier[];
+  max_name_length: number;
+};
+
+/**
+ * `GET /api/v1/content-api/usage` — the Usage tab's whole answer (REQ-019, slice 3).
+ *
+ * Three summaries over two sources (the durable table and the live Redis window), and the split is
+ * carried on the wire rather than resolved by the panel. `rows` is raw; `series`, `tokens` and
+ * `endpoints` are the server's roll-ups, and the panel renders those rather than computing its own
+ * — a client-side sum is a second answer to "how much did this token do", and the second answer is
+ * the one that disagrees with the usage route's own numbers.
+ */
+export type ContentApiUsage = {
+  /** Days the answer covers. The server clamps a larger ask rather than refusing it. */
+  days: number;
+  /** The durable rows, newest day first — the raw material behind every roll-up above. */
+  rows: ContentApiUsageRow[];
+  /** Per-token totals, the table under the chart. */
+  tokens: ContentApiUsageToken[];
+  /** What the traffic is made of, busiest first. */
+  endpoints: ContentApiUsageEndpoint[];
+  /** One bar per day, oldest first, zero-filled so a quiet day is a short bar and not a gap. */
+  series: ContentApiUsageDay[];
+  /**
+   * Whether the live window could be read at all.
+   *
+   * `false` means `pending_requests` is `null` — **not** `0`. A panel that rendered it as zero would
+   * be telling an operator nothing is in flight while the counter is unreachable.
+   */
+  pending_readable: boolean;
+  /** Requests counted but not yet flushed, or `null` when the window could not be read. */
+  pending_requests: number | null;
+  /** Refusals in the live window, or `null` when the window could not be read. */
+  pending_throttled: number | null;
+};
+
+/** One durable row. `endpoint` is the matched route, with no `/api/v1` prefix. */
+export type ContentApiUsageRow = {
+  token_id: string;
+  /** ISO day, `YYYY-MM-DD`. */
+  day: string;
+  endpoint: string;
+  requests: number;
+  errors: number;
+  throttled: number;
+};
+
+/** One token's line in the usage table. */
+export type ContentApiUsageToken = {
+  token_id: string;
+  name: string;
+  flushed_requests: number;
+  flushed_errors: number;
+  flushed_throttled: number;
+  /** Counted in the live window, not yet in the table. */
+  pending_requests: number;
+  /** Counted in the live window, not yet in the table. */
+  pending_throttled: number;
+  /** `null` when the token has never authenticated. */
+  last_used_at: string | null;
+};
+
+/** One line of the endpoint leaderboard. */
+export type ContentApiUsageEndpoint = {
+  endpoint: string;
+  /** Flushed **plus** pending, so it is comparable with the per-token total. */
+  requests: number;
+  throttled: number;
+  /** How many of `requests` are already durable. `requests - flushed_requests` is still counting. */
+  flushed_requests: number;
+};
+
+/** One bar of the chart. */
+export type ContentApiUsageDay = {
+  /** ISO day, `YYYY-MM-DD`. */
+  day: string;
+  requests: number;
+  throttled: number;
+};
+
+/**
+ * One documented operation, as the Docs tab reads it.
+ *
+ * A *narrowed* view of the OpenAPI document rather than the document itself typed out. The panel
+ * indexes into a handful of well-known keys, and a `Record<string, unknown>` for everything else
+ * would let a rename in the document turn into `undefined` at render time rather than a type
+ * error. The tests assert the server's document actually has these keys.
+ */
+export type OpenApiOperation = {
+  /** Stable id — also the Explorer's dropdown key (`pages.list`). */
+  operationId: string;
+  /** One line written for somebody integrating. */
+  summary: string;
+  /** The scope the token needs, or `null` for a route that needs only a valid token. */
+  "x-required-scope": string | null;
+  /** `posts` is a page type today; the blog module will give it its own fields. */
+  "x-experimental"?: boolean;
+  parameters: OpenApiParameter[];
+  responses: Record<string, { description: string }>;
+};
+
+/** One query (or path, or header) parameter. */
+export type OpenApiParameter = {
+  name: string;
+  /** `query`, `path` or `header`. */
+  in: string;
+  required: boolean;
+  description: string;
+};
+
+/**
+ * The document the Docs tab renders.
+ *
+ * Only the keys the screen reads are typed; `paths` is indexed by the path string and the method
+ * beside it, because that is exactly the document's own shape and pretending otherwise would mean
+ * a second data model that has to be kept in step.
+ */
+export type OpenApiDocument = {
+  openapi: string;
+  info: {
+    title: string;
+    version: string;
+    description: string;
+    license?: { name: string };
+  };
+  servers: { url: string }[];
+  paths: Record<string, Record<string, OpenApiOperation>>;
+  components: {
+    securitySchemes: Record<string, { type: string; scheme?: string; description?: string }>;
+    schemas: Record<string, { description?: string; required?: string[]; properties?: Record<string, unknown> }>;
+  };
+};
+
+/** One response header the Explorer pane shows, in the order the platform considers load-bearing. */
+export type ExplorerHeader = {
+  /** Header name, lower-case, as sent. */
+  name: string;
+  /** Header value. */
+  value: string;
+};
+
+/** The call rendered as a caller would write it, in three languages. */
+export type ExplorerSnippets = {
+  curl: string;
+  fetch: string;
+  python: string;
+};
+
+/**
+ * Which token made the call — and never any part of its secret.
+ *
+ * There is deliberately no field a plaintext could hide in. The platform stores only a digest, so
+ * a type with a `plaintext?: string` would be `undefined` forever and would teach the next person
+ * that this is where a credential goes.
+ */
+export type ExplorerToken = {
+  id: string;
+  name: string;
+  /** The `omn_xxxxxxxx` marker — the only part that is ever displayed. */
+  prefix: string;
+  /** Requests-per-minute tier, so a refusal can be compared with the budget. */
+  rate_limit_per_minute: number;
+  /**
+   * Budget left in this minute after the call, or `null` when the counter could not be read.
+   *
+   * `null` is "we do not know", which is not `0` — the meter fails open, and a `0` here would tell
+   * an operator their token is spent when the platform never counted anything.
+   */
+  remaining: number | null;
+};
+
+/**
+ * `POST /api/v1/content-api/explorer` — one real call, made as a chosen token (REQ-019, slice 3).
+ *
+ * The **server's** answer, not a reconstruction of it. The status, the headers, the body and the
+ * `duration_ms` all come from the handler that serves an integrator, so a reader comparing the
+ * pane against their own integration is comparing the same two answers.
+ */
+export type ExplorerAnswer = {
+  /** The documented operation that was called. */
+  operation_id: string;
+  /** Its HTTP method, upper-case, from the document. */
+  method: string;
+  /** The resolved request URL, exactly as dispatched. */
+  url: string;
+  /**
+   * The route the call was **metered** against (`/content/pages`).
+   *
+   * The template, not the resolved path: one endpoint is one row on the Usage tab's leaderboard
+   * however many slugs were walked, and this is the field that makes the two screens reconcilable.
+   */
+  metered_route: string;
+  /** Status the read surface answered. */
+  status: number;
+  /** The headers a caller branches on. */
+  headers: ExplorerHeader[];
+  /** The parsed body, or the raw text as a string when the route did not answer JSON. */
+  body: unknown;
+  /** Whether `body` is the parsed document rather than a string. */
+  body_is_json: boolean;
+  /** Wall-clock milliseconds the dispatch took. */
+  duration_ms: number;
+  /**
+   * `next_cursor` lifted out of a list response, or `null`.
+   *
+   * Lifted by the server rather than read out of `body` in the browser, because the pane renders
+   * the body and the "next page" button from the same response and two reads of one response can
+   * disagree about what it said.
+   */
+  next_cursor: string | null;
+  /** The token that acted. */
+  token: ExplorerToken;
+  /** The call in three languages. */
+  snippets: ExplorerSnippets;
+};
+
+/** One endpoint as the Explorer's picker offers it. */
+export type ExplorerEndpoint = {
+  /** The document's `operationId`; also the deep link's `endpoint` value. */
+  operationId: string;
+  /** Upper-case method badge. */
+  method: string;
+  /** The path template, shown so the reader knows what they are about to call. */
+  path: string;
+  /** One line, straight from the document. */
+  summary: string;
+  /** The scope a token needs, or `null` for a route that needs only a valid token. */
+  requiredScope: string | null;
+  /** `posts` is a page type today; the blog module will give it fields of its own. */
+  experimental: boolean;
+  /** Declared query parameters, in document order, with their descriptions. */
+  query: { name: string; description: string }[];
+  /** Declared path parameters — always required, and rendered as such. */
+  pathParams: { name: string; description: string }[];
+};
+
 // -------------------------------------------------------------------------------------------
 // System health (REQ-014).
 //
@@ -2626,126 +3855,3 @@ export type HealthSettings = {
 
 /** What `PATCH /health/incidents/{id}` accepts. */
 export type HealthIncidentAction = "acknowledge" | "resolve";
-
-// ---------------------------------------------------------------------------------------------
-// AI App Builder (REQ-045)
-// ---------------------------------------------------------------------------------------------
-
-/** One plan as the console list renders it. */
-export type AppBuilderPlan = {
-  id: string;
-  title: string;
-  status: string;
-  plan_version: number;
-  model_label: string;
-  created_by: string | null;
-  artifact_count: number;
-  accepted_count: number;
-  rejected_count: number;
-  pending_count: number;
-  invalid_count: number;
-  cost_cents: number;
-  /** Why generation failed or the plan was rejected; absent while the plan is open. */
-  error?: string;
-  created_at: string;
-};
-
-/** The page of plans plus what the filter bar draws itself from. */
-export type AppBuilderPlanList = {
-  plans: AppBuilderPlan[];
-  total: number;
-  statuses: string[];
-  page_size: number;
-};
-
-/** One validator finding, `{ path, message }` (REQ-045). */
-export type AppBuilderFinding = { path?: string; message: string };
-
-/** One artifact as the review tree and the detail pane render it. */
-export type AppBuilderArtifact = {
-  id: string;
-  kind: string;
-  key: string;
-  parent_key?: string;
-  ordinal: number;
-  status: string;
-  /** The artifact body, exactly as generated or edited — untyped on purpose. */
-  spec: Record<string, unknown>;
-  rationale: string;
-  /** The validator's answer for this artifact. */
-  validation: AppBuilderFinding[] | null;
-  rejected_reason?: string;
-  supersedes_id?: string;
-  updated_at: string;
-};
-
-/** The counters the footer renders, straight from the API. */
-export type AppBuilderCounts = {
-  artifacts: number;
-  accepted: number;
-  rejected: number;
-  pending: number;
-  invalid: number;
-};
-
-/** What stands between a plan and apply, named (the server decides; the panel never re-derives it). */
-export type AppBuilderBlocker = {
-  kind: string;
-  key: string;
-  status: string;
-  reason?: string;
-};
-
-/** One plan with everything the review screen draws. */
-export type AppBuilderPlanDetail = {
-  plan: AppBuilderPlan;
-  artifacts: AppBuilderArtifact[];
-  counts: AppBuilderCounts;
-  blockers: AppBuilderBlocker[];
-  /** Whether every required artifact is resolved. */
-  applicable: boolean;
-  decision_reason?: string;
-  applied_at: string | null;
-};
-
-/** One worked example for the composer's chips. */
-export type AppBuilderExample = { title: string; prompt: string };
-
-/** The composer's vocabulary — served with no database round-trip. */
-export type AppBuilderVocabulary = {
-  examples: AppBuilderExample[];
-  kinds: string[];
-  statuses: string[];
-  plan_statuses: string[];
-  field_types: string[];
-  max_prompt_len: number;
-};
-
-/** What an accept, reject or edit answers, so the client never re-fetches to draw new state. */
-export type AppBuilderDecision = {
-  artifact: AppBuilderArtifact;
-  counts: AppBuilderCounts;
-  blockers: AppBuilderBlocker[];
-};
-
-/** What rejecting or deleting a plan answers. */
-export type AppBuilderPlanDecision = { plan: AppBuilderPlan };
-
-/**
- * One plan a bulk delete would not remove (REQ-045 slice 4).
- *
- * The reason is the **server's** sentence, rendered verbatim: a client that re-derived "it
- * was applied" from the row would one day disagree with the rule the store enforced, and the
- * reviewer would be told a plan was safe to delete when it is not.
- */
-export type AppBuilderBulkFailure = { id: string; message: string };
-
-/** What `POST /app-builder/plans/bulk-delete` answers — both halves, always. */
-export type AppBuilderBulkDelete = {
-  /** How many plans the selection named. */
-  requested: number;
-  /** How many are gone. */
-  deleted: number;
-  /** The plans that stayed, each with the reason it did. */
-  failures: AppBuilderBulkFailure[];
-};

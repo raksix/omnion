@@ -10,7 +10,16 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@omnion/theme-agency": "workspace:*",
+    "@omnion/theme-commerce": "workspace:*",
+    "@omnion/theme-corporate": "workspace:*",
+    "@omnion/theme-documentation": "workspace:*",
+    "@omnion/theme-government": "workspace:*",
+    "@omnion/theme-magazine": "workspace:*",
     "@omnion/theme-minimal": "workspace:*",
+    "@omnion/theme-portfolio": "workspace:*",
+    "@omnion/theme-startup": "workspace:*",
+    "@omnion/theme-tech": "workspace:*",
     "@omnion/theme-sdk": "workspace:*",
     "@omnion/types": "workspace:*",
     "next": "16.3.6",

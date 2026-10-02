@@ -1,0 +1,442 @@
+/**
+ * Magazine — An editorial site: a serif display face, a rule above every section and a standfirst.
+ *
+ * The tokens are the theme; everything below reads them. A settings revision overrides the
+ * same custom property names, which is why they are declared once and never spelled into a
+ * rule — two code paths computing "the effective colour" is how a preview ends up lying.
+ *
+ * Every element selector is scoped to `html[data-theme="magazine"]`. All ten bundled sheets are
+ * loaded by the renderer's static import graph, so an unscoped `body { … }` here would style
+ * every theme's pages with this theme's palette. Block classes are already prefixed and need
+ * no scoping; the resets, the focus ring and the media queries do.
+ */
+
+/* The theme's tokens. A theme is its palette: everything below reads these, and a
+   settings revision overrides them on the same custom property names, which is why they are
+   declared once here rather than spelled into each rule.
+
+   ## Why these rules are scoped to `data-theme`
+
+   All ten bundled stylesheets are loaded by the renderer's single import graph, because a
+   CSS import is static and `resolveTheme()` is a runtime call. Ten sheets declaring `body`
+   would therefore fight, and the winner would be whichever sheet the bundler happened to
+   order last — a site's theme would render with whichever palette sorted highest, which is
+   the "colour-swapped clones" failure in its purest form.
+
+   Scoping to `html[data-theme="<key>"]` is what makes one bundle carry ten themes: only the
+   sheet whose key matches the active theme matches anything. `data-theme` is written by
+   `apps/web/app/layout.tsx` from the same `resolveTheme()` the page is drawn with, so the
+   stylesheet and the markup can never be chosen by different code.
+*/
+html[data-theme="magazine"] {
+  --ma-magazine-canvas: #fffdf9;
+  --ma-magazine-surface: #f5f0e6;
+  --ma-magazine-ink: #1a1714;
+  --ma-magazine-muted: #6d6459;
+  --ma-magazine-line: #d8cebd;
+  --ma-magazine-accent: #8a2f2f;
+  --ma-magazine-accent_soft: #f6e7e7;
+  --ma-magazine-font-body: ui-serif, "Iowan Old Style", Georgia, "Times New Roman", serif;
+  --ma-magazine-font-title: ui-serif, "Iowan Old Style", Georgia, "Times New Roman", serif;
+  --ma-magazine-measure: 36rem;
+  --ma-magazine-title-scale: clamp(2.4rem, 1.6rem + 3vw, 3.6rem);
+  --ma-magazine-title-weight: 700;
+  --ma-magazine-title-tracking: -0.03em;
+  --ma-magazine-radius: 0px;
+  --ma-magazine-base-size: 18px;
+  --ma-magazine-container: 1120px;
+}
+
+/* Dark mode is a token swap, never a second set of rules: the pair lives in the manifest and
+   the stylesheet only decides which pair the visitor gets. */
+@media (prefers-color-scheme: dark) {
+  html[data-theme="magazine"] {
+    --ma-magazine-canvas: #131110;
+    --ma-magazine-surface: #1c1917;
+    --ma-magazine-ink: #efe9df;
+    --ma-magazine-muted: #a1968a;
+    --ma-magazine-line: #332d27;
+    --ma-magazine-accent: #e08a8a;
+    --ma-magazine-accent_soft: #371d1d;
+  }
+}
+
+
+/* The reset is scoped to the active theme for the reason the tokens are: all ten sheets ship
+   in one bundle, and an unscoped `body` rule would let every one of them style every page. */
+html[data-theme="magazine"] *,
+html[data-theme="magazine"] *::before,
+html[data-theme="magazine"] *::after {
+  box-sizing: border-box;
+}
+
+html[data-theme="magazine"] {
+  background-color: var(--ma-magazine-canvas);
+  color-scheme: light dark;
+}
+
+html[data-theme="magazine"] body {
+  margin: 0;
+  background: var(--ma-magazine-canvas);
+  color: var(--ma-magazine-ink);
+  font-family: var(--ma-magazine-font-body);
+  font-size: var(--ma-magazine-base-size);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+html[data-theme="magazine"] ::selection {
+  background-color: var(--ma-magazine-accent-soft);
+}
+
+html[data-theme="magazine"] a {
+  color: var(--ma-magazine-accent);
+  text-underline-offset: 3px;
+}
+
+/* The focus ring is the one rule every theme shares unscoped in spirit and scoped in practice:
+   a theme that removed it would fail the accessibility bar rather than look different. */
+html[data-theme="magazine"] :focus-visible {
+  outline: 3px solid var(--ma-magazine-accent);
+  outline-offset: 2px;
+}
+
+html[data-theme="magazine"] img {
+  max-width: 100%;
+  height: auto;
+}
+
+
+/* The shell: a full-height column that pins the footer to the bottom on a short page. */
+.ma-magazine-shell {
+  display: flex;
+  min-height: 100dvh;
+  flex-direction: column;
+}
+
+.ma-magazine-header,
+.ma-magazine-footer {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+}
+
+.ma-magazine-header {
+  border-bottom: 0; padding-bottom: 0.75rem;
+}
+
+.ma-magazine-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--ma-magazine-line);
+  color: var(--ma-magazine-muted);
+  font-size: 0.8125rem;
+}
+
+.ma-magazine-main {
+  width: 100%;
+  max-width: var(--ma-magazine-container);
+  margin-inline: auto;
+  padding: 3rem 1.5rem 4rem;
+}
+
+.ma-magazine-article {
+  max-width: var(--ma-magazine-measure);
+}
+
+.ma-magazine-title {
+  margin: 0;
+  font-family: var(--ma-magazine-font-title);
+  font-size: var(--ma-magazine-title-scale);
+  font-weight: var(--ma-magazine-title-weight);
+  line-height: 1.1;
+  letter-spacing: var(--ma-magazine-title-tracking);
+}
+
+.ma-magazine-eyebrow {
+  margin: 0 0 0.75rem;
+  color: var(--ma-magazine-accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.ma-magazine-summary {
+  margin: 1rem 0 0;
+  color: var(--ma-magazine-muted);
+  font-size: 1.15em;
+}
+
+.ma-magazine-meta {
+  margin: 1.5rem 0 0;
+  color: var(--ma-magazine-muted);
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+}
+
+.ma-magazine-body {
+  margin-top: 2.5rem;
+}
+
+.ma-magazine-body p {
+  margin: 0 0 1.25rem;
+  white-space: pre-line;
+}
+
+.ma-magazine-body p:last-child {
+  margin-bottom: 0;
+}
+
+
+.ma-magazine-brand {
+  font-family: var(--ma-magazine-font-title);
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--ma-magazine-ink);
+  text-decoration: none;
+}
+
+.ma-magazine-issue {
+  color: var(--ma-magazine-muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+/* The section rule: the editorial device that replaces a component. */
+.ma-magazine-rule {
+  width: 100%;
+  height: 3px;
+  margin-top: 0.5rem;
+  background: var(--ma-magazine-ink);
+}
+
+.ma-magazine-standfirst {
+  margin: 1.25rem 0 0;
+  font-size: 1.25em;
+  line-height: 1.45;
+  font-style: italic;
+  color: var(--ma-magazine-muted);
+}
+
+.ma-magazine-heading {
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--ma-magazine-line);
+  font-size: 1.6em;
+}
+
+.ma-magazine-card {
+  border: 0;
+  border-top: 1px solid var(--ma-magazine-line);
+  border-radius: 0;
+  background: transparent;
+  padding-inline: 0;
+}
+
+
+/* Blocks (REQ-063). The markup is the SDK's; everything here is this theme's styling of it. */
+.ma-magazine-block {
+  margin: 0 0 1.75rem;
+}
+
+.ma-magazine-block:last-child {
+  margin-bottom: 0;
+}
+
+.ma-magazine-heading {
+  margin: 2.5rem 0 0.75rem;
+  font-family: var(--ma-magazine-font-title);
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+.ma-magazine-heading:first-child {
+  margin-top: 0;
+}
+
+.ma-magazine-align-center {
+  text-align: center;
+}
+
+.ma-magazine-align-right {
+  text-align: right;
+}
+
+.ma-magazine-figure {
+  margin-inline: 0;
+}
+
+.ma-magazine-figure figcaption {
+  margin-top: 0.5rem;
+  color: var(--ma-magazine-muted);
+  font-size: 0.8125rem;
+}
+
+.ma-magazine-testimonial {
+  margin-inline: 0;
+  padding: 1.25rem 1.5rem;
+  border-left: 3px solid var(--ma-magazine-accent);
+  background: var(--ma-magazine-surface);
+  border-radius: var(--ma-magazine-radius);
+}
+
+.ma-magazine-testimonial blockquote {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.ma-magazine-testimonial figcaption {
+  margin-top: 0.5rem;
+  color: var(--ma-magazine-muted);
+  font-size: 0.8125rem;
+}
+
+.ma-magazine-gallery {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.ma-magazine-gallery img {
+  border-radius: var(--ma-magazine-radius);
+}
+
+.ma-magazine-columns {
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.ma-magazine-cta {
+  padding: 1.75rem;
+  border-radius: var(--ma-magazine-radius);
+  background: var(--ma-magazine-accent-soft);
+}
+
+.ma-magazine-cta h2 {
+  margin: 0 0 0.5rem;
+}
+
+.ma-magazine-cta p {
+  margin: 0 0 1rem;
+  color: var(--ma-magazine-muted);
+}
+
+.ma-magazine-cta-link {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: var(--ma-magazine-radius);
+  background: var(--ma-magazine-accent);
+  color: var(--ma-magazine-canvas);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.ma-magazine-cards {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.ma-magazine-card {
+  padding: 1.25rem;
+  border: 1px solid var(--ma-magazine-line);
+  border-radius: var(--ma-magazine-radius);
+  background: var(--ma-magazine-surface);
+}
+
+.ma-magazine-card h3 {
+  margin: 0 0 0.5rem;
+}
+
+.ma-magazine-card p {
+  margin: 0 0 0.75rem;
+  color: var(--ma-magazine-muted);
+  font-size: 0.9375rem;
+}
+
+.ma-magazine-plans {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.ma-magazine-plans ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ma-magazine-plan {
+  padding: 1.25rem;
+  border: 1px solid var(--ma-magazine-line);
+  border-radius: var(--ma-magazine-radius);
+}
+
+.ma-magazine-plan h3 {
+  margin: 0;
+}
+
+.ma-magazine-price {
+  margin: 0.25rem 0 0.75rem;
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.ma-magazine-plan ul li {
+  padding: 0.25rem 0;
+  color: var(--ma-magazine-muted);
+  font-size: 0.9375rem;
+}
+
+.ma-magazine-faq > div {
+  padding: 0.875rem 0;
+  border-bottom: 1px solid var(--ma-magazine-line);
+}
+
+.ma-magazine-faq dt {
+  font-weight: 600;
+}
+
+.ma-magazine-faq dd {
+  margin: 0.35rem 0 0;
+  color: var(--ma-magazine-muted);
+}
+
+.ma-magazine-raw pre {
+  overflow-x: auto;
+  padding: 1rem;
+  border-radius: var(--ma-magazine-radius);
+  background: var(--ma-magazine-surface);
+  font-size: 0.875rem;
+}
+
+.ma-magazine-raw-note {
+  margin: 0 0 0.5rem;
+  color: var(--ma-magazine-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.ma-magazine-unknown {
+  padding: 0.75rem 1rem;
+  border: 1px dashed var(--ma-magazine-line);
+  border-radius: var(--ma-magazine-radius);
+  color: var(--ma-magazine-muted);
+  font-size: 0.9375rem;
+}
+
+@media (max-width: 720px) {
+  .ma-magazine-gallery,
+  .ma-magazine-columns,
+  .ma-magazine-cards,
+  .ma-magazine-plans {
+    grid-template-columns: 1fr;
+  }
+}

@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::definition::StepDefinition;
 use crate::error::{Result, WorkflowError};
 use crate::model::{
-    EXECUTION_COLUMNS, ExecutionStatus, NewWorkflow, STEP_COLUMNS, StepKind, StepStatus,
-    TriggerKind, WORKFLOW_COLUMNS, Workflow, WorkflowExecution, WorkflowStep,
+    EXECUTION_COLUMNS, ExecutionStatus, NewWorkflow, STEP_COLUMNS, StepStatus, TriggerKind,
+    WORKFLOW_COLUMNS, Workflow, WorkflowExecution, WorkflowStep,
 };
 
 /// Columns of `workflows` for one `select`, in [`Workflow`] order.
@@ -23,25 +23,10 @@ fn workflow_columns() -> &'static str {
 
 /// Insert a workflow definition.
 pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow> {
-    // A rule is born with a *valid* graph — a trigger, an end, and the edge between them.
-    //
-    // The column default is `{"nodes":[],"edges":[]}`, which is why this was a bug rather than
-    // a cosmetic gap: 0051 backfilled the rules that existed, and every rule created *after*
-    // it inherited the empty default. The builder then opened on a canvas with nothing on it,
-    // and the server refused the first save with `graph_invalid` — "the graph has no nodes,
-    // a definition needs at least a trigger" — for a rule the author had just created through
-    // the same screen. An unsaveable new rule is the one defect no amount of editing recovers
-    // from, so the row starts valid and the author only ever moves forward from there.
-    //
-    // The starter is the same `Graph::starter` the backfill and the registry describe, so a
-    // rule born here and a rule backfilled by SQL open identically.
-    let starter = crate::graph::Graph::starter(new.trigger.as_str(), new.trigger_event.as_deref());
     let sql = format!(
         "insert into workflows (organization_id, site_id, name, description, enabled, \
-         trigger_kind, schedule, trigger_event, conditions, on_error, run_as_user_id, \
-         rate_limit_per_hour, concurrency, next_run_at, steps, graph, created_by) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                 coalesce($12, 60), coalesce($13, 'queue'), $14, $15, $16, $17) returning {}",
+         trigger_kind, schedule, trigger_event, conditions, next_run_at, steps, created_by) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) returning {}",
         workflow_columns()
     );
 
@@ -55,22 +40,8 @@ pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow
         .bind(new.schedule)
         .bind(new.trigger_event)
         .bind(new.conditions)
-        .bind(new.on_error.as_str())
-        .bind(new.run_as_user_id)
-        // The two bounds are written as `coalesce` on a nullable bind rather than as a
-        // required value: a caller outside the automation layer (a scheduled workflow
-        // created through the workflows surface) sends nothing and gets the column
-        // default, so the bound is something a rule opts into rather than something
-        // every workflow must supply.
-        .bind(new.rate_limit_per_hour)
-        .bind(new.concurrency)
         .bind(new.next_run_at)
         .bind(new.steps)
-        // The graph the builder opens on, seeded rather than defaulted.
-        .bind(
-            serde_json::to_value(starter)
-                .unwrap_or_else(|_| serde_json::json!({ "nodes": [], "edges": [] })),
-        )
         .bind(new.created_by)
         .fetch_one(pool)
         .await?;
@@ -129,16 +100,6 @@ pub struct WorkflowUpdate {
     pub conditions: serde_json::Value,
     /// New next due time (schedules only).
     pub next_run_at: Option<OffsetDateTime>,
-    /// The rule's own error policy.
-    pub on_error: crate::model::OnError,
-    /// Whose authority the rule's host actions run with (REQ-003 slice 3). `None` means the
-    /// author, so a whole-rule write cannot silently leave a run-as nobody.
-    pub run_as_user_id: Option<Uuid>,
-    /// The rule's rolling-hour run limit (REQ-003 slice 4). `None` leaves the stored value
-    /// alone, so a write from outside the rule editor never moves a bound the author set.
-    pub rate_limit_per_hour: Option<i32>,
-    /// The rule's concurrency policy (REQ-003 slice 4). `None` leaves it alone, as above.
-    pub concurrency: Option<String>,
     /// New step definitions as stored JSON.
     pub steps: serde_json::Value,
 }
@@ -152,9 +113,7 @@ pub async fn update_workflow(
     let sql = format!(
         "update workflows set name = $2, description = $3, site_id = $4, enabled = $5, \
          trigger_kind = $6, schedule = $7, next_run_at = $8, steps = $9, trigger_event = $10, \
-         conditions = $11, on_error = $12, run_as_user_id = $13, \
-         rate_limit_per_hour = coalesce($14, rate_limit_per_hour), \
-         concurrency = coalesce($15, concurrency), updated_at = now() \
+         conditions = $11, updated_at = now() \
          where id = $1 returning {}",
         workflow_columns()
     );
@@ -171,61 +130,7 @@ pub async fn update_workflow(
         .bind(update.steps)
         .bind(update.trigger_event)
         .bind(update.conditions)
-        .bind(update.on_error.as_str())
-        .bind(update.run_as_user_id)
-        // `coalesce(column, column)` is "leave it alone": a write that did not come from
-        // the rule editor (arming, renaming, pausing) must not silently reset a bound the
-        // author set deliberately. Same reasoning as `run_as_user_id` above.
-        .bind(update.rate_limit_per_hour)
-        .bind(update.concurrency)
         .fetch_optional(pool)
-        .await?;
-
-    Ok(workflow)
-}
-
-/// Rewrite a workflow definition on a caller's connection.
-///
-/// The same statement as [`update_workflow`], for the one caller that must not commit on
-/// its own: a version restore writes the definition **and** the history row that records
-/// it, and those two are one fact. With a pool in each, a failure between them leaves a
-/// restored rule whose history does not mention the restore — which is exactly the state
-/// the Versions tab exists to make impossible to explain.
-pub async fn update_workflow_on<'e, E>(
-    executor: E,
-    id: Uuid,
-    update: WorkflowUpdate,
-) -> Result<Option<Workflow>>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    let sql = format!(
-        "update workflows set name = $2, description = $3, site_id = $4, enabled = $5, \
-         trigger_kind = $6, schedule = $7, next_run_at = $8, steps = $9, trigger_event = $10, \
-         conditions = $11, on_error = $12, run_as_user_id = $13, \
-         rate_limit_per_hour = coalesce($14, rate_limit_per_hour), \
-         concurrency = coalesce($15, concurrency), updated_at = now() \
-         where id = $1 returning {}",
-        workflow_columns()
-    );
-
-    let workflow: Option<Workflow> = sqlx::query_as(&sql)
-        .bind(id)
-        .bind(update.name)
-        .bind(update.description)
-        .bind(update.site_id)
-        .bind(update.enabled)
-        .bind(update.trigger.as_str())
-        .bind(update.schedule)
-        .bind(update.next_run_at)
-        .bind(update.steps)
-        .bind(update.trigger_event)
-        .bind(update.conditions)
-        .bind(update.on_error.as_str())
-        .bind(update.run_as_user_id)
-        .bind(update.rate_limit_per_hour)
-        .bind(update.concurrency)
-        .fetch_optional(executor)
         .await?;
 
     Ok(workflow)
@@ -311,15 +216,8 @@ pub async fn create_execution(
     steps: &[StepDefinition],
 ) -> Result<(WorkflowExecution, Vec<WorkflowStep>)> {
     let mut transaction = pool.begin().await?;
-    let created = create_execution_in(
-        &mut transaction,
-        workflow,
-        trigger,
-        triggered_by,
-        steps,
-        None,
-    )
-    .await?;
+    let created =
+        create_execution_in(&mut transaction, workflow, trigger, triggered_by, steps).await?;
     transaction.commit().await?;
     Ok(created)
 }
@@ -328,20 +226,17 @@ pub async fn create_execution(
 ///
 /// The automation layer needs it: a match starts a run and advances the event cursor in ONE
 /// transaction, so a crash can never leave a cursor that skipped an event whose run never
-/// existed (and a replay can never start the same run twice). It also passes the event
-/// payload, because a branch step reads `event.<field>` from the run and the run detail
-/// shows the payload beside the trace.
+/// existed (and a replay can never start the same run twice).
 pub async fn create_execution_in(
     connection: &mut sqlx::PgConnection,
     workflow: &Workflow,
     trigger: TriggerKind,
     triggered_by: Option<Uuid>,
     steps: &[StepDefinition],
-    event_payload: Option<serde_json::Value>,
 ) -> Result<(WorkflowExecution, Vec<WorkflowStep>)> {
     let execution_sql = format!(
         "insert into workflow_executions (workflow_id, organization_id, status, trigger_kind, \
-         triggered_by, event_payload) values ($1, $2, 'running', $3, $4, $5) returning {}",
+         triggered_by) values ($1, $2, 'running', $3, $4) returning {}",
         EXECUTION_COLUMNS
     );
 
@@ -350,40 +245,25 @@ pub async fn create_execution_in(
         .bind(workflow.organization_id)
         .bind(trigger.as_str())
         .bind(triggered_by)
-        .bind(event_payload)
         .fetch_one(&mut *connection)
         .await?;
 
     let step_sql = format!(
-        "insert into workflow_steps (execution_id, step_no, name, kind, action, params, on_error, \
-         timeout_ms, status, attempts, max_attempts) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', 0, $9) \
+        "insert into workflow_steps (execution_id, step_no, name, kind, action, params, status, \
+         attempts, max_attempts) values ($1, $2, $3, $4, $5, $6, 'pending', 0, $7) \
          returning {}",
         STEP_COLUMNS
     );
 
     let mut rows = Vec::with_capacity(steps.len());
     for (index, step) in steps.iter().enumerate() {
-        // A control step's `action` is derived, not authored: the definition check already
-        // refused a branch that names an action and a stop that does not, and the panel
-        // writes `{"kind": "branch", "params": {…}}` with no `action` field at all. Storing
-        // `None` for one of those would trip `workflow_steps_action_shape`, which is the
-        // database doing exactly its job.
-        let action = match step.kind {
-            StepKind::Branch => Some(crate::branch::BRANCH_ACTION.to_owned()),
-            StepKind::Task => step.action.clone(),
-            StepKind::Wait | StepKind::Stop | StepKind::Approval => None,
-        };
-
         let row: WorkflowStep = sqlx::query_as(&step_sql)
             .bind(execution.id)
             .bind(index as i32 + 1)
             .bind(step.name.trim())
             .bind(step.kind.as_str())
-            .bind(action)
+            .bind(step.action.as_deref())
             .bind(step.params.clone())
-            .bind(step.on_error.as_str())
-            .bind(step.timeout_ms)
             .bind(step.max_attempts)
             .fetch_one(&mut *connection)
             .await?;
@@ -391,183 +271,6 @@ pub async fn create_execution_in(
     }
 
     Ok((execution, rows))
-}
-
-/// Create a run that starts at one node of a graph, and write the prefix as *skipped*.
-///
-/// The same write as [`create_execution`] with one difference, and the difference is the
-/// whole feature: the steps before the start are inserted as `skipped` rows carrying the
-/// reason, rather than as `pending` rows the engine would run. Inserting them is not
-/// optional — the criterion asks for the earlier nodes to *stay* skipped, and a trace that
-/// omits them cannot show they were passed over, only that they are missing.
-///
-/// Everything else is deliberately shared with `create_execution`: the same insert, the
-/// same columns, the same transaction. A second write of "create a run" that differed
-/// only in the prefix status would be a second place for the step numbering to drift, and
-/// the numbering is the one thing `claim_due_step` orders by.
-pub async fn create_execution_from_node(
-    pool: &PgPool,
-    workflow: &Workflow,
-    trigger: TriggerKind,
-    triggered_by: Option<Uuid>,
-    steps: &[StepDefinition],
-    plan: &crate::run_from::RunFromPlan,
-) -> Result<(WorkflowExecution, Vec<WorkflowStep>)> {
-    let mut transaction = pool.begin().await?;
-
-    let execution = insert_execution(
-        &mut transaction,
-        workflow,
-        trigger,
-        triggered_by,
-        None,
-        Some(plan.node_id.clone()),
-    )
-    .await?;
-
-    let mut rows = Vec::with_capacity(steps.len() + plan.skipped.len());
-
-    // The skipped prefix first, in its stored positions, so `step_no` is written in the
-    // order the engine will read it and a partially written run is still legible.
-    for skipped in &plan.skipped {
-        let step = definition_of(steps, skipped.step_no);
-        let row = insert_skipped_step(&mut transaction, execution.id, skipped, step).await?;
-        rows.push(row);
-    }
-
-    for (index, step) in steps.iter().enumerate() {
-        let step_no = index as i32 + 1 + plan.skipped.len() as i32;
-        let row = insert_pending_step(&mut transaction, execution.id, step_no, step).await?;
-        rows.push(row);
-    }
-
-    transaction.commit().await?;
-    Ok((execution, rows))
-}
-
-/// The definition a skipped position refers to, when the caller handed one over.
-fn definition_of<'a>(steps: &'a [StepDefinition], step_no: i32) -> Option<&'a StepDefinition> {
-    steps.get((step_no - 1).max(0) as usize)
-}
-
-/// The stored action of a step, which for a control step is derived rather than authored.
-fn step_action(step: &StepDefinition) -> Option<String> {
-    match step.kind {
-        StepKind::Branch => Some(crate::branch::BRANCH_ACTION.to_owned()),
-        StepKind::Task => step.action.clone(),
-        StepKind::Wait | StepKind::Stop | StepKind::Approval => None,
-    }
-}
-
-/// Insert the run row itself, and nothing else.
-async fn insert_execution(
-    connection: &mut sqlx::PgConnection,
-    workflow: &Workflow,
-    trigger: TriggerKind,
-    triggered_by: Option<Uuid>,
-    event_payload: Option<serde_json::Value>,
-    started_from_node: Option<String>,
-) -> Result<WorkflowExecution> {
-    let sql = format!(
-        "insert into workflow_executions (workflow_id, organization_id, status, trigger_kind, \
-         triggered_by, event_payload, started_from_node) \
-         values ($1, $2, 'running', $3, $4, $5, $6) returning {EXECUTION_COLUMNS}"
-    );
-
-    Ok(sqlx::query_as(&sql)
-        .bind(workflow.id)
-        .bind(workflow.organization_id)
-        .bind(trigger.as_str())
-        .bind(triggered_by)
-        .bind(event_payload)
-        .bind(started_from_node)
-        .fetch_one(&mut *connection)
-        .await?)
-}
-
-/// Insert one step the engine will run.
-async fn insert_pending_step(
-    connection: &mut sqlx::PgConnection,
-    execution_id: Uuid,
-    step_no: i32,
-    step: &StepDefinition,
-) -> Result<WorkflowStep> {
-    let sql = format!(
-        "insert into workflow_steps (execution_id, step_no, name, kind, action, params, \
-         on_error, timeout_ms, status, attempts, max_attempts) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', 0, $9) returning {STEP_COLUMNS}"
-    );
-
-    Ok(sqlx::query_as(&sql)
-        .bind(execution_id)
-        .bind(step_no)
-        .bind(step.name.trim())
-        .bind(step.kind.as_str())
-        .bind(step_action(step))
-        .bind(step.params.clone())
-        .bind(step.on_error.as_str())
-        .bind(step.timeout_ms)
-        .bind(step.max_attempts)
-        .fetch_one(&mut *connection)
-        .await?)
-}
-
-/// Insert one step the run passed over, with the sentence the trace shows.
-///
-/// The step is written as `skipped` at insert time rather than inserted pending and
-/// updated afterwards. Two reasons, and the second is the whole point: a crash between
-/// the two writes would leave a run whose prefix the engine is about to run — the exact
-/// side effect *Run from here* exists to avoid — and the row is then never claimed, so
-/// "inserted as skipped" needs no reconciliation pass to be safe.
-async fn insert_skipped_step(
-    connection: &mut sqlx::PgConnection,
-    execution_id: Uuid,
-    skipped: &crate::run_from::SkippedStep,
-    step: Option<&StepDefinition>,
-) -> Result<WorkflowStep> {
-    let sql = format!(
-        "insert into workflow_steps (execution_id, step_no, name, kind, action, params, \
-         on_error, timeout_ms, status, attempts, max_attempts, skip_reason) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, 'skipped', 0, $9, $10) returning {STEP_COLUMNS}"
-    );
-
-    // A skipped step with no definition to copy is written with the shape the column
-    // constraints accept for a control step: no action, empty params. That happens only
-    // when the caller passed a step list that does not cover the whole definition, and
-    // the row is still honest — it names the position and the reason, which is all the
-    // trace needs from a step that did not run.
-    let (kind, action, params, on_error, timeout_ms, max_attempts) = match step {
-        Some(step) => (
-            step.kind.as_str().to_owned(),
-            step_action(step),
-            step.params.clone(),
-            step.on_error.as_str().to_owned(),
-            step.timeout_ms,
-            step.max_attempts,
-        ),
-        None => (
-            "wait".to_owned(),
-            None,
-            serde_json::json!({}),
-            "inherit".to_owned(),
-            0,
-            1,
-        ),
-    };
-
-    Ok(sqlx::query_as(&sql)
-        .bind(execution_id)
-        .bind(skipped.step_no)
-        .bind(skipped.name.trim())
-        .bind(kind)
-        .bind(action)
-        .bind(params)
-        .bind(on_error)
-        .bind(timeout_ms)
-        .bind(max_attempts)
-        .bind(&skipped.reason)
-        .fetch_one(&mut *connection)
-        .await?)
 }
 
 /// The armed, event-triggered workflows of one tenant that listen for one event.
@@ -701,33 +404,23 @@ pub struct ClaimedStep {
     pub step_no: i32,
     /// Step name.
     pub name: String,
-    /// `task`, `wait`, `branch` or `stop`.
+    /// `task` or `wait`.
     pub kind: String,
     /// Built-in action of a task step.
     pub action: Option<String>,
     /// Step parameters.
     pub params: serde_json::Value,
-    /// What this step's own failure does (`inherit` takes the rule's policy).
-    pub on_error: String,
-    /// How long the step may block before it is failed with the limit named.
-    pub timeout_ms: i32,
     /// Attempt number of the claim (1 for the first).
     pub attempts: i32,
     /// Attempts allowed in total.
     pub max_attempts: i32,
-    /// The approval row gating this step, when it is an approval step that has parked.
-    pub approval_id: Option<Uuid>,
 }
 
 /// Claim the next step that is due.
 ///
-/// One statement, one row: the run's oldest open step that is due and whose earlier steps
-/// have all finished. The row lock makes the claim exclusive even when several API
-/// instances run the engine at the same time.
-///
-/// The `e.status = 'running'` filter is the whole of the approval gate's protection: a run
-/// parked on a person has no claimable step, so nothing behind a pending decision can
-/// progress — not the gate itself, not the effect the gate was there to hold back.
+/// One statement, one row: the run's oldest open step that is due and whose earlier steps have
+/// all finished. The row lock makes the claim exclusive even when several API instances run the
+/// engine at the same time.
 pub async fn claim_due_step(pool: &PgPool) -> Result<Option<ClaimedStep>> {
     let claimed: Option<ClaimedStep> = sqlx::query_as(
         "with due as ( \
@@ -749,7 +442,7 @@ pub async fn claim_due_step(pool: &PgPool) -> Result<Option<ClaimedStep>> {
          set status = 'running', attempts = s.attempts + 1, started_at = now() \
          from due where s.id = due.id \
          returning s.id, s.execution_id, s.step_no, s.name, s.kind, s.action, s.params, \
-                   s.on_error, s.timeout_ms, s.attempts, s.max_attempts, s.approval_id",
+                   s.attempts, s.max_attempts",
     )
     .fetch_optional(pool)
     .await?;
@@ -837,248 +530,6 @@ pub async fn cancel_step(pool: &PgPool, step_id: Uuid) -> Result<()> {
     Ok(())
 }
 
-/// Mark a step failed, and mark that the run deliberately outlived it.
-///
-/// The row stays `failed` — the trace must not pretend a step succeeded — and `ignored` is
-/// what tells [`settle_execution`] that this failure does not make the run a failure. A run
-/// whose only failure was outlived settles as completed, and its summary still names what
-/// happened, because the trace keeps the row and the error.
-pub async fn fail_step_ignored(pool: &PgPool, step_id: Uuid, message: &str) -> Result<()> {
-    sqlx::query(
-        "update workflow_steps set status = 'failed', finished_at = now(), error = $2, \
-         ignored = true where id = $1 and status = 'running'",
-    )
-    .bind(step_id)
-    .bind(message)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
-/// Attach a **run guard's** reason to a step that has already succeeded.
-///
-/// This exists because [`fail_step`] cannot be reused here, and the reason it cannot is the
-/// whole point of this function. A guard is consulted *after* `complete_step` has already
-/// written `status = 'succeeded'`, and `fail_step`'s guard clause is `and status = 'running'`
-/// — so the call matched **zero rows**. The run still stopped, the steps after it were still
-/// closed, and the reason an operator needs was silently dropped on the floor.
-///
-/// A silently-dropped write is the worst kind of bug in a state machine: everything *looks*
-/// right — the run is `failed`, the trace shows the repeat, only the sentence saying why is
-/// missing — and the missing sentence is the entire reason the guard's message is long. The
-/// trace showed three steps with no explanation, which is the same as the guard not being
-/// installed.
-///
-/// So the step goes back to `failed` (it did repeat, and a trace that says `succeeded` next to
-/// a stopped run is lying), the guard's reason is written, and the row is **not** marked
-/// `ignored`: unlike a step whose failure the rule outlived, this one is the reason the run
-/// stopped, and `settle_execution` must see it.
-pub async fn fail_step_after_success(pool: &PgPool, step_id: Uuid, message: &str) -> Result<u64> {
-    let failed = sqlx::query(
-        "update workflow_steps set status = 'failed', finished_at = now(), error = $2 \
-         where id = $1 and status = 'succeeded'",
-    )
-    .bind(step_id)
-    .bind(message)
-    .execute(pool)
-    .await?
-    .rows_affected();
-
-    Ok(failed)
-}
-
-/// Close every step after `step_id` as cancelled, because a branch or a stop ended the run.
-///
-/// `cancelled` rather than `succeeded` is the honest state: those steps never ran, and the
-/// trace must say so. Their cancellation does not fail the run either — the run's own
-/// terminal state is written separately by the caller, and a run that stopped on purpose is
-/// a completed run.
-pub async fn end_run_after_branch(pool: &PgPool, execution_id: Uuid, step_id: Uuid) -> Result<u64> {
-    let closed = sqlx::query(
-        "update workflow_steps set status = 'cancelled', finished_at = now(), \
-             error = 'the run ended before this step' \
-         where execution_id = $1 and id <> $2 \
-           and status in ('pending', 'waiting', 'running')",
-    )
-    .bind(execution_id)
-    .bind(step_id)
-    .execute(pool)
-    .await?
-    .rows_affected();
-
-    Ok(closed)
-}
-
-/// Write a run's terminal state directly, for the two cases the engine decides itself.
-///
-/// Only the two *voluntary* endings use this: a branch that decided, and a stop step. A
-/// failure still goes through [`settle_execution`], because only that one derives the status
-/// from the rows.
-pub async fn settle_execution_as(pool: &PgPool, execution_id: Uuid, status: &str) -> Result<bool> {
-    let settled = sqlx::query(
-        "update workflow_executions set status = $2, finished_at = now() \
-         where id = $1 and status = 'running'",
-    )
-    .bind(execution_id)
-    .bind(status)
-    .execute(pool)
-    .await?
-    .rows_affected();
-
-    Ok(settled > 0)
-}
-
-/// Put a claimed step back in the queue without counting an attempt.
-///
-/// For a step whose claim was lost to a stopped runner and that has no attempts to spend —
-/// a wait that never parked, a branch or a stop that never decided. The attempt counter is
-/// left alone, which is what makes the lost claim invisible to the step's own budget.
-pub async fn requeue_step(pool: &PgPool, step_id: Uuid) -> Result<()> {
-    sqlx::query(
-        "update workflow_steps set status = 'pending', started_at = null, \
-         available_at = now() where id = $1 and status = 'running'",
-    )
-    .bind(step_id)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
-/// Re-open a run from one of its steps: the step and everything after it go back on the
-/// queue, and the steps that already succeeded are left untouched.
-///
-/// This is **Retry** and **Resume from here** on the run detail, and they are the same
-/// write on purpose. Re-running only the failed step would let a run whose middle failed
-/// march on to completion, so a retry deliberately re-runs the whole tail — which is
-/// exactly what an operator means by "try that again" on a run detail.
-///
-/// Three invariants the write keeps:
-///
-/// * a `cancelled` step is re-opened but a **cancelled run is not** — cancellation was a
-///   person's decision, and "retry" must not silently undo it;
-/// * the attempt counter of a re-opened step is reset, because the operator's click is a
-///   new attempt budget, not the last one of the old one;
-/// * `ignored` is cleared, so a step that once failed and was deliberately outlived does
-///   not stay exempt when it is run again.
-///
-/// It answers how many steps it re-opened, so the caller can log it and the panel can say
-/// "steps 3–5 are queued again" rather than "something happened".
-pub async fn retry_step_from(pool: &PgPool, execution_id: Uuid, step_no: i32) -> Result<u64> {
-    let requeued = sqlx::query(
-        "update workflow_steps set status = 'pending', error = null, ignored = false, \
-             attempts = 0, available_at = now(), started_at = null, finished_at = null, \
-             output = null \
-         where execution_id = $1 and step_no >= $2 \
-           and status in ('failed', 'cancelled', 'pending', 'waiting')",
-    )
-    .bind(execution_id)
-    .bind(step_no)
-    .execute(pool)
-    .await?
-    .rows_affected();
-
-    sqlx::query(
-        "update workflow_executions set status = 'running', finished_at = null, error = null \
-         where id = $1 and status = 'failed'",
-    )
-    .bind(execution_id)
-    .execute(pool)
-    .await?;
-
-    Ok(requeued)
-}
-
-/// Re-open **exactly one** step of a settled run, leaving every other row alone.
-///
-/// This is *Retry this node* on the canvas, and it is deliberately **not** a narrower
-/// [`retry_step_from`]. The tail re-run re-opens `step_no >= N` because the steps after a
-/// failed one depend on a result it never produced — a run with a hole in the middle must
-/// not be allowed to march on. A node click is the other question: the operator is
-/// re-running *one* action they watched fail, and re-running its neighbours is a second
-/// side effect they did not ask for.
-///
-/// Three columns are the difference, and each one is a decision rather than an omission:
-///
-/// * **one row.** The `WHERE` names one `step_no`, so a retry cannot widen into the tail
-///   by accident — the walk asserts the returned count, which is the only thing that
-///   catches a later edit of this query.
-/// * **the attempt counter is reset, and that is not an oversight.** It was the opposite at
-///   first: the reasoning was "a single node is not a new budget", and the walk killed it
-///   with a constraint. `workflow_steps_attempts_shape` caps `attempts` at `max_attempts`,
-///   and `claim_due_step` *increments* on claim — so re-queuing a step that had spent its
-///   budget produces a row the engine is forbidden to claim, and the retry is accepted,
-///   audited, and then silently never runs. The honest reading is the other one: pressing
-///   this button is an operator asking for that node to be attempted again, and a control
-///   whose stated purpose is "try this again" that cannot try again is a dead control. The
-///   reset is bounded by `max_attempts`, which is the ceiling the step was authored with —
-///   not an unbounded budget.
-/// * **the run is re-opened.** `claim_due_step` only looks at runs whose status is
-///   `running`, so a step queued against a `failed` run would sit there forever. Only
-///   `failed` is re-opened — a `cancelled` run was closed on purpose and
-///   `retry_node_plan` refuses it before this is ever reached.
-///
-/// The `ignored` flag is cleared for the same reason it is cleared in the tail re-run: a
-/// step that once failed and was deliberately outlived must not stay exempt when it is
-/// tried again. Its `error` is cleared too, so a re-opened step does not show the previous
-/// failure as its own current one.
-pub async fn retry_single_step(pool: &PgPool, execution_id: Uuid, step_no: i32) -> Result<u64> {
-    let requeued = sqlx::query(
-        "update workflow_steps set status = 'pending', error = null, ignored = false, \
-             attempts = 0, available_at = now(), started_at = null, finished_at = null, \
-             output = null \
-         where execution_id = $1 and step_no = $2 \
-           and status in ('failed', 'cancelled', 'ignored')",
-    )
-    .bind(execution_id)
-    .bind(step_no)
-    .execute(pool)
-    .await?
-    .rows_affected();
-
-    if requeued > 0 {
-        sqlx::query(
-            "update workflow_executions set status = 'running', finished_at = null, error = null \
-             where id = $1 and status = 'failed'",
-        )
-        .bind(execution_id)
-        .execute(pool)
-        .await?;
-    }
-
-    Ok(requeued)
-}
-
-/// One step of a run, as the retry/resume endpoints need to address it.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct StepPosition {
-    /// The step's 1-based position in its run.
-    pub step_no: i32,
-    /// The step's current status.
-    pub status: String,
-    /// The step's `on_error` policy, for the log line.
-    pub on_error: String,
-}
-
-/// Read the one step a retry/resume request addresses, or `None` when it does not exist.
-pub async fn find_step(
-    pool: &PgPool,
-    execution_id: Uuid,
-    step_no: i32,
-) -> Result<Option<StepPosition>> {
-    let step: Option<StepPosition> = sqlx::query_as(
-        "select step_no, status, on_error from workflow_steps \
-         where execution_id = $1 and step_no = $2",
-    )
-    .bind(execution_id)
-    .bind(step_no)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(step)
-}
-
 /// Derive a run's terminal state once no step is open, and write it.
 ///
 /// Answers `Some(status)` only for the call that actually settled the run, so the caller can
@@ -1097,7 +548,7 @@ pub async fn settle_execution(
     let counts: Counts = sqlx::query_as(
         "select \
              count(*) filter (where status in ('pending', 'running', 'waiting')) as open, \
-             count(*) filter (where status = 'failed' and not ignored) as failed, \
+             count(*) filter (where status = 'failed') as failed, \
              count(*) filter (where status = 'cancelled') as cancelled \
          from workflow_steps where execution_id = $1",
     )
@@ -1117,13 +568,11 @@ pub async fn settle_execution(
         ExecutionStatus::Completed
     };
 
-    // A failed run reports the first failure it met, so a later reader sees why. A failure
-    // the run deliberately outlived is not one: `ignored` is the flag that says the author
-    // chose to continue past it, so the run is not a failure because of that row.
+    // A failed run reports the first failure it met, so a later reader sees why.
     let error: Option<String> = if status == ExecutionStatus::Failed {
         sqlx::query_scalar::<_, Option<String>>(
             "select error from workflow_steps where execution_id = $1 and status = 'failed' \
-             and not ignored order by step_no asc limit 1",
+             order by step_no asc limit 1",
         )
         .bind(execution_id)
         .fetch_one(pool)
@@ -1217,8 +666,8 @@ pub async fn stale_steps(
     limit: i64,
 ) -> Result<Vec<WorkflowStep>> {
     let sql = "select s.id, s.execution_id, s.step_no, s.name, s.kind, s.action, s.params, \
-                      s.on_error, s.timeout_ms, s.status, s.attempts, s.max_attempts, \
-                      s.available_at, s.started_at, s.finished_at, s.output, s.error, s.ignored \
+                      s.status, s.attempts, s.max_attempts, s.available_at, s.started_at, \
+                      s.finished_at, s.output, s.error \
                from workflow_steps s \
                join workflow_executions e on e.id = s.execution_id \
                where s.status = 'running' and e.status = 'running' \
@@ -1239,11 +688,6 @@ pub async fn stale_steps(
 ///
 /// An instance can stop between "the last step succeeded" and "the run is completed"; the next
 /// sweep closes those runs instead of leaving them running forever.
-///
-/// A run parked on a person is **not** one of them: its gate step is `waiting`, so the
-/// `not exists` guard already skips it, and the `status = 'running'` filter is the second
-/// line — a run that a decision reopened and that happens to have no open step is settled
-/// by that decision's own write, not by this one.
 pub async fn reconcile_executions(pool: &PgPool, limit: i64) -> Result<Vec<Uuid>> {
     let stale: Vec<Uuid> = sqlx::query_scalar(
         "select e.id from workflow_executions e \

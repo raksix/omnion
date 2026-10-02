@@ -5,6 +5,19 @@
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
 import type {
+  BlockRegistry,
+  BlockValidationResult,
+  ContentBlock,
+  ContentPattern,
+  ContentApiToken,
+  ContentApiUsage,
+  ContentApiVocabulary,
+  CreatedContentApiToken,
+  ExplorerAnswer,
+  ExplorerEndpoint,
+  OpenApiDocument,
+  OpenApiOperation,
+
   SecurityBulkResult,
   SecurityFinding,
   SecurityFindingFilter,
@@ -55,7 +68,44 @@ import type {
   WebhookRotation,
   WebhookStats,
   WebhookTestReport,
+
+  CommentBan,
+  CommentBulkResult,
+  CommentInbox,
+  CommentInboxRow,
+  CommentSettingsDocument,
   CreatedMediaShare,
+  ImportReport,
+  Member,
+  MemberDelivery,
+  MemberDetail,
+  MemberList,
+  MemberSettingsDocument,
+  NewsletterIssue,
+  NewsletterList,
+  NewsletterListRow,
+  NewsletterSubscriber,
+  NewNewsletterList,
+  SubscriberPage,
+  Form,
+  NewCommentReply,
+  FeaturedCandidate,
+  FeaturedCandidatesBody,
+  FeaturedChanges,
+  FeaturedImage,
+  FeaturedMedia,
+  FeaturedMediaBody,
+  PageSeo,
+  PageSeoBody,
+  SeoBrokenLink,
+  SeoOverview,
+  SeoRedirect,
+  SeoRedirectImport,
+  SeoRedirectTest,
+  SeoSettings,
+  FormDetail,
+  Inbox,
+  Submission,
   EventCatalogue,
   EventFilters,
   EventPage,
@@ -77,6 +127,7 @@ import type {
   MediaGrant,
   MediaGrantSubject,
   MediaGrantsResponse,
+  MediaReplaceResult,
   MediaShare,
   MediaActivity,
   MediaUsage,
@@ -89,7 +140,6 @@ import type {
   MediaScanSettingsInput,
   MediaSweepResult,
   MediaStorageSettingsInput,
-  MediaReplaceResult,
   MediaRetentionList,
   MediaRetentionPolicy,
   MediaRetentionPolicyInput,
@@ -130,22 +180,22 @@ import type {
   NotificationRow,
   NotificationSettingsRow,
   NotificationSummary,
+  Menu,
+  MenuDetail,
+  MenuItem,
+  PagePreview,
+  PublishingEntry,
+  RenderedMenu,
+  RenderedMenuItem,
+  PageTemplateSummary,
+  PatternBlocksResponse,
+  PatternListResponse,
+  Revision,
+  RevisionDiff,
   Site,
+  TemplateListResponse,
   User,
-  AppBuilderArtifact,
-  AppBuilderBlocker,
-  AppBuilderBulkDelete,
-  AppBuilderCounts,
-  AppBuilderDecision,
-  AppBuilderExample,
-  AppBuilderFinding,
-  AppBuilderPlan,
-  AppBuilderPlanDecision,
-  AppBuilderPlanDetail,
-  AppBuilderPlanList,
-  AppBuilderVocabulary,
 } from "./types";
-
 // The portal's own shapes live in their own module rather than in `types.ts`, because they come
 // with a *rule* attached (only `IssuedDeveloperKey` may hold a token) that is worth reading
 // next to the type itself rather than one of two hundred lines of a shared list.
@@ -473,6 +523,85 @@ export async function fetchPages(siteId: string, status?: string): Promise<Page[
   return body.pages;
 }
 
+/** One page with its working draft and the revision visitors see. */
+export function fetchPage(pageId: string): Promise<Page> {
+  return request<Page>(`/api/v1/pages/${encodeURIComponent(pageId)}`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Featured media (REQ-064, slice 4d)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Read one page's featured image, its crop and what a renderer would do with them.
+ *
+ * The response carries the renderer's own payload (`render`) rather than the fields alone, so
+ * this screen's preview and the public page's markup are the same object rather than two
+ * re-derivations that can agree with each other and disagree with the site.
+ */
+export function fetchFeaturedMedia(pageId: string): Promise<FeaturedMediaBody> {
+  return request<FeaturedMediaBody>(
+    `/api/v1/pages/${encodeURIComponent(pageId)}/featured-media`,
+  );
+}
+
+/**
+ * Write one page's featured image.
+ *
+ * `focal_x`/`focal_y` are omitted rather than sent when the editor did not touch the crop: the
+ * server reads a MISSING key as "leave it" and an explicit `null` as "clear it", and sending both
+ * as `null` on every save would clear the crop of every page the panel ever touched.
+ */
+export function saveFeaturedMedia(
+  pageId: string,
+  changes: FeaturedChanges,
+): Promise<FeaturedMediaBody> {
+  const body: FeaturedChanges = {};
+  if (changes.media_id !== undefined) {
+    body.media_id = changes.media_id;
+  }
+  if (changes.alt !== undefined) {
+    body.alt = changes.alt;
+  }
+  if (changes.legend !== undefined) {
+    body.legend = changes.legend;
+  }
+  if (changes.focal_x !== undefined) {
+    body.focal_x = changes.focal_x;
+  }
+  if (changes.focal_y !== undefined) {
+    body.focal_y = changes.focal_y;
+  }
+  if (changes.clear !== undefined) {
+    body.clear = changes.clear;
+  }
+  return request<FeaturedMediaBody>(
+    `/api/v1/pages/${encodeURIComponent(pageId)}/featured-media`,
+    { method: "PUT", body: JSON.stringify(body) },
+  );
+}
+
+/**
+ * The images a page could feature.
+ *
+ * A separate read from the page's own because it is a different question with a different power:
+ * this one is about the LIBRARY and needs `media.read`, while the page's own read is about the
+ * page. `limit` is clamped server-side, so the picker pages rather than asking for everything.
+ */
+export function fetchFeaturedCandidates(
+  siteId: string,
+  limit?: number,
+): Promise<FeaturedCandidatesBody> {
+  const query = new URLSearchParams();
+  if (limit !== undefined) {
+    query.set("limit", String(limit));
+  }
+  const suffix = query.size > 0 ? `?${query.toString()}` : "";
+  return request<FeaturedCandidatesBody>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/featured-media/candidates${suffix}`,
+  );
+}
+
 /** Create a page together with its first, draft revision. */
 export function createPage(input: {
   siteId: string;
@@ -496,17 +625,220 @@ export function createPage(input: {
 /** Edit a page: a content change appends the next draft revision, a slug rename does not. */
 export function updatePage(
   pageId: string,
-  changes: { slug?: string; title?: string; body?: string; summary?: string },
+  changes: {
+    slug?: string;
+    title?: string;
+    body?: string;
+    summary?: string;
+    blocks?: unknown[];
+  },
 ): Promise<Page> {
   const body: Record<string, unknown> = {};
   if (changes.slug !== undefined) body.slug = changes.slug;
   if (changes.title !== undefined) body.title = changes.title;
   if (changes.body !== undefined) body.body = changes.body;
   if (changes.summary !== undefined) body.summary = changes.summary;
+  if (changes.blocks !== undefined) body.blocks = changes.blocks;
   return request<Page>(`/api/v1/pages/${encodeURIComponent(pageId)}`, {
     method: "PATCH",
     body: JSON.stringify(body),
   });
+}
+
+// -- Patterns and page templates (REQ-063, slice 3) --------------------------------------------------
+
+/**
+ * The pattern library, optionally narrowed to one category and one tenant.
+ *
+ * The tenant is a parameter rather than something the server infers because the platform Owner
+ * has *no* primary organization — that is what makes it an Owner — so a route that only falls back
+ * to the account's own tenant answers the Owner `400 organization_required` on the one screen it
+ * opens first. Every tenant-addressed read in this client takes it the same way (`fetchSites`).
+ */
+export async function fetchPatterns(category?: string, organizationId?: string): Promise<ContentPattern[]> {
+  const query = new URLSearchParams();
+  if (category) query.set("category", category);
+  if (organizationId) query.set("organization_id", organizationId);
+  const suffix = query.size ? `?${query.toString()}` : "";
+  const body = await request<PatternListResponse>(`/api/v1/patterns${suffix}`);
+  return body.patterns;
+}
+
+/** One pattern, with its block group. */
+export function fetchPattern(patternId: string): Promise<ContentPattern> {
+  return request<ContentPattern>(`/api/v1/patterns/${encodeURIComponent(patternId)}`);
+}
+
+/**
+ * The blocks a pattern contributes to a page, with ids minted server-side.
+ *
+ * Deliberately a server call rather than a client-side rename of the pattern's own payload: the
+ * ids that matter are the ones the page will *store*, and a browser that re-mints them has a
+ * second implementation of "copy this pattern" which will disagree with the server's the first
+ * time either one learns a rule the other does not have.
+ */
+export function fetchPatternBlocks(
+  patternId: string,
+  organizationId?: string,
+): Promise<PatternBlocksResponse> {
+  // A path-addressed read has no body to name a tenant in, so it rides the query string. Without
+  // it the route answers `400 organization_required` to the platform account that owns the
+  // pattern — the fifth call site to forget this, and the reason the editor's "insert pattern"
+  // could not read a pattern the same screen had just saved.
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request<PatternBlocksResponse>(
+    `/api/v1/patterns/${encodeURIComponent(patternId)}/blocks${query}`,
+  );
+}
+
+/**
+ * Save a pattern. The key is its identity, so a `POST` with an existing key replaces that
+ * pattern — which is why the library's "save my changes" and "create a new one" are one call.
+ */
+export function savePattern(input: {
+  key: string;
+  name: string;
+  category?: string;
+  description?: string;
+  blocks: ContentBlock[];
+  organizationId?: string;
+}): Promise<ContentPattern> {
+  const body: Record<string, unknown> = {
+    key: input.key,
+    name: input.name,
+    blocks: input.blocks,
+  };
+  if (input.category !== undefined) body.category = input.category;
+  if (input.description !== undefined) body.description = input.description;
+  if (input.organizationId !== undefined) body.organization_id = input.organizationId;
+  return request<ContentPattern>("/api/v1/patterns", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Edit a pattern's name, category, description or block group. */
+export function updatePattern(
+  patternId: string,
+  changes: {
+    name?: string;
+    category?: string;
+    description?: string;
+    blocks?: ContentBlock[];
+  },
+): Promise<ContentPattern> {
+  const body: Record<string, unknown> = {};
+  if (changes.name !== undefined) body.name = changes.name;
+  if (changes.category !== undefined) body.category = changes.category;
+  if (changes.description !== undefined) body.description = changes.description;
+  if (changes.blocks !== undefined) body.blocks = changes.blocks;
+  return request<ContentPattern>(`/api/v1/patterns/${encodeURIComponent(patternId)}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Remove a pattern from the library. */
+export function deletePattern(patternId: string): Promise<void> {
+  return request<void>(`/api/v1/patterns/${encodeURIComponent(patternId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** The page template gallery, with the platform's own starting points. */
+export async function fetchPageTemplates(organizationId?: string): Promise<PageTemplateSummary[]> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  const body = await request<TemplateListResponse>(`/api/v1/page-templates${query}`);
+  return body.templates;
+}
+
+/** Create a page from a template: a real draft page whose blocks match the template's. */
+export function createPageFromTemplate(input: {
+  siteId: string;
+  templateId: string;
+  slug: string;
+  title: string;
+}): Promise<Page> {
+  return request<Page>("/api/v1/pages/from-template", {
+    method: "POST",
+    body: JSON.stringify({
+      site_id: input.siteId,
+      template_id: input.templateId,
+      slug: input.slug,
+      title: input.title,
+    }),
+  });
+}
+
+// -- The block system (REQ-063) ---------------------------------------------------------------------
+
+/** The block registry: every type the platform ships, with its props schema. */
+export function fetchBlockRegistry(): Promise<BlockRegistry> {
+  return request<BlockRegistry>("/api/v1/blocks");
+}
+
+/** Validate a block tree without writing it — the editor's live validation. */
+export function validateBlocks(blocks: unknown[]): Promise<BlockValidationResult> {
+  return request<BlockValidationResult>("/api/v1/blocks/validate", {
+    method: "POST",
+    body: JSON.stringify({ blocks }),
+  });
+}
+
+/**
+ * Compare two revisions block by block (REQ-063).
+ *
+ * `against` is optional: the API defaults to the revision before the one being read, which is
+ * the question an author opening a revision actually has. It is passed only when the revisions
+ * screen's picker names a different base.
+ */
+export function fetchRevisionDiff(
+  pageId: string,
+  revisionId: string,
+  against?: string,
+): Promise<RevisionDiff> {
+  const query = against
+    ? `?against=${encodeURIComponent(against)}`
+    : "";
+  return request<RevisionDiff>(
+    `/api/v1/pages/${encodeURIComponent(pageId)}/revisions/${encodeURIComponent(revisionId)}/diff${query}`,
+  );
+}
+
+/**
+ * The renderer-frame payload of a page's working draft (REQ-063, slice 2).
+ *
+ * `viewport` picks the screen: the server filters the tree for it, so a phone frame does not
+ * carry a desktop block in the DOM wearing a `display: none`. The screen switch has to be a
+ * round trip on purpose — the filter lives in the same place the public renderer's filter lives,
+ * and a client-side copy is exactly how a preview starts disagreeing with the site.
+ */
+export function fetchPagePreview(
+  pageId: string,
+  viewport: "desktop" | "mobile" = "desktop",
+  simulatedMedia: string[] = [],
+): Promise<PagePreview> {
+  const query = new URLSearchParams();
+  if (viewport === "mobile") {
+    query.set("viewport", "mobile");
+  }
+  // The simulation travels in the query rather than being applied here: the server owns which
+  // files are gone, and a client that dropped the ids itself would be a second implementation of
+  // the degradation this screen exists to show.
+  if (simulatedMedia.length > 0) {
+    query.set("media", simulatedMedia.join(","));
+  }
+  const suffix = query.size > 0 ? `?${query.toString()}` : "";
+  return request<PagePreview>(
+    `/api/v1/pages/${encodeURIComponent(pageId)}/preview${suffix}`,
+  );
+}
+
+/** The revision history of a page, newest first. */
+export function fetchRevisions(pageId: string): Promise<Revision[]> {
+  return request<{ revisions: Revision[] }>(
+    `/api/v1/pages/${encodeURIComponent(pageId)}/revisions`,
+  ).then((body) => body.revisions);
 }
 
 /** Publish the page's working draft — the revision visitors then see. */
@@ -3816,689 +4148,6 @@ export function fetchIamProvisioningLog(input: {
   return request(`/api/v1/iam/provisioning/log${query ? `?${query}` : ""}`);
 }
 
-// ---------------------------------------------------------------------------------------------
-// Automations (docs/requests/REQ-003) — trigger → condition → action
-// ---------------------------------------------------------------------------------------------
-
-/** One payload field of a documented event, as the condition picker offers it. */
-export type AutomationEventField = {
-  /** The field as it appears in the payload, dotted for nesting. */
-  key: string;
-  /** `string`, `number`, `boolean`, `array` or `object`. */
-  kind: string;
-  /** What the field holds, in product language. */
-  label: string;
-};
-
-/** One event of the library. */
-export type AutomationEvent = {
-  /** Event name as the bus records it. */
-  name: string;
-  /** What happened, in product language. */
-  description: string;
-  /** The group the picker files it under. */
-  group: string;
-  /** The payload fields a condition or binding may read. */
-  fields: AutomationEventField[];
-  /** `true` when the event belongs to a site. */
-  site_scoped: boolean;
-};
-
-/** One operator of the closed comparison set. */
-export type AutomationOperator = {
-  /** Stable operator key. */
-  key: string;
-  /** `false` for the two existence operators, which take no value. */
-  needs_value: boolean;
-};
-
-/** One action of the closed action set. */
-export type AutomationAction = {
-  /** Stable action key. */
-  key: string;
-  /** What it does, in product language. */
-  description: string;
-  /** `true` when the action touches the world rather than the run only. */
-  host: boolean;
-};
-
-/** The closed vocabulary a rule is written in. */
-export type AutomationCatalogue = {
-  /** The event library, with the payload fields each event carries. */
-  events: AutomationEvent[];
-  /** The closed comparison set. */
-  condition_operators: AutomationOperator[];
-  /** The closed action set. */
-  actions: AutomationAction[];
-  /** How the rule starts. */
-  trigger_kinds: string[];
-  /** The condition group modes the editor offers. */
-  group_modes: string[];
-  /** How deep groups may nest. */
-  max_group_depth: number;
-  /** How many conditions and groups a rule may carry in total. */
-  max_conditions: number;
-  /** The event a webhook trigger listens for. */
-  hook_event: string;
-  /** The hook path with the token left out. */
-  hook_path_template: string;
-  /** How a payload field is named inside a condition or a binding. */
-  binding_syntax: string;
-  /** An example of the payload an inbound call produces. */
-  hook_sample: Record<string, unknown>;
-  /** The operators a `branch` step offers — the same nine the conditions use. */
-  branch_operators: AutomationOperator[];
-  /** The step kinds a definition may carry. */
-  step_kinds: string[];
-  /** The permission that may decide a parked `approval` step. */
-  approval_permission: string;
-  /** The default and the ceiling of a gate's lifetime, in hours. */
-  approval_ttl_hours: number;
-  max_approval_ttl_hours: number;
-  /** What a step's own failure may do; `inherit` takes the rule's policy. */
-  on_error_policies: AutomationStepOnError[];
-  /** The longest a step may block, in milliseconds, and the default. */
-  max_step_timeout_ms: number;
-  default_step_timeout_ms: number;
-  /** The methods an outbound call may use. */
-  outbound_methods: string[];
-  /** How many rules deep a `run_workflow` chain may go. */
-  max_chain_depth: number;
-};
-
-/** One run of a rule, as the run detail reads it. */
-export type AutomationExecution = {
-  /** Run id. */
-  id: string;
-  /** Rule the run belongs to. */
-  workflow_id: string;
-  /** `running`, `completed`, `failed` or `cancelled`. */
-  status: string;
-  /**
-   * How the run started.
-   *
-   * The list endpoint names this `trigger` and the detail `trigger_kind`; both are mapped
-   * onto this one field by the fetcher below, so the panel never has to know which endpoint
-   * answered.
-   */
-  trigger_kind: string;
-  /** The list endpoint's spelling of {@link trigger_kind}, normalised onto it. */
-  trigger?: string;
-  /** When it started. */
-  started_at: string;
-  /** When it finished, if it has. */
-  finished_at: string | null;
-  /** The failing step's message, when the run failed. */
-  error: string | null;
-};
-
-/** One step of a run's trace. */
-export type AutomationRunStep = {
-  /** 1-based position. */
-  step_no: number;
-  /** Step name. */
-  name: string;
-  /** `task`, `wait`, `branch`, `stop` or `approval`. */
-  kind: string;
-  /** Action key of a task step. */
-  action: string | null;
-  /** `pending`, `running`, `waiting`, `succeeded`, `failed` or `cancelled`. */
-  status: string;
-  /** Attempts made so far. */
-  attempts: number;
-  /** Attempts allowed in total. */
-  max_attempts: number;
-  /** What this step's own failure does. */
-  on_error: string;
-  /** How long this step may block, in milliseconds. */
-  timeout_ms: number;
-  /** `true` when the run deliberately outlived this step's failure. */
-  ignored: boolean;
-  /** The step's output, when it succeeded. */
-  output: Record<string, unknown> | null;
-  /** The last failure's message. */
-  error: string | null;
-  /**
-   * When the current attempt started, and when the step reached a terminal state.
-   *
-   * Both are what makes the trace's duration column honest: without them every step reads
-   * as having taken no time, which is indistinguishable from having run instantly.
-   */
-  started_at?: string | null;
-  finished_at?: string | null;
-};
-
-/** The run detail: the run, its steps and the payload it started from. */
-export type AutomationRunDetail = AutomationExecution & {
-  /** Steps, in order. */
-  steps: AutomationRunStep[];
-  /** The event payload the run started from. */
-  event_payload?: Record<string, unknown>;
-  /** `true` when this run offers Retry. */
-  can_retry: boolean;
-  /** `true` when this run is still going. */
-  can_cancel: boolean;
-};
-
-/** What "Run now" started. */
-export type AutomationRunStarted = {
-  /** The run that started. */
-  execution_id: string;
-  /** The rule it belongs to. */
-  workflow_id: string;
-  /** How many steps it carries. */
-  steps: number;
-};
-
-/** What a retry or a resume re-queued. */
-export type AutomationRetryResult = {
-  /** The run that was re-opened. */
-  execution_id: string;
-  /** The step the operator pointed at. */
-  step_no: number;
-  /** How many steps went back on the queue. */
-  requeued: number;
-};
-
-/** One comparison inside a condition group. */
-export type AutomationCondition = {
-  /** Field path into the event payload. */
-  field: string;
-  /** How the field is compared. */
-  operator: string;
-  /** Value to compare with; absent for the two existence operators. */
-  value?: unknown;
-};
-
-/** One member of a condition group: a comparison or a nested group. */
-export type AutomationNode = AutomationCondition | AutomationGroup;
-
-/** A group of condition nodes. */
-export type AutomationGroup = {
-  /** `all` (every member holds) or `any` (one member holds). */
-  mode?: "all" | "any";
-  all?: AutomationNode[];
-  any?: AutomationNode[];
-  /** Members of a nested group, when the panel holds the flat editing shape. */
-  nodes?: AutomationNode[];
-};
-
-/** The hook surface of a webhook-triggered rule. */
-export type AutomationHook = {
-  /** `true` once a token has been minted. */
-  configured: boolean;
-  /** How many calls the current window has spent. */
-  window_used: number;
-  /** The window's ceiling. */
-  window_limit: number;
-  /** When the window rolls over. */
-  window_resets_at: string;
-  /** The path template, with the token left out. */
-  path_template: string;
-};
-
-/** One automation rule. */
-export type Automation = {
-  /** Rule id. */
-  id: string;
-  /** Organization that owns the rule. */
-  organization_id: string;
-  /** Site the rule is bound to, when it is. */
-  site_id: string | null;
-  /** Display name. */
-  name: string;
-  /** Free-form description. */
-  description: string;
-  /** Whether the rule fires. */
-  enabled: boolean;
-  /** Event the rule listens for. */
-  event: string;
-  /** How the rule starts: `event` or `inbound_webhook`. */
-  trigger: string;
-  /** The condition tree as stored. */
-  conditions: AutomationGroup | AutomationCondition[];
-  /** How many comparisons the tree carries. */
-  condition_count: number;
-  /** Actions to run, in order. */
-  actions: AutomationNode[];
-  /** The rule's own error policy; a step that inherits takes this. */
-  on_error: AutomationOnError;
-  /** Whose authority the rule's host actions run with; `null` means the author. */
-  run_as_user_id: string | null;
-  /** Which of the two it is, in a sentence the editor shows beside the picker. */
-  run_as_description: string;
-  /** What each host action needs, so the panel can say what a run-as account is asked for. */
-  action_permissions: [string, string][];
-  /** How many runs the trigger has started. */
-  trigger_count: number;
-  /**
-   * The version a graph write must quote.
-   *
-   * Present on the list for the same reason it is on the row: a rule opened from a list row
-   * and then saved has no other way to learn it, and a client that guessed `0` would be
-   * refused with a conflict about a version the author was never shown.
-   */
-  graph_version: number;
-  /** When the rule last fired. */
-  last_triggered_at: string | null;
-  /** Creation time. */
-  created_at: string;
-  /** Last change. */
-  updated_at: string;
-  /** The hook surface, for a webhook-triggered rule. */
-  hook?: AutomationHook;
-};
-
-/** What a step's own failure does; `inherit` takes the rule's policy. */
-export type AutomationStepOnError = "inherit" | "stop" | "continue";
-
-/** The rule's own error policy. A rule may not choose `inherit` — that is a step's. */
-export type AutomationOnError = "stop" | "continue";
-
-/** One step of a rule's action list. */
-export type AutomationStep = {
-  /** Display name; unique within the rule. */
-  name: string;
-  /** `task`, `wait`, `branch`, `stop` or `approval`. */
-  kind: string;
-  /** Action key of a task step. */
-  action?: string | null;
-  /** Action parameters. */
-  params: Record<string, unknown>;
-  /** What this step's own failure does. */
-  on_error?: AutomationStepOnError;
-  /** How long this step may block, in milliseconds. */
-  timeout_ms?: number;
-  /** Attempts allowed in total. */
-  max_attempts: number;
-};
-
-/** The condition report of a dry run: one row, answered. */
-export type AutomationConditionReport = {
-  /** The comparison as the author wrote it. */
-  condition: AutomationCondition;
-  /** `true` when the payload satisfied it. */
-  holds: boolean;
-  /** The payload's value for the field, when it had one. */
-  found?: unknown;
-};
-
-/** One group of a dry-run report. */
-export type AutomationGroupReport = {
-  /** `all` or `any`. */
-  mode: string;
-  /** What the group answered. */
-  holds: boolean;
-  /** The members, in order. */
-  nodes: Array<AutomationConditionReport | AutomationGroupReport>;
-};
-
-/** What one action of a dry run would have done. */
-export type AutomationActionReport = {
-  /** Step name, so the report lines up with the editor. */
-  name: string;
-  /** The action key. */
-  action: string;
-  /** `true` when the action touches the world. */
-  host: boolean;
-  /** `would_send`, `would_call`… — what the step would do. */
-  outcome: string;
-  /** The parameters after the payload was resolved into them. */
-  params: Record<string, unknown>;
-  /** A readable one-line summary, when the action has one. */
-  summary?: string;
-};
-
-/** The whole dry-run report. */
-export type AutomationDryRun = {
-  /** `true` when the conditions held and the actions would have run. */
-  would_run: boolean;
-  /** Why the rule would not run, when it would not. */
-  reason: string | null;
-  /** The condition tree, answered row by row. */
-  conditions: AutomationGroupReport;
-  /** The actions, in order. */
-  actions: AutomationActionReport[];
-  /** Nothing in this report was sent, published or called. */
-  simulated: boolean;
-};
-
-/** One stored test report or captured payload. */
-export type AutomationTestEvent = {
-  /** Row id. */
-  id: string;
-  /** `test` or `listen`. */
-  kind: string;
-  /** The payload the row carries. */
-  payload: Record<string, unknown> | null;
-  /** Event id, when a listener captured one. */
-  event_id: number | null;
-  /** Event name, when a listener captured one. */
-  event_name: string | null;
-  /** `true` while a listener waits for its next event. */
-  armed: boolean;
-  /** When the row was written. */
-  created_at: string;
-  /** When a listener filled in. */
-  captured_at: string | null;
-};
-
-/** The answer of a dry run. */
-export type AutomationTestResult = {
-  /** The report, row by row. */
-  report: AutomationDryRun;
-  /** The stored report. */
-  recorded: AutomationTestEvent;
-};
-
-/**
- * One gate a parked automation run is waiting on (REQ-003 slice 3).
- *
- * There is deliberately **no token** on this type. The panel decides through the decider's
- * own session and the gate's own id, so reading the queue can never hand out the credential
- * that opens it — the token is minted by the engine when the run parks and travels to the
- * decider out of band, exactly as the inbound hook token does.
- */
-export type AutomationApproval = {
-  /** Approval id — what the decision endpoint is addressed by. */
-  id: string;
-  /** The run that is parked. */
-  execution_id: string;
-  /** The step inside that run. */
-  step_no: number;
-  /** The step's name. */
-  step_name: string;
-  /** The rule that asked, when the rule still exists. */
-  rule_id: string | null;
-  /** Its name. */
-  rule_name: string | null;
-  /** Organization the gate belongs to. */
-  organization_id: string;
-  /** When the run parked. */
-  requested_at: string;
-  /** When the gate stops accepting decisions. */
-  expires_at: string;
-  /** The permission a decider must hold. */
-  permission: string;
-  /** The message the author wrote for the decider. */
-  message: string;
-  /** `true` when the deadline has passed; the panel then offers only Reject. */
-  expired: boolean;
-};
-
-/** The answer of a decision: what happened to the run. */
-export type AutomationDecisionResult = {
-  /** The gate that was decided. */
-  approval_id: string;
-  /** What it was decided as. */
-  decision: "approved" | "rejected";
-  /** The run that was let go (approved) or ended (rejected). */
-  execution_id: string;
-  /** `running` after an approval, `cancelled` after a rejection. */
-  execution_status: string;
-};
-
-/** `GET /api/v1/approvals` — the gates waiting in one organization. */
-export function fetchApprovals(
-  options: { organizationId?: string | null; status?: "pending" | "decided" } = {},
-): Promise<{ approvals: AutomationApproval[]; total: number }> {
-  const query = new URLSearchParams();
-  if (options.organizationId) {
-    query.set("organization_id", options.organizationId);
-  }
-  query.set("status", options.status ?? "pending");
-  return request<{ approvals: AutomationApproval[]; total: number }>(
-    `/api/v1/approvals?${query.toString()}`,
-  );
-}
-
-/**
- * `POST /api/v1/approvals/{id}/decide` — let a parked run go on, or end it.
- *
- * The token is sent in the body, never in the path: a token in a URL is written to every
- * access log on the way in, and an approval is a credential that can let a message leave
- * the process. A repeat press is answered `200` with the decision the gate already has,
- * so a double click cannot apply twice.
- *
- * **No token is sent from the panel**, and that is the point of the split: the *authority*
- * to decide is the session's `workflows.approve`, which this screen's route guard already
- * checked, while the token is the second factor a notification carries. A decider who
- * followed a link brings one and it is checked; a decider who opened the panel brings their
- * session, which is the same power by a different route.
- */
-export function decideApproval(
-  approvalId: string,
-  decision: "approved" | "rejected",
-  note?: string,
-): Promise<AutomationDecisionResult> {
-  return request<AutomationDecisionResult>(
-    `/api/v1/approvals/${encodeURIComponent(approvalId)}/decide`,
-    { method: "POST", body: JSON.stringify({ decision, note: note ?? null }) },
-  );
-}
-
-/** A newly minted hook token — the only response that carries one. */
-export type AutomationHookToken = {
-  /** The URL to give the caller, token included. */
-  url: string;
-  /** The token on its own. */
-  token: string;
-  /** The rule the URL belongs to. */
-  automation_id: string;
-};
-
-/** The rule list. */
-export function fetchAutomations(organizationId?: string): Promise<{ automations: Automation[] }> {
-  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
-  return request<{ automations: Automation[] }>(`/api/v1/automations${query}`);
-}
-
-/** The closed vocabulary a rule is written in. */
-export function fetchAutomationCatalogue(): Promise<AutomationCatalogue> {
-  return request<AutomationCatalogue>("/api/v1/automations/catalogue");
-}
-
-/** One rule. */
-export function fetchAutomation(automationId: string): Promise<Automation> {
-  return request<Automation>(`/api/v1/automations/${automationId}`);
-}
-
-/**
- * A rule to write.
- *
- * One shape for both `createAutomation` and `updateAutomation`, so a field added here
- * cannot reach one and miss the other — which is how a rule's error policy ends up
- * quietly resetting to the default every time somebody toggles a rule.
- */
-export type AutomationInput = {
-  organization_id?: string | null;
-  site_id?: string | null;
-  name: string;
-  description?: string;
-  enabled?: boolean;
-  event: string;
-  conditions?: unknown;
-  hook_triggered?: boolean;
-  /** The rule's own failure policy; a step that inherits takes this. */
-  on_error?: AutomationOnError;
-  /**
-   * Whose authority the rule's host actions run with; `null` follows the author.
-   *
-   * The API resolves it at *run* time, so handing a rule to a service account changes what
-   * happens from the next run — which is what a settings field is expected to do.
-   */
-  run_as_user_id?: string | null;
-  actions: AutomationStep[];
-};
-
-/** Write a rule. */
-export function createAutomation(input: AutomationInput): Promise<Automation> {
-  return request<Automation>("/api/v1/automations", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Replace a rule. */
-export function updateAutomation(
-  automationId: string,
-  input: AutomationInput,
-): Promise<Automation> {
-  return request<Automation>(`/api/v1/automations/${automationId}`, {
-    method: "PUT",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Remove a rule and its run history. */
-export function deleteAutomation(automationId: string): Promise<null> {
-  return request<null>(`/api/v1/automations/${automationId}`, { method: "DELETE" });
-}
-
-/** Evaluate a hand-written payload against a rule without touching anything. */
-export function testAutomation(automationId: string, payload: unknown): Promise<AutomationTestResult> {
-  return request<AutomationTestResult>(`/api/v1/automations/${automationId}/test`, {
-    method: "POST",
-    body: JSON.stringify({ payload }),
-  });
-}
-
-/** Arm a one-shot listener for a rule's next real event. */
-export function listenAutomation(automationId: string): Promise<AutomationTestEvent> {
-  return request<AutomationTestEvent>(`/api/v1/automations/${automationId}/listen`, {
-    method: "POST",
-  });
-}
-
-/** A rule's test reports and captured payloads, newest first. */
-export function fetchAutomationTests(automationId: string): Promise<{ tests: AutomationTestEvent[] }> {
-  return request<{ tests: AutomationTestEvent[] }>(`/api/v1/automations/${automationId}/tests`);
-}
-
-/** Mint a fresh inbound-webhook token; the response is the only place one appears. */
-export function rotateAutomationHook(automationId: string): Promise<AutomationHookToken> {
-  return request<AutomationHookToken>(`/api/v1/automations/${automationId}/rotate-hook`, {
-    method: "POST",
-  });
-}
-
-/**
- * Start one run now, in the real world.
- *
- * This is the one automations control that sends, publishes and calls for real — the
- * dry run beside it is the simulation, and this is not. The response is the run, so the
- * panel can link straight to its trace.
- */
-export function runAutomation(automationId: string): Promise<AutomationRunStarted> {
-  return request<AutomationRunStarted>(`/api/v1/automations/${automationId}/run`, {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
-}
-
-/** One run with its step trace. */
-export function fetchAutomationRun(executionId: string): Promise<AutomationRunDetail> {
-  return request<AutomationRunDetail>(`/api/v1/workflow-executions/${executionId}`);
-}
-
-/* ---------------------------------------------------------------------------------------------
- * *Listen for a real event* (REQ-004 slice 3, criterion 5)
- *
- * Arming and reading are **two calls and not one that does both**, and the reason is the
- * one that only shows up in production: a panel that polls by POSTing re-arms its own
- * listener on every tick, so the row the matcher fills is a row the previous tick deleted —
- * the capture appears for one frame and the author watches a spinner and nothing else. The
- * `readWorkflowListeners` call is the only one the panel repeats.
- */
-
-/** One armed (or spent) listener, as the builder's inspector reads it. */
-export interface WorkflowListener {
-  id: string;
-  node_id: string;
-  event_name: string;
-  /** `armed` | `captured` | `expired` — derived by the server, never stored. */
-  status: "armed" | "captured" | "expired";
-  armed_at: string;
-  expires_at: string;
-  /** Seconds left, clamped at zero by the server so a bar can be drawn from it. */
-  expires_in_seconds: number;
-  captured_at?: string;
-  event_id?: number;
-  payload: Record<string, unknown> | null;
-  payload_text?: string;
-}
-
-/** What arming answers. The token is here and nowhere else. */
-export interface WorkflowListenerArmed {
-  listener: WorkflowListener;
-  token: string;
-  expires_in_seconds: number;
-}
-
-/** What the read answers. */
-export interface WorkflowListenerList {
-  listeners: WorkflowListener[];
-  armed: number;
-  captured?: WorkflowListener;
-}
-
-/** Arm a one-shot listener for one node. This is the only call that mints a token. */
-export function armWorkflowListener(
-  workflowId: string,
-  nodeId: string,
-): Promise<WorkflowListenerArmed> {
-  return request<WorkflowListenerArmed>(
-    `/api/v1/workflows/${encodeURIComponent(workflowId)}/listen`,
-    { method: "POST", body: JSON.stringify({ node_id: nodeId }) },
-  );
-}
-
-/** The rule's listeners and whatever they captured. Safe to repeat; arms nothing. */
-export function readWorkflowListeners(workflowId: string): Promise<WorkflowListenerList> {
-  return request<WorkflowListenerList>(
-    `/api/v1/workflows/${encodeURIComponent(workflowId)}/listeners`,
-  );
-}
-
-/** Read one listener back by its token — the handle a caller scripts against. */
-export function readWorkflowListener(
-  workflowId: string,
-  token: string,
-): Promise<WorkflowListener> {
-  return request<WorkflowListener>(
-    `/api/v1/workflows/${encodeURIComponent(workflowId)}/listeners/${encodeURIComponent(token)}`,
-  );
-}
-
-/**
- * Try a failed run again from one step.
- *
- * The chosen step **and everything after it** go back on the queue: re-running only the
- * failed step would let a run whose middle failed march on to completion, which is not
- * what "try that again" means to anybody reading a trace. The steps that already
- * succeeded are left exactly as they are.
- */
-export function retryAutomationStep(
-  executionId: string,
-  stepNo: number,
-): Promise<AutomationRetryResult> {
-  return request<AutomationRetryResult>(
-    `/api/v1/workflow-executions/${executionId}/retry-step`,
-    { method: "POST", body: JSON.stringify({ step_no: stepNo }) },
-  );
-}
-
-/** The same write as {@link retryAutomationStep}, named for what the button says. */
-export function resumeAutomationFrom(
-  executionId: string,
-  stepNo: number,
-): Promise<AutomationRetryResult> {
-  return request<AutomationRetryResult>(
-    `/api/v1/workflow-executions/${executionId}/resume-from`,
-    { method: "POST", body: JSON.stringify({ step_no: stepNo }) },
-  );
-}
-
 /* ---------------------------------------------------------------------------------------------
  * Enterprise sign-in providers (REQ-006, slice 4b-2; docs/07-IAM.md §11)
  *
@@ -4648,267 +4297,6 @@ export function fetchSsoProviders(): Promise<{
   return request("/api/v1/auth/sso/providers");
 }
 
-/* ---------------------------------------------------------------------------------------------
- * The automation operations surfaces (REQ-003 slice 4)
- *
- * Three reads an operator reaches for when a rule is not doing what its author expected —
- * "what did this look like on Tuesday", "who changed it", "what would a starter look like" —
- * and one write among them, the restore. The restore is a **definition write**, so the API
- * guards it with `workflows.manage` and audits it exactly like a save; the reads carry
- * `workflows.read`, the same power that reads the rule.
- * ------------------------------------------------------------------------------------------- */
-
-/** One stored version of a rule, as the Versions tab lists it. */
-export type AutomationVersion = {
-  /** Version row id — what *Restore* is addressed by. */
-  id: string;
-  /** The rule it belongs to. */
-  automation_id: string;
-  /** The number it was written as. */
-  version: number;
-  /** `created`, `updated` or `restored`. */
-  change: string;
-  /**
-   * What changed, in words.
-   *
-   * `{ changed: [{ field, from, to }], count }`, and `{ first: true }` for the version a
-   * rule was born as — which has nothing to be different from and says so rather than
-   * reporting an empty change set that reads like "you changed nothing".
-   */
-  summary: AutomationVersionSummary;
-  /** The whole definition as it was written. */
-  definition: Record<string, unknown>;
-  /** Who wrote it; `null` when the account has since been deleted. */
-  created_by: string | null;
-  /** When, RFC 3339. */
-  created_at: string;
-  /** The version whose content was restored, when this row is a restore. */
-  restored_from: string | null;
-  /** `true` when the rule as it stands is this row. */
-  current: boolean;
-};
-
-/** One line of a version's diff: the field, and the two values it moved between. */
-export type AutomationVersionChange = {
-  /** Which field of the definition moved. */
-  field: string;
-  /** What it was. */
-  from: unknown;
-  /** What it became. */
-  to: unknown;
-};
-
-/**
- * What one write changed.
- *
- * A fixed list of fields rather than a structural diff: a structural walk reports every key
- * a later slice added as a change on every edit, and needs rewriting the first time the
- * definition's shape changes — which is the thing that happens most often here.
- */
-export type AutomationVersionSummary = {
-  /** The fields that moved, in the order the panel lists them. */
-  changed?: AutomationVersionChange[];
-  /** How many, derived from the list so the number cannot disagree with the rows. */
-  count?: number;
-  /** `true` for the version a rule was created as. */
-  first?: boolean;
-};
-
-/** The Versions tab payload. */
-export type AutomationVersionList = {
-  /** The rule the history belongs to. */
-  automation_id: string;
-  /** The number the rule is on now. */
-  current_version: number;
-  /** History, newest first. */
-  versions: AutomationVersion[];
-  /**
-   * `true` when the rule has no history row at all.
-   *
-   * A rule written before this feature shipped is *untracked*, not *unchanged*, and the tab
-   * says which one it is looking at.
-   */
-  untracked: boolean;
-};
-
-/** One version with its diff, as `GET …/versions/{id}` answers it. */
-export type AutomationVersionComparison = {
-  /** The version being looked at. */
-  version: AutomationVersion;
-  /** The number it was compared against, or `null` for the first version. */
-  compared_to: number | null;
-  /** What changed, in words. */
-  summary: AutomationVersionSummary;
-};
-
-/** A rule's definition history, newest first. */
-export function fetchAutomationVersions(
-  automationId: string,
-): Promise<AutomationVersionList> {
-  return request<AutomationVersionList>(
-    `/api/v1/automations/${encodeURIComponent(automationId)}/versions`,
-  );
-}
-
-/** One version, with what it changed against the one before it. */
-export function fetchAutomationVersion(
-  automationId: string,
-  versionId: string,
-): Promise<AutomationVersionComparison> {
-  return request<AutomationVersionComparison>(
-    `/api/v1/automations/${encodeURIComponent(automationId)}/versions/${encodeURIComponent(
-      versionId,
-    )}`,
-  );
-}
-
-/**
- * Put a stored definition back.
- *
- * **Appends** rather than rewinds: the old content becomes the next version and
- * `restored_from` says where it came from, so the history stays a line and "v3 → v1 → v3"
- * never looks like a bug. The rule keeps its id, its run history and its webhook token.
- *
- * The body is empty by design — a caller that could send its own definition here would be
- * able to write a rule the panel never validated.
- */
-export function restoreAutomationVersion(
-  automationId: string,
-  versionId: string,
-): Promise<AutomationVersion> {
-  return request<AutomationVersion>(
-    `/api/v1/automations/${encodeURIComponent(automationId)}/versions/${encodeURIComponent(
-      versionId,
-    )}/restore`,
-    { method: "POST", body: JSON.stringify({}) },
-  );
-}
-
-/** One audit row, as the Audit tab lists it. */
-export type AutomationAuditEntry = {
-  /** Row id. */
-  id: number;
-  /** Stable action name, e.g. `automation.updated`. */
-  action: string;
-  /** Who did it, when a person did. */
-  actor_user_id: string | null;
-  /** `user`, `agent`, `service` or `system`. */
-  actor_type: string;
-  /** What was acted on. */
-  target_type: string | null;
-  /** Its id, as text. */
-  target_id: string | null;
-  /** Structured detail; never carries secrets. */
-  metadata: Record<string, unknown>;
-  /** When, RFC 3339. */
-  created_at: string;
-};
-
-/** Who changed this rule, and when. */
-export function fetchAutomationAudit(
-  automationId: string,
-  input: { limit?: number } = {},
-): Promise<{ automation_id: string; entries: AutomationAuditEntry[] }> {
-  const query = input.limit ? `?limit=${input.limit}` : "";
-  return request(`/api/v1/automations/${encodeURIComponent(automationId)}/audit${query}`);
-}
-
-/** One starter rule in the gallery. */
-export type AutomationTemplate = {
-  /** Stable key; the gallery's row identity. */
-  key: string;
-  /** Display name. */
-  name: string;
-  /** One line about what it does. */
-  description: string;
-  /** The category the gallery groups by. */
-  category: string;
-  /** The event the rule listens for. */
-  event: string;
-  /** How many conditions it starts with. */
-  condition_count: number;
-  /** How many actions it starts with. */
-  action_count: number;
-  /**
-   * What has to be filled in before it can run.
-   *
-   * Named rather than guessed: a template that says "needs a destination" is honest, and the
-   * request's criterion is that a starter is savable "without edits beyond its missing
-   * credentials".
-   */
-  requires: string[];
-  /** `false` when an action's host is not on the allow-list yet. */
-  installable: boolean;
-  /** Why it is not installable, when it is not. */
-  blocked_reason: string | null;
-  /** The request body `POST /api/v1/automations` takes, verbatim. */
-  body: Record<string, unknown>;
-};
-
-/** The six starter rules, in gallery order. */
-export function fetchAutomationTemplates(): Promise<{ templates: AutomationTemplate[] }> {
-  return request<{ templates: AutomationTemplate[] }>("/api/v1/automations/templates");
-}
-
-/* ---------------------------------------------------------------------------------------------
- * The run history and the two controls that act on a run
- *
- * A rule is a workflow whose trigger is an event, so the run history is the *workflow*
- * execution list — inventing an automation-specific one would mean two answers to "what did
- * this rule do last week". The two controls that repair a run (retry and resume) are the same
- * write on purpose: re-running only the failed step would let a run whose middle failed march
- * on to completion, which is not what "try that again" means to anybody reading a trace.
- * ------------------------------------------------------------------------------------------- */
-
-/** One run of a rule, as the run **list** answers it (no steps). */
-export type AutomationRunSummary = {
-  /** Execution id — the trace route is addressed by it. */
-  id: string;
-  /** The rule that ran. */
-  workflow_id: string;
-  /** `running`, `completed`, `failed`, `cancelled` or `awaiting_approval`. */
-  status: string;
-  /** `manual`, `schedule` or `event`. */
-  trigger: string;
-  /** When it started, RFC 3339. */
-  started_at: string;
-  /** When it settled. */
-  finished_at: string | null;
-  /** The failing step's message, when the run failed. */
-  error: string | null;
-  /** How many steps the run carries. */
-  step_count?: number;
-};
-
-/**
- * The run history of one rule, newest first.
- *
- * `step_count` is filled here when the API sent a step array and left `undefined` when it
- * did not, so the column shows an em dash rather than a fabricated zero — "the API did not
- * say" and "the run had no steps" are different facts.
- */
-export async function fetchAutomationRunHistory(
-  automationId: string,
-  limit = 50,
-): Promise<AutomationRunSummary[]> {
-  const answer = await request<{
-    workflow_id: string;
-    executions: (AutomationRunSummary & { steps?: unknown[] })[];
-  }>(`/api/v1/workflows/${encodeURIComponent(automationId)}/executions?limit=${limit}`);
-
-  return answer.executions.map((run) => ({
-    ...run,
-    step_count: Array.isArray(run.steps) ? run.steps.length : undefined,
-  }));
-}
-
-/** Stop a running execution. */
-export function cancelAutomationRun(executionId: string): Promise<AutomationRunDetail> {
-  return request<AutomationRunDetail>(
-    `/api/v1/workflow-executions/${encodeURIComponent(executionId)}/cancel`,
-    { method: "POST", body: JSON.stringify({}) },
-  );
-}
 // ---------------------------------------------------------------------------------------------
 // Transformation presets (docs/requests/REQ-010, slice 3)
 // ---------------------------------------------------------------------------------------------
@@ -5159,222 +4547,6 @@ export function releaseMediaQuarantine(
   );
 }
 
-// ---------------------------------------------------------------------------------------------
-// The visual workflow builder (REQ-004)
-// ---------------------------------------------------------------------------------------------
-
-/** One output port of a node type. */
-export interface GraphPort {
-  /** What an edge's `source_port` refers to. */
-  key: string;
-  /** What leaving through this port means. */
-  label: string;
-  /** `true` when leaving here ends the run. */
-  terminal: boolean;
-}
-
-/** One field of a node's parameter form. */
-export interface GraphParamField {
-  /** Key in the node's `params`. */
-  key: string;
-  /** Label above the input. */
-  label: string;
-  /** `text`, `textarea`, `number`, `select` or `boolean`. */
-  kind: string;
-  /** `true` when the node is refused without it. */
-  required: boolean;
-  /** The legal values of a `select`. */
-  options: string[];
-  /** Help text under the input. */
-  help: string;
-}
-
-/** One node type the palette offers. */
-export interface GraphNodeType {
-  /** Registry key, stored on a node as `type`. */
-  key: string;
-  /** What the palette calls it. */
-  label: string;
-  /** Which rail group it sits in. */
-  category: string;
-  /** One line under the card. */
-  summary: string;
-  /** Output ports, in draw order. */
-  outputs: GraphPort[];
-  /** The parameter fields the inspector draws. */
-  params: GraphParamField[];
-  /** `true` when the engine never runs it. Always `false` for a plugin node. */
-  inert: boolean;
-  /** The parameters a freshly dropped card starts with. */
-  defaults: Record<string, unknown>;
-  /**
-   * `Plugin: <name>` for a plugin node, `undefined` for a core one.
-   *
-   * Optional rather than an empty string so the palette can tell "not a plugin" from "a
-   * plugin that failed to name itself" — and the second is refused server-side, so `undefined`
-   * is safe to treat as an ordinary node.
-   */
-  badge?: string;
-  /** The providing plugin's key, when this is a plugin node. Names the badge's tooltip. */
-  provider?: string;
-}
-
-/** The palette's whole registry. */
-export interface GraphNodeTypes {
-  /** Every node type, in rail order: core first, then plugin types. */
-  node_types: GraphNodeType[];
-  /**
-   * The rail's groups, in draw order. `Plugins` appears **only** when a plugin contributed a
-   * node type — an organization with no plugins never sees a heading it cannot fill.
-   */
-  categories: string[];
-}
-
-/** One node of a graph. */
-export interface GraphNode {
-  /** Stable id within the graph. */
-  id: string;
-  /** The registry key. */
-  type: string;
-  /** What the canvas draws on the card. */
-  label: string;
-  /** The node's parameters. */
-  params: Record<string, unknown>;
-  /** Where it sits. */
-  position: { x: number; y: number };
-}
-
-/** One connection between two nodes. */
-export interface GraphEdge {
-  /** Stable id within the graph. */
-  id: string;
-  /** Node the edge leaves. */
-  source: string;
-  /** Output port it leaves from. */
-  source_port: string;
-  /** Node it arrives at. */
-  target: string;
-}
-
-/** One thing validation has to say about a graph. */
-export interface GraphFinding {
-  /** `error` or `warning`. */
-  severity: "error" | "warning";
-  /** Stable machine-readable code. */
-  code: string;
-  /** Human-readable explanation, naming the node. */
-  message: string;
-  /** The node the finding is about, when there is one. */
-  node_id: string | null;
-  /** The other end of a two-node finding. */
-  related_node_id: string | null;
-}
-
-/** What a validation answers. */
-export interface GraphValidation {
-  /** `true` when nothing is an error. */
-  valid: boolean;
-  /** Every finding. */
-  findings: GraphFinding[];
-  /** How many are errors. */
-  error_count: number;
-  /** How many are warnings. */
-  warning_count: number;
-}
-
-/** A definition as the builder reads it. */
-export interface WorkflowGraph {
-  /** The rule's id. */
-  id: string;
-  /** The nodes and the connections between them. */
-  graph: { nodes: GraphNode[]; edges: GraphEdge[] };
-  /** Positions, viewport and collapsed groups. */
-  ui_state: Record<string, unknown>;
-  /** The version a save must quote. */
-  graph_version: number;
-  /** When the definition was last validated. */
-  validated_at: string | null;
-  /** The first validation error, when there was one. */
-  validation_error: string | null;
-  /** The step list the projection derived. */
-  steps: unknown[];
-  /** How many nodes the canvas draws. */
-  node_count: number;
-  /** How many connections the canvas draws. */
-  edge_count: number;
-  /** What the author would see if they pressed Run now. */
-  projection: { valid: boolean; step_count: number; reason: string | null };
-  /**
-   * Every finding, so the problems panel lists all of them. A save of a graph that is still
-   * being wired succeeds and reports them here — a rule is built by being incomplete, and a
-   * save that refused the work would refuse the first card the author adds.
-   */
-  findings?: GraphFinding[];
-  /** How many of `findings` are errors. */
-  error_count?: number;
-}
-
-/** The node-type registry the palette draws. */
-export function fetchGraphNodeTypes(): Promise<GraphNodeTypes> {
-  return request<GraphNodeTypes>("/api/v1/workflows/node-types");
-}
-
-/** One rule's graph, layout, version and projection. */
-export function fetchWorkflowGraph(workflowId: string): Promise<WorkflowGraph> {
-  return request<WorkflowGraph>(`/api/v1/workflows/${workflowId}/graph`);
-}
-
-/**
- * Replace a rule's graph.
- *
- * `graphVersion` is the version the editor loaded. A mismatch is a `409`, and the caller
- * keeps its local copy on screen rather than reloading over the author's work.
- */
-export function saveWorkflowGraph(
-  workflowId: string,
-  input: {
-    graph: WorkflowGraph["graph"];
-    ui_state?: Record<string, unknown> | null;
-    graph_version: number;
-  },
-): Promise<WorkflowGraph> {
-  return request<WorkflowGraph>(`/api/v1/workflows/${workflowId}/graph`, {
-    method: "PUT",
-    body: JSON.stringify(input),
-  });
-}
-
-/**
- * Save only the layout.
- *
- * Positions are not semantics: this bumps neither the version nor the step list, so panning
- * the canvas all afternoon never invalidates a colleague's edit.
- */
-export function saveWorkflowUiState(
-  workflowId: string,
-  uiState: Record<string, unknown>,
-): Promise<null> {
-  return request<null>(`/api/v1/workflows/${workflowId}/graph/ui-state`, {
-    method: "PUT",
-    body: JSON.stringify({ ui_state: uiState }),
-  });
-}
-
-/**
- * Validate a graph, stored or not.
- *
- * A body validates what the editor is holding without storing it; no body validates the
- * stored graph, which is what the toolbar's Validate button sends.
- */
-export function validateWorkflowGraph(
-  workflowId: string,
-  graph?: WorkflowGraph["graph"],
-): Promise<GraphValidation> {
-  return request<GraphValidation>(`/api/v1/workflows/${workflowId}/validate`, {
-    method: "POST",
-    body: JSON.stringify(graph ? { graph, graph_version: 0 } : {}),
-  });
-}
 
 // ---------------------------------------------------------------------------------------------
 // Notifications (docs/requests/REQ-021, slice 1)
@@ -5678,6 +4850,345 @@ export function runNotificationRoute(input: {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Forms and the submission inbox (REQ-064, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/** The forms of one site. */
+export function fetchForms(siteId: string): Promise<Form[]> {
+  return request<Form[]>(`/api/v1/forms?site_id=${encodeURIComponent(siteId)}`);
+}
+
+/**
+ * One form with its fields and the vocabulary the builder draws from.
+ *
+ * The vocabulary travels with the document rather than being hard-coded in the panel, for the
+ * same reason the menu's does: a palette that offers a field type the server then refuses is a
+ * palette whose rejection arrives as an unexplained 400.
+ */
+export function fetchForm(formId: string): Promise<FormDetail> {
+  return request<FormDetail>(`/api/v1/forms/${encodeURIComponent(formId)}`);
+}
+
+/** A field as the builder submits it. */
+export type FormFieldInput = {
+  key: string;
+  label: string;
+  field_type: string;
+  required: boolean;
+  placeholder?: string | null;
+  help_text?: string | null;
+  width: string;
+  rules: Record<string, unknown>;
+  options: unknown;
+};
+
+export function createForm(input: {
+  site_id: string;
+  key: string;
+  name: string;
+  fields: FormFieldInput[];
+}): Promise<FormDetail> {
+  return request<FormDetail>("/api/v1/forms", { method: "POST", body: JSON.stringify(input) });
+}
+
+/**
+ * Save a form's settings.
+ *
+ * The server validates the *pair*: a message action with no message and a redirect action with no
+ * URL are both refused. So the panel sends both fields on every save rather than pretending the
+ * two are independent, and the store decides which one the form actually uses.
+ */
+export function updateForm(
+  formId: string,
+  input: {
+    name?: string;
+    key?: string;
+    submit_action?: string;
+    submit_message?: string | null;
+    redirect_url?: string | null;
+    notify_emails?: string[];
+    notify_subject?: string | null;
+    honeypot?: boolean;
+    min_fill_seconds?: number;
+    rate_limit_per_hour?: number;
+    retention_days?: number;
+  },
+): Promise<FormDetail> {
+  return request<FormDetail>(`/api/v1/forms/${encodeURIComponent(formId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Replace a form's whole canvas — the builder's Save. */
+export function saveFormFields(formId: string, fields: FormFieldInput[]): Promise<FormDetail> {
+  return request<FormDetail>(`/api/v1/forms/${encodeURIComponent(formId)}/fields`, {
+    method: "PUT",
+    body: JSON.stringify({ fields }),
+  });
+}
+
+/** Publish or unpublish a form. */
+export function setFormStatus(formId: string, status: string): Promise<FormDetail> {
+  return request<FormDetail>(`/api/v1/forms/${encodeURIComponent(formId)}/publish`, {
+    method: "POST",
+    body: JSON.stringify({ status }),
+  });
+}
+
+export function deleteForm(formId: string): Promise<void> {
+  return request<void>(`/api/v1/forms/${encodeURIComponent(formId)}`, { method: "DELETE" });
+}
+
+/** The inbox filters, as the screen and the export both send them. */
+export type SubmissionFilters = {
+  status?: string;
+  search?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+  offset?: number;
+};
+
+/** The query string of a filter set, shared by the list and the export. */
+function submissionQuery(filters: SubmissionFilters): string {
+  const parts = Object.entries(filters)
+    .filter(([, value]) => value !== undefined && value !== "" && value !== null)
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+  return parts.length === 0 ? "" : `?${parts.join("&")}`;
+}
+
+/** The inbox, under exactly the filters the screen shows. */
+export function fetchSubmissions(formId: string, filters: SubmissionFilters = {}): Promise<Inbox> {
+  return request<Inbox>(
+    `/api/v1/forms/${encodeURIComponent(formId)}/submissions${submissionQuery(filters)}`,
+  );
+}
+
+/** Change one submission's inbox state. */
+export function setSubmissionStatus(
+  formId: string,
+  submissionId: string,
+  status: string,
+): Promise<Submission> {
+  return request<Submission>(
+    `/api/v1/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(submissionId)}`,
+    { method: "PATCH", body: JSON.stringify({ status }) },
+  );
+}
+
+/** Move several submissions at once — the inbox's bulk bar. */
+export function bulkSubmissionStatus(
+  formId: string,
+  ids: string[],
+  status: string,
+): Promise<Inbox> {
+  return request<Inbox>(`/api/v1/forms/${encodeURIComponent(formId)}/submissions`, {
+    method: "PATCH",
+    body: JSON.stringify({ ids, status }),
+  });
+}
+
+export function deleteSubmission(formId: string, submissionId: string): Promise<void> {
+  return request<void>(
+    `/api/v1/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(submissionId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/**
+ * Download the filtered inbox as CSV.
+ *
+ * A plain fetch and a blob, not the JSON client: the endpoint answers `text/csv`, and routing it
+ * through `request` would hand the owner a JSON parse error instead of a file. The filters are
+ * the ones the list sends, and that is the whole contract of the button — a download that ignored
+ * them would be a way to export the unfiltered inbox from a screen that says "Export 12".
+ */
+export async function exportSubmissionsCsv(
+  formId: string,
+  filters: SubmissionFilters = {},
+): Promise<void> {
+  const response = await fetch(
+    `/api/v1/forms/${encodeURIComponent(formId)}/submissions/export${submissionQuery(filters)}`,
+    { credentials: "include" },
+  );
+  if (!response.ok) {
+    // The CSV route answers the platform's own error envelope, so the message is read out of it
+    // rather than dumping raw HTML into an error strip: a filter the server refused has a code
+    // and a sentence, and printing the body would show the visitor markup.
+    const text = await response.text();
+    let code = "export_failed";
+    let message = "the export failed";
+    try {
+      const body = JSON.parse(text) as { code?: string; message?: string };
+      if (body?.code) code = body.code;
+      if (body?.message) message = body.message;
+    } catch {
+      // Not JSON: keep the defaults rather than showing markup.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "submissions.csv";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+// ---------------------------------------------------------------------------------------------
+// Menus and the scheduled publishing queue (REQ-064, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** The menus of one site. */
+export function fetchMenus(siteId: string): Promise<Menu[]> {
+  return request<Menu[]>(`/api/v1/menus?site_id=${encodeURIComponent(siteId)}`);
+}
+
+/**
+ * One menu with its items and the vocabulary the editor draws from.
+ *
+ * The vocabulary travels with the document rather than being hard-coded in the panel: a list the
+ * server would then refuse is a picker that offers an option the save rejects, and the rejection
+ * is a 400 the editor sees as an unexplained failure.
+ */
+export function fetchMenu(menuId: string): Promise<MenuDetail> {
+  return request<MenuDetail>(`/api/v1/menus/${encodeURIComponent(menuId)}`);
+}
+
+export function createMenu(input: {
+  site_id: string;
+  key: string;
+  name: string;
+}): Promise<Menu> {
+  return request<Menu>("/api/v1/menus", { method: "POST", body: JSON.stringify(input) });
+}
+
+export function updateMenu(
+  menuId: string,
+  input: { name?: string; key?: string; locations?: string[] },
+): Promise<Menu> {
+  return request<Menu>(`/api/v1/menus/${encodeURIComponent(menuId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteMenu(menuId: string): Promise<void> {
+  return request<void>(`/api/v1/menus/${encodeURIComponent(menuId)}`, { method: "DELETE" });
+}
+
+/**
+ * Save the whole item tree and the claimed locations in one write.
+ *
+ * One request rather than one per row: a reorder of six items is one transaction that either
+ * lands whole or not at all, and six partial updates that can half-apply are how a site's header
+ * ends up with a duplicate and a hole.
+ */
+export function saveMenuDocument(
+  menuId: string,
+  input: { items: MenuItemInput[]; locations: string[] },
+): Promise<MenuDetail> {
+  return request<MenuDetail>(`/api/v1/menus/${encodeURIComponent(menuId)}/items`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/** `Add pages…` — only published pages of this site are inserted, labels come from their titles. */
+export function addPagesToMenu(
+  menuId: string,
+  input: { page_ids: string[]; parent_id?: string | null; position?: number | null },
+): Promise<MenuDetail> {
+  return request<MenuDetail>(`/api/v1/menus/${encodeURIComponent(menuId)}/items/from-pages`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * What the theme renders for a location, filtered for an audience.
+ *
+ * The editor's preview calls the *public* endpoint rather than re-implementing the filter, so a
+ * preview and the live site cannot disagree about who sees a members-only link.
+ *
+ * `site` is a site's **global key or a host**, never a uuid. The public addressing rule
+ * (`routes::public::classify_hint`) reads a dot as "this is a host" and anything else as a key, so
+ * a uuid is looked up as a key, matches nothing and answers 404 — while the authenticated half of
+ * the same screen works, because `/menus` takes `site_id`. Two endpoints naming "the site"
+ * differently is the defect; this comment is what stops it coming back.
+ */
+export function fetchRenderedMenu(
+  location: string,
+  audience: "visitor" | "member",
+  site?: string,
+): Promise<RenderedMenu | null> {
+  const query = new URLSearchParams({ audience });
+  if (site) query.set("site", site);
+  return request<RenderedMenu | null>(
+    `/api/v1/public/menus/${encodeURIComponent(location)}?${query.toString()}`,
+  );
+}
+
+/** The queue. Filters are the server's, so the count on screen is the count in the database. */
+export function fetchPublishingQueue(filters: {
+  status?: string;
+  page_type?: string;
+  limit?: number;
+  /**
+   * The site the panel is showing. Required in practice: the queue is scoped to a site like every
+   * other content screen, and the server reads the organization from this site — which is also
+   * what lets the platform owner (an account with no primary organization) read the queue at all.
+   */
+  site_id?: string;
+} = {}): Promise<PublishingEntry[]> {
+  const query = new URLSearchParams();
+  if (filters.site_id) query.set("site_id", filters.site_id);
+  if (filters.status) query.set("status", filters.status);
+  if (filters.page_type) query.set("page_type", filters.page_type);
+  if (filters.limit) query.set("limit", String(filters.limit));
+  const suffix = query.toString();
+  return request<PublishingEntry[]>(`/api/v1/publishing/queue${suffix ? `?${suffix}` : ""}`);
+}
+
+export function rescheduleEntry(entryId: string, scheduledAt: string): Promise<PublishingEntry> {
+  return request<PublishingEntry>(`/api/v1/publishing/queue/${encodeURIComponent(entryId)}`, {
+    method: "PUT",
+    body: JSON.stringify({ scheduled_at: scheduledAt }),
+  });
+}
+
+export function cancelEntry(entryId: string): Promise<PublishingEntry> {
+  return request<PublishingEntry>(
+    `/api/v1/publishing/queue/${encodeURIComponent(entryId)}/cancel`,
+    { method: "POST" },
+  );
+}
+
+/**
+ * Make the entry due and let the runner do the work.
+ *
+ * Deliberately not a second publish path: a button with its own lighter publish would leave two
+ * definitions of "published" in one platform, and they would disagree within a week.
+ */
+export function publishEntryNow(entryId: string): Promise<PublishingEntry> {
+  return request<PublishingEntry>(
+    `/api/v1/publishing/queue/${encodeURIComponent(entryId)}/publish-now`,
+    { method: "POST" },
+  );
+}
+
+export function retryEntry(entryId: string): Promise<PublishingEntry> {
+  return request<PublishingEntry>(
+    `/api/v1/publishing/queue/${encodeURIComponent(entryId)}/retry`,
+    { method: "POST" },
+  );
+}
+
+/** One item as the editor submits it — the same shape the stored item has. */
+export type MenuItemInput = MenuItem;
 // The event feed and the catalogue (REQ-016, slice 1)
 // ---------------------------------------------------------------------------------------------
 
@@ -6013,6 +5524,705 @@ export function importSecurityReport(
     method: "POST",
     body: JSON.stringify({ report, source }),
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// SEO toolkit (REQ-064, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The whole SEO screen in one read.
+ *
+ * One endpoint rather than six: the screen is a set of panels over ONE site, and a panel that
+ * fetches its own slice is a screen with five loading states and five ways to show a number
+ * from a different moment than its neighbour.
+ */
+export function fetchSeoOverview(siteId: string): Promise<SeoOverview> {
+  return request<SeoOverview>(`/api/v1/seo/settings?site_id=${encodeURIComponent(siteId)}`);
+}
+
+/** A page's SEO fields and the tags they produce. */
+export function fetchPageSeo(pageId: string): Promise<PageSeoBody> {
+  return request<PageSeoBody>(`/api/v1/pages/${encodeURIComponent(pageId)}/seo`);
+}
+
+/**
+ * Save a page's SEO fields and get the tags back from the same call.
+ *
+ * The response carries the generated tag set so the SERP preview and the JSON-LD view update
+ * from the call that saved them. A panel that re-derives the preview itself has two
+ * implementations of "what a crawler sees", and they drift on the first edge case.
+ */
+export function savePageSeo(pageId: string, seo: PageSeo): Promise<PageSeoBody> {
+  return request<PageSeoBody>(`/api/v1/pages/${encodeURIComponent(pageId)}/seo`, {
+    method: "PUT",
+    body: JSON.stringify(seo),
+  });
+}
+
+export function createSeoRedirect(input: {
+  site_id: string;
+  from_path: string;
+  to_path: string;
+  status_code?: number;
+  pattern?: string;
+  enabled?: boolean;
+}): Promise<SeoRedirect> {
+  return request<SeoRedirect>("/api/v1/seo/redirects", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateSeoRedirect(
+  ruleId: string,
+  input: {
+    from_path: string;
+    to_path: string;
+    status_code?: number;
+    pattern?: string;
+    enabled?: boolean;
+  },
+): Promise<SeoRedirect> {
+  return request<SeoRedirect>(`/api/v1/seo/redirects/${encodeURIComponent(ruleId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteSeoRedirect(ruleId: string): Promise<void> {
+  return request<void>(`/api/v1/seo/redirects/${encodeURIComponent(ruleId)}`, {
+    method: "DELETE",
+  });
+}
+
+/**
+ * Ask what would answer a path — and what else would.
+ *
+ * This does not count a hit, which is the whole reason it is a separate entry point from the
+ * public resolver: an owner trying three candidate rules must not leave three hits in the column
+ * they are reading to decide whether any of the rules is needed.
+ */
+export function testSeoRedirect(ruleId: string, path: string): Promise<SeoRedirectTest> {
+  return request<SeoRedirectTest>(
+    `/api/v1/seo/redirects/${encodeURIComponent(ruleId)}/test`,
+    { method: "POST", body: JSON.stringify({ path }) },
+  );
+}
+
+/**
+ * Read a CSV of redirect rules — and write nothing, unless `dryRun` is false.
+ *
+ * The default is deliberately the read: a 400-row file is something an owner wants to see
+ * before they commit it, and the report is exactly what the parse already produced. The write is
+ * a second, explicit press, and a file with anything refused writes **nothing** — the endpoint
+ * answers 422 with the lines that stopped it, which is why this is not a `request` that throws.
+ */
+export async function importSeoRedirects(input: {
+  site_id: string;
+  csv: string;
+  dry_run: boolean;
+}): Promise<SeoRedirectImport> {
+  const response = await fetch("/api/v1/seo/redirects/import", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(input),
+    credentials: "same-origin",
+  });
+  const body = (await response.json().catch(() => ({}))) as Partial<SeoRedirectImport>;
+  if (!response.ok && response.status !== 422) {
+    // 422 carries the report, so it is a result rather than a failure. Anything else is a real
+    // refusal (a 403, a 404) and gets the same treatment as every other call on this surface.
+    throw new ApiError(response.status, "redirect_import_failed", body?.summary ?? "the import could not be read");
+  }
+  return {
+    clean: body?.clean === true,
+    imported: body?.imported ?? 0,
+    accepted: body?.accepted ?? 0,
+    summary: body?.summary ?? "",
+    rejected: body?.rejected ?? [],
+  };
+}
+
+/**
+ * Download a site's rules as CSV.
+ *
+ * A `<a download>` cannot carry a panel session's headers, so this fetches the file and hands the
+ * browser an object URL — which is also why the `Content-Disposition` header is asserted on the
+ * server side rather than assumed here: this is the code that has to honour it.
+ */
+export async function downloadSeoRedirectCsv(siteId: string): Promise<void> {
+  const response = await fetch(
+    `/api/v1/seo/redirects/export?site_id=${encodeURIComponent(siteId)}`,
+    { credentials: "same-origin" },
+  );
+  if (!response.ok) {
+    throw new ApiError(response.status, "redirect_export_failed", "the export could not be read");
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "redirects.csv";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  // Revoking immediately can cancel the download in some browsers; a tick is enough for the click
+  // to have been consumed, and an orphaned object URL is a leak that lasts as long as the panel.
+  setTimeout(() => URL.revokeObjectURL(url), 1_000);
+}
+
+/** Save a site's sitemap settings and robots.txt. */
+export function saveSeoSettings(
+  siteId: string,
+  input: {
+    sitemap_types: string[];
+    default_priority: number;
+    default_change_frequency: string;
+    robots_txt: string;
+  },
+): Promise<SeoSettings> {
+  return request<SeoSettings>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/seo/settings`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+/** Rebuild the sitemap and store it. */
+export function regenerateSitemap(siteId: string): Promise<SeoSettings> {
+  return request<SeoSettings>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/seo/sitemap/regenerate`,
+    { method: "POST" },
+  );
+}
+
+/** Run the internal-link crawl now. */
+export function scanBrokenLinks(siteId: string): Promise<SeoBrokenLink[]> {
+  return request<SeoBrokenLink[]>("/api/v1/seo/broken-links", {
+    method: "POST",
+    body: JSON.stringify({ site_id: siteId }),
+  });
+}
+
+/** Dismiss a broken link, or bring a dismissed one back. */
+export function setBrokenLinkIgnored(linkId: string, ignored: boolean): Promise<void> {
+  return request<void>(`/api/v1/seo/broken-links/${encodeURIComponent(linkId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ ignored }),
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Page comments (REQ-064, slice 4a)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The moderation inbox: one tab, plus the counts for all four.
+ *
+ * One endpoint rather than a list and a separate counts call, because the tab bar and the table
+ * are one screen and two reads can show two moments — a count that says 4 over a table that
+ * shows 3 is a moderator wondering whether they lost one.
+ */
+export function fetchCommentInbox(filters: {
+  site_id: string;
+  status?: string;
+  search?: string;
+  page_id?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<CommentInbox> {
+  const query = new URLSearchParams({ site_id: filters.site_id });
+  for (const key of ["status", "search", "page_id", "limit", "offset"] as const) {
+    const value = filters[key];
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  return request<CommentInbox>(`/api/v1/comments?${query.toString()}`);
+}
+
+/** One comment, with the page it was left on. */
+export function fetchComment(id: string, siteId: string): Promise<CommentInboxRow> {
+  return request<CommentInboxRow>(
+    `/api/v1/comments/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Move a comment to a state.
+ *
+ * `reason` is only meaningful for `spam` and `trash`, and the panel sends it when the moderator
+ * typed one: a spam row with no reason is a row a moderator has to investigate to learn what the
+ * platform already knew.
+ */
+export function moderateComment(
+  id: string,
+  siteId: string,
+  status: string,
+  reason?: string,
+): Promise<CommentInboxRow> {
+  return request<CommentInboxRow>(
+    `/api/v1/comments/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ status, reason: reason || undefined }),
+    },
+  );
+}
+
+/**
+ * Moderate a selection.
+ *
+ * The answer reports per-comment outcomes rather than a bare count, and the panel shows the
+ * partial case: a bulk action that moved 8 of 10 and reports "10 moderated" is worse than no
+ * bulk action, because the two it did not touch are invisible.
+ */
+export function bulkModerateComments(
+  siteId: string,
+  commentIds: string[],
+  status: string,
+): Promise<CommentBulkResult> {
+  return request<CommentBulkResult>(
+    `/api/v1/comments/bulk?site_id=${encodeURIComponent(siteId)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ status, comment_ids: commentIds }),
+    },
+  );
+}
+
+/** Answer a comment as the site. Published immediately. */
+export function replyToComment(
+  id: string,
+  reply: NewCommentReply,
+): Promise<CommentInboxRow> {
+  return request<CommentInboxRow>(`/api/v1/comments/${encodeURIComponent(id)}/reply`, {
+    method: "POST",
+    body: JSON.stringify(reply),
+  });
+}
+
+/** Remove a comment for good. The Trash tab only. */
+export function deleteComment(id: string, siteId: string): Promise<void> {
+  return request<void>(
+    `/api/v1/comments/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** The moderation policy and the bans, in one read. */
+export function fetchCommentSettings(siteId: string): Promise<CommentSettingsDocument> {
+  return request<CommentSettingsDocument>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/comment-settings`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Save the moderation policy.
+ *
+ * The panel sends the whole policy rather than a diff, and the server applies each field it was
+ * given over the stored row — so a panel that grows a new toggle next year cannot reset the
+ * settings this year's panel knew nothing about.
+ */
+export function saveCommentSettings(
+  siteId: string,
+  settings: Partial<CommentSettingsDocument["settings"]> & { comments_enabled: boolean },
+): Promise<CommentSettingsDocument> {
+  return request<CommentSettingsDocument>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/comment-settings`,
+    { method: "PUT", body: JSON.stringify(settings) },
+  );
+}
+
+/** Place a ban. An `ip` value is fingerprinted by the server, never stored raw. */
+export function addCommentBan(
+  siteId: string,
+  input: { kind: "email" | "ip"; value: string; reason?: string; expires_at?: string | null },
+): Promise<CommentBan> {
+  return request<CommentBan>(`/api/v1/sites/${encodeURIComponent(siteId)}/comment-bans`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Lift a ban. */
+export function removeCommentBan(siteId: string, banId: string): Promise<void> {
+  return request<void>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/comment-bans/${encodeURIComponent(banId)}`,
+    { method: "DELETE" },
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Members (REQ-064, slice 4c)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The members table and its three state counts.
+ *
+ * One endpoint rather than a list plus a separate counts call: the chips and the table are one
+ * screen, and two reads can show two moments — a chip that says 4 over three rows leaves an
+ * operator wondering whether they lost a member.
+ */
+export function fetchMemberList(filters: {
+  site_id: string;
+  status?: string;
+  search?: string;
+  role?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<MemberList> {
+  const query = new URLSearchParams({ site_id: filters.site_id });
+  for (const key of ["status", "search", "role", "limit", "offset"] as const) {
+    const value = filters[key];
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  return request<MemberList>(`/api/v1/members?${query.toString()}`);
+}
+
+/** One member, with the last ten sign-ins. */
+export function fetchMember(id: string, siteId: string): Promise<MemberDetail> {
+  return request<MemberDetail>(
+    `/api/v1/members/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * The operator creates an account, with or without a password.
+ *
+ * `password` is optional on purpose: creating a row WITH a password makes a usable account the
+ * operator chose the address for, and omitting it makes an invitation the member must claim. The
+ * panel asks which, because the difference is whether the first sign-in needs a link.
+ */
+export function createMember(input: {
+  site_id: string;
+  email: string;
+  name?: string;
+  password?: string;
+  roles?: string[];
+}): Promise<Member> {
+  return request<Member>("/api/v1/members", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Edit a member.
+ *
+ * `roles` REPLACES the whole list rather than appending, and that is why the panel always sends
+ * it: a member editor that only ever adds a role cannot take one away, and a visitor who must
+ * keep a role they were granted by mistake holds it for as long as the site exists.
+ */
+export function patchMember(
+  id: string,
+  siteId: string,
+  changes: {
+    name?: string | null;
+    status?: string;
+    roles?: string[];
+    signin_note?: string | null;
+  },
+): Promise<Member> {
+  return request<Member>(
+    `/api/v1/members/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "PATCH", body: JSON.stringify(changes) },
+  );
+}
+
+/**
+ * Block a member, naming the reason.
+ *
+ * A separate route rather than `patchMember({status:"blocked"})` because it is the one
+ * destructive button in the table and it carries the reason — a block with no stated reason is a
+ * decision an operator has to reverse twice.
+ */
+export function blockMember(id: string, siteId: string, reason?: string): Promise<Member> {
+  return request<Member>(
+    `/api/v1/members/${encodeURIComponent(id)}/block?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST", body: JSON.stringify({ reason: reason || undefined }) },
+  );
+}
+
+/** The operator vouches for an address they know. */
+export function verifyMember(id: string, siteId: string): Promise<Member> {
+  return request<Member>(
+    `/api/v1/members/${encodeURIComponent(id)}/verify?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST" },
+  );
+}
+
+/**
+ * Mint a fresh verification link.
+ *
+ * The answer says whether mail went out, so the panel can tell an operator that nothing was sent
+ * rather than leaving them to find out from a member who never received anything.
+ */
+export function sendMemberVerification(id: string, siteId: string): Promise<MemberDelivery> {
+  return request<MemberDelivery>(
+    `/api/v1/members/${encodeURIComponent(id)}/send-verification?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST" },
+  );
+}
+
+/** Mint a password reset link. */
+export function sendMemberReset(id: string, siteId: string): Promise<MemberDelivery> {
+  return request<MemberDelivery>(
+    `/api/v1/members/${encodeURIComponent(id)}/send-reset?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST" },
+  );
+}
+
+/** Kill every live member session. A blocked member's cookie stops on the next request. */
+export function signOutMemberEverywhere(
+  id: string,
+  siteId: string,
+): Promise<{ member_id: string; sessions_removed: number }> {
+  return request<{ member_id: string; sessions_removed: number }>(
+    `/api/v1/members/${encodeURIComponent(id)}/sign-out-everywhere?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST" },
+  );
+}
+
+/**
+ * Delete a visitor account and everything it owns.
+ *
+ * The only irreversible action on the screen, and the only one the panel puts behind a
+ * confirmation that names the address it is about to erase.
+ */
+export function deleteMember(id: string, siteId: string): Promise<void> {
+  return request<void>(
+    `/api/v1/members/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** The site's membership policy. */
+export function fetchMemberSettings(siteId: string): Promise<MemberSettingsDocument> {
+  return request<MemberSettingsDocument>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/members/settings`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Save the policy.
+ *
+ * The panel sends the whole document and the server applies each field it was given over the
+ * stored row — a panel that grows a field next year cannot reset the ones this year's panel knew
+ * nothing about.
+ */
+export function saveMemberSettings(
+  siteId: string,
+  settings: Partial<MemberSettingsDocument["settings"]>,
+): Promise<MemberSettingsDocument> {
+  return request<MemberSettingsDocument>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/members/settings`,
+    { method: "PUT", body: JSON.stringify(settings) },
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Newsletter (REQ-064, slice 4b)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Every list of a site, each carrying its four counts.
+ *
+ * One endpoint rather than a list plus a counts call per row, because the counts are printed
+ * beside the list they belong to: a "3" over a table that now shows 4 is an owner wondering
+ * whether they lost a subscriber.
+ */
+export function fetchNewsletterLists(siteId: string): Promise<NewsletterList[]> {
+  return request<NewsletterList[]>(
+    `/api/v1/newsletter/lists?site_id=${encodeURIComponent(siteId)}`,
+    { cache: "no-store" },
+  );
+}
+
+/** One list. */
+export function fetchNewsletterList(id: string, siteId: string): Promise<NewsletterList> {
+  return request<NewsletterList>(
+    `/api/v1/newsletter/lists/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Create a list.
+ *
+ * `key` is deliberately optional: the server derives one from the name and resolves a
+ * collision to `weekly-news-2` rather than refusing. A panel that demanded a unique key would
+ * make the owner invent a slug to get past a form that should just work.
+ */
+export function createNewsletterList(body: NewNewsletterList): Promise<NewsletterList> {
+  return request<NewsletterList>("/api/v1/newsletter/lists", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * Change a list.
+ *
+ * The client sends only the fields the form owns, so a `double_opt_in` an owner never looked at
+ * is not silently reset by saving a name.
+ */
+export function patchNewsletterList(
+  id: string,
+  siteId: string,
+  patch: { name?: string; description?: string; double_opt_in?: boolean },
+): Promise<NewsletterList> {
+  return request<NewsletterList>(
+    `/api/v1/newsletter/lists/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "PUT", body: JSON.stringify(patch) },
+  );
+}
+
+/**
+ * Delete a list.
+ *
+ * The list's subscribers go with it (`on delete cascade`): the screen's confirmation names the
+ * count, because "delete this list" and "delete these 412 addresses" are different decisions
+ * and the second one is irreversible.
+ */
+export function deleteNewsletterList(id: string, siteId: string): Promise<void> {
+  return request<void>(
+    `/api/v1/newsletter/lists/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** One filtered page of subscribers. */
+export function fetchSubscribers(filters: {
+  site_id: string;
+  list_id?: string;
+  status?: string;
+  search?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<SubscriberPage> {
+  const query = new URLSearchParams({ site_id: filters.site_id });
+  for (const key of ["list_id", "status", "search", "limit", "offset"] as const) {
+    const value = filters[key];
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  return request<SubscriberPage>(`/api/v1/newsletter/subscribers?${query.toString()}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * Add one address by hand.
+ *
+ * The response is a 202-shaped `pending` row on a double-opt-in list: the panel says "a
+ * confirmation link is on its way" rather than "added", because the address cannot receive an
+ * issue until somebody clicks it, and a table that claimed otherwise would be lying.
+ */
+export function addSubscriber(
+  listId: string,
+  siteId: string,
+  body: { email: string; name?: string; source?: string },
+): Promise<NewsletterSubscriber> {
+  return request<NewsletterSubscriber>(
+    `/api/v1/newsletter/lists/${encodeURIComponent(listId)}/subscribers?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+/** Move a subscriber to a state. `reason` is stored and shown on the row. */
+export function setSubscriberStatus(
+  id: string,
+  siteId: string,
+  status: string,
+  reason?: string,
+): Promise<NewsletterSubscriber> {
+  return request<NewsletterSubscriber>(
+    `/api/v1/newsletter/subscribers/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "PATCH", body: JSON.stringify({ status, reason: reason || undefined }) },
+  );
+}
+
+/** Remove a subscriber row for good — the panel's own action, not the unsubscribe link. */
+export function deleteSubscriber(id: string, siteId: string): Promise<void> {
+  return request<void>(
+    `/api/v1/newsletter/subscribers/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/**
+ * Import addresses from CSV text.
+ *
+ * The report is returned rather than summarised to a count: an import that says "18 added" over
+ * a file with 40 rows has lost 22 addresses somewhere, and those 22 are named in `skipped`.
+ */
+export function importSubscribers(
+  listId: string,
+  siteId: string,
+  csv: string,
+  source?: string,
+): Promise<ImportReport> {
+  return request<ImportReport>(
+    `/api/v1/newsletter/lists/${encodeURIComponent(listId)}/import?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST", body: JSON.stringify({ csv, source: source || undefined }) },
+  );
+}
+
+/**
+ * Export the filtered rows as CSV text.
+ *
+ * The server answers `{ csv: "..." }` rather than a `text/csv` response, because a
+ * `Content-Disposition` header is invisible to `fetch`: the file would arrive as a string the
+ * operator has to save by hand, which is not what "Export" means to them.
+ */
+export async function exportSubscribers(filters: {
+  site_id: string;
+  list_id?: string;
+  status?: string;
+  search?: string;
+}): Promise<string> {
+  const query = new URLSearchParams({ site_id: filters.site_id });
+  for (const key of ["list_id", "status", "search"] as const) {
+    const value = filters[key];
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  const body = await request<{ csv: string }>(
+    `/api/v1/newsletter/subscribers/export?${query.toString()}`,
+  );
+  return body.csv;
+}
+
+/** The sent-issue archive. */
+export function fetchNewsletterIssues(filters: {
+  site_id: string;
+  limit?: number;
+}): Promise<NewsletterIssue[]> {
+  const query = new URLSearchParams({ site_id: filters.site_id });
+  if (filters.limit) query.set("limit", String(filters.limit));
+  return request<NewsletterIssue[]>(`/api/v1/newsletter/issues?${query.toString()}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * Send an issue and archive it.
+ *
+ * `recipient_count` comes back from the send rather than being computed by the browser: the
+ * list changed after the send, so a count read now is a count about a different question.
+ */
+export function sendNewsletterIssue(body: {
+  site_id: string;
+  list_id: string;
+  subject: string;
+  body_html: string;
+  archive_slug?: string;
+}): Promise<{ id: string; recipient_count: number; archive_slug: string }> {
+  return request<{ id: string; recipient_count: number; archive_slug: string }>(
+    "/api/v1/newsletter/issues",
+    { method: "POST", body: JSON.stringify(body) },
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6521,376 +6731,634 @@ export function saveBackupSettings(input: {
   });
 }
 
-// ---------------------------------------------------------------------------------------------
-// AI workflow builder (docs/requests/REQ-046) — the draft console
-// ---------------------------------------------------------------------------------------------
-
-/** One draft as the console list renders it. */
-export type AiWorkflowDraft = {
-  id: string;
-  title: string;
-  status: string;
-  model_key: string | null;
-  created_by: string | null;
-  created_at: string;
-  updated_at: string;
-  workflow_id: string | null;
-  has_definition: boolean;
-  error: string | null;
-  tokens: number;
-};
-
-/** One step of a draft's definition, as the review screen draws it. */
-export type AiWorkflowStep = {
-  position: number;
+/**
+ * The theme gallery of one site (REQ-062 slice 1).
+ *
+ * The response is the whole screen's state, not a list: the active key, whether that key is
+ * one the gallery can show, and whether a rollback has something to restore. `rollbackTarget`
+ * is `null` for "nothing to go back to" AND for "going back would change nothing" — so the
+ * panel renders the button from the server's answer rather than computing it, which is the only
+ * way the button and the database can agree.
+ */
+export type ThemeCard = {
+  key: string;
   name: string;
-  kind: string;
-  action: string | null;
-  params: unknown;
+  version: string;
+  description: string;
+  author: string;
+  modes: string[];
+  slotCount: number;
+  tokenCount: number;
+  previewImage: string | null;
+  /**
+   * The URL the card should request, or `null` when this build serves no such file.
+   *
+   * Computed by the server with the same rule the asset route uses to decide what it will
+   * serve, so the two cannot disagree — a client that guessed the URL would request a file
+   * that 404s, and the card would show a broken-image glyph as though it were the theme.
+   */
+  previewUrl: string | null;
+  source: "bundled" | "uploaded";
+  canDelete: boolean;
 };
 
-/** One draft as the review screen renders it. */
-export type AiWorkflowDraftDetail = AiWorkflowDraft & {
-  organization_id: string;
-  site_id: string | null;
-  prompt: string;
-  rationale: string | null;
-  definition: unknown;
-  tokens_input: number;
-  tokens_output: number;
-  revision_note: string | null;
-  revision_count: number;
-  decided_by: string | null;
-  decision_reason: string | null;
-  steps: AiWorkflowStep[];
-  decided_at: string | null;
+export type GalleryEntry = { theme: ThemeCard; isActive: boolean };
+
+export type ThemeGallery = {
+  siteKey: string;
+  activeKey: string;
+  activeKnown: boolean;
+  rollbackTarget: string | null;
+  themes: GalleryEntry[];
 };
 
-/** One page of drafts, with the vocabulary the console renders itself from. */
-export type AiWorkflowDraftList = {
-  drafts: AiWorkflowDraft[];
-  total: number;
-  statuses: string[];
-  page_size: number;
+export type ActivationResult = {
+  gallery: ThemeGallery;
+  themeKey: string;
+  previousThemeKey: string | null;
+  restored: boolean;
 };
 
-/** One action of the engine's closed registry. */
-export type AiWorkflowAction = {
-  action: string;
-  summary: string;
-  host: boolean;
-};
-
-/** One worked example the empty state offers. */
-export type AiWorkflowExample = {
-  title: string;
-  prompt: string;
-  note: string;
-};
-
-/** The examples and the action vocabulary. */
-export type AiWorkflowVocabulary = {
-  examples: AiWorkflowExample[];
-  actions: AiWorkflowAction[];
-};
-
-/** The "created by" select's options. */
-export type AiWorkflowAuthor = { id: string; drafts: number };
-
-/** Every list filter is a query parameter, because the console keeps them in the URL. */
-export type AiWorkflowDraftQuery = {
-  status?: string[];
-  q?: string;
-  by?: string;
-  siteId?: string;
-  organizationId?: string;
-  offset?: number;
-  limit?: number;
-};
-
-/** The query string a filter set produces, with empty values omitted. */
-function draftQueryString(query: AiWorkflowDraftQuery): string {
-  const params = new URLSearchParams();
-  if (query.status && query.status.length > 0) {
-    params.set("status", query.status.join(","));
-  }
-  if (query.q && query.q.trim()) params.set("q", query.q.trim());
-  if (query.by) params.set("by", query.by);
-  if (query.siteId) params.set("site_id", query.siteId);
-  if (query.organizationId) params.set("organization_id", query.organizationId);
-  if (query.offset) params.set("offset", String(query.offset));
-  if (query.limit) params.set("limit", String(query.limit));
-  return params.toString();
+export async function fetchThemeGallery(siteId: string): Promise<ThemeGallery> {
+  const query = new URLSearchParams({ site: siteId });
+  return request<ThemeGallery>(`/api/v1/themes?${query.toString()}`);
 }
 
-/** One page of drafts. */
-export function fetchAiWorkflowDrafts(
-  query: AiWorkflowDraftQuery = {},
-): Promise<AiWorkflowDraftList> {
-  const search = draftQueryString(query);
-  return request<AiWorkflowDraftList>(
-    `/api/v1/ai/workflows/drafts${search ? `?${search}` : ""}`,
+export async function fetchTheme(key: string): Promise<ThemeCard> {
+  return request<ThemeCard>(`/api/v1/themes/${encodeURIComponent(key)}`);
+}
+
+export async function activateTheme(siteId: string, themeKey: string): Promise<ActivationResult> {
+  return request<ActivationResult>(`/api/v1/sites/${encodeURIComponent(siteId)}/theme`, {
+    method: "POST",
+    body: JSON.stringify({ theme_key: themeKey }),
+  });
+}
+
+export async function rollbackTheme(siteId: string): Promise<ActivationResult> {
+  return request<ActivationResult>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme/rollback`,
+    { method: "POST" },
   );
 }
 
-/** One draft, with its definition and its step list. */
-export function fetchAiWorkflowDraft(draftId: string): Promise<AiWorkflowDraftDetail> {
-  return request<AiWorkflowDraftDetail>(
-    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}`,
+/**
+ * Theme settings (REQ-062 slice 2) — the customize screen's client.
+ *
+ * Three types and not one, because the store returns three answers and collapsing them into a
+ * single "current settings" object is how a panel ends up showing a draft as if it were live:
+ * `draft` is what the editor holds, `published` is what a visitor gets, and a site that has
+ * never published has `published: null` — which is a different message ("nothing is published
+ * yet, the theme's own defaults are live") rather than an absent field.
+ */
+export type ThemeSettingsRevision = {
+  id: string;
+  siteId: string;
+  revisionNo: number;
+  themeKey: string;
+  tokens: Record<string, unknown>;
+  typography: Record<string, unknown>;
+  layout: Record<string, unknown>;
+  branding: Record<string, unknown>;
+  headerFooter: Record<string, unknown>;
+  defaultMode: string;
+  createdBy: string | null;
+  createdAt: string;
+  publishedAt: string | null;
+  restoredFromId: string | null;
+};
+
+export type ThemeRevisionSummary = {
+  id: string;
+  revisionNo: number;
+  themeKey: string;
+  createdAt: string;
+  createdBy: string | null;
+  createdByName: string | null;
+  isPublished: boolean;
+  isDraft: boolean;
+  restoredFromNo: number | null;
+};
+
+/** One contrast finding, measured by the server — never re-measured in the browser. */
+export type ThemeContrastFinding = {
+  foreground: string;
+  background: string;
+  mode: string;
+  ratio: number;
+  required: number;
+  message: string;
+};
+
+export type ThemeBrandingLimits = {
+  /** Largest accepted file, in bytes, after the theme manifest narrowed the platform default. */
+  maxBytes: number;
+  minPx: number;
+  maxPx: number;
+  contentTypes: string[];
+};
+
+export type ThemeSettingsView = {
+  siteId: string;
+  themeKey: string;
+  draft: ThemeSettingsRevision | null;
+  published: ThemeSettingsRevision | null;
+  revisions: ThemeRevisionSummary[];
+  contrast: ThemeContrastFinding[];
+  defaultTokens: Record<string, unknown>;
+  /** What the three branding keys are checked against on the next save (criterion 9). */
+  brandingLimits: ThemeBrandingLimits;
+};
+
+/** What `PUT` accepts. Every section defaults, so a partial edit is a legal save. */
+export type ThemeSettingsInput = {
+  themeKey: string;
+  tokens: Record<string, unknown>;
+  typography: Record<string, unknown>;
+  layout: Record<string, unknown>;
+  branding: Record<string, unknown>;
+  headerFooter: Record<string, unknown>;
+  defaultMode: string;
+};
+
+export type ThemeRevisionDetail = {
+  revision: ThemeSettingsRevision;
+  /** Per-field changes against the previous revision. Empty for revision 1. */
+  diff: { field: string; from: unknown; to: unknown }[];
+};
+
+export async function fetchThemeSettings(siteId: string): Promise<ThemeSettingsView> {
+  return request<ThemeSettingsView>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-settings`,
   );
 }
 
-/** The authors this organization's drafts carry. */
-export function fetchAiWorkflowAuthors(organizationId?: string): Promise<AiWorkflowAuthor[]> {
-  const search = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
-  return request<AiWorkflowAuthor[]>(`/api/v1/ai/workflows/drafts/authors${search}`);
+/** Save a draft. A save is never a publish — the site does not change. */
+export async function saveThemeSettings(
+  siteId: string,
+  input: ThemeSettingsInput,
+): Promise<ThemeSettingsView> {
+  return request<ThemeSettingsView>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-settings`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
 }
 
-/** The empty state's examples and the engine's closed action registry. */
-export function fetchAiWorkflowVocabulary(): Promise<AiWorkflowVocabulary> {
-  return request<AiWorkflowVocabulary>("/api/v1/ai/workflows/examples");
+/**
+ * Publish the draft.
+ *
+ * `acknowledgeContrast` is a real argument and not a convenience: the server refuses a publish
+ * whose tokens are below AA with a 422 unless the caller says it has seen the findings, and a
+ * client that always sent `true` would make the guard unsatisfiable in the same way a missing
+ * field makes it unsatisfiable. The panel sends it only after showing the badge.
+ */
+export async function publishThemeSettings(
+  siteId: string,
+  acknowledgeContrast: boolean,
+): Promise<ThemeSettingsView> {
+  return request<ThemeSettingsView>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-settings/publish`,
+    { method: "POST", body: JSON.stringify({ acknowledge_contrast: acknowledgeContrast }) },
+  );
 }
 
-/** Delete a draft. Never the workflow it produced. */
-export function removeAiWorkflowDraft(draftId: string): Promise<null> {
-  return request<null>(`/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}`, {
+/**
+ * The contrast findings for a palette that has NOT been saved — the measurement the customize
+ * screen shows while the operator is still editing.
+ *
+ * **This is a route because the panel was measuring the wrong palette.** The screen kept the
+ * draft it was editing beside the last server response and printed the *response's* findings,
+ * so an operator who dragged the accent into a failing pair was told every pair passed while
+ * the preview beside them showed otherwise — and the publish refusal, which instructs the
+ * operator to read that panel, pointed them at the all-clear.
+ *
+ * The measurement stays on the server for the reason it is everywhere else: a ratio computed in
+ * the browser disagrees with the 422 in colour-space rounding and in the large-text threshold,
+ * and a badge that disagrees with the guard is worse than no badge.
+ */
+export type ThemeContrastCheck = {
+  findings: ThemeContrastFinding[];
+  /** The theme the defaults were merged under, so the panel can name what it measured. */
+  themeKey: string;
+};
+
+export async function checkThemeSettingsContrast(
+  siteId: string,
+  themeKey: string,
+  tokens: Record<string, unknown>,
+): Promise<ThemeContrastCheck> {
+  return request<ThemeContrastCheck>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-settings/contrast-check`,
+    { method: "POST", body: JSON.stringify({ theme_key: themeKey, tokens }) },
+  );
+}
+
+export async function fetchThemeRevision(
+  siteId: string,
+  revisionNo: number,
+): Promise<ThemeRevisionDetail> {
+  return request<ThemeRevisionDetail>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-settings/revisions/${revisionNo}`,
+  );
+}
+
+/** Restore an earlier revision. The server writes a NEW revision; history is append-only. */
+export async function restoreThemeRevision(
+  siteId: string,
+  revisionNo: number,
+): Promise<ThemeSettingsView> {
+  return request<ThemeSettingsView>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-settings/revisions/${revisionNo}/restore`,
+    { method: "POST" },
+  );
+}
+
+// --- Theme layouts and packages (REQ-062, slice 3) --------------------------------------------
+
+/**
+ * One slot as the builder's picker renders it.
+ *
+ * `state` is a word and not a boolean because the badge has three of them: a slot the theme
+ * ships, a slot the site replaced, and a slot nobody has put anything in. A client that got
+ * `isDefault: false` for both a customised slot and an empty one would paint the same badge on
+ * two different facts.
+ */
+export type ThemeSlotEntry = {
+  slot: string;
+  state: "theme" | "custom" | "empty";
+  isDefault: boolean;
+  blockCount: number;
+  blocks: unknown[];
+};
+
+export type ThemeLayoutsView = {
+  siteId: string;
+  themeKey: string;
+  /** Always all eight slots the platform renders, in the picker's order. */
+  slots: ThemeSlotEntry[];
+  /** The registry's block types, so the package validator can be shown without a round trip. */
+  knownBlockTypes: string[];
+};
+
+export type ThemeSlot = {
+  siteId: string;
+  themeKey: string;
+  slot: string;
+  blocks: unknown[];
+  isDefault: boolean;
+  updatedAt?: string;
+};
+
+/**
+ * What a slot save answers.
+ *
+ * `issues` are the validator's own messages — warnings travel back with the save rather than
+ * being thrown away, because an empty column in a header is stored and rendered and the author
+ * is the only person who can decide that was deliberate.
+ */
+export type ThemeSlotSaveResult = {
+  layout: ThemeSlot;
+  issues: string[];
+};
+
+/** One thing wrong with an uploaded package, addressed by a path into the file. */
+export type ThemePackageFinding = {
+  path: string;
+  message: string;
+  severity: "error" | "warning";
+};
+
+export type ThemePackageReport = {
+  themeKey: string;
+  name: string;
+  version: string;
+  slots: unknown;
+  tokens: unknown;
+  findings: ThemePackageFinding[];
+  valid: boolean;
+  errorCount: number;
+};
+
+export type ThemePackageExport = ThemePackageReport;
+
+export type ThemeInstallResult = {
+  install: { themeKey: string; version: string; active: boolean };
+  report: ThemePackageReport;
+};
+
+/** The builder's whole payload: the slot picker and the first slot's canvas in one answer. */
+export async function fetchThemeLayouts(siteId: string): Promise<ThemeLayoutsView> {
+  return request<ThemeLayoutsView>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-layouts`,
+  );
+}
+
+export async function fetchThemeSlot(siteId: string, slot: string): Promise<ThemeSlot> {
+  return request<ThemeSlot>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-layouts/${encodeURIComponent(slot)}`,
+  );
+}
+
+/**
+ * Save a slot's blocks.
+ *
+ * The body is the block tree itself and not a `{ blocks }` wrapper, because the canvas already
+ * holds a tree and a wrapper is one more shape to keep in step with it.
+ */
+export async function saveThemeSlot(
+  siteId: string,
+  slot: string,
+  blocks: unknown[],
+): Promise<ThemeSlotSaveResult> {
+  return request<ThemeSlotSaveResult>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-layouts/${encodeURIComponent(slot)}`,
+    { method: "PUT", body: JSON.stringify(blocks) },
+  );
+}
+
+/**
+ * Put a slot back to what the theme ships.
+ *
+ * The server answers 409 when the theme shipped no default for that slot, and that is a real
+ * state rather than an error to swallow: there is nothing to restore to, and a client that
+ * emptied the slot instead would destroy work.
+ */
+export async function resetThemeSlot(siteId: string, slot: string): Promise<{ layout: ThemeSlot }> {
+  return request<{ layout: ThemeSlot }>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-layouts/${encodeURIComponent(slot)}/reset`,
+    { method: "POST" },
+  );
+}
+
+/** The site's look as a package: its active theme, its published tokens, its slot trees. */
+export async function exportThemePackage(siteId: string): Promise<ThemePackageExport> {
+  return request<ThemePackageExport>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-package/export`,
+  );
+}
+
+/** A dry run. Writes nothing, and answers with every problem rather than the first one. */
+export async function validateThemePackage(
+  pkg: unknown,
+): Promise<ThemePackageReport> {
+  return request<ThemePackageReport>("/api/v1/themes/validate", {
+    method: "POST",
+    body: JSON.stringify(pkg),
+  });
+}
+
+/** Install a validated package. The result says `active: false` — an install is not a switch. */
+export async function installThemePackage(pkg: unknown): Promise<ThemeInstallResult> {
+  return request<ThemeInstallResult>("/api/v1/themes/install", {
+    method: "POST",
+    body: JSON.stringify(pkg),
+  });
+}
+
+/**
+ * Remove an uploaded theme.
+ *
+ * The server refuses with 409 for a bundled theme and for one a site still renders with, and
+ * the two refusals are different problems — so this throws rather than returning a boolean, and
+ * the screen shows the server's sentence.
+ */
+export async function removeTheme(themeKey: string): Promise<{ removed: string }> {
+  return request<{ removed: string }>(`/api/v1/themes/${encodeURIComponent(themeKey)}`, {
     method: "DELETE",
   });
 }
 
-// ---- The decision half (REQ-046 slice 4) ---------------------------------------------------
+// ---------------------------------------------------------------------------------------------
+// Content API tokens (REQ-019, slice 1)
+// ---------------------------------------------------------------------------------------------
 
-/** What a decision answers: the draft as it now reads, plus what the decision produced. */
-export type AiWorkflowDecision = {
-  draft: AiWorkflowDraftDetail;
-  workflow_id?: string;
-  enabled: boolean;
-};
+/** Every token of the organization. Prefix-only: the API has no secret to return here. */
+export function fetchContentApiTokens(): Promise<ContentApiToken[]> {
+  return request<ContentApiToken[]>("/api/v1/content-api/tokens");
+}
 
-/** One planned step of a test run, as the review screen draws the plan. */
-export type AiWorkflowTestRunStep = {
-  position: number;
+/**
+ * The vocabulary the create dialog draws from.
+ *
+ * Read from the server rather than hard-coded: a dialog that invents its own scope list will
+ * eventually offer a scope the store refuses, and the editor finds out at submit time.
+ */
+export function fetchContentApiVocabulary(): Promise<ContentApiVocabulary> {
+  return request<ContentApiVocabulary>("/api/v1/content-api/tokens/vocabulary");
+}
+
+/**
+ * Mint a token. The returned `plaintext` exists once and cannot be fetched again — the store keeps
+ * only its SHA-256 — so the caller must show it before discarding the response.
+ */
+export function createContentApiToken(input: {
   name: string;
-  kind: string;
-  action: string | null;
-  /** Whether the HOST runs this action — the line that says the step leaves the process. */
-  host: boolean;
-  /** The permission the action needs at run time, or `null` for the engine's own actions. */
-  permission: string | null;
-  params: unknown;
-};
-
-/**
- * What a test run reports.
- *
- * A test run validates the definition and projects it step by step; it does **not** dispatch
- * a run, so the `note` is the platform's own sentence about that and the screen shows it
- * rather than letting the operator assume a rule was exercised.
- */
-export type AiWorkflowTestRun = {
-  draft_id: string;
-  workflow_id: string | null;
-  definition: unknown;
-  steps: AiWorkflowTestRunStep[];
-  verdict: string;
-  note: string;
-};
-
-/**
- * Approve a draft: it becomes a **disabled** workflow.
- *
- * `409` on a second call, naming the workflow the first call created — the message is the
- * reason the operator can act on the conflict.
- */
-export function approveAiWorkflowDraft(
-  draftId: string,
-): Promise<AiWorkflowDecision> {
-  return request<AiWorkflowDecision>(
-    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}/approve`,
-    { method: "POST" },
-  );
-}
-
-/** Reject a draft. The reason is required by the API, not merely by this form. */
-export function rejectAiWorkflowDraft(
-  draftId: string,
-  reason: string,
-): Promise<AiWorkflowDecision> {
-  return request<AiWorkflowDecision>(
-    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}/reject`,
-    { method: "POST", body: JSON.stringify({ reason }) },
-  );
-}
-
-/** Save an operator-edited definition. The API revalidates and changes nothing on failure. */
-export function saveAiWorkflowDefinition(
-  draftId: string,
-  definition: unknown,
-): Promise<AiWorkflowDraftDetail> {
-  return request<AiWorkflowDraftDetail>(
-    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}`,
-    { method: "PATCH", body: JSON.stringify({ definition }) },
-  );
-}
-
-/** Validate a draft's definition and get the plan back, without running anything. */
-export function testRunAiWorkflowDraft(draftId: string): Promise<AiWorkflowTestRun> {
-  return request<AiWorkflowTestRun>(
-    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}/test-run`,
-    { method: "POST" },
-  );
-}
-
-/** One stage of a generation, as the progress panel draws it. */
-export type AiWorkflowStage = "plan" | "validate" | "repair";
-
-/** What a finished generation reports. */
-export type AiWorkflowDone = {
-  draft_id: string;
-  status: string;
-  repaired: boolean;
-  attempts: number;
-  tokens: number;
-};
-
-/**
- * Generate a draft, streaming.
- *
- * The API answers `text/event-stream` with `stage` frames (what the platform is doing),
- * a `done` frame carrying the stored draft's id, or an `error` frame with a stable code. It
- * carries **no prose**: the answer is validated before `done`, so a client that rendered
- * deltas would be rendering a definition that may still be refused. A `409` before the first
- * frame is the console's no-provider state, which is raised here as an `ApiError` so the
- * caller handles one shape either way.
- *
- * `signal` is the Cancel button: aborting closes the stream, and the draft row keeps the
- * `generating` status its own cleanup answers — nothing is written from the client side.
- */
-export async function streamGenerateWorkflowDraft(
-  input: { prompt: string; model?: string; siteId?: string; organizationId?: string },
-  handlers: AiWorkflowStreamHandlers = {},
-  signal?: AbortSignal,
-): Promise<void> {
-  await streamDraft(
-    "/api/v1/ai/workflows/generate",
-    {
-      prompt: input.prompt,
-      model: input.model && input.model.trim() ? input.model.trim() : null,
-      site_id: input.siteId || null,
-      organization_id: input.organizationId || null,
-    },
-    handlers,
-    signal,
-  );
-}
-
-/**
- * Ask the model for a change to an existing draft, streaming.
- *
- * The same frames and the same reader as [`streamGenerateWorkflowDraft`], and that is the
- * point: a revision that answered after one round-trip would leave the operator staring at
- * a button they can press again, and the review screen's progress panel would have to be a
- * second implementation of the panel the console already has.
- */
-export async function streamReviseWorkflowDraft(
-  draftId: string,
-  note: string,
-  model: string | undefined,
-  handlers: AiWorkflowStreamHandlers = {},
-  signal?: AbortSignal,
-): Promise<void> {
-  await streamDraft(
-    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}/revise`,
-    { note, model: model && model.trim() ? model.trim() : null },
-    handlers,
-    signal,
-  );
-}
-
-/** The callbacks a generation stream reports through. */
-export type AiWorkflowStreamHandlers = {
-  onStage?: (stage: AiWorkflowStage) => void;
-  onDone?: (done: AiWorkflowDone) => void;
-};
-
-/**
- * Read one generation or revision stream.
- *
- * One reader for both routes: the frames are the same contract (`stage` / `done` / `error`),
- * and two readers would be two places where an `error` frame is handled slightly differently
- * — which is exactly the kind of difference that shows up as "asking for changes does
- * nothing" while generating works.
- */
-async function streamDraft(
-  path: string,
-  body: Record<string, unknown>,
-  handlers: AiWorkflowStreamHandlers,
-  signal?: AbortSignal,
-): Promise<void> {
-  const response = await fetch(path, {
+  site_id?: string | null;
+  scopes: string[];
+  allowed_origins?: string[];
+  rate_limit_per_minute?: number;
+  expires_in_days?: number;
+}): Promise<CreatedContentApiToken> {
+  return request<CreatedContentApiToken>("/api/v1/content-api/tokens", {
     method: "POST",
-    credentials: "same-origin",
-    headers: {
-      "content-type": "application/json",
-      accept: "text/event-stream",
-      // The METHOD is what makes this a mutating call; passing only `{ signal }` would read as
-      // a `GET`, send no token, and this stream would be the one screen whose save answers
-      // `403 csrf_failed` while every other write on the platform works.
-      ...csrfHeader({ method: "POST" }),
-    },
-    body: JSON.stringify(body),
-    signal,
+    body: JSON.stringify(input),
   });
+}
 
-  if (!response.ok || !response.body) {
-    const payload = (await readJson(response)) as ErrorBody | null;
-    throw new ApiError(
-      response.status,
-      payload?.error?.code ?? "unknown_error",
-      payload?.error?.message ?? `The API answered with status ${response.status}.`,
-    );
-  }
+/** Edit a token. Rotation is a separate verb: a rename must not silently reissue a secret. */
+export function updateContentApiToken(
+  tokenId: string,
+  input: {
+    name?: string;
+    scopes?: string[];
+    allowed_origins?: string[];
+    rate_limit_per_minute?: number;
+    expires_in_days?: number;
+  },
+): Promise<ContentApiToken> {
+  return request<ContentApiToken>(`/api/v1/content-api/tokens/${encodeURIComponent(tokenId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+/** Issue a new secret. The previous one stops working immediately. */
+export function rotateContentApiToken(tokenId: string): Promise<CreatedContentApiToken> {
+  return request<CreatedContentApiToken>(
+    `/api/v1/content-api/tokens/${encodeURIComponent(tokenId)}/rotate`,
+    { method: "POST" },
+  );
+}
 
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+/** Revoke. Idempotent, so a double-clicked confirm is not an error. */
+export function revokeContentApiToken(tokenId: string): Promise<void> {
+  return request<void>(`/api/v1/content-api/tokens/${encodeURIComponent(tokenId)}`, {
+    method: "DELETE",
+  });
+}
 
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const frame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      boundary = buffer.indexOf("\n\n");
+/**
+ * `GET /api/v1/content-api/usage` — the Usage tab's data (REQ-019, slice 3).
+ *
+ * The `days` the screen asks for is the window it is *rendering*, and it is sent rather than
+ * configured: the route is also reachable by an integrator, and a client that could only ever ask
+ * for 30 days would make the parameter untestable from anywhere but this screen.
+ */
+export function fetchContentApiUsage(days: number): Promise<ContentApiUsage> {
+  return request<ContentApiUsage>(`/api/v1/content-api/usage?days=${encodeURIComponent(String(days))}`);
+}
 
-      let event = "message";
-      let data = "";
-      for (const line of frame.split("\n")) {
-        if (line.startsWith("event: ")) event = line.slice(7).trim();
-        else if (line.startsWith("data: ")) data += line.slice(6);
-      }
-      if (!data) continue;
+/**
+ * `POST /api/v1/content-api/explorer` — make one documented call as one token (REQ-019, slice 3).
+ *
+ * The **token id**, never a plaintext: the panel has no credential to send and cannot obtain one,
+ * so the server dispatches the call as the named token's row. A version of this client that
+ * accepted `token` as a string would be asking the operator to paste the one secret this
+ * installation can never show them twice.
+ */
+export function runContentApiExplorer(input: {
+  token_id: string;
+  operation_id: string;
+  params: Record<string, string>;
+}): Promise<ExplorerAnswer> {
+  return request<ExplorerAnswer>("/api/v1/content-api/explorer", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
 
-      const payload = JSON.parse(data) as Record<string, unknown>;
-      if (event === "stage") {
-        handlers.onStage?.(payload.stage as AiWorkflowStage);
-      } else if (event === "done") {
-        handlers.onDone?.(payload as unknown as AiWorkflowDone);
-        return;
-      } else if (event === "error") {
-        throw new ApiError(
-          502,
-          (payload.code as string) ?? "generation_failed",
-          (payload.message as string) ?? "The generation did not finish.",
-        );
-      }
+/**
+ * The endpoints the Explorer's picker offers, derived from the OpenAPI document the server serves.
+ *
+ * Flattened and split into path/query parameters here rather than in the view, because both halves
+ * of the form need the same answer and a component that re-derives it per render is a second
+ * answer to "what does this endpoint take". The `{slug}` template markers become `pathParams`,
+ * which is what lets the form mark them required instead of guessing from the parameter name.
+ */
+export function explorerEndpoints(document: OpenApiDocument): ExplorerEndpoint[] {
+  const endpoints: ExplorerEndpoint[] = [];
+  for (const [path, methods] of Object.entries(document.paths ?? {})) {
+    for (const [method, operation] of Object.entries(methods)) {
+      if (!operation || typeof operation !== "object" || !operation.operationId) continue;
+      endpoints.push({
+        operationId: operation.operationId,
+        method: method.toUpperCase(),
+        path,
+        summary: operation.summary,
+        requiredScope: operation["x-required-scope"],
+        experimental: operation["x-experimental"] ?? false,
+        query: queryParametersOf(operation, path),
+        pathParams: pathParametersOf(operation, path),
+      });
     }
   }
+  return endpoints;
 }
 
+/** The endpoint's query parameters, in the document's own order. */
+function queryParametersOf(operation: OpenApiOperation, path: string): ExplorerEndpoint["query"] {
+  return (operation.parameters ?? [])
+    .filter((parameter) => parameter.in === "query" && !isPathParameter(parameter.name, path))
+    .map((parameter) => ({ name: parameter.name, description: parameter.description }));
+}
+
+/**
+ * The endpoint's path parameters, in the order they appear in the template.
+ *
+ * Sorted by their position in the template rather than by the document's parameter array, so the
+ * form shows `slug` in the order the URL carries it — a form ordered alphabetically is a form
+ * whose order has nothing to do with the request it builds.
+ */
+function pathParametersOf(
+  operation: OpenApiOperation,
+  path: string,
+): ExplorerEndpoint["pathParams"] {
+  const declared = (operation.parameters ?? []).filter((parameter) =>
+    isPathParameter(parameter.name, path),
+  );
+  const ordered = [...declared].sort(
+    (left, right) => path.indexOf(`{${left.name}}`) - path.indexOf(`{${right.name}}`),
+  );
+  return ordered.map((parameter) => ({
+    name: parameter.name,
+    description: parameter.description,
+  }));
+}
+
+/** Whether a parameter travels in the path rather than the query. */
+function isPathParameter(name: string, path: string): boolean {
+  return path.includes(`{${name}}`);
+}
+
+/**
+ * `GET /api/v1/content-api/openapi.json` — the contract, rendered by the Docs tab.
+ *
+ * Session-authenticated on purpose, even though the same document is also served to a content
+ * token: the panel cannot hold a token, and an admin screen that has to mint a credential to show
+ * a description eventually leaks one. The document itself is built by the same server function in
+ * both cases, so the two cannot describe different APIs.
+ */
+export function fetchContentApiOpenApi(): Promise<OpenApiDocument> {
+  return request<OpenApiDocument>("/api/v1/content-api/openapi.json");
+}
+
+/**
+ * Download the document in one of its two serializations.
+ *
+ * A blob rather than a link to the route, for two reasons that are both about the panel and not
+ * about the download: the response's `content-disposition` names the filename the API chose, and a
+ * session cookie is only sent by `fetch`, never by an `<a href>` the browser navigates for. So a
+ * plain link would either download `openapi.json` under the wrong name or answer `401` — and the
+ * first of those looks like it worked.
+ */
+export async function downloadContentApiOpenApi(
+  format: "json" | "yaml",
+): Promise<{ blob: Blob; filename: string }> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/v1/content-api/openapi.json?format=${format}`, {
+      credentials: "same-origin",
+      headers: { accept: format === "yaml" ? "application/yaml" : "application/json" },
+    });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+  if (!response.ok) {
+    const body = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      body?.error?.code ?? "unknown_error",
+      body?.error?.message ?? `The API answered with status ${response.status}.`,
+      body?.error?.details ?? null,
+    );
+  }
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+  return {
+    blob: await response.blob(),
+    filename: match?.[1] ?? `omnion-content-api.${format}`,
+  };
+}
+
+/**
+ * Save a blob under `filename` and report the name that landed.
+ *
+ * `URL.revokeObjectURL` runs after `click()` rather than immediately: revoking synchronously can
+ * beat the browser to the download it was just asked to start, which shows up as a download that
+ * "does nothing" on a fast machine and works on a slow one.
+ */
+export function saveBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+}
+
+// ---------------------------------------------------------------------------------------------
 // System health (REQ-014).
 //
 // The overview is fetched with `cache: "no-store"` and the POST carries the CSRF header
@@ -7161,369 +7629,6 @@ export function deleteHealthMaintenanceWindow(id: string): Promise<void> {
   return request<void>(`/api/v1/health/maintenance-windows/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
-}
-
-// ---------------------------------------------------------------------------------------------
-// AI App Builder (REQ-045).
-//
-// The console and the review workspace talk to nine routes and one stream. Two decisions are
-// worth naming because they are the reason the client looks like this:
-//
-// * **The decision routes answer with the counters and the blockers.** Accepting one artifact
-//   usually removes one blocker, so a client that re-fetched the whole plan after every
-//   decision would spend a round trip to redraw three numbers the answer already carried —
-//   and would show a stale count for the duration of the request.
-// * **`getAppBuilderPlan` is the only read that is not cached.** The review screen is a
-//   decision surface: a plan that renders from a cached body is a plan whose artifacts may
-//   have been regenerated since, which is precisely the change the reviewer came to see.
-// ---------------------------------------------------------------------------------------------
-
-/** The composer's vocabulary: sample prompts, kinds, statuses, field types. */
-export function fetchAppBuilderVocabulary(): Promise<AppBuilderVocabulary> {
-  return request<AppBuilderVocabulary>("/api/v1/app-builder/examples");
-}
-
-/**
- * The plan list. Every filter is in the URL, so a reload and a bookmark land on the same
- * view — the QA pass depends on it, and so does anybody comparing two screenshots.
- */
-export function fetchAppBuilderPlans(query: {
-  status?: string;
-  q?: string;
-  mine?: boolean;
-  offset?: number;
-  limit?: number;
-  organizationId?: string;
-} = {}): Promise<AppBuilderPlanList> {
-  const params = new URLSearchParams();
-  if (query.status) params.set("status", query.status);
-  if (query.q && query.q.trim()) params.set("q", query.q.trim());
-  if (query.mine) params.set("mine", "true");
-  if (query.offset) params.set("offset", String(query.offset));
-  if (query.limit) params.set("limit", String(query.limit));
-  if (query.organizationId) params.set("organization_id", query.organizationId);
-  const search = params.toString();
-  return request<AppBuilderPlanList>(`/api/v1/app-builder/plans${search ? `?${search}` : ""}`);
-}
-
-/** One plan with its artifacts, counters and blockers — the review workspace's whole state. */
-export function fetchAppBuilderPlan(planId: string): Promise<AppBuilderPlanDetail> {
-  return request<AppBuilderPlanDetail>(
-    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}`,
-    { cache: "no-store" },
-  );
-}
-
-/** Accept one artifact. Refused with `422` naming the finding when the validator refused it. */
-export function acceptAppBuilderArtifact(
-  planId: string,
-  artifactId: string,
-): Promise<AppBuilderDecision> {
-  return request<AppBuilderDecision>(
-    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/artifacts/${encodeURIComponent(artifactId)}/accept`,
-    { method: "POST" },
-  );
-}
-
-/** Refuse one artifact. `reason` is required by the store: a bare refusal teaches nobody anything. */
-export function rejectAppBuilderArtifact(
-  planId: string,
-  artifactId: string,
-  reason: string,
-): Promise<AppBuilderDecision> {
-  return request<AppBuilderDecision>(
-    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/artifacts/${encodeURIComponent(artifactId)}/reject`,
-    { method: "POST", body: JSON.stringify({ reason }) },
-  );
-}
-
-/**
- * Edit one draft artifact. The body is **untrusted input of the same kind the model's is**, so
- * it goes back through the same validator: a `422` here carries the field path that broke.
- */
-export function editAppBuilderArtifact(
-  planId: string,
-  artifactId: string,
-  spec: Record<string, unknown>,
-): Promise<AppBuilderDecision> {
-  return request<AppBuilderDecision>(
-    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/artifacts/${encodeURIComponent(artifactId)}`,
-    { method: "PATCH", body: JSON.stringify({ spec }) },
-  );
-}
-
-/** Refuse the whole plan. */
-export function rejectAppBuilderPlan(planId: string, reason: string): Promise<AppBuilderPlanDecision> {
-  return request<AppBuilderPlanDecision>(
-    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/reject`,
-    { method: "POST", body: JSON.stringify({ reason }) },
-  );
-}
-
-/** Delete a plan that was never applied; an applied plan answers `409` and stays. */
-export function deleteAppBuilderPlan(planId: string): Promise<void> {
-  return request<void>(`/api/v1/app-builder/plans/${encodeURIComponent(planId)}`, {
-    method: "DELETE",
-  });
-}
-
-/**
- * Remove a selection of drafts in one call (REQ-045 slice 4).
- *
- * **`POST /plans/bulk-delete` and not `DELETE /plans/{id}` repeated by the client.** Three
- * reasons, and the third is the one that decides it:
- *
- * * twenty row-level deletes are twenty round trips, twenty audit rows and twenty chances for
- *   a filter change to land between two of them;
- * * a per-row delete cannot report a *partial* outcome — it answers `204` or `409` for the
- *   whole page, so a selection mixing three drafts with the one applied plan would show the
- *   operator a refusal and leave the three untouched;
- * * the refusals are the server's. An applied plan has to stay, and the client does not own
- *   that rule — it re-derives it, it can only ever agree with the store until it does not.
- */
-export function bulkDeleteAppBuilderPlans(ids: string[]): Promise<AppBuilderBulkDelete> {
-  return request<AppBuilderBulkDelete>("/api/v1/app-builder/plans/bulk-delete", {
-    method: "POST",
-    body: JSON.stringify({ ids }),
-  });
-}
-
-/**
- * The plan as a downloadable JSON document (REQ-045 slice 4).
- *
- * A raw `fetch` rather than `request<T>` for two reasons, both of which the health export
- * above already had to solve: the response is an **attachment**, so going through the JSON
- * helper would parse the file into an object and throw away the one thing the caller wants
- * (the bytes), and a `request` that cannot parse the body reports a parse failure as an
- * API error with a status of `200`.
- *
- * The artifact count is read back **out of the file**, not taken from a header, because the
- * header would be written by the same code path that made the mistake — the assertion in the
- * console's note ("22 artifacts") is only worth anything if it was counted from the
- * download the operator got.
- */
-export async function downloadAppBuilderPlanExport(
-  planId: string,
-): Promise<{ blob: Blob; filename: string; artifacts: number; schema: string }> {
-  const url = `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/export`;
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      credentials: "same-origin",
-      headers: { accept: "application/json" },
-      cache: "no-store",
-    });
-  } catch {
-    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
-  }
-
-  if (!response.ok) {
-    let code = "export_failed";
-    let message = `The export answered with status ${response.status}.`;
-    try {
-      const body = JSON.parse(await response.text()) as ErrorBody;
-      code = body.error?.code ?? code;
-      message = body.error?.message ?? message;
-    } catch {
-      // A non-JSON error body is still an error; the status stays in the message.
-    }
-    throw new ApiError(response.status, code, message);
-  }
-
-  const disposition = response.headers.get("content-disposition") ?? "";
-  const match = /filename="?([^";]+)"?/.exec(disposition);
-  const blob = await response.blob();
-
-  let artifacts = 0;
-  let schema = "";
-  try {
-    const parsed = JSON.parse(await blob.text()) as {
-      schema?: string;
-      artifacts?: unknown[];
-    };
-    artifacts = Array.isArray(parsed.artifacts) ? parsed.artifacts.length : 0;
-    schema = parsed.schema ?? "";
-  } catch {
-    // An unparseable download is reported by the caller's note as an artifact count of
-    // zero, which is the honest reading: the file did not carry a plan this panel can name.
-  }
-
-  return { blob, filename: match?.[1] ?? `omnion-app-plan-${planId.slice(0, 8)}.json`, artifacts, schema };
-}
-
-/** One frame of a generation, as the two handlers report it. */
-export type AppBuilderStreamHandlers = {
-  /** What the platform is doing right now (`plan`). */
-  onStage?: (stage: string) => void;
-  /** The plan the generation produced or failed on — it exists either way. */
-  onFailed?: (failure: { code: string; message: string }) => void;
-};
-
-/**
- * Generate a plan from a prompt, reading the stream to its end.
- *
- * The frames carry **no artifact bodies**: the answer is validated before it is stored, so a
- * client that rendered deltas would be rendering something apply may still refuse. What the
- * stream does carry is the failure — and the plan row exists whichever way it ends, so the
- * reviewer can *see* the attempt that failed instead of watching a banner and losing the
- * sentence they typed. `signal` is the Cancel button; aborting stops the read and nothing
- * is written from this side.
- */
-export async function streamGenerateAppBuilderPlan(
-  input: { prompt: string; model?: string; title?: string; organizationId?: string },
-  handlers: AppBuilderStreamHandlers = {},
-  signal?: AbortSignal,
-): Promise<void> {
-  const response = await fetch("/api/v1/app-builder/generate", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: {
-      "content-type": "application/json",
-      accept: "text/event-stream",
-      // The METHOD is what makes this a mutating call; a `{ signal }`-only init reads as a
-      // GET, sends no token, and this one screen answers `403 csrf_failed` while every other
-      // write on the platform works.
-      ...csrfHeader({ method: "POST" }),
-    },
-    body: JSON.stringify({
-      prompt: input.prompt,
-      model: input.model && input.model.trim() ? input.model.trim() : null,
-      title: input.title && input.title.trim() ? input.title.trim() : null,
-      organization_id: input.organizationId || null,
-    }),
-    signal,
-  });
-
-  if (!response.ok || !response.body) {
-    const payload = (await readJson(response)) as ErrorBody | null;
-    throw new ApiError(
-      response.status,
-      payload?.error?.code ?? "unknown_error",
-      payload?.error?.message ?? `The API answered with status ${response.status}.`,
-    );
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const frame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      boundary = buffer.indexOf("\n\n");
-
-      let event = "message";
-      let data = "";
-      for (const line of frame.split("\n")) {
-        if (line.startsWith("event: ")) event = line.slice(7).trim();
-        else if (line.startsWith("data: ")) data += line.slice(6);
-      }
-      if (!data) continue;
-
-      const payload = JSON.parse(data) as Record<string, unknown>;
-      if (event === "stage") {
-        handlers.onStage?.(payload.stage as string);
-      } else if (event === "error") {
-        handlers.onFailed?.({
-          code: (payload.code as string) ?? "generation_failed",
-          message: (payload.message as string) ?? "The generation did not finish.",
-        });
-        return;
-      }
-    }
-  }
-}
-
-/**
- * Ask the model for one artifact again, with a note, streaming.
- *
- * Same reader as the plan generation on purpose: a revision that answered after one round
- * trip would leave the operator pressing a button again, and the review screen would need a
- * second implementation of the progress panel the console already has. The answer carries
- * the artifact as it now reads, the counters and the blockers.
- */
-export async function streamRegenerateAppBuilderArtifact(
-  planId: string,
-  artifactId: string,
-  feedback: string,
-  handlers: {
-    onStage?: (stage: string) => void;
-    onArtifact?: (decision: AppBuilderDecision) => void;
-  } = {},
-  model?: string,
-  signal?: AbortSignal,
-): Promise<void> {
-  const response = await fetch(
-    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/artifacts/${encodeURIComponent(artifactId)}/regenerate`,
-    {
-      method: "POST",
-      credentials: "same-origin",
-      headers: {
-        "content-type": "application/json",
-        accept: "text/event-stream",
-        ...csrfHeader({ method: "POST" }),
-      },
-      body: JSON.stringify({
-        feedback,
-        model: model && model.trim() ? model.trim() : null,
-      }),
-      signal,
-    },
-  );
-
-  if (!response.ok || !response.body) {
-    const payload = (await readJson(response)) as ErrorBody | null;
-    throw new ApiError(
-      response.status,
-      payload?.error?.code ?? "unknown_error",
-      payload?.error?.message ?? `The API answered with status ${response.status}.`,
-    );
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const frame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      boundary = buffer.indexOf("\n\n");
-
-      let event = "message";
-      let data = "";
-      for (const line of frame.split("\n")) {
-        if (line.startsWith("event: ")) event = line.slice(7).trim();
-        else if (line.startsWith("data: ")) data += line.slice(6);
-      }
-      if (!data) continue;
-
-      const payload = JSON.parse(data) as Record<string, unknown>;
-      if (event === "stage") {
-        handlers.onStage?.(payload.stage as string);
-      } else if (event === "artifact") {
-        handlers.onArtifact?.(payload as unknown as AppBuilderDecision);
-        return;
-      } else if (event === "error") {
-        throw new ApiError(
-          502,
-          (payload.code as string) ?? "regeneration_failed",
-          (payload.message as string) ?? "The regeneration did not finish.",
-        );
-      }
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------------------------

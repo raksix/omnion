@@ -1,0 +1,422 @@
+/**
+ * Portfolio — A personal site: one column, the name set large, and work presented as numbered entries.
+ *
+ * The tokens are the theme; everything below reads them. A settings revision overrides the
+ * same custom property names, which is why they are declared once and never spelled into a
+ * rule — two code paths computing "the effective colour" is how a preview ends up lying.
+ *
+ * Every element selector is scoped to `html[data-theme="portfolio"]`. All ten bundled sheets are
+ * loaded by the renderer's static import graph, so an unscoped `body { … }` here would style
+ * every theme's pages with this theme's palette. Block classes are already prefixed and need
+ * no scoping; the resets, the focus ring and the media queries do.
+ */
+
+/* The theme's tokens. A theme is its palette: everything below reads these, and a
+   settings revision overrides them on the same custom property names, which is why they are
+   declared once here rather than spelled into each rule.
+
+   ## Why these rules are scoped to `data-theme`
+
+   All ten bundled stylesheets are loaded by the renderer's single import graph, because a
+   CSS import is static and `resolveTheme()` is a runtime call. Ten sheets declaring `body`
+   would therefore fight, and the winner would be whichever sheet the bundler happened to
+   order last — a site's theme would render with whichever palette sorted highest, which is
+   the "colour-swapped clones" failure in its purest form.
+
+   Scoping to `html[data-theme="<key>"]` is what makes one bundle carry ten themes: only the
+   sheet whose key matches the active theme matches anything. `data-theme` is written by
+   `apps/web/app/layout.tsx` from the same `resolveTheme()` the page is drawn with, so the
+   stylesheet and the markup can never be chosen by different code.
+*/
+html[data-theme="portfolio"] {
+  --po-portfolio-canvas: #ffffff;
+  --po-portfolio-surface: #fafafa;
+  --po-portfolio-ink: #171717;
+  --po-portfolio-muted: #6a6a6a;
+  --po-portfolio-line: #e5e5e5;
+  --po-portfolio-accent: #b45309;
+  --po-portfolio-accent_soft: #fdf1e3;
+  --po-portfolio-font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --po-portfolio-font-title: ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  --po-portfolio-measure: 40rem;
+  --po-portfolio-title-scale: clamp(2.2rem, 1.5rem + 2.4vw, 3.2rem);
+  --po-portfolio-title-weight: 600;
+  --po-portfolio-title-tracking: -0.02em;
+  --po-portfolio-radius: 0px;
+  --po-portfolio-base-size: 17px;
+  --po-portfolio-container: 1120px;
+}
+
+/* Dark mode is a token swap, never a second set of rules: the pair lives in the manifest and
+   the stylesheet only decides which pair the visitor gets. */
+@media (prefers-color-scheme: dark) {
+  html[data-theme="portfolio"] {
+    --po-portfolio-canvas: #101010;
+    --po-portfolio-surface: #191919;
+    --po-portfolio-ink: #ededed;
+    --po-portfolio-muted: #9d9d9d;
+    --po-portfolio-line: #2b2b2b;
+    --po-portfolio-accent: #f0b354;
+    --po-portfolio-accent_soft: #33240f;
+  }
+}
+
+
+/* The reset is scoped to the active theme for the reason the tokens are: all ten sheets ship
+   in one bundle, and an unscoped `body` rule would let every one of them style every page. */
+html[data-theme="portfolio"] *,
+html[data-theme="portfolio"] *::before,
+html[data-theme="portfolio"] *::after {
+  box-sizing: border-box;
+}
+
+html[data-theme="portfolio"] {
+  background-color: var(--po-portfolio-canvas);
+  color-scheme: light dark;
+}
+
+html[data-theme="portfolio"] body {
+  margin: 0;
+  background: var(--po-portfolio-canvas);
+  color: var(--po-portfolio-ink);
+  font-family: var(--po-portfolio-font-body);
+  font-size: var(--po-portfolio-base-size);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+html[data-theme="portfolio"] ::selection {
+  background-color: var(--po-portfolio-accent-soft);
+}
+
+html[data-theme="portfolio"] a {
+  color: var(--po-portfolio-accent);
+  text-underline-offset: 3px;
+}
+
+/* The focus ring is the one rule every theme shares unscoped in spirit and scoped in practice:
+   a theme that removed it would fail the accessibility bar rather than look different. */
+html[data-theme="portfolio"] :focus-visible {
+  outline: 3px solid var(--po-portfolio-accent);
+  outline-offset: 2px;
+}
+
+html[data-theme="portfolio"] img {
+  max-width: 100%;
+  height: auto;
+}
+
+
+/* The shell: a full-height column that pins the footer to the bottom on a short page. */
+.po-portfolio-shell {
+  display: flex;
+  min-height: 100dvh;
+  flex-direction: column;
+}
+
+.po-portfolio-header,
+.po-portfolio-footer {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+}
+
+.po-portfolio-header {
+  justify-content: center; flex-direction: column; gap: 0.25rem;
+}
+
+.po-portfolio-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--po-portfolio-line);
+  color: var(--po-portfolio-muted);
+  font-size: 0.8125rem;
+}
+
+.po-portfolio-main {
+  width: 100%;
+  max-width: var(--po-portfolio-container);
+  margin-inline: auto;
+  padding: 3rem 1.5rem 4rem;
+}
+
+.po-portfolio-article {
+  max-width: var(--po-portfolio-measure);
+}
+
+.po-portfolio-title {
+  margin: 0;
+  font-family: var(--po-portfolio-font-title);
+  font-size: var(--po-portfolio-title-scale);
+  font-weight: var(--po-portfolio-title-weight);
+  line-height: 1.1;
+  letter-spacing: var(--po-portfolio-title-tracking);
+}
+
+.po-portfolio-eyebrow {
+  margin: 0 0 0.75rem;
+  color: var(--po-portfolio-accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.po-portfolio-summary {
+  margin: 1rem 0 0;
+  color: var(--po-portfolio-muted);
+  font-size: 1.15em;
+}
+
+.po-portfolio-meta {
+  margin: 1.5rem 0 0;
+  color: var(--po-portfolio-muted);
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+}
+
+.po-portfolio-body {
+  margin-top: 2.5rem;
+}
+
+.po-portfolio-body p {
+  margin: 0 0 1.25rem;
+  white-space: pre-line;
+}
+
+.po-portfolio-body p:last-child {
+  margin-bottom: 0;
+}
+
+
+.po-portfolio-header {
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.po-portfolio-brand {
+  color: var(--po-portfolio-ink);
+  font-family: var(--po-portfolio-font-title);
+  font-size: 1.5rem;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+}
+
+.po-portfolio-kind {
+  color: var(--po-portfolio-muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.po-portfolio-card {
+  border: 1px solid var(--po-portfolio-ink);
+  background: transparent;
+  border-radius: 0;
+}
+
+
+/* Blocks (REQ-063). The markup is the SDK's; everything here is this theme's styling of it. */
+.po-portfolio-block {
+  margin: 0 0 1.75rem;
+}
+
+.po-portfolio-block:last-child {
+  margin-bottom: 0;
+}
+
+.po-portfolio-heading {
+  margin: 2.5rem 0 0.75rem;
+  font-family: var(--po-portfolio-font-title);
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+.po-portfolio-heading:first-child {
+  margin-top: 0;
+}
+
+.po-portfolio-align-center {
+  text-align: center;
+}
+
+.po-portfolio-align-right {
+  text-align: right;
+}
+
+.po-portfolio-figure {
+  margin-inline: 0;
+}
+
+.po-portfolio-figure figcaption {
+  margin-top: 0.5rem;
+  color: var(--po-portfolio-muted);
+  font-size: 0.8125rem;
+}
+
+.po-portfolio-testimonial {
+  margin-inline: 0;
+  padding: 1.25rem 1.5rem;
+  border-left: 3px solid var(--po-portfolio-accent);
+  background: var(--po-portfolio-surface);
+  border-radius: var(--po-portfolio-radius);
+}
+
+.po-portfolio-testimonial blockquote {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.po-portfolio-testimonial figcaption {
+  margin-top: 0.5rem;
+  color: var(--po-portfolio-muted);
+  font-size: 0.8125rem;
+}
+
+.po-portfolio-gallery {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.po-portfolio-gallery img {
+  border-radius: var(--po-portfolio-radius);
+}
+
+.po-portfolio-columns {
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.po-portfolio-cta {
+  padding: 1.75rem;
+  border-radius: var(--po-portfolio-radius);
+  background: var(--po-portfolio-accent-soft);
+}
+
+.po-portfolio-cta h2 {
+  margin: 0 0 0.5rem;
+}
+
+.po-portfolio-cta p {
+  margin: 0 0 1rem;
+  color: var(--po-portfolio-muted);
+}
+
+.po-portfolio-cta-link {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: var(--po-portfolio-radius);
+  background: var(--po-portfolio-accent);
+  color: var(--po-portfolio-canvas);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.po-portfolio-cards {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.po-portfolio-card {
+  padding: 1.25rem;
+  border: 1px solid var(--po-portfolio-line);
+  border-radius: var(--po-portfolio-radius);
+  background: var(--po-portfolio-surface);
+}
+
+.po-portfolio-card h3 {
+  margin: 0 0 0.5rem;
+}
+
+.po-portfolio-card p {
+  margin: 0 0 0.75rem;
+  color: var(--po-portfolio-muted);
+  font-size: 0.9375rem;
+}
+
+.po-portfolio-plans {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.po-portfolio-plans ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.po-portfolio-plan {
+  padding: 1.25rem;
+  border: 1px solid var(--po-portfolio-line);
+  border-radius: var(--po-portfolio-radius);
+}
+
+.po-portfolio-plan h3 {
+  margin: 0;
+}
+
+.po-portfolio-price {
+  margin: 0.25rem 0 0.75rem;
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.po-portfolio-plan ul li {
+  padding: 0.25rem 0;
+  color: var(--po-portfolio-muted);
+  font-size: 0.9375rem;
+}
+
+.po-portfolio-faq > div {
+  padding: 0.875rem 0;
+  border-bottom: 1px solid var(--po-portfolio-line);
+}
+
+.po-portfolio-faq dt {
+  font-weight: 600;
+}
+
+.po-portfolio-faq dd {
+  margin: 0.35rem 0 0;
+  color: var(--po-portfolio-muted);
+}
+
+.po-portfolio-raw pre {
+  overflow-x: auto;
+  padding: 1rem;
+  border-radius: var(--po-portfolio-radius);
+  background: var(--po-portfolio-surface);
+  font-size: 0.875rem;
+}
+
+.po-portfolio-raw-note {
+  margin: 0 0 0.5rem;
+  color: var(--po-portfolio-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.po-portfolio-unknown {
+  padding: 0.75rem 1rem;
+  border: 1px dashed var(--po-portfolio-line);
+  border-radius: var(--po-portfolio-radius);
+  color: var(--po-portfolio-muted);
+  font-size: 0.9375rem;
+}
+
+@media (max-width: 720px) {
+  .po-portfolio-gallery,
+  .po-portfolio-columns,
+  .po-portfolio-cards,
+  .po-portfolio-plans {
+    grid-template-columns: 1fr;
+  }
+}

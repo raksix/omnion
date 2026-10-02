@@ -13,7 +13,7 @@ publish = false
 # feature.
 reqwest = { workspace = true, features = ["json"] }
 
-axum = { workspace = true, features = ["multipart"] }
+axum = { workspace = true, features = ["multipart", "matched-path"] }
 tokio.workspace = true
 tower.workspace = true
 serde.workspace = true
@@ -23,6 +23,10 @@ serde_json.workspace = true
 # every category and priority filter.
 percent-encoding.workspace = true
 sqlx.workspace = true
+# The content usage meter increments its counters with a Lua script, and the typed `Script`
+# wrapper lives behind a feature this workspace does not enable — so the meter speaks raw `EVAL`
+# (the same choice `crates/security/src/limiter_redis.rs` documents for the same reason).
+redis.workspace = true
 time.workspace = true
 tracing.workspace = true
 uuid.workspace = true
@@ -52,8 +56,6 @@ omnion-policy-engine = { path = "../../crates/policy-engine" }
 omnion-search = { path = "../../crates/search" }
 omnion-storage = { path = "../../crates/storage" }
 omnion-workflows = { path = "../../crates/workflows" }
-omnion-module-ai = { path = "../../modules/ai" }
-omnion-module-app-builder = { path = "../../modules/app-builder" }
 
 # Enterprise sign-in (REQ-006, slice 4b-2): the authorization URL is assembled with a real
 # URL parser (so a provider endpoint cannot smuggle a fragment or a second origin into it), and
@@ -61,13 +63,17 @@ omnion-module-app-builder = { path = "../../modules/app-builder" }
 url.workspace = true
 base64.workspace = true
 
+# The form builder hashes a sender's address and user agent before they reach the inbox
+# (`routes/forms.rs`): the rate limiter only asks whether the same sender came back, and a
+# raw address in a form inbox turns the owner's database into a log of every visitor who used
+# the contact form.
+sha2.workspace = true
 [dev-dependencies]
 http-body-util = "0.1"
 # The passkey integration walk (tests/webauthn.rs) holds the private half of a credential and
 # signs the ceremony's own message, so the verification runs exactly as it does in production.
 p256.workspace = true
 base64.workspace = true
-sha2 = "0.10"
 rand = "0.8"
 # The enterprise sign-in walk (tests/sso_live.rs) runs a *real* identity provider — a loopback
 # OIDC/SAML server it starts itself — so the round trip is proven over a socket with real RSA

@@ -32,7 +32,22 @@ SHM_MIN_FREE_PCT="${OMNION_SHM_MIN_FREE_PCT:-15}"
 
 dir_mb() { du -sm "$1" 2>/dev/null | cut -f1; }
 free_gb() { df -BG --output=avail "$ROOT" 2>/dev/null | tail -1 | tr -dc '0-9'; }
-shm_free_pct() { df --output=pcent "$SHM" 2>/dev/null | tail -1 | tr -dc '0-9'; }
+# Percent FREE, not percent used.
+#
+# `df --output=pcent` is Use% — how full the filesystem is — and this function has always been
+# named, printed ("$SHM free NN%") and compared (`-lt SHM_MIN_FREE_PCT`) as though it were the
+# opposite. So the tmpfs relief in 3c could never run: it fires when free space drops BELOW 15%,
+# and Use% only drops below 15 when the filesystem is 85% EMPTY. On a box where /dev/shm is a
+# real RAM-backed tmpfs shared by every writer's build target, the one step that reclaims
+# orphans there was silently skipped at exactly the moment it was needed — and it printed
+# "/dev/shm free 98%" while `df` said 98% full. A guard that reports the inverse of the thing it
+# is guarding is worse than no guard: it reads as a measurement.
+shm_free_pct() {
+  local used
+  used="$(df --output=pcent "$SHM" 2>/dev/null | tail -1 | tr -dc '0-9')"
+  [ -n "${used:-}" ] || { echo 0; return; }
+  echo $(( 100 - used ))
+}
 
 say() { printf '%s\n' "$*"; }
 
@@ -82,45 +97,6 @@ reclaimable() {
   return 0
 }
 
-# Is a live process WORKING IN this directory (or anything under it)?
-#
-# `worktree_busy` above asks a narrower question and, for a Next cache, asks it of the wrong
-# thing. It compares `/proc/N/cwd` to a worktree root with `=`, and a live QA admin server's
-# cwd is not the worktree root — pm2 starts it in the app it serves, so it is
-# `<worktree>/apps/admin`. The equality never held, `worktree_busy` answered "nobody", and the
-# guard deleted the `.next` of a server that was serving the walkthrough at the time.
-#
-# That is not a rare shape: it is every pass. `run.sh` starts `omnion-qa-admin-<stack>` in the
-# app directory, and the dev server grows its cache well past `NEXT_MAX_MB` while the pass is
-# still walking — the cache is large BECAUSE it is in use.
-#
-# So the test is a PREFIX test over cwd, not an equality, and it is the honest question anyway:
-# "is anybody still working here" is what every reclaim decision in this script needs, and an
-# exact match answers a question nobody asked — a process whose cwd is a sibling app in the
-# same worktree is still a reason to leave the worktree alone.
-#
-# `/proc/N/cwd` on a process we cannot read answers empty, and empty is not a prefix of any
-# worktree, so an unreadable entry cannot manufacture a false "busy" — it just does not count.
-#
-# The test accepts the directory ITSELF as well as anything under it, and the first draft did
-# not: `"$wt"/*` matches only children, so asking about the one directory a process is actually
-# sitting in — `<worktree>/apps/admin`, where the dev server's cwd lives — answered "idle"
-# while the caller was describing a directory that was in use. The guard was written, proven
-# against the wrong argument, and green. Equality is not a special case here: "working in this
-# directory" and "working in something inside it" are the same answer to a question about
-# whether to delete something.
-worktree_under() {
-  local wt="$1" p cwd
-  for p in /proc/[0-9]*; do
-    cwd="$(readlink "$p/cwd" 2>/dev/null)"
-    [ -n "$cwd" ] || continue
-    case "$cwd" in
-      "$wt"|"$wt"/*) return 0 ;;
-    esac
-  done
-  return 1
-}
-
 # 1. incremental compilation cache is pure speed — always safe, do it first
 freed=0
 for inc in "$ROOT"/omnion*/target/debug/incremental; do
@@ -135,39 +111,11 @@ done
 # 2. Next.js build cache. A QA pass starts a Turbopack dev server, and its cache is the
 # single biggest thing on this disk: ten worktrees held 13 GB of it. The dev server
 # rebuilds what it needs, so a stale cache is pure waste.
-#
-# — and a LIVE cache is not a stale one.
-#
-# This step had no liveness test while every other reclaim step had one, and it is the only
-# step that deletes a directory a RUNNING PROCESS IS USING. Observed on 2026-10-01, on the
-# wave-3 stack: at 03:54 the guard removed `omnion-w3/apps/admin/.next`, the dev server logged
-# `The directory at ".../.next/dev" was deleted. Restarting the server to recover...`, and the
-# walkthrough continued into a server that was restarting. It did not crash the pass, so the
-# summary read "55 pages, no findings on the builder" and three ticks of notes were written
-# about the box being tired. What actually happened is in the admin error log with a timestamp
-# on it, and every screen after `/analytics/downloads` came back `chrome-error://chromewebdata/`
-# — the harness recorded those as pages with no problems, because a page that never loaded has
-# no problems.
-#
-# The asymmetry is the point: `target/` is disposable SPEED, so losing it costs a rebuild. A
-# dev server's cache is its live working set, and deleting it does not slow the server down, it
-# stops it. So this step is the one that had to ask first, and steps 3b/4/5 already knew how.
 for nx in "$ROOT"/omnion*/apps/*/.next; do
   [ -d "$nx" ] || continue
   m=$(dir_mb "$nx")
   if [ "$m" -gt "$NEXT_MAX_MB" ]; then
-    # The APP that owns this cache — `<root>/omnion[-<stack>]/apps/<app>`. This is the directory
-    # to ask about: a dev server's cwd is the app, and asking about the worktree ROOT answers the
-    # broader question ("is anybody working in this worktree") — true for a sibling app, which is
-    # a reason to be careful, but it names the wrong directory in the log line below.
-    app="$(dirname "$nx")"
-    wt="$(dirname "$(dirname "$app")")"
-    label="$(basename "$wt")/$(basename "$app")"
-    if worktree_under "$app"; then
-      say "keep next cache ${m}M: ${label} — a live process is working in it"
-      continue
-    fi
-    say "drop next cache ${m}M: ${label}"
+    say "drop next cache ${m}M: $(basename "$(dirname "$(dirname "$(dirname "$nx")")")")/$(basename "$nx")"
     freed=$((freed + m)); rm -rf "$nx"
   fi
 done

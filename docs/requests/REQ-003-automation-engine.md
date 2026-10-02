@@ -1,6 +1,6 @@
 # REQ-003 — Automation Engine
 
-> **Status:** done (slice 4 · `b130f0b`, `684741e`, `49f7ac2`, `50902cc`, `aaac3c0`, `5e9264a`, `8aede17`, `881b8b4`, `cdfb970`, `658d522`, `8e3bb23`, `04bd7c1`, `b8b834a`) · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
+> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core engine (`crates/workflows`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -136,146 +136,23 @@ the payload; the rule id is the only identifier returned to the caller.
 
 ### Acceptance criteria
 
-- [x] The rule list, editor, run history, run detail and templates screens exist at the routes above and appear in the QA walkthrough inventory.
-      *Slice 1* walked the list and the editor on desktop and mobile. **Slice 4** added
-      `/automations/templates` to the route inventory and drove the run history, the run detail
-      (`/automations/[id]/runs/<run_id>`), the Versions tab, the Audit tab and the gallery from
-      the depth pass — none of which can appear in a static route list, because the trace carries
-      a run id and the tabs are behind a strip drawn only for a rule that exists.
+- [ ] The rule list, editor, run history, run detail and templates screens exist at the routes above and appear in the QA walkthrough inventory.
 - [ ] A rule on `user.created` sends a welcome e-mail to a new account in the QA stack (the mail sink proves exactly one message, correct recipient and subject).
-      *Slice 1:* the event library, the matcher and the `send_email` action are in place, but the end-to-end "a real signup sends one
-      message" walk is not yet written — it belongs with the run screens in slice 4.
-- [x] Condition groups work: an `all` inside `any` evaluates correctly against fixture payloads and round-trips through save and reload unchanged.
-      *Proved:* `crates/automation/src/groups.rs` — the tree evaluates, serialises flat to `{"all"|"any":[…]}`, reads back byte for byte,
-      refuses four levels, an empty nested group and more than 24 nodes, and a bare v0 array still reads as one `all` group.
-      The engine's `conditions` column accepts both shapes and `build_definition` stores the group object.
+- [ ] Condition groups work: an `all` inside `any` evaluates correctly against fixture payloads and round-trips through save and reload unchanged.
 - [ ] An inbound hook call starts a run whose payload the conditions read; a wrong or rotated token answers 404 and never reveals whether a rule exists.
-      *Partly proved:* `POST /api/v1/hooks/{token}` records `automation.hook.received` with the caller's body under `hook.body`, and an
-      unknown/rotated/unshaped token answers `404 not_found` (asserted over the live stack: a wrong token returned exactly that). The
-      run-side walk — a real call starting a run whose conditions read the body — is not written yet.
-- [x] `http_request` to a host outside `automation_settings.http_allowed_hosts` is refused at save time naming the host, and delivered with `x-omnion-signature` when allowed.
-      *Proved:* `crates/automation/src/outbound.rs` — the URL is split into scheme/host/port/path (a
-      `user@host` URL is refused rather than re-read, which is the classic allow-list bypass), the host
-      is matched against the list by suffix and never against a query, and an **empty** list allows
-      nothing. The API refuses at `POST`/`PUT` naming the host and what an administrator has to do
-      (`check_outbound_hosts`). Every call carries `x-omnion-signature` (HMAC-SHA256 of the rule's key
-      over `<ts>.<METHOD>.<path>.<sha256(body)>`), `x-omnion-timestamp` and `x-omnion-run`; the walk
-      re-derives the signature from the rule's stored key, and shows a different key, a different
-      timestamp, a different method, a different path and a tampered body all fail. A rule cannot forge
-      the platform's own headers.
-- [x] A dry run reports `would_send` per host action without sending e-mail or calling a URL.
-      *Proved:* `crates/automation/src/testing.rs` resolves the payload into every action through the same `resolve_params` the matcher
-      uses and reports `would_send` / `would_call` / `would_publish`; the QA pass reads every outcome back and asserts each starts with
-      `would_`. `POST /api/v1/automations/{id}/test` stores the report and audits it.
+- [ ] `http_request` to a host outside `automation_settings.http_allowed_hosts` is refused at save time naming the host, and delivered with `x-omnion-signature` when allowed.
+- [ ] A dry run reports `would_send` per host action without sending e-mail or calling a URL.
 - [ ] "Run now" starts exactly one run; a second press inside the rate window shows the limit message and starts nothing.
-      *Proved:* `POST /api/v1/automations/{id}/run` starts exactly one run — the execution and its
-      steps are rows before the response leaves, and the walk reads the id back and settles the run to
-      `completed`. A rule whose `{{event.*}}` bindings need an event is **refused in words** rather than
-      run against an invented payload.
-      **The rate half is now in place** (`omnion_automation::limits`): the window is counted in
-      `workflow_rate_windows` and read under `for update` **inside the transaction that starts the
-      run**, because the request's own risk note is that a check before the insert is two statements
-      and a second API instance between them turns one decision into two. The refusal is an `Admit`
-      that names its bound (`rate_limit_per_hour` or `concurrency`) rather than only its numbers — an
-      operator reading a run history needs to know *which* control to change. `concurrency: skip`
-      drops the trigger and reports it; `queue` lets it wait. Both set `workflows.last_error` and emit
-      `automation.rule.limit_reached`, and the panel's "7 of 60" line reads the same counter without
-      taking the lock (a few seconds stale is a counter; stale in a *decision* is a bug).
-- [x] A `publish_page` step is refused with `automation.rule.permission_revoked` when the run-as account no longer holds `content.pages.publish`.
-      *Proved:* `crates/automation/src/authority.rs` — `workflows.run_as_user_id` names the account, `None`
-      follows the author, and **a deleted author resolves to nobody** rather than to any fallback
-      (the walk deletes the author and asserts the run refuses rather than falling back to the
-      account that pressed *Run now*). `authorise_action` runs *before* any parameter is read and
-      before the world is touched, and the refusal is a message the engine's `stop` policy ends the
-      run on — not a retry. `permission_for` is a closed `match`, so an action with no entry cannot
-      run at all. The walk publishes with the permission present (`completed`), removes it from the
-      role, publishes again (`failed`), and reads `automation.rule.permission_revoked`,
-      `content.pages.publish` and "run-as" out of the step's error — then asserts the event is on
-      the bus.
-- [x] A `wait_for_approval` step parks the run as `awaiting_approval`, the pending panel lists it, approving resumes it, rejecting ends it without the effect.
-      *Proved:* the run status is `awaiting_approval` — open, and **not claimable** — and the claim
-      query's `e.status = 'running'` filter is the whole protection. The walk drives the engine hard
-      and asserts the run is still parked, the gate step is `waiting` and the step behind it is
-      `pending`; the queue lists it with its step name, permission, message and deadline, and
-      **carries no token**. Approving releases the run (`running`), the gate succeeds with the
-      decider's id on its output, and the step behind it runs. Rejecting ends the run as
-      `cancelled`, the gate's row says `rejected by an approver`, and the step behind it says it
-      was never reached. The author is `403` on both the read and the decision — reading the queue
-      *is* the deciding power.
-- [x] Deciding an approval twice has no second effect (single-use token) and an expired approval is refused with a clear message.
-      *Proved:* the decision is one `update … where decision is null`, so a second press matches zero
-      rows and is answered `200` with the decision the gate already has — the walk presses *approve*
-      then *reject* and reads `approved` back, then counts exactly one decided row with one decider
-      and one timestamp. A wrong token and a wrong id both answer `404 approval_not_found`
-      (three shapes tried, including an empty one), and the gate is still waiting afterwards. An
-      expired gate answers `400 approval_expired` naming the next step, and the sweeper closes it —
-      `approvals_expired: 1` — after which the **engine** ends the run, not the sweep. The token is
-      optional in the body by design: the authority is the session's `workflows.approve`, and the
-      token is the second factor a notification carries.
-- [x] Retry re-runs only the failed step; resume-from re-runs that step and everything after it; neither duplicates an already-sent e-mail (mail sink count asserted).
-      *Proved, with one correction to the request's wording:* `retry_step_from` re-runs the chosen step
-      **and everything after it** for both controls. Re-running *only* the failed step would let a run
-      whose middle failed march on to completion, which is not what "try that again" means on a trace —
-      so the two controls are the same write on purpose. The steps that already succeeded are left
-      untouched, and the walk asserts the mail sink's count is unchanged across a retry (the earlier
-      email is **not** re-sent) and that `resume-from` re-queues exactly the failed tail. A cancelled
-      run is refused: cancellation was a person's decision.
-- [x] `timeout_ms` is honoured: a slow `http_request` fails naming the limit, and the step shows attempts used against attempts allowed.
-      *Proved:* the runner refuses to wait past the budget (`tokio::time::timeout` around the handler
-      future) and the failure names the limit — the walk points a rule at a host that accepts the
-      connection and says nothing, sets `timeout_ms: 250`, and reads "did not answer within 250 ms" out
-      of the step's error with `attempts: 1` against `max_attempts: 1`. A timeout outside the ceiling is
-      refused at write time with `invalid_step_timeout`. (The out-of-scope half of the line — attempts
-      used against attempts allowed on the *trace* — is the run-detail screen, slice 4's.)
+- [ ] A `publish_page` step is refused with `automation.rule.permission_revoked` when the run-as account no longer holds `content.pages.publish`.
+- [ ] A `wait_for_approval` step parks the run as `awaiting_approval`, the pending panel lists it, approving resumes it, rejecting ends it without the effect.
+- [ ] Deciding an approval twice has no second effect (single-use token) and an expired approval is refused with a clear message.
+- [ ] Retry re-runs only the failed step; resume-from re-runs that step and everything after it; neither duplicates an already-sent e-mail (mail sink count asserted).
+- [ ] `timeout_ms` is honoured: a slow `http_request` fails naming the limit, and the step shows attempts used against attempts allowed.
 - [ ] The endless-loop guard aborts a rule that repeats the same step with identical resolved parameters and explains why in the trace.
-      *Proved:* `crates/automation/src/loopguard.rs` — the fingerprint is the step kind, the action and the **canonical** parameters, so a repeat that
-      reorders its keys is still a repeat; a different value is not. `crates/workflows/src/guard.rs` puts the check in the one place it belongs: after
-      a step succeeds, in the same write a `stop` step and a failed step do, so a guard that says stop has exactly the power a stop has. The engine
-      takes a `&dyn RunGuard` **next to** the action handler rather than as a method on it, because the content worker runs synthetic steps and needs
-      no guard — `NoRunGuard` is an honest default, not a silent "no guard installed". The refusal names the repeat, and `last_stopped_at` means a
-      re-armed rule does not immediately refuse itself on its own last step. The API process installs `LoopGuard`, and a test asserts it builds both
-      the actions and the guard: a runner with only the actions can send an email forever and never notice.
-      *Still open:* the run-detail **trace** that shows the message is slice 4's remaining screen work, and the guard's test has to be shown to fail
-      when the guard is removed (the request asks for that) — the walk comes with the run screens.
 - [ ] A paused rule does not fire, and re-arming it does not replay events recorded while it was paused.
-      *Proved in part:* the matcher only reads armed rules (`store::list_event_rules` filters `enabled`), and a paused webhook rule's token
-      stops resolving (`hooks::find_rule` filters `enabled`), so its URL answers 404 like a wrong one. The "does not replay while paused"
-      walk is not written yet.
-- [x] Every definition change is audited with actor, diff summary and timestamp, and the Audit tab lists those entries.
-      *Slice 1 audited every change* (`automation.created` / `.updated` / `.deleted` / `.tested` / `.listener_armed` / `.hook_rotated`, each
-      with the actor and a metadata summary; the hook token is deliberately never audited). The **Audit tab** is slice 4's, and it took two
-      defects to make it answer at all.
-      **The first was a decode.** `rule_audit_entries` selected the bare `ip_address` column — an `inet` in Postgres — into an
-      `Option<String>`. Every read of the trail failed with "mismatched types", the endpoint answered **500**, and the panel drew its
-      error. The screen said "nothing has been recorded yet" because that is the one thing it was told, on a rule with a full trail.
-      `crates/audit` already casts on the way *in* (`ip_address::text`); the read needed the same cast on the way out.
-      **The second was the walk, not the product** — and it is the reason the first was invisible. The integration walk's requests carry
-      no `ConnectInfo`, so its audit rows all had a NULL `ip_address` and never exercised the decode at all: the test passed while
-      every browser request 500'd. The walk now creates its rule from a request with a connection address and asserts that the row it
-      writes has one; with the cast removed, the walk fails with the browser's exact 500, and with it, all six walks pass.
-      The pass now reads `audit rows 4 · automation.version_restored, automation.updated, automation.run_started, automation.created`
-      with `listsTheCreate` and `listsTheEdit` both true.
-- [x] All six templates load, validate and save without edits beyond their missing credentials.
-      *Slice 4* (the templates gallery). The pass reads `cards 6 · categories 6 · offersSix true`, presses the first *installable*
-      card — a template whose own credential is missing says so on the card and refuses, so pressing the first card would prove
-      nothing — and reads the install notice back. The installed starter is then found on the ordinary list, which is what makes it a
-      rule rather than a gallery object, and `apps/api/tests/automation_operations.rs` carries a walk that saves all six through the
-      ordinary create.
+- [ ] Every definition change is audited with actor, diff summary and timestamp, and the Audit tab lists those entries.
+- [ ] All six templates load, validate and save without edits beyond their missing credentials.
 - [ ] Empty, loading and error states exist on every screen; no dead buttons and no "coming soon" text.
-      **Slice 3** adds the pending panel (visually distinct from the table, Approve/Reject, both
-      disabled once the gate has expired), the run-as picker with the account list and the
-      sentence the **API** resolved rather than one guessed from the picker, the permissions the
-      rule's actions need, and a gate step's three typed controls. A gate with a permission that is
-      not a key, no message, or a lifetime outside 1–720 h is reported in the same summary with Save
-      disabled. The pending panel's *absent* state is asserted too: a panel that renders an empty box
-      reads as a failure and one that never renders reads as a missing feature.
-      *Proved for the slice-1 screens:* the list has a loading table, an empty state ("No automations yet") with New rule, a
-      no-match state, a load-error banner and a notice; the editor has a validation summary that disables Save, a save-error alert, an
-      empty-conditions explanation and an "empty nested group" explanation. **Slice 2** adds the rule's own
-      failure policy, the per-step policy and budget, a branch with no field, a branch reading something no
-      run can read, a stop with no reason and a timeout outside the engine's ceiling — all reported in the
-      same summary, with Save disabled while any is open, and the host allow-list refusal rendered as a
-      save error that names the host. The walkthrough clicks every one of them.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough pass with zero high findings.
 
 ### QA plan
@@ -298,55 +175,10 @@ visually distinct from the table, and no clipped copy in the editor's sticky foo
    *Done when:* a rule on `user.created` with a nested condition fires from a real signup and a test event produces the same evaluation with no side effects.
 2. **Action library and error paths** — `http_request` (allow-list + signature), `publish_page`, `run_workflow`, `branch`/`stop` kinds, per-step `on_error`, `timeout_ms`, retry/resume endpoints and the run-detail controls.
    *Done when:* a failing step routes to a failure branch, retry succeeds without duplicating the earlier e-mail, and a disallowed host never leaves the process.
-   *Shipped* (`73bc32e`, `ac5cb44`, `240e3e6`, `ed6b670`). Two notes on the spec, both recorded rather than
-   papered over: the "routes to a **failure branch**" half is shipped as the per-step `on_error`
-   (`stop` closes the steps after the failure, `continue` outlives it) — a *named* failure branch is REQ-004's
-   graph, and this request's own "Out" section reserves the node canvas for it. And **retry re-runs the
-   tail, not only the failed step**, for the reason above; the request's wording is the thing that changes,
-   not the behaviour. Migration `0023_automation_actions`.
 3. **Approvals and run-as authority** — `wait_for_approval`, `workflow_approvals`, `workflows.approve`, the pending panel, decision endpoints with single-use tokens, `run_as_user_id` checks, `automation.rule.permission_revoked`.
    *Done when:* a publish step is blocked by a revoked permission, and a gated publish completes only after an approval.
-   *Shipped* (`8ecfba0`, `0cb9920`). Both halves proved by `apps/api/tests/automation_approvals.rs`
-   (4 walks) and by the `automationsapprovals` QA pass. Migration `0024_automation_approvals`.
-   Two notes on the spec, both recorded rather than papered over:
-   * **The decision token is optional in the body.** The request's risk note says approval links are
-     credentials and are "delivered to a panel page that posts the token in the body" — and a token
-     that is *mandatory* would mean the pending panel can decide nothing, because a queue read must
-     never mint a credential. The split is therefore: the **authority** to open a gate is the
-     session's `workflows.approve` (checked by the route guard), and the **token** is the second
-     factor a notification carries (checked when it is sent). A forwarded link whose token belongs
-     to another gate decides nothing.
-   * **An expired gate is decided as a rejection**, not as a third state. "Nobody answered" and "no"
-     are the same answer, and a third state would need a third ending and a third colour in the run
-     history for what is one fact — *it did not go ahead*. The sweep records the decision; the
-     engine's next claim ends the run, so the clock and the state machine stay separate.
 4. **Operations polish** — rate limits and concurrency, endless-loop guard, templates gallery, versions/restore, audit tab, mobile and empty states, event emissions.
    *Done when:* the six templates run green on the QA database and the limit and loop guards each have a test that fails when the guard is removed.
-   *Engine + API half shipped* (`b130f0b`, `684741e`, `49f7ac2`; migration `0031_automation_operations`).
-   The bounds are enforced in the run-start transaction and the guard is installed beside the
-   action handler. **The screen half shipped this tick** (`50902cc`): run history, the run detail
-   with its step trace, the templates gallery, versions/restore and the Audit tab are built, and
-   both criteria that needed a trace now close. Slice 4 stays **open**, on one item rather than
-   five: the walkthrough has not yet walked these five screens, so "no untested screen" is not yet
-   satisfied for them. The next tick extends `scripts/qa/walkthrough.cjs`'s routes and closes with
-   a full `run.sh` pass — that pass is the gate, and until it runs the slice is not done.
-   Migration `0032_automation_versions`.
-   **Slice 4 is done** (`8e3bb23`, `04bd7c1`, `b8b834a`). The gate was a w3 pass that had to answer three questions this tick could not:
-   is the stack still up, is the Versions tab listing anything, and what does the Audit tab say. Each had been a phantom rather than a
-   finding, so each got a fix before the answer was believable — a pass that lost its stack now reports **no result** instead of a red
-   report, a panel with no rows says *which* no rows, and `openRuleByName` proves the editor opened by reading the rule's name out of
-   the loaded form instead of assuming a click worked. With those in place the pass reads: run history `1` row, the trace on its own
-   route with `1 of 1 attempts`, the payload disclosure opening, Retry accepted, Versions `1 → 2 → 3` across create/edit/restore with
-   `appended: true`, the Audit tab listing `automation.created`, `automation.updated` and `automation.version_restored`, six templates
-   with the first installable one installed, and `NET_FAILURES=0`.
-
-   **The one product defect this pass found was the audit read** (`8e3bb23`) — the `inet` decode described in the acceptance list
-   above. Everything else it found was in the pass, and that is the honest split: three of the four "empty" screens this REQ had been
-   carrying were never empty, they were unmeasured.
-
-   **Still open, and deliberately so:** the "welcome e-mail on signup", inbound-hook-run, "a paused rule does not replay" walks, and the
-   loop guard's trace message — all carried over from earlier slices, all unchanged by this tick, all part of a later close-out pass
-   rather than of slice 4.
 
 ### Risks / notes
 

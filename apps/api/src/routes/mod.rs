@@ -68,30 +68,27 @@
 //! public by nature — a rendered site's tracking script posts to it — and protected by a body
 //! cap, a per-site rate limit and a collector that decides before it writes. The worker that
 //! keeps the rollups fresh is `crate::analytics_runner`.
-//!
-//! The app-builder surface (`/app-builder`, docs/requests/REQ-045) turns one sentence into
-//! typed artifacts and is the platform's headline "build me an app" path. Its four permission
-//! keys are a split that mirrors the request's own two acts: `appbuilder.read` sees plans,
-//! `appbuilder.generate` spends a generation, `appbuilder.review` is a person accepting,
-//! rejecting or editing an artifact, and `appbuilder.apply` is the only key that may write a
-//! live table — and it is deliberately not a variant of `review`, because the apply runner
-//! also creates roles and permissions, so one key would let a reviewer grant themselves the
-//! power the plan proposed. **Apply is not registered yet**: the runner is slice 3, and a
-//! button that answers "coming soon" is what the plan's Definition of Done forbids. See
-//! `crate::routes::app_builder`.
 
+pub mod theme_layouts;
+pub mod theme_settings;
+pub mod theme_assets;
+pub mod themes;
 pub mod ai;
-pub mod ai_workflow_decisions;
-pub mod ai_workflows;
 pub mod analytics;
-pub mod app_builder;
 pub mod auth;
 pub mod automation;
-pub mod automation_approvals;
-pub mod automation_operations;
 pub mod backups;
+pub mod blocks;
 pub mod commands;
+pub mod comments;
 pub mod content;
+pub mod content_api;
+pub mod content_usage;
+pub mod content_explorer;
+pub mod content_openapi;
+pub mod content_read;
+pub mod featured_media;
+pub mod forms;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -115,10 +112,14 @@ pub mod media_shares;
 pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
+pub mod menus;
+pub mod members;
+pub mod newsletter;
 pub mod notifications;
 pub mod notifications_admin;
 pub mod notifications_test;
 pub mod onboarding;
+pub mod patterns;
 pub mod public;
 pub mod readyz;
 pub mod restore_jobs;
@@ -130,12 +131,11 @@ pub mod security_headers;
 pub mod security_ip;
 pub mod security_limiter;
 pub mod security_secrets;
+pub mod seo;
 pub mod sso;
 pub mod tenancy;
 pub mod webauthn;
 pub mod webhooks;
-pub mod workflow_graph;
-pub mod workflow_listener;
 pub mod workflows;
 
 use axum::Router;
@@ -424,6 +424,50 @@ pub fn router(state: AppState) -> Router {
 
     // Content: pages and their revision history (docs/05-VERSIONING.md §4–§7). Reading the
     // history needs the read key; every mutation carries its own.
+    // The block registry (REQ-063, slice 1): the registry document and the dry-run validator
+    // both change nothing, so they read with `content.blocks.read` — the power an editor needs
+    // to author against the registry at all. Writing a block tree is `content.pages.update` on
+    // the page it belongs to, so the two halves of the editor carry the two keys that mean
+    // something: "may I see what I can build" and "may I change this page".
+    let blocks_registry =
+        get(blocks::list_blocks).layer(guards::require(&state, "content.blocks.read"));
+    let blocks_validate =
+        post(blocks::validate_blocks).layer(guards::require(&state, "content.blocks.read"));
+
+    // Patterns and page templates (REQ-063, slice 3). Both libraries read with the block read
+    // key — what an author may build is not a privilege — but writing is a separate key from
+    // editing a page, because a pattern outlives the page it was cut from and is reused across
+    // every site of the organization. Building from a template is the other direction: it needs
+    // `content.pages.create` (it creates a page) and no curation power at all.
+    let patterns_list =
+        get(patterns::list_patterns).layer(guards::require(&state, "content.blocks.read"));
+    let patterns_save =
+        post(patterns::save_pattern).layer(guards::require(&state, "content.patterns.manage"));
+    let templates_list =
+        get(patterns::list_templates).layer(guards::require(&state, "content.blocks.read"));
+    let templates_save =
+        post(patterns::save_template).layer(guards::require(&state, "content.templates.manage"));
+    let page_from_template = post(patterns::create_page_from_template)
+        .layer(guards::require(&state, "content.pages.create"));
+
+    let pattern = get(patterns::get_pattern)
+        .layer(guards::require(&state, "content.blocks.read"))
+        .merge(
+            put(patterns::update_pattern).layer(guards::require(&state, "content.patterns.manage")),
+        )
+        .merge(
+            delete(patterns::delete_pattern)
+                .layer(guards::require(&state, "content.patterns.manage")),
+        );
+
+    // The insert path reads a pattern's blocks with ids already fresh for the page they are
+    // going into, so it carries the read key — inserting is authoring, not curation.
+    let pattern_blocks =
+        get(patterns::get_pattern_blocks).layer(guards::require(&state, "content.blocks.read"));
+
+    let template = delete(patterns::delete_template)
+        .layer(guards::require(&state, "content.templates.manage"));
+
     let pages = get(content::list_pages)
         .layer(guards::require(&state, "content.pages.read"))
         .merge(post(content::create_page).layer(guards::require(&state, "content.pages.create")));
@@ -436,6 +480,13 @@ pub fn router(state: AppState) -> Router {
     let page_publish =
         post(content::publish_page).layer(guards::require(&state, "content.pages.publish"));
 
+    // REQ-063 slice 2: the preview frame reads the *draft* of a page and hands the panel a tree
+    // the server has already filtered for the chosen viewport. It changes nothing, so it carries
+    // the same read key as opening the page — a frame that needed a second permission would only
+    // teach authors to skip the one screen that shows the phone render.
+    let page_preview =
+        get(content::preview_page).layer(guards::require(&state, "content.pages.read"));
+
     let page_restore =
         post(content::restore_revision).layer(guards::require(&state, "content.pages.restore"));
 
@@ -444,6 +495,12 @@ pub fn router(state: AppState) -> Router {
 
     let page_revision =
         get(content::get_revision).layer(guards::require(&state, "content.pages.read"));
+
+    // REQ-063: the block-level compare two revisions, on the same read key as reading either
+    // of them — looking at a history is `content.pages.read`, and needing a second permission to
+    // ask what changed inside it would only teach authors to restore instead of compare.
+    let page_revision_diff =
+        get(content::diff_revision).layer(guards::require(&state, "content.pages.read"));
 
     let page_revision_comments =
         get(content::list_revision_comments).layer(guards::require(&state, "content.pages.read"));
@@ -753,13 +810,6 @@ pub fn router(state: AppState) -> Router {
     // A published page points at its own assets, so the library's read side is public too.
     let public_media = get(media::public_media);
 
-    // Inbound automation webhooks (REQ-003 slice 1). This route carries **no** permission
-    // guard on purpose: the token in the path is the credential, and a session would defeat
-    // the point of a webhook. The handler's own discipline is what protects it — an
-    // unshaped token never reaches the database, every failure answers the same 404, the
-    // rule's name is never echoed back, and a per-rule rate window bounds the burst.
-    let hooks = post(automation::receive_hook);
-
     // Workflows: the definitions and their run history (docs/requests/REQ-003). Reading needs
     // `workflows.read`, writing a definition `workflows.manage`, and starting or cancelling a
     // run `workflows.run`; every handler applies the tenancy scope rule through the workflow's
@@ -778,20 +828,6 @@ pub fn router(state: AppState) -> Router {
     let workflow_run =
         post(workflows::run_workflow).layer(guards::require(&state, "workflows.run"));
 
-    // *Run from here* (REQ-004 slice 3) starts a run, so it is guarded by `workflows.run`
-    // and not by `workflows.manage`: a viewer who may start a rule may start part of one,
-    // and a manager who cannot start runs still cannot start this.
-    let workflow_run_from_node =
-        post(workflows::run_workflow_from_node).layer(guards::require(&state, "workflows.run"));
-
-    // *Retry this node* (REQ-004 slice 3) re-runs work, so it is guarded by
-    // `workflows.run` on the same reasoning as *Run from here*: a viewer who may start a
-    // rule may re-run one of its steps, and a manager who cannot start runs still cannot
-    // re-run one. It is deliberately NOT `workflows.manage` — a graph edit is a definition
-    // change, and this changes nothing about the definition.
-    let workflow_execution_retry_node =
-        post(workflows::retry_workflow_node).layer(guards::require(&state, "workflows.run"));
-
     let workflow_executions =
         get(workflows::list_executions).layer(guards::require(&state, "workflows.read"));
 
@@ -800,35 +836,6 @@ pub fn router(state: AppState) -> Router {
 
     let workflow_execution_cancel =
         post(workflows::cancel_execution).layer(guards::require(&state, "workflows.run"));
-
-    // The visual builder's surfaces (REQ-004 slice 1). The registry is a *static* segment,
-    // so it can never be captured by `/workflows/{id}` — the ordering is not load-bearing
-    // but the distinctness is.
-    let workflow_node_types =
-        get(workflow_graph::list_node_types).layer(guards::require(&state, "workflows.read"));
-
-    let workflow_graph_read =
-        get(workflow_graph::get_graph).layer(guards::require(&state, "workflows.read"));
-
-    let workflow_graph_write =
-        put(workflow_graph::replace_graph).layer(guards::require(&state, "workflows.manage"));
-
-    let workflow_graph_ui_state =
-        put(workflow_graph::replace_ui_state).layer(guards::require(&state, "workflows.manage"));
-
-    // *Listen for a real event* (REQ-004 slice 3, criterion 5). Arming is `workflows.run`,
-    // not `workflows.manage`: it changes nothing about the definition, and it is the first
-    // half of running the rule for real, so it belongs with the power that can already start
-    // a run. Reading the armed rows back is `workflows.read` — the panel's "listening"
-    // indicator must work for somebody who may look at a rule but not start it.
-    let workflow_listen =
-        post(workflow_listener::listen_workflow).layer(guards::require(&state, "workflows.run"));
-
-    let workflow_listeners =
-        get(workflow_listener::list_workflow_listeners).layer(guards::require(&state, "workflows.read"));
-
-    let workflow_graph_validate =
-        post(workflow_graph::validate_graph).layer(guards::require(&state, "workflows.manage"));
 
     // Onboarding: the first-run flow (REQ-050). No permission guard — the flow itself decides
     // who may act, and it must be reachable before any account, role or binding exists.
@@ -861,131 +868,6 @@ pub fn router(state: AppState) -> Router {
     let ai_model = patch(ai::update_model).layer(guards::require(&state, "ai.providers.manage"));
 
     let ai_chat = post(ai::chat).layer(guards::require(&state, "ai.chat"));
-
-    // The AI workflow builder's console (docs/requests/REQ-046). The permission choices are
-    // borrowed rather than invented, and each one is a decision:
-    //
-    // * `workflows.read` for the list and the detail — a draft belongs to the workflow
-    //   surface, and an auditor who can read the rules that run must be able to read the
-    //   drafts that proposed them.
-    // * `ai.chat` for `generate` — it spends tokens, exactly as the chat route does, and a
-    //   new key would be carried by no role until an administrator visited the catalogue,
-    //   which silently means "nobody".
-    // * `workflows.manage` for the delete — a draft is an automation object and removing it is
-    //   an automation change.
-    let ai_workflow_drafts =
-        get(ai_workflows::list_drafts).layer(guards::require(&state, "workflows.read"));
-
-    let ai_workflow_generate =
-        post(ai_workflows::generate).layer(guards::require(&state, "ai.chat"));
-
-    let ai_workflow_authors = get(ai_workflows::list_authors)
-        .layer(guards::require(&state, "workflows.read"));
-
-    // The vocabulary the console renders itself from, and the empty state's prompts. `ai.chat`
-    // rather than `workflows.read` because the examples ARE generation prompts: showing them
-    // to somebody who cannot spend a generation hands out a button that answers 403.
-    let ai_workflow_examples =
-        get(ai_workflows::examples).layer(guards::require(&state, "ai.chat"));
-
-    let ai_workflow_draft = get(ai_workflows::get_draft)
-        .layer(guards::require(&state, "workflows.read"))
-        .merge(
-            delete(ai_workflows::delete_draft)
-                .layer(guards::require(&state, "workflows.manage")),
-        )
-        .merge(
-            // Saving an edited definition is a `workflows.manage` write, and it is the one
-            // the spec pairs with revalidation: the bytes came from a human, so the same
-            // validator the model's answer went through has to see them too.
-            patch(ai_workflow_decisions::save_definition)
-                .layer(guards::require(&state, "workflows.manage")),
-        );
-
-    // The decision half of the console (REQ-046 slice 4). Three different permissions, and
-    // the split is the point: deciding a draft **is** the materialisation of a workflow, so
-    // `approve` is `workflows.manage`; spending tokens is `ai.chat`, the same key generate
-    // sits behind, so a role that may manage rules but may not chat cannot arm one; and a
-    // test run reports what a rule *would* do, so it is `workflows.run` — the key the rule
-    // itself would need.
-    let ai_workflow_revise = post(ai_workflow_decisions::revise)
-        .layer(guards::require(&state, "ai.chat"));
-    let ai_workflow_approve = post(ai_workflow_decisions::approve)
-        .layer(guards::require(&state, "workflows.manage"));
-    let ai_workflow_reject = post(ai_workflow_decisions::reject)
-        .layer(guards::require(&state, "workflows.manage"));
-    let ai_workflow_test_run = post(ai_workflow_decisions::test_run)
-        .layer(guards::require(&state, "workflows.run"));
-
-    // The AI app builder's console and review workspace (docs/requests/REQ-045). Four keys,
-    // borrowed one per act rather than one per screen, and the split that matters is
-    // `review` against `apply`:
-    //
-    // * `appbuilder.read` for the list, the detail and the vocabulary — reading a proposal is
-    //   what an auditor does with one.
-    // * `appbuilder.generate` for `generate` and `regenerate`: both spend a generation, so
-    //   both sit behind the same power.
-    // * `appbuilder.review` for the three decisions a person makes to an artifact and for the
-    //   two whole-plan ones. Accepting, rejecting, editing, discarding and rejecting the plan
-    //   are all "the reviewer is tidying up proposals" — none of them writes a live table.
-    // * `appbuilder.apply` is **declared and unused**, because the apply runner is slice 3 and
-    //   a route that answered "coming soon" is what the Definition of Done forbids. It is
-    //   catalogued now so the key is a key a role can be given, and the REQ's own acceptance
-    //   line ("the four keys exist in the catalogue") is true today rather than on the day the
-    //   runner lands.
-    let app_builder_plans =
-        get(app_builder::list_plans).layer(guards::require(&state, "appbuilder.read"));
-
-    // The bulk delete. A **static** segment rather than `/plans/{id}/bulk-delete`, because axum
-    // ranks a static segment ahead of a capture — and a path that means "the plan whose id is
-    // `bulk-delete`" is not a path anybody should have to reason about. `appbuilder.review`, the
-    // same power as the single delete: a bulk is the same power over several rows, not a lesser
-    // one.
-    let app_builder_bulk_delete =
-        post(app_builder::bulk_delete_plans).layer(guards::require(&state, "appbuilder.review"));
-
-    let app_builder_examples =
-        get(app_builder::examples).layer(guards::require(&state, "appbuilder.read"));
-
-    let app_builder_generate =
-        post(app_builder::generate).layer(guards::require(&state, "appbuilder.generate"));
-
-    let app_builder_plan = get(app_builder::get_plan)
-        .layer(guards::require(&state, "appbuilder.read"))
-        .merge(delete(app_builder::delete_plan).layer(guards::require(&state, "appbuilder.review")));
-
-    // The plan as a downloadable file. Its own path rather than a `?format=json` on the
-    // detail, for the same reason the decisions above have their own paths: a content
-    // negotiation parameter is invisible to anybody reading the route table, and the one
-    // caller that must not take the inline branch — the browser, which would open a tab
-    // instead of downloading a file — is exactly the caller that does not read the query
-    // string. `appbuilder.read`, not `.review`: exporting is reading.
-    let app_builder_plan_export =
-        get(app_builder::export_plan).layer(guards::require(&state, "appbuilder.read"));
-
-    // The whole plan's own decisions, on their own paths rather than merged onto
-    // `/plans/{id}`. A `POST /plans/{id}` that silently meant "reject this plan" is a verb a
-    // REST client cannot discover, and a review screen that guesses the wrong one destroys a
-    // plan — so the path says what it does.
-    let app_builder_plan_reject =
-        post(app_builder::reject_plan).layer(guards::require(&state, "appbuilder.review"));
-
-    // The artifact tree's three decisions. The literal segments are registered **before**
-    // nothing parameterised here, but the ordering still matters for `/artifacts/{id}` versus
-    // `/artifacts/{id}/accept`: axum matches the longer literal path for its own methods, and
-    // a `POST` to `/artifacts/{id}/accept` must not be read as an edit of a plan whose id is
-    // the word "accept".
-    let app_builder_artifact = patch(app_builder::edit_artifact)
-        .layer(guards::require(&state, "appbuilder.review"));
-
-    let app_builder_artifact_accept =
-        post(app_builder::accept_artifact).layer(guards::require(&state, "appbuilder.review"));
-
-    let app_builder_artifact_reject =
-        post(app_builder::reject_artifact).layer(guards::require(&state, "appbuilder.review"));
-
-    let app_builder_artifact_regenerate = post(app_builder::regenerate_artifact)
-        .layer(guards::require(&state, "appbuilder.generate"));
 
     // Events and webhooks (docs/01-VISION.md §13, P12): reading the endpoints and their queue
     // history is `webhooks.read`, connecting, changing, testing and removing them is
@@ -1057,11 +939,10 @@ pub fn router(state: AppState) -> Router {
     let event_retention_sweep =
         post(webhooks::sweep_retention).layer(guards::require(&state, "webhooks.manage"));
 
-    // Automations (docs/requests/REQ-003, P13 + slice 1): a rule is an event-triggered
-    // workflow, so its read and write powers are the workflow keys the engine already
-    // defines — being allowed to define an automation and being allowed to run it are the
-    // same two powers a workflow carries. The handler checks the tenancy scope through the
-    // rule's organization.
+    // Automations (docs/requests/REQ-003, P13): a rule is an event-triggered workflow, so its
+    // read and write powers are the workflow keys the engine already defines — being allowed to
+    // define an automation and being allowed to run it are the same two powers a workflow
+    // carries. The handler checks the tenancy scope through the rule's organization.
     let automations = get(automation::list_automations)
         .layer(guards::require(&state, "workflows.read"))
         .merge(
@@ -1080,61 +961,6 @@ pub fn router(state: AppState) -> Router {
             delete(automation::delete_automation)
                 .layer(guards::require(&state, "workflows.manage")),
         );
-
-    // Test fire: a dry run and a one-shot listener are the same power as running a rule —
-    // neither sends an e-mail, publishes a page or calls a URL, but both read the rule's own
-    // definition and its run history, so they are `workflows.run`.
-    let automation_test =
-        post(automation::test_automation).layer(guards::require(&state, "workflows.run"));
-
-    let automation_listen =
-        post(automation::listen_automation).layer(guards::require(&state, "workflows.run"));
-
-    let automation_tests =
-        get(automation::list_tests).layer(guards::require(&state, "workflows.read"));
-
-    // Minting a hook token rewrites the rule's trigger credential, which is the same write
-    // as changing the rule itself.
-    let automation_rotate_hook =
-        post(automation::rotate_hook).layer(guards::require(&state, "workflows.manage"));
-
-    // "Run now" is the one control that touches the world — it sends, publishes and calls
-    // for real — so it is `workflows.run`, the same power the engine itself needs.
-    let automation_run =
-        post(automation::run_automation).layer(guards::require(&state, "workflows.run"));
-
-    // Repairing a run is running power too: it puts a step back on the queue, and that
-    // step's action touches the world exactly as it did the first time. Both endpoints are
-    // the same write, because "retry" and "resume from here" mean the same thing on a trace.
-    let execution_retry_step =
-        post(automation::retry_step).layer(guards::require(&state, "workflows.run"));
-    let execution_resume_from =
-        post(automation::resume_from).layer(guards::require(&state, "workflows.run"));
-
-    // The operations surfaces of slice 4: the definition history an operator reads to
-    // answer "what did this rule look like on Tuesday", the restore that puts it back, the
-    // templates gallery and the audit tab. Reading a history is `workflows.read` — the
-    // same power that reads the rule; **restoring is a definition write**, so it is
-    // `workflows.manage` and it is audited exactly like a `PUT`. A restore that carried
-    // only run power would let anybody who may fire a rule rewrite it.
-    let automation_versions =
-        get(automation_operations::list_versions).layer(guards::require(&state, "workflows.read"));
-    let automation_version_restore = post(automation_operations::restore_version)
-        .layer(guards::require(&state, "workflows.manage"));
-    let automation_version =
-        get(automation_operations::get_version).layer(guards::require(&state, "workflows.read"));
-    let automation_audit =
-        get(automation_operations::list_audit).layer(guards::require(&state, "workflows.read"));
-    let automation_templates =
-        get(automation_operations::list_templates).layer(guards::require(&state, "workflows.read"));
-
-    // Pending approvals (docs/requests/REQ-003 slice 3). Reading the gates and letting a
-    // parked run go on are one power, and deliberately NOT `workflows.run`: the person who
-    // writes a rule must not be the person who waves through everything that rule parks.
-    let approvals_list = get(automation_approvals::list_approvals)
-        .layer(guards::require(&state, "workflows.approve"));
-    let approval_decide = post(automation_approvals::decide_approval)
-        .layer(guards::require(&state, "workflows.approve"));
 
     // Search (docs/requests/REQ-002): the one search box and its index. Searching is
     // `search.read` — the box every signed-in account holds — and the handler narrows the
@@ -1272,6 +1098,381 @@ pub fn router(state: AppState) -> Router {
         // between the two modules, and this is the only way to show that from a browser.
         .route("/notifications/route", post(notifications_admin::run_route))
         .route_layer(guards::require(&state, "notifications.admin"));
+
+    // Menus (REQ-064, slice 1). Reading a menu is `menus.read` — an editor needs to see the
+    // navigation before deciding anything about it — and every write is `menus.manage`, which
+    // is a genuinely separate power: an account that may publish a page should not thereby
+    // rewrite the site's header. The public payload carries no guard at all, because a theme
+    // that needs a session to draw its navigation cannot be rendered by anything.
+    let menus_list = get(menus::list_menus).layer(guards::require(&state, "menus.read"));
+    let menus_create = post(menus::create_menu).layer(guards::require(&state, "menus.manage"));
+    let menu_read = get(menus::get_menu).layer(guards::require(&state, "menus.read"));
+    let menu_write = put(menus::update_menu)
+        .layer(guards::require(&state, "menus.manage"))
+        .merge(delete(menus::delete_menu).layer(guards::require(&state, "menus.manage")));
+    let menu_items_write =
+        put(menus::save_menu_items).layer(guards::require(&state, "menus.manage"));
+    let menu_items_from_pages =
+        post(menus::add_pages_to_menu).layer(guards::require(&state, "menus.manage"));
+    // The rendered menu a theme draws. Unauthenticated by nature, and audience-filtered by
+    // query — see `menus::public_menu`.
+    let public_menu = get(menus::public_menu);
+
+    // Content API tokens (REQ-019, slice 1). Reading the list and its vocabulary is one power
+    // (`content.api.read`) and minting, rotating and revoking is another (`content.api.manage`),
+    // because a token outlives the session that made it: whoever can create one can hand read
+    // access to published content to somebody outside the organization, and that is not the same
+    // privilege as watching who is already calling. The list answers prefix-only, so the route
+    // cannot leak a secret even by accident.
+    let content_api_tokens_list = get(content_api::list_tokens)
+        .layer(guards::require(&state, "content.api.read"));
+    let content_api_vocabulary = get(content_api::token_vocabulary)
+        .layer(guards::require(&state, "content.api.read"));
+    let content_api_token_create = post(content_api::create_token)
+        .layer(guards::require(&state, "content.api.manage"));
+    let content_api_token_update = patch(content_api::update_token)
+        .layer(guards::require(&state, "content.api.manage"));
+    let content_api_token_rotate = post(content_api::rotate_token)
+        .layer(guards::require(&state, "content.api.manage"));
+    let content_api_token_revoke = delete(content_api::revoke_token)
+        .layer(guards::require(&state, "content.api.manage"));
+    // The Docs tab's own read. A reader who may see the tokens may see the contract they are for —
+    // and the panel cannot reach the token-authenticated copy, so this is not a convenience
+    // duplicate but the only way the screen can render at all.
+    let content_api_openapi = get(content_api::openapi_document)
+        .layer(guards::require(&state, "content.api.read"));
+    // Reading what the tokens have done is the same power as reading them: a viewer of this
+    // section can already see a token's name, prefix and rate tier, and has lost nothing by also
+    // seeing how much it has been used. There is deliberately no separate "usage" permission — a
+    // permission nobody needs to *act* on only ever surprises an operator by being absent from
+    // someone's role.
+    let content_api_usage = get(content_usage::usage)
+        .layer(guards::require(&state, "content.api.read"));
+
+    // The Explorer's dispatcher (REQ-019, slice 3). `content.api.read`, not `manage`: making a
+    // call spends the *token's* budget and reads what that token may read, and a reader of this
+    // section can already mint such a token — so a `manage` requirement here would refuse an
+    // operator who may legitimately try out a token without letting them break one they do not
+    // own. The escalation argument is the scope list: `media:read` is what a call needs, and the
+    // route answers `403 insufficient_scope` naming it, which is the surface's own behaviour.
+    let content_api_explorer = post(content_explorer::explorer_call)
+        .layer(guards::require(&state, "content.api.read"));
+
+    // The token surface itself. Declared as its own router so the six routes read as one unit
+    // next to their permission layer, and merged into the v1 tree below.
+    let content_api = Router::new()
+        .route("/content-api/usage", content_api_usage)
+        .route("/content-api/explorer", content_api_explorer)
+        .route("/content-api/tokens", content_api_tokens_list)
+        .route("/content-api/tokens", content_api_token_create)
+        .route("/content-api/tokens/vocabulary", content_api_vocabulary)
+        .route("/content-api/tokens/{id}", content_api_token_update)
+        .route("/content-api/tokens/{id}", content_api_token_revoke)
+        .route("/content-api/tokens/{id}/rotate", content_api_token_rotate)
+        // Reading what the tokens have done is the same power as reading them: `content.api.read`
+        // is a viewer of this section, and a role that can see a token's name, prefix and rate
+        // tier has lost nothing by also seeing how much it has been used. There is no separate
+        // "usage" permission to add later — a permission nobody needs to *act* on is a permission
+        // that only ever surprises an operator by being missing.
+        // A literal path next to the `{id}` siblings: registering it after them would make
+        // matchit read `openapi` as a token id.
+        .route("/content-api/openapi.json", content_api_openapi);
+
+    // The headless content read surface (REQ-019, slice 2). No panel permission layer: these
+    // routes authenticate a *content token* through the `ContentToken` extractor instead, and
+    // they are the only routes in the v1 tree that do — a panel session must not be able to read
+    // them, because a session is a human inside the organization while this surface exists to
+    // hand published content to something outside it. Adding a session fallback here would make
+    // every integrator's token optional, which is the opposite of what the token is for.
+    let content_read = Router::new()
+        .route("/content/pages", get(content_read::list_pages))
+        .route("/content/pages/{slug}", get(content_read::get_page))
+        .route("/content/posts", get(content_read::list_posts))
+        .route("/content/posts/{slug}", get(content_read::get_post))
+        .route("/content/media", get(content_read::list_media))
+        .route("/content/sites", get(content_read::list_sites))
+        .route("/content/openapi.json", get(content_read::openapi_document));
+
+    // Scheduled publishing (REQ-064, slice 1). One key for the whole queue: reading it, moving
+    // an entry and cancelling one are the same power a publisher already has
+    // (`content.pages.schedule`), and a second key would only answer "who may look at the
+    // queue" separately from "who may change it" without making either safer.
+    let publishing_queue =
+        get(menus::list_queue).layer(guards::require(&state, "content.pages.schedule"));
+    let publishing_entry =
+        put(menus::reschedule_entry).layer(guards::require(&state, "content.pages.schedule"));
+    let publishing_entry_cancel =
+        post(menus::cancel_entry).layer(guards::require(&state, "content.pages.schedule"));
+    let publishing_entry_now =
+        post(menus::publish_now).layer(guards::require(&state, "content.pages.schedule"));
+    let publishing_entry_retry =
+        post(menus::retry_entry).layer(guards::require(&state, "content.pages.schedule"));
+    let page_schedule =
+        post(menus::schedule_page).layer(guards::require(&state, "content.pages.schedule"));
+
+    // Forms (REQ-064, slice 2). Three powers, not two: `forms.read` draws the builder and the
+    // list, `forms.manage` writes the definition, and `forms.submissions.read` reads what
+    // visitors sent. The third key is the one that matters — a person who may design the form
+    // has no business reading the answers, and every owner of a contact form has been that
+    // person at some point. The public submit route carries no guard at all: it is the endpoint
+    // a stranger's browser posts to.
+    let forms_list = get(forms::list_forms).layer(guards::require(&state, "forms.read"));
+    let forms_create = post(forms::create_form).layer(guards::require(&state, "forms.manage"));
+    let form_read = get(forms::get_form).layer(guards::require(&state, "forms.read"));
+    let form_write = put(forms::update_form)
+        .layer(guards::require(&state, "forms.manage"))
+        .merge(delete(forms::delete_form).layer(guards::require(&state, "forms.manage")));
+    let form_fields = put(forms::save_form_fields).layer(guards::require(&state, "forms.manage"));
+    let form_publish = post(forms::set_form_status).layer(guards::require(&state, "forms.manage"));
+    // The inbox: reading it AND changing a row's state take the same key, because an inbox you
+    // may read but not act on is a screen with buttons that answer 403.
+    let submissions_list =
+        get(forms::list_submissions).layer(guards::require(&state, "forms.submissions.read"));
+    let submissions_bulk = patch(forms::bulk_submission_status)
+        .layer(guards::require(&state, "forms.submissions.read"));
+    let submissions_export =
+        get(forms::export_submissions).layer(guards::require(&state, "forms.submissions.read"));
+    let submission_read =
+        get(forms::get_submission).layer(guards::require(&state, "forms.submissions.read"));
+    let submission_write = patch(forms::set_submission_status)
+        .layer(guards::require(&state, "forms.submissions.read"))
+        .merge(
+            delete(forms::delete_submission)
+                .layer(guards::require(&state, "forms.submissions.read")),
+        );
+    // Unauthenticated, like the rendered menu: a form on a live page is posted to by browsers
+    // that have no account on this installation.
+    let public_form_submit = post(forms::public_submit);
+
+    // SEO toolkit (REQ-064, slice 3). TWO powers, and the split is the same one the CMS has
+    // drawn everywhere: `seo.read` looks at a site's search setup, `seo.manage` changes it.
+    // The public routes below carry no guard at all — a sitemap, a robots.txt and a redirect are
+    // what a crawler asks for before it has any account anywhere.
+    let seo_overview = get(seo::get_seo_overview).layer(guards::require(&state, "seo.read"));
+    let page_seo_read = get(seo::get_page_seo).layer(guards::require(&state, "seo.read"));
+    let page_seo_write = put(seo::put_page_seo).layer(guards::require(&state, "seo.manage"));
+
+    // A page's featured image (REQ-064, slice 4d). **Three guards across two routes, and the
+    // first version had two and got it wrong.** The mistake was guarding the page's own read with
+    // `media.read` "because the body mentions a file" — which locked a page editor who can edit
+    // the page's title, body and crop out of reading the alt they are required to write. The three
+    // questions are genuinely different and each gets its own key:
+    //
+    //   * reading THIS page's image      → `content.pages.read`   — it is the page's own field
+    //   * writing it                     → `content.pages.update` — the same power as its body
+    //   * listing what it could point at  → `media.read`           — that is a question about the
+    //     LIBRARY, and it is the one that can enumerate files rather than name one
+    //
+    // The picker is a separate route for the third reason alone: one endpoint serving both would
+    // need one guard for both, and the weaker one wins — either an editor with an empty picker or
+    // a page editor holding the whole library.
+    let featured_read =
+        get(featured_media::get_featured_media).layer(guards::require(&state, "content.pages.read"));
+    let featured_write = put(featured_media::put_featured_media)
+        .layer(guards::require(&state, "content.pages.update"));
+    let featured_candidates =
+        get(featured_media::list_candidates).layer(guards::require(&state, "media.read"));
+    // The theme gallery (REQ-062 slice 1). Two read permissions and one write, and the
+    // split follows the question each one answers rather than the verb: the gallery is a
+    // listing (`themes.read`), the single theme is the renderer's own lookup, and activation
+    // is the only thing on this surface that changes what a signed-out visitor sees — so it
+    // carries its own key and cannot be reached by a `themes.read` account.
+    let themes_gallery =
+        get(themes::list_gallery).layer(guards::require(&state, "themes.read"));
+    let theme_read = get(themes::get_theme).layer(guards::require(&state, "themes.read"));
+    // A theme's own preview image (REQ-062 slice 4, acceptance 3). `themes.read`, because it
+    // is the gallery card's own read and the gallery is already that permission — a preview
+    // image is presentation data about a theme, and gating it harder than the theme's own
+    // manifest would make the gallery's card fail for a reason the card cannot explain.
+    let theme_asset =
+        get(theme_assets::theme_asset).layer(guards::require(&state, "themes.read"));
+    let theme_activate =
+        post(themes::activate_theme).layer(guards::require(&state, "themes.activate"));
+    let theme_rollback =
+        post(themes::rollback_theme).layer(guards::require(&state, "themes.activate"));
+    // Theme settings (REQ-062 slice 2). Read is `themes.read` because the history screen is a
+    // reading; every write is `themes.customize`, which is deliberately NOT implied by
+    // `themes.activate`. The save and the publish are different powers too — a designer who
+    // may stage a palette but not put it in front of visitors is a real setup, so the split
+    // is by *what the write does*, not by which table it touches.
+    let theme_settings_read =
+        get(theme_settings::read_settings).layer(guards::require(&state, "themes.read"));
+    let theme_settings_save = put(theme_settings::save_settings)
+        .layer(guards::require(&state, "themes.customize"));
+    // The dry run is gated on `themes.read`, not on `themes.customize`: it writes nothing, so
+    // the power it needs is the power to READ the draft it measures. Gating a measurement on
+    // the edit permission would answer "your palette is fine" with a 403 to a viewer, which
+    // reads as "your palette is broken".
+    let theme_settings_contrast_check = post(theme_settings::check_contrast)
+        .layer(guards::require(&state, "themes.read"));
+    let theme_settings_publish = post(theme_settings::publish_settings)
+        .layer(guards::require(&state, "themes.customize"));
+    let theme_settings_revisions = get(theme_settings::list_revisions)
+        .layer(guards::require(&state, "themes.read"));
+    let theme_settings_revision = get(theme_settings::read_revision)
+        .layer(guards::require(&state, "themes.read"));
+    let theme_settings_restore = post(theme_settings::restore_revision)
+        .layer(guards::require(&state, "themes.customize"));
+    // Theme layouts and packages (REQ-062 slice 3). The builder reads with `themes.read` and
+    // writes with `themes.customize`, exactly as the settings surface does — a slot and a
+    // colour token are the same power over the same site.
+    //
+    // The package routes are `themes.install`/`themes.export` and NOT `themes.customize`,
+    // because they are not about one site: a package crosses sites, and an account that may
+    // restyle the site it is on has no business writing a row every site in the installation
+    // can see. The validate route carries `themes.install` too — a dry run that an editor
+    // cannot perform is a dry run they guess at instead.
+    let theme_layouts_read =
+        get(theme_layouts::read_layouts).layer(guards::require(&state, "themes.read"));
+    let theme_layout_slot_read =
+        get(theme_layouts::read_slot).layer(guards::require(&state, "themes.read"));
+    let theme_layout_slot_save = put(theme_layouts::save_slot)
+        .layer(guards::require(&state, "themes.customize"));
+    let theme_layout_slot_reset = post(theme_layouts::reset_slot)
+        .layer(guards::require(&state, "themes.customize"));
+    let theme_package_export =
+        get(theme_layouts::export_package).layer(guards::require(&state, "themes.export"));
+    let theme_package_validate =
+        post(theme_layouts::validate_package).layer(guards::require(&state, "themes.install"));
+    let theme_package_install =
+        post(theme_layouts::install_package).layer(guards::require(&state, "themes.install"));
+    let theme_remove = delete(theme_layouts::remove_theme)
+        .layer(guards::require(&state, "themes.install"));
+    let seo_redirect_create =
+        post(seo::create_redirect).layer(guards::require(&state, "seo.manage"));
+    let seo_redirect_write = put(seo::update_redirect)
+        .layer(guards::require(&state, "seo.manage"))
+        .merge(delete(seo::delete_redirect).layer(guards::require(&state, "seo.manage")));
+    let seo_redirect_test = post(seo::test_redirect).layer(guards::require(&state, "seo.read"));
+    // The import writes rules, so it carries `seo.manage` like every other write on this surface
+    // — a *read* guard would have let any account that may look at the rules paste a file into
+    // the table. The export is the read it is: a caller who may see the rules may take them away.
+    let seo_redirect_import =
+        post(seo::import_redirects).layer(guards::require(&state, "seo.manage"));
+    let seo_redirect_export = get(seo::export_redirects).layer(guards::require(&state, "seo.read"));
+    let seo_settings_write = put(seo::put_settings).layer(guards::require(&state, "seo.manage"));
+    let seo_sitemap_regenerate =
+        post(seo::regenerate_sitemap).layer(guards::require(&state, "seo.manage"));
+    let seo_broken_read = get(seo::list_broken_links).layer(guards::require(&state, "seo.read"));
+    let seo_broken_scan = post(seo::scan_broken_links).layer(guards::require(&state, "seo.manage"));
+    let seo_broken_write =
+        patch(seo::set_broken_link_ignored).layer(guards::require(&state, "seo.manage"));
+    // Unauthenticated by nature — see the note above.
+    let public_sitemap = get(seo::public_sitemap);
+    let public_robots = get(seo::public_robots);
+    let public_redirect = get(seo::public_redirect);
+
+    // Newsletter (REQ-064, slice 4b). Two powers, and the public surface underneath them: the
+    // signup, the confirmation click and the unsubscribe click are the only unauthenticated
+    // routes in this module, and each of them writes to somebody else's inbox — so the confirm
+    // and unsubscribe tokens are the whole security surface, hashed and single-use.
+    let newsletter_lists_read =
+        get(newsletter::list_lists).layer(guards::require(&state, "newsletter.read"));
+    let newsletter_lists_write = post(newsletter::create_list)
+        .layer(guards::require(&state, "newsletter.manage"));
+    let newsletter_list_read =
+        get(newsletter::get_list).layer(guards::require(&state, "newsletter.read"));
+    let newsletter_list_write = put(newsletter::patch_list)
+        .layer(guards::require(&state, "newsletter.manage"))
+        .merge(delete(newsletter::delete_list).layer(guards::require(&state, "newsletter.manage")));
+    let newsletter_subscribers_read =
+        get(newsletter::list_subscribers).layer(guards::require(&state, "newsletter.read"));
+    // TWO separate POST method routers on purpose: they serve DIFFERENT paths
+    // (`/newsletter/lists/{id}/subscribers` and `/newsletter/lists/{id}/import`), and merging
+    // two POST routers panics at router construction with "Overlapping method route" — which
+    // takes down the whole application, not just this screen. A method router is a per-PATH
+    // thing; the paths are what decide.
+    let newsletter_list_subscribers_write =
+        post(newsletter::add_subscriber).layer(guards::require(&state, "newsletter.manage"));
+    let newsletter_list_import = post(newsletter::import_subscribers)
+        .layer(guards::require(&state, "newsletter.manage"));
+    let newsletter_subscriber_read =
+        get(newsletter::get_subscriber).layer(guards::require(&state, "newsletter.read"));
+    let newsletter_subscriber_write = patch(newsletter::set_subscriber_status)
+        .layer(guards::require(&state, "newsletter.manage"))
+        .merge(
+            delete(newsletter::delete_subscriber)
+                .layer(guards::require(&state, "newsletter.manage")),
+        );
+    let newsletter_export =
+        get(newsletter::export_subscribers).layer(guards::require(&state, "newsletter.read"));
+    let newsletter_issues_read =
+        get(newsletter::list_issues).layer(guards::require(&state, "newsletter.read"));
+    let newsletter_issues_write =
+        post(newsletter::send_issue).layer(guards::require(&state, "newsletter.manage"));
+
+    let public_newsletter_subscribe = post(newsletter::public_subscribe);
+    let public_newsletter_confirm = get(newsletter::public_confirm);
+    let public_newsletter_unsubscribe = get(newsletter::public_unsubscribe);
+    let public_newsletter_issue = get(newsletter::public_issue);
+    let public_newsletter_lists = get(newsletter::public_lists);
+
+    // Memberships (REQ-064, slice 4c). Two powers, and the split is the point: a member table
+    // shows every address on the site, so "somebody may look at it" must not also mean
+    // "somebody may block the one member they dislike, mint them a password reset, or delete
+    // them". `memberships.manage` additionally owns the SITE's policy, because gating decides
+    // who can read which published page.
+    //
+    // The public half carries no guard and no member session of the platform's own kind: these
+    // are the routes a browser with no account on this installation posts to. The literal
+    // segments are declared before the parameterised ones so axum ranks `/members/verify`
+    // ahead of a hypothetical `/members/{id}`.
+    let members_read = get(members::list_members).layer(guards::require(&state, "memberships.read"));
+    let members_create =
+        post(members::create_member).layer(guards::require(&state, "memberships.manage"));
+    let member_read = get(members::get_member).layer(guards::require(&state, "memberships.read"));
+    let member_write = patch(members::patch_member)
+        .layer(guards::require(&state, "memberships.manage"))
+        .merge(
+            delete(members::delete_member).layer(guards::require(&state, "memberships.manage")),
+        );
+    let member_block =
+        post(members::block_member).layer(guards::require(&state, "memberships.manage"));
+    let member_verify =
+        post(members::verify_member).layer(guards::require(&state, "memberships.manage"));
+    let member_send_verification = post(members::send_verification)
+        .layer(guards::require(&state, "memberships.manage"));
+    let member_send_reset =
+        post(members::send_reset).layer(guards::require(&state, "memberships.manage"));
+    let member_signout_everywhere = post(members::signout_everywhere)
+        .layer(guards::require(&state, "memberships.manage"));
+    let member_settings_read =
+        get(members::get_settings).layer(guards::require(&state, "memberships.read"));
+    let member_settings_write =
+        put(members::put_settings).layer(guards::require(&state, "memberships.manage"));
+    let public_member_signup = post(members::public_signup);
+    let public_member_signin = post(members::public_signin);
+    let public_member_signout = post(members::public_signout);
+    let public_member_me = get(members::public_me).merge(put(members::public_update_me));
+    let public_member_verify = get(members::public_verify);
+    let public_member_reset = post(members::public_password_reset);
+    let public_member_gate = get(members::public_gate);
+
+    // Comments (REQ-064, slice 4a). Two powers and one public surface. `comments.read` opens
+    // the inbox, `comments.manage` changes a row and edits the policy — and the two are
+    // deliberately separate, because the value of the split is exactly the case where a site
+    // hands the inbox to somebody who should not be able to approve a defamatory comment and
+    // hand the policy to somebody who should not be able to turn moderation off.
+    let comments_inbox = get(comments::list_comments).layer(guards::require(&state, "comments.read"));
+    let comments_bulk = post(comments::bulk_moderate).layer(guards::require(&state, "comments.manage"));
+    let comment_read = get(comments::get_comment).layer(guards::require(&state, "comments.read"));
+    let comment_write = patch(comments::moderate_comment)
+        .layer(guards::require(&state, "comments.manage"))
+        .merge(delete(comments::delete_comment).layer(guards::require(&state, "comments.manage")));
+    let comment_reply =
+        post(comments::reply).layer(guards::require(&state, "comments.manage"));
+    let comment_settings_read =
+        get(comments::get_settings).layer(guards::require(&state, "comments.read"));
+    let comment_settings_write =
+        put(comments::put_settings).layer(guards::require(&state, "comments.manage"));
+    let comment_ban_create =
+        post(comments::add_ban).layer(guards::require(&state, "comments.manage"));
+    let comment_ban_write =
+        delete(comments::remove_ban).layer(guards::require(&state, "comments.manage"));
+    // The two public routes carry no guard at all: a comment thread and the form that posts it
+    // are read and written by browsers that have no account on this installation.
+    let public_comment_thread = get(comments::public_thread);
+    let public_comment_submit = post(comments::public_submit);
 
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
     // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
@@ -1847,12 +2048,72 @@ pub fn router(state: AppState) -> Router {
         .route("/sites/{id}/domains", domains)
         .route("/sites/{id}/domains/{domain_id}", domain)
         .route("/sites/{id}/domains/{domain_id}/primary", domain_primary)
+        .route("/blocks", blocks_registry)
+        .route("/blocks/validate", blocks_validate)
+        .route("/patterns", patterns_list)
+        .route("/patterns", patterns_save)
+        .route("/patterns/{id}", pattern)
+        .route("/patterns/{id}/blocks", pattern_blocks)
+        .route("/page-templates", templates_list)
+        .route("/page-templates", templates_save)
+        .route("/page-templates/{id}", template)
+        .route("/pages/from-template", page_from_template)
         .route("/pages", pages)
         .route("/pages/{id}", page)
         .route("/pages/{id}/publish", page_publish)
+        // Menus and the publishing queue (REQ-064, slice 1). The static segments are declared
+        // before the parameter ones so axum ranks them ahead of `{id}`.
+        .route("/menus", menus_list)
+        .route("/menus", menus_create)
+
+        // The panel-side token manager for the headless surface. Merged rather than nested
+        // under a prefix, because the guard layers already carry the permissions and a second
+        // nesting level would only add a place for a route to be declared and forgotten.
+        .merge(content_api)
+        .merge(content_read)
+
+        .route("/menus/{id}", menu_read.merge(menu_write))
+        .route("/menus/{id}/items", menu_items_write)
+        .route("/menus/{id}/items/from-pages", menu_items_from_pages)
+        .route("/publishing/queue", publishing_queue)
+        .route("/publishing/queue/{id}", publishing_entry)
+        .route("/publishing/queue/{id}/cancel", publishing_entry_cancel)
+        .route("/publishing/queue/{id}/publish-now", publishing_entry_now)
+        .route("/publishing/queue/{id}/retry", publishing_entry_retry)
+        .route("/pages/{id}/schedule", page_schedule)
+        .route("/public/menus/{location}", public_menu)
+        // The three public SEO surfaces. The host is a path parameter rather than a header so
+        // they can be cached and proxied like any other file, and so a crawler following a
+        // canonical URL lands on the right site without a `Host` header being trusted through a
+        // CDN that rewrites it.
+        .route("/public/{host}/sitemap.xml", public_sitemap)
+        .route("/public/{host}/robots.txt", public_robots)
+        .route("/public/{host}/redirect", public_redirect)
+        // Forms and their inbox (REQ-064, slice 2). The static segments are declared before the
+        // parameter ones so axum ranks them ahead of `{id}` — `/forms/{id}/submissions/export`
+        // is a literal, and a route registered after `/forms/{id}/submissions/{sid}` would never
+        // be reached.
+        .route("/forms", forms_list)
+        .route("/forms", forms_create)
+        .route("/forms/{id}", form_read.merge(form_write))
+        .route("/forms/{id}/fields", form_fields)
+        .route("/forms/{id}/publish", form_publish)
+        .route("/forms/{id}/submissions", submissions_list)
+        .route("/forms/{id}/submissions", submissions_bulk)
+        .route("/forms/{id}/submissions/export", submissions_export)
+        .route(
+            "/forms/{id}/submissions/{sid}",
+            submission_read.merge(submission_write),
+        )
+        .route("/public/forms/{key}/submit", public_form_submit)
+        .route("/pages/{id}/preview", page_preview)
         .route("/pages/{id}/restore", page_restore)
         .route("/pages/{id}/revisions", page_revisions)
         .route("/pages/{id}/revisions/{revision_id}", page_revision)
+        .route(
+            "/pages/{id}/revisions/{revision_id}/diff",
+            page_revision_diff,
+        )
         .route(
             "/pages/{id}/revisions/{revision_id}/translations",
             page_translations,
@@ -1861,6 +2122,106 @@ pub fn router(state: AppState) -> Router {
             "/pages/{id}/revisions/{revision_id}/translations/{language}",
             page_translation,
         )
+        // SEO toolkit (REQ-064, slice 3). The page tab hangs off `/pages/{id}/seo` beside the
+        // other per-page sub-resources, and the site-wide surface lives under `/seo` with the
+        // settings under `/sites/{id}/seo` — three prefixes for one feature, because each names
+        // a different scope and a single one would have made a page's SEO a site-level route
+        // with a page id in the query.
+        .route("/pages/{id}/seo", page_seo_read.merge(page_seo_write))
+        .route(
+            "/pages/{id}/featured-media",
+            featured_read.merge(featured_write),
+        )
+        .route(
+            "/sites/{site_id}/featured-media/candidates",
+            featured_candidates,
+        )
+        .route("/seo/settings", seo_overview)
+        .route("/seo/redirects", seo_redirect_create)
+        // Before `/seo/redirects/{id}`: axum's matchit would otherwise read "import" as a
+        // redirect id and hand the CSV to a handler that expects a UUID, which fails as a 400
+        // with a message about the path instead of about the file.
+        .route("/seo/redirects/import", seo_redirect_import)
+        .route("/seo/redirects/export", seo_redirect_export)
+        .route("/seo/redirects/{id}", seo_redirect_write)
+        .route("/seo/redirects/{id}/test", seo_redirect_test)
+        .route("/sites/{site_id}/seo/settings", seo_settings_write)
+        .route(
+            "/sites/{site_id}/seo/sitemap/regenerate",
+            seo_sitemap_regenerate,
+        )
+        .route("/seo/broken-links", seo_broken_read.merge(seo_broken_scan))
+        .route("/seo/broken-links/{id}", seo_broken_write)
+        // Newsletter (REQ-064, slice 4b). The panel is three tables and one archive; the
+        // `/public` half is the signup, the two link clicks and the archive page, and none of
+        // them carry a session. The literal segments are declared before the parameter ones so
+        // axum ranks `/newsletter/subscribers/export` ahead of `/newsletter/subscribers/{id}` —
+        // a route registered after a parameterised sibling is unreachable, and the export is
+        // the one button an owner reaches for under pressure.
+        .route("/newsletter/lists", newsletter_lists_read)
+        .route("/newsletter/lists", newsletter_lists_write)
+        .route("/newsletter/lists/{id}", newsletter_list_read.merge(newsletter_list_write))
+        .route(
+            "/newsletter/lists/{id}/subscribers",
+            newsletter_list_subscribers_write,
+        )
+        .route("/newsletter/lists/{id}/import", newsletter_list_import)
+        .route("/newsletter/subscribers", newsletter_subscribers_read)
+        .route("/newsletter/subscribers/export", newsletter_export)
+        .route(
+            "/newsletter/subscribers/{id}",
+            newsletter_subscriber_read.merge(newsletter_subscriber_write),
+        )
+        .route("/newsletter/issues", newsletter_issues_read)
+        .route("/newsletter/issues", newsletter_issues_write)
+        .route("/public/newsletter/lists", public_newsletter_lists)
+        .route("/public/newsletter/confirm", public_newsletter_confirm)
+        .route("/public/newsletter/unsubscribe", public_newsletter_unsubscribe)
+        .route("/public/newsletter/issues/{slug}", public_newsletter_issue)
+        .route(
+            "/public/newsletter/{key}/subscribe",
+            public_newsletter_subscribe,
+        )
+        // Memberships (REQ-064, slice 4c). The panel is the table, the drawer and the policy;
+        // the `/public` half is the visitor's own signup, sign-in, profile, the two link clicks
+        // and the gate probe a theme asks before it draws a page. The per-site policy hangs off
+        // `/sites/{id}`, beside the other per-site surfaces.
+        //
+        // The literal segments are declared BEFORE `/members/{id}` so axum ranks
+        // `/members/settings`-style paths ahead of it — a route registered after a
+        // parameterised sibling is unreachable, and the visitor's sign-in is the one link a
+        // member area cannot afford to lose.
+        .route("/members", members_read)
+        .route("/members", members_create)
+        .route("/members/{id}", member_read.merge(member_write))
+        .route("/members/{id}/block", member_block)
+        .route("/members/{id}/verify", member_verify)
+        .route("/members/{id}/send-verification", member_send_verification)
+        .route("/members/{id}/send-reset", member_send_reset)
+        .route("/members/{id}/sign-out-everywhere", member_signout_everywhere)
+        .route("/sites/{site_id}/members/settings", member_settings_read)
+        .route("/sites/{site_id}/members/settings", member_settings_write)
+        .route("/public/members/signup", public_member_signup)
+        .route("/public/members/signin", public_member_signin)
+        .route("/public/members/signout", public_member_signout)
+        .route("/public/members/me", public_member_me)
+        .route("/public/members/verify", public_member_verify)
+        .route("/public/members/password-reset", public_member_reset)
+        .route("/public/members/gate", public_member_gate)
+        // Comments (REQ-064, slice 4a). The inbox is `/comments`, the policy hangs off the site
+        // it belongs to (`/sites/{id}/comment-settings`, beside the other per-site surfaces) and
+        // the visitor's two routes live under `/public` where every unauthenticated surface on
+        // this platform already lives.
+        .route("/comments", comments_inbox)
+        .route("/comments/bulk", comments_bulk)
+        .route("/comments/{id}", comment_read.merge(comment_write))
+        .route("/comments/{id}/reply", comment_reply)
+        .route("/sites/{site_id}/comment-settings", comment_settings_read)
+        .route("/sites/{site_id}/comment-settings", comment_settings_write)
+        .route("/sites/{site_id}/comment-bans", comment_ban_create)
+        .route("/sites/{site_id}/comment-bans/{id}", comment_ban_write)
+        .route("/public/comments/{page}", public_comment_thread)
+        .route("/public/comments/{page}", public_comment_submit)
         .route("/media", media)
         .merge(media_upload)
         .route("/media/{id}", media_entry)
@@ -1975,37 +2336,67 @@ pub fn router(state: AppState) -> Router {
             media_version_download,
         )
         .route("/public/pages/{slug}", public_pages)
+        .route("/themes", themes_gallery)
+        .route("/themes/{key}", theme_read)
+        .route("/themes/{key}/assets/{file}", theme_asset)
+        .route("/sites/{site_id}/theme", theme_activate)
+        .route("/sites/{site_id}/theme/rollback", theme_rollback)
+        .route("/sites/{site_id}/theme-settings", theme_settings_read)
+        .route("/sites/{site_id}/theme-settings", theme_settings_save)
+        .route(
+            "/sites/{site_id}/theme-settings/contrast-check",
+            theme_settings_contrast_check,
+        )
+        .route(
+            "/sites/{site_id}/theme-settings/publish",
+            theme_settings_publish,
+        )
+        .route(
+            "/sites/{site_id}/theme-settings/revisions",
+            theme_settings_revisions,
+        )
+        .route(
+            "/sites/{site_id}/theme-settings/revisions/{revision_no}",
+            theme_settings_revision,
+        )
+        .route(
+            "/sites/{site_id}/theme-settings/revisions/{revision_no}/restore",
+            theme_settings_restore,
+        )
+        // Theme layouts and packages (REQ-062 slice 3). `/themes/{key}` above is a GET, and a
+        // `DELETE` on the same path is a different method — axum merges those, so the two
+        // coexist. `validate` and `install` are registered BEFORE `/themes/{key}` for the
+        // reason `/backups/sweep` is: a `POST /themes/validate` would otherwise be a perfect
+        // `key` and no conflict at all, so this is a readability choice rather than a
+        // correctness one — but it keeps the static names next to each other.
+        .route("/themes/validate", theme_package_validate)
+        .route("/themes/install", theme_package_install)
+        .route("/sites/{site_id}/theme-layouts", theme_layouts_read)
+        .route(
+            "/sites/{site_id}/theme-layouts/{slot}",
+            theme_layout_slot_read,
+        )
+        .route(
+            "/sites/{site_id}/theme-layouts/{slot}",
+            theme_layout_slot_save,
+        )
+        .route(
+            "/sites/{site_id}/theme-layouts/{slot}/reset",
+            theme_layout_slot_reset,
+        )
+        .route(
+            "/sites/{site_id}/theme-package/export",
+            theme_package_export,
+        )
+        .route("/themes/{key}", theme_remove)
         .route("/public/media/{id}", public_media)
         // The share token route: unauthenticated by nature, because the token is the
         // credential. It is a *static* `shared` segment, so it never collides with the
         // `{id}` parameter above it.
         .route("/public/media/shared/{token}", public_media_shared)
         .route("/workflows", workflows)
-        .route("/workflows/node-types", workflow_node_types)
         .route("/workflows/{id}", workflow)
         .route("/workflows/{id}/run", workflow_run)
-        // A distinct path, not a body on `/run`: the two answers differ in *kind* — one is
-        // a whole run, the other a run with a prefix that did not run — and a client that
-        // sends `node_id` to the plain endpoint and gets a full run back would be a
-        // silent wrong answer rather than a refusal.
-        .route("/workflows/{id}/run-from-node", workflow_run_from_node)
-        .route(
-            "/workflow-executions/{id}/retry-node",
-            workflow_execution_retry_node,
-        )
-        .route(
-            "/workflows/{id}/graph",
-            workflow_graph_read.merge(workflow_graph_write),
-        )
-        .route("/workflows/{id}/graph/ui-state", workflow_graph_ui_state)
-        .route("/workflows/{id}/listen", workflow_listen)
-        .route("/workflows/{id}/listeners", workflow_listeners)
-        .route(
-            "/workflows/{id}/listeners/{token}",
-            get(workflow_listener::get_workflow_listener)
-                .layer(guards::require(&state, "workflows.read")),
-        )
-        .route("/workflows/{id}/validate", workflow_graph_validate)
         .route("/workflows/{id}/executions", workflow_executions)
         .route("/workflow-executions/{id}", workflow_execution)
         .route(
@@ -2026,42 +2417,6 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/models", ai_models)
         .route("/ai/models/{id}", ai_model)
         .route("/ai/chat", ai_chat)
-        .route("/ai/workflows/drafts", ai_workflow_drafts)
-        .route("/ai/workflows/generate", ai_workflow_generate)
-        .route("/ai/workflows/examples", ai_workflow_examples)
-        .route("/ai/workflows/drafts/authors", ai_workflow_authors)
-        .route("/ai/workflows/drafts/{id}", ai_workflow_draft)
-        .route("/ai/workflows/drafts/{id}/revise", ai_workflow_revise)
-        .route("/ai/workflows/drafts/{id}/approve", ai_workflow_approve)
-        .route("/ai/workflows/drafts/{id}/reject", ai_workflow_reject)
-        .route("/ai/workflows/drafts/{id}/test-run", ai_workflow_test_run)
-        // The AI app builder (docs/requests/REQ-045). The literal `examples` segment is
-        // declared **before** `/plans/{id}` for the same reason `/events/catalogue` is: it is
-        // a sibling, and a parameterised route registered first would read `examples` as a plan
-        // id and answer "no such plan" for a request that is perfectly valid.
-        .route("/app-builder/plans", app_builder_plans)
-        .route("/app-builder/plans/bulk-delete", app_builder_bulk_delete)
-        .route("/app-builder/examples", app_builder_examples)
-        .route("/app-builder/generate", app_builder_generate)
-        .route("/app-builder/plans/{id}", app_builder_plan)
-        .route("/app-builder/plans/{id}/export", app_builder_plan_export)
-        .route("/app-builder/plans/{id}/reject", app_builder_plan_reject)
-        .route(
-            "/app-builder/plans/{id}/artifacts/{artifact_id}",
-            app_builder_artifact,
-        )
-        .route(
-            "/app-builder/plans/{id}/artifacts/{artifact_id}/accept",
-            app_builder_artifact_accept,
-        )
-        .route(
-            "/app-builder/plans/{id}/artifacts/{artifact_id}/reject",
-            app_builder_artifact_reject,
-        )
-        .route(
-            "/app-builder/plans/{id}/artifacts/{artifact_id}/regenerate",
-            app_builder_artifact_regenerate,
-        )
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)
@@ -2082,31 +2437,7 @@ pub fn router(state: AppState) -> Router {
         .route("/events/retention/sweep", event_retention_sweep)
         .route("/automations", automations)
         .route("/automations/catalogue", automation_catalogue)
-        .route("/automations/templates", automation_templates)
-        .route("/automations/{id}/versions", automation_versions)
-        .route(
-            "/automations/{id}/versions/{version_id}",
-            automation_version,
-        )
-        .route(
-            "/automations/{id}/versions/{version_id}/restore",
-            automation_version_restore,
-        )
-        .route("/automations/{id}/audit", automation_audit)
         .route("/automations/{id}", automation_entry)
-        .route("/automations/{id}/test", automation_test)
-        .route("/automations/{id}/listen", automation_listen)
-        .route("/automations/{id}/tests", automation_tests)
-        .route("/automations/{id}/rotate-hook", automation_rotate_hook)
-        .route("/automations/{id}/run", automation_run)
-        .route("/approvals", approvals_list)
-        .route("/approvals/{id}/decide", approval_decide)
-        .route("/workflow-executions/{id}/retry-step", execution_retry_step)
-        .route(
-            "/workflow-executions/{id}/resume-from",
-            execution_resume_from,
-        )
-        .route("/hooks/{token}", hooks)
         .route(
             "/pages/{id}/revisions/{revision_id}/comments",
             page_revision_comments,

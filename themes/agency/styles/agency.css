@@ -1,0 +1,434 @@
+/**
+ * Agency — A studio site: an oversized display line, wide gutters and a card grid that breaks the measure.
+ *
+ * The tokens are the theme; everything below reads them. A settings revision overrides the
+ * same custom property names, which is why they are declared once and never spelled into a
+ * rule — two code paths computing "the effective colour" is how a preview ends up lying.
+ *
+ * Every element selector is scoped to `html[data-theme="agency"]`. All ten bundled sheets are
+ * loaded by the renderer's static import graph, so an unscoped `body { … }` here would style
+ * every theme's pages with this theme's palette. Block classes are already prefixed and need
+ * no scoping; the resets, the focus ring and the media queries do.
+ */
+
+/* The theme's tokens. A theme is its palette: everything below reads these, and a
+   settings revision overrides them on the same custom property names, which is why they are
+   declared once here rather than spelled into each rule.
+
+   ## Why these rules are scoped to `data-theme`
+
+   All ten bundled stylesheets are loaded by the renderer's single import graph, because a
+   CSS import is static and `resolveTheme()` is a runtime call. Ten sheets declaring `body`
+   would therefore fight, and the winner would be whichever sheet the bundler happened to
+   order last — a site's theme would render with whichever palette sorted highest, which is
+   the "colour-swapped clones" failure in its purest form.
+
+   Scoping to `html[data-theme="<key>"]` is what makes one bundle carry ten themes: only the
+   sheet whose key matches the active theme matches anything. `data-theme` is written by
+   `apps/web/app/layout.tsx` from the same `resolveTheme()` the page is drawn with, so the
+   stylesheet and the markup can never be chosen by different code.
+*/
+html[data-theme="agency"] {
+  --ag-agency-canvas: #fffdf9;
+  --ag-agency-surface: #f6f1e8;
+  --ag-agency-ink: #1b1815;
+  --ag-agency-muted: #6d6459;
+  --ag-agency-line: #e3dacb;
+  --ag-agency-accent: #d94f2b;
+  --ag-agency-accent_soft: #fbeae3;
+  --ag-agency-font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --ag-agency-font-title: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  --ag-agency-measure: 38rem;
+  --ag-agency-title-scale: clamp(2.6rem, 1.2rem + 5vw, 5rem);
+  --ag-agency-title-weight: 800;
+  --ag-agency-title-tracking: -0.05em;
+  --ag-agency-radius: 4px;
+  --ag-agency-base-size: 18px;
+  --ag-agency-container: 1120px;
+}
+
+/* Dark mode is a token swap, never a second set of rules: the pair lives in the manifest and
+   the stylesheet only decides which pair the visitor gets. */
+@media (prefers-color-scheme: dark) {
+  html[data-theme="agency"] {
+    --ag-agency-canvas: #141210;
+    --ag-agency-surface: #201c17;
+    --ag-agency-ink: #f2ede4;
+    --ag-agency-muted: #a89c8c;
+    --ag-agency-line: #332d25;
+    --ag-agency-accent: #ff8a5c;
+    --ag-agency-accent_soft: #3a1d12;
+  }
+}
+
+
+/* The reset is scoped to the active theme for the reason the tokens are: all ten sheets ship
+   in one bundle, and an unscoped `body` rule would let every one of them style every page. */
+html[data-theme="agency"] *,
+html[data-theme="agency"] *::before,
+html[data-theme="agency"] *::after {
+  box-sizing: border-box;
+}
+
+html[data-theme="agency"] {
+  background-color: var(--ag-agency-canvas);
+  color-scheme: light dark;
+}
+
+html[data-theme="agency"] body {
+  margin: 0;
+  background: var(--ag-agency-canvas);
+  color: var(--ag-agency-ink);
+  font-family: var(--ag-agency-font-body);
+  font-size: var(--ag-agency-base-size);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+html[data-theme="agency"] ::selection {
+  background-color: var(--ag-agency-accent-soft);
+}
+
+html[data-theme="agency"] a {
+  color: var(--ag-agency-accent);
+  text-underline-offset: 3px;
+}
+
+/* The focus ring is the one rule every theme shares unscoped in spirit and scoped in practice:
+   a theme that removed it would fail the accessibility bar rather than look different. */
+html[data-theme="agency"] :focus-visible {
+  outline: 3px solid var(--ag-agency-accent);
+  outline-offset: 2px;
+}
+
+html[data-theme="agency"] img {
+  max-width: 100%;
+  height: auto;
+}
+
+
+/* The shell: a full-height column that pins the footer to the bottom on a short page. */
+.ag-agency-shell {
+  display: flex;
+  min-height: 100dvh;
+  flex-direction: column;
+}
+
+.ag-agency-header,
+.ag-agency-footer {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+}
+
+.ag-agency-header {
+  border-bottom: 0; padding-inline: 0;
+}
+
+.ag-agency-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--ag-agency-line);
+  color: var(--ag-agency-muted);
+  font-size: 0.8125rem;
+}
+
+.ag-agency-main {
+  width: 100%;
+  max-width: var(--ag-agency-container);
+  margin-inline: auto;
+  padding: 3rem 1.5rem 4rem;
+}
+
+.ag-agency-article {
+  max-width: var(--ag-agency-measure);
+}
+
+.ag-agency-title {
+  margin: 0;
+  font-family: var(--ag-agency-font-title);
+  font-size: var(--ag-agency-title-scale);
+  font-weight: var(--ag-agency-title-weight);
+  line-height: 1.1;
+  letter-spacing: var(--ag-agency-title-tracking);
+}
+
+.ag-agency-eyebrow {
+  margin: 0 0 0.75rem;
+  color: var(--ag-agency-accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.ag-agency-summary {
+  margin: 1rem 0 0;
+  color: var(--ag-agency-muted);
+  font-size: 1.15em;
+}
+
+.ag-agency-meta {
+  margin: 1.5rem 0 0;
+  color: var(--ag-agency-muted);
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+}
+
+.ag-agency-body {
+  margin-top: 2.5rem;
+}
+
+.ag-agency-body p {
+  margin: 0 0 1.25rem;
+  white-space: pre-line;
+}
+
+.ag-agency-body p:last-child {
+  margin-bottom: 0;
+}
+
+
+.ag-agency-header {
+  max-width: var(--ag-agency-container);
+  margin-inline: auto;
+}
+
+.ag-agency-brand {
+  color: var(--ag-agency-ink);
+  font-weight: 800;
+  font-size: 1.125rem;
+  letter-spacing: -0.03em;
+  text-decoration: none;
+}
+
+.ag-agency-contact {
+  color: var(--ag-agency-ink);
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-decoration: none;
+  border-bottom: 2px solid var(--ag-agency-accent);
+  padding-bottom: 0.125rem;
+}
+
+/* The card grid breaks the text column on purpose — a studio's work is not a footnote to
+   its copy, and the break is what makes the page look composed rather than templated. */
+.ag-agency-main .ag-agency-cards,
+.ag-agency-main .ag-agency-gallery {
+  width: min(72rem, 100vw - 3rem);
+  max-width: none;
+  margin-left: 50%;
+  transform: translateX(-50%);
+}
+
+.ag-agency-card {
+  border: 2px solid var(--ag-agency-ink);
+  background: transparent;
+  border-radius: 0;
+}
+
+
+/* Blocks (REQ-063). The markup is the SDK's; everything here is this theme's styling of it. */
+.ag-agency-block {
+  margin: 0 0 1.75rem;
+}
+
+.ag-agency-block:last-child {
+  margin-bottom: 0;
+}
+
+.ag-agency-heading {
+  margin: 2.5rem 0 0.75rem;
+  font-family: var(--ag-agency-font-title);
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+.ag-agency-heading:first-child {
+  margin-top: 0;
+}
+
+.ag-agency-align-center {
+  text-align: center;
+}
+
+.ag-agency-align-right {
+  text-align: right;
+}
+
+.ag-agency-figure {
+  margin-inline: 0;
+}
+
+.ag-agency-figure figcaption {
+  margin-top: 0.5rem;
+  color: var(--ag-agency-muted);
+  font-size: 0.8125rem;
+}
+
+.ag-agency-testimonial {
+  margin-inline: 0;
+  padding: 1.25rem 1.5rem;
+  border-left: 3px solid var(--ag-agency-accent);
+  background: var(--ag-agency-surface);
+  border-radius: var(--ag-agency-radius);
+}
+
+.ag-agency-testimonial blockquote {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.ag-agency-testimonial figcaption {
+  margin-top: 0.5rem;
+  color: var(--ag-agency-muted);
+  font-size: 0.8125rem;
+}
+
+.ag-agency-gallery {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.ag-agency-gallery img {
+  border-radius: var(--ag-agency-radius);
+}
+
+.ag-agency-columns {
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.ag-agency-cta {
+  padding: 1.75rem;
+  border-radius: var(--ag-agency-radius);
+  background: var(--ag-agency-accent-soft);
+}
+
+.ag-agency-cta h2 {
+  margin: 0 0 0.5rem;
+}
+
+.ag-agency-cta p {
+  margin: 0 0 1rem;
+  color: var(--ag-agency-muted);
+}
+
+.ag-agency-cta-link {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: var(--ag-agency-radius);
+  background: var(--ag-agency-accent);
+  color: var(--ag-agency-canvas);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.ag-agency-cards {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.ag-agency-card {
+  padding: 1.25rem;
+  border: 1px solid var(--ag-agency-line);
+  border-radius: var(--ag-agency-radius);
+  background: var(--ag-agency-surface);
+}
+
+.ag-agency-card h3 {
+  margin: 0 0 0.5rem;
+}
+
+.ag-agency-card p {
+  margin: 0 0 0.75rem;
+  color: var(--ag-agency-muted);
+  font-size: 0.9375rem;
+}
+
+.ag-agency-plans {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.ag-agency-plans ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ag-agency-plan {
+  padding: 1.25rem;
+  border: 1px solid var(--ag-agency-line);
+  border-radius: var(--ag-agency-radius);
+}
+
+.ag-agency-plan h3 {
+  margin: 0;
+}
+
+.ag-agency-price {
+  margin: 0.25rem 0 0.75rem;
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.ag-agency-plan ul li {
+  padding: 0.25rem 0;
+  color: var(--ag-agency-muted);
+  font-size: 0.9375rem;
+}
+
+.ag-agency-faq > div {
+  padding: 0.875rem 0;
+  border-bottom: 1px solid var(--ag-agency-line);
+}
+
+.ag-agency-faq dt {
+  font-weight: 600;
+}
+
+.ag-agency-faq dd {
+  margin: 0.35rem 0 0;
+  color: var(--ag-agency-muted);
+}
+
+.ag-agency-raw pre {
+  overflow-x: auto;
+  padding: 1rem;
+  border-radius: var(--ag-agency-radius);
+  background: var(--ag-agency-surface);
+  font-size: 0.875rem;
+}
+
+.ag-agency-raw-note {
+  margin: 0 0 0.5rem;
+  color: var(--ag-agency-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.ag-agency-unknown {
+  padding: 0.75rem 1rem;
+  border: 1px dashed var(--ag-agency-line);
+  border-radius: var(--ag-agency-radius);
+  color: var(--ag-agency-muted);
+  font-size: 0.9375rem;
+}
+
+@media (max-width: 720px) {
+  .ag-agency-gallery,
+  .ag-agency-columns,
+  .ag-agency-cards,
+  .ag-agency-plans {
+    grid-template-columns: 1fr;
+  }
+}

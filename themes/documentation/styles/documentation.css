@@ -1,0 +1,480 @@
+/**
+ * Documentation — Docs: a sticky table of contents rail, a monospace affordance line and tight line height.
+ *
+ * The tokens are the theme; everything below reads them. A settings revision overrides the
+ * same custom property names, which is why they are declared once and never spelled into a
+ * rule — two code paths computing "the effective colour" is how a preview ends up lying.
+ *
+ * Every element selector is scoped to `html[data-theme="documentation"]`. All ten bundled sheets are
+ * loaded by the renderer's static import graph, so an unscoped `body { … }` here would style
+ * every theme's pages with this theme's palette. Block classes are already prefixed and need
+ * no scoping; the resets, the focus ring and the media queries do.
+ */
+
+/* The theme's tokens. A theme is its palette: everything below reads these, and a
+   settings revision overrides them on the same custom property names, which is why they are
+   declared once here rather than spelled into each rule.
+
+   ## Why these rules are scoped to `data-theme`
+
+   All ten bundled stylesheets are loaded by the renderer's single import graph, because a
+   CSS import is static and `resolveTheme()` is a runtime call. Ten sheets declaring `body`
+   would therefore fight, and the winner would be whichever sheet the bundler happened to
+   order last — a site's theme would render with whichever palette sorted highest, which is
+   the "colour-swapped clones" failure in its purest form.
+
+   Scoping to `html[data-theme="<key>"]` is what makes one bundle carry ten themes: only the
+   sheet whose key matches the active theme matches anything. `data-theme` is written by
+   `apps/web/app/layout.tsx` from the same `resolveTheme()` the page is drawn with, so the
+   stylesheet and the markup can never be chosen by different code.
+*/
+html[data-theme="documentation"] {
+  --do-documentation-canvas: #ffffff;
+  --do-documentation-surface: #f6f8fa;
+  --do-documentation-ink: #1f2328;
+  --do-documentation-muted: #636c76;
+  --do-documentation-line: #d1d9e0;
+  --do-documentation-accent: #0969da;
+  --do-documentation-accent_soft: #e6f0fb;
+  --do-documentation-font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --do-documentation-font-title: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  --do-documentation-measure: 48rem;
+  --do-documentation-title-scale: clamp(1.8rem, 1.4rem + 1.6vw, 2.4rem);
+  --do-documentation-title-weight: 700;
+  --do-documentation-title-tracking: -0.01em;
+  --do-documentation-radius: 6px;
+  --do-documentation-base-size: 16px;
+  --do-documentation-container: 1120px;
+}
+
+/* Dark mode is a token swap, never a second set of rules: the pair lives in the manifest and
+   the stylesheet only decides which pair the visitor gets. */
+@media (prefers-color-scheme: dark) {
+  html[data-theme="documentation"] {
+    --do-documentation-canvas: #0e1116;
+    --do-documentation-surface: #161b22;
+    --do-documentation-ink: #e6edf3;
+    --do-documentation-muted: #8d96a0;
+    --do-documentation-line: #262c36;
+    --do-documentation-accent: #6cb6ff;
+    --do-documentation-accent_soft: #12243a;
+  }
+}
+
+
+/* The reset is scoped to the active theme for the reason the tokens are: all ten sheets ship
+   in one bundle, and an unscoped `body` rule would let every one of them style every page. */
+html[data-theme="documentation"] *,
+html[data-theme="documentation"] *::before,
+html[data-theme="documentation"] *::after {
+  box-sizing: border-box;
+}
+
+html[data-theme="documentation"] {
+  background-color: var(--do-documentation-canvas);
+  color-scheme: light dark;
+}
+
+html[data-theme="documentation"] body {
+  margin: 0;
+  background: var(--do-documentation-canvas);
+  color: var(--do-documentation-ink);
+  font-family: var(--do-documentation-font-body);
+  font-size: var(--do-documentation-base-size);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+html[data-theme="documentation"] ::selection {
+  background-color: var(--do-documentation-accent-soft);
+}
+
+html[data-theme="documentation"] a {
+  color: var(--do-documentation-accent);
+  text-underline-offset: 3px;
+}
+
+/* The focus ring is the one rule every theme shares unscoped in spirit and scoped in practice:
+   a theme that removed it would fail the accessibility bar rather than look different. */
+html[data-theme="documentation"] :focus-visible {
+  outline: 3px solid var(--do-documentation-accent);
+  outline-offset: 2px;
+}
+
+html[data-theme="documentation"] img {
+  max-width: 100%;
+  height: auto;
+}
+
+
+/* The shell: a full-height column that pins the footer to the bottom on a short page. */
+.do-documentation-shell {
+  display: flex;
+  min-height: 100dvh;
+  flex-direction: column;
+}
+
+.do-documentation-header,
+.do-documentation-footer {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+}
+
+.do-documentation-header {
+  position: sticky; top: 0; z-index: 10; background: var(--do-documentation-canvas); border-bottom: 1px solid var(--do-documentation-line);
+}
+
+.do-documentation-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--do-documentation-line);
+  color: var(--do-documentation-muted);
+  font-size: 0.8125rem;
+}
+
+.do-documentation-main {
+  width: 100%;
+  max-width: var(--do-documentation-container);
+  margin-inline: auto;
+  padding: 3rem 1.5rem 4rem;
+}
+
+.do-documentation-article {
+  max-width: var(--do-documentation-measure);
+}
+
+.do-documentation-title {
+  margin: 0;
+  font-family: var(--do-documentation-font-title);
+  font-size: var(--do-documentation-title-scale);
+  font-weight: var(--do-documentation-title-weight);
+  line-height: 1.1;
+  letter-spacing: var(--do-documentation-title-tracking);
+}
+
+.do-documentation-eyebrow {
+  margin: 0 0 0.75rem;
+  color: var(--do-documentation-accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.do-documentation-summary {
+  margin: 1rem 0 0;
+  color: var(--do-documentation-muted);
+  font-size: 1.15em;
+}
+
+.do-documentation-meta {
+  margin: 1.5rem 0 0;
+  color: var(--do-documentation-muted);
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+}
+
+.do-documentation-body {
+  margin-top: 2.5rem;
+}
+
+.do-documentation-body p {
+  margin: 0 0 1.25rem;
+  white-space: pre-line;
+}
+
+.do-documentation-body p:last-child {
+  margin-bottom: 0;
+}
+
+
+.do-documentation-brand {
+  color: var(--do-documentation-ink);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.do-documentation-version {
+  padding: 0.125rem 0.5rem;
+  border-radius: 4px;
+  background: var(--do-documentation-accent-soft);
+  color: var(--do-documentation-accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+/* A long page needs a spine: the rail is sticky beside the article, not above it. */
+.do-documentation-frame {
+  display: grid;
+  gap: 2.5rem;
+  width: 100%;
+  max-width: var(--do-documentation-container);
+  margin-inline: auto;
+  padding: 2rem 1.5rem 4rem;
+  grid-template-columns: 15rem minmax(0, 1fr);
+}
+
+.do-documentation-toc {
+  position: sticky;
+  top: 5rem;
+  align-self: start;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-right: 1.25rem;
+  border-right: 1px solid var(--do-documentation-line);
+  font-size: 0.9375rem;
+}
+
+.do-documentation-toc-title {
+  margin: 0;
+  color: var(--do-documentation-muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.do-documentation-toc a {
+  color: var(--do-documentation-ink);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.do-documentation-toc-kind {
+  color: var(--do-documentation-muted);
+  font-size: 0.8125rem;
+  text-transform: capitalize;
+}
+
+.do-documentation-main {
+  padding: 0;
+  max-width: none;
+  min-width: 0;
+}
+
+/* Docs are read, not skimmed. */
+.do-documentation-body {
+  line-height: 1.75;
+}
+
+@media (max-width: 900px) {
+  .do-documentation-frame {
+    grid-template-columns: 1fr;
+  }
+
+  .do-documentation-toc {
+    position: static;
+    border-right: 0;
+    border-bottom: 1px solid var(--do-documentation-line);
+    padding-bottom: 1rem;
+  }
+}
+
+
+/* Blocks (REQ-063). The markup is the SDK's; everything here is this theme's styling of it. */
+.do-documentation-block {
+  margin: 0 0 1.75rem;
+}
+
+.do-documentation-block:last-child {
+  margin-bottom: 0;
+}
+
+.do-documentation-heading {
+  margin: 2.5rem 0 0.75rem;
+  font-family: var(--do-documentation-font-title);
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+.do-documentation-heading:first-child {
+  margin-top: 0;
+}
+
+.do-documentation-align-center {
+  text-align: center;
+}
+
+.do-documentation-align-right {
+  text-align: right;
+}
+
+.do-documentation-figure {
+  margin-inline: 0;
+}
+
+.do-documentation-figure figcaption {
+  margin-top: 0.5rem;
+  color: var(--do-documentation-muted);
+  font-size: 0.8125rem;
+}
+
+.do-documentation-testimonial {
+  margin-inline: 0;
+  padding: 1.25rem 1.5rem;
+  border-left: 3px solid var(--do-documentation-accent);
+  background: var(--do-documentation-surface);
+  border-radius: var(--do-documentation-radius);
+}
+
+.do-documentation-testimonial blockquote {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.do-documentation-testimonial figcaption {
+  margin-top: 0.5rem;
+  color: var(--do-documentation-muted);
+  font-size: 0.8125rem;
+}
+
+.do-documentation-gallery {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.do-documentation-gallery img {
+  border-radius: var(--do-documentation-radius);
+}
+
+.do-documentation-columns {
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.do-documentation-cta {
+  padding: 1.75rem;
+  border-radius: var(--do-documentation-radius);
+  background: var(--do-documentation-accent-soft);
+}
+
+.do-documentation-cta h2 {
+  margin: 0 0 0.5rem;
+}
+
+.do-documentation-cta p {
+  margin: 0 0 1rem;
+  color: var(--do-documentation-muted);
+}
+
+.do-documentation-cta-link {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: var(--do-documentation-radius);
+  background: var(--do-documentation-accent);
+  color: var(--do-documentation-canvas);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.do-documentation-cards {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.do-documentation-card {
+  padding: 1.25rem;
+  border: 1px solid var(--do-documentation-line);
+  border-radius: var(--do-documentation-radius);
+  background: var(--do-documentation-surface);
+}
+
+.do-documentation-card h3 {
+  margin: 0 0 0.5rem;
+}
+
+.do-documentation-card p {
+  margin: 0 0 0.75rem;
+  color: var(--do-documentation-muted);
+  font-size: 0.9375rem;
+}
+
+.do-documentation-plans {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.do-documentation-plans ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.do-documentation-plan {
+  padding: 1.25rem;
+  border: 1px solid var(--do-documentation-line);
+  border-radius: var(--do-documentation-radius);
+}
+
+.do-documentation-plan h3 {
+  margin: 0;
+}
+
+.do-documentation-price {
+  margin: 0.25rem 0 0.75rem;
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.do-documentation-plan ul li {
+  padding: 0.25rem 0;
+  color: var(--do-documentation-muted);
+  font-size: 0.9375rem;
+}
+
+.do-documentation-faq > div {
+  padding: 0.875rem 0;
+  border-bottom: 1px solid var(--do-documentation-line);
+}
+
+.do-documentation-faq dt {
+  font-weight: 600;
+}
+
+.do-documentation-faq dd {
+  margin: 0.35rem 0 0;
+  color: var(--do-documentation-muted);
+}
+
+.do-documentation-raw pre {
+  overflow-x: auto;
+  padding: 1rem;
+  border-radius: var(--do-documentation-radius);
+  background: var(--do-documentation-surface);
+  font-size: 0.875rem;
+}
+
+.do-documentation-raw-note {
+  margin: 0 0 0.5rem;
+  color: var(--do-documentation-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.do-documentation-unknown {
+  padding: 0.75rem 1rem;
+  border: 1px dashed var(--do-documentation-line);
+  border-radius: var(--do-documentation-radius);
+  color: var(--do-documentation-muted);
+  font-size: 0.9375rem;
+}
+
+@media (max-width: 720px) {
+  .do-documentation-gallery,
+  .do-documentation-columns,
+  .do-documentation-cards,
+  .do-documentation-plans {
+    grid-template-columns: 1fr;
+  }
+}

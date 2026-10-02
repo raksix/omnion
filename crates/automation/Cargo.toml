@@ -7,15 +7,8 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-# The outbound `http_request` action signs every call with HMAC-SHA256 (the rule's key
-# over the timestamp, method, path and body hash) and verifies one in constant time, so a
-# receiver has a reference implementation rather than a description of the scheme.
-hmac.workspace = true
-rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-hex.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 time.workspace = true
@@ -23,14 +16,6 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 omnion-audit = { path = "../audit" }
-# The `ai.prompt` host action calls a model through the same router the console uses, so the
-# rule's prompt is resolved and billed by the AI Hub rather than by a second client here:
-# two clients would be two answers to "which provider serves this model".
-omnion-ai-hub = { path = "../ai-hub" }
 omnion-content = { path = "../content" }
 omnion-events = { path = "../events" }
-# A rule's host actions resolve the run-as account's *effective* permissions at run time
-# (REQ-003 slice 3), so the layer needs the same resolution the guard uses — a second
-# implementation of "does this account hold this key" is a second answer to the question.
-omnion-permissions = { path = "../permissions" }
 omnion-workflows = { path = "../workflows" }

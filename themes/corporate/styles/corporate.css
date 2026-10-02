@@ -1,0 +1,444 @@
+/**
+ * Corporate — An institutional company site: a full-width masthead, a narrow reading column and section rules.
+ *
+ * The tokens are the theme; everything below reads them. A settings revision overrides the
+ * same custom property names, which is why they are declared once and never spelled into a
+ * rule — two code paths computing "the effective colour" is how a preview ends up lying.
+ *
+ * Every element selector is scoped to `html[data-theme="corporate"]`. All ten bundled sheets are
+ * loaded by the renderer's static import graph, so an unscoped `body { … }` here would style
+ * every theme's pages with this theme's palette. Block classes are already prefixed and need
+ * no scoping; the resets, the focus ring and the media queries do.
+ */
+
+/* The theme's tokens. A theme is its palette: everything below reads these, and a
+   settings revision overrides them on the same custom property names, which is why they are
+   declared once here rather than spelled into each rule.
+
+   ## Why these rules are scoped to `data-theme`
+
+   All ten bundled stylesheets are loaded by the renderer's single import graph, because a
+   CSS import is static and `resolveTheme()` is a runtime call. Ten sheets declaring `body`
+   would therefore fight, and the winner would be whichever sheet the bundler happened to
+   order last — a site's theme would render with whichever palette sorted highest, which is
+   the "colour-swapped clones" failure in its purest form.
+
+   Scoping to `html[data-theme="<key>"]` is what makes one bundle carry ten themes: only the
+   sheet whose key matches the active theme matches anything. `data-theme` is written by
+   `apps/web/app/layout.tsx` from the same `resolveTheme()` the page is drawn with, so the
+   stylesheet and the markup can never be chosen by different code.
+*/
+html[data-theme="corporate"] {
+  --co-corporate-canvas: #ffffff;
+  --co-corporate-surface: #f6f7f9;
+  --co-corporate-ink: #14181e;
+  --co-corporate-muted: #5b6472;
+  --co-corporate-line: #dfe3e9;
+  --co-corporate-accent: #0b4fa8;
+  --co-corporate-accent_soft: #e8f0fb;
+  --co-corporate-font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --co-corporate-font-title: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  --co-corporate-measure: 40rem;
+  --co-corporate-title-scale: clamp(2.1rem, 1.4rem + 2.6vw, 3.1rem);
+  --co-corporate-title-weight: 700;
+  --co-corporate-title-tracking: -0.025em;
+  --co-corporate-radius: 2px;
+  --co-corporate-base-size: 17px;
+  --co-corporate-container: 1120px;
+}
+
+/* Dark mode is a token swap, never a second set of rules: the pair lives in the manifest and
+   the stylesheet only decides which pair the visitor gets. */
+@media (prefers-color-scheme: dark) {
+  html[data-theme="corporate"] {
+    --co-corporate-canvas: #12161c;
+    --co-corporate-surface: #1a1f27;
+    --co-corporate-ink: #eef1f5;
+    --co-corporate-muted: #98a2b3;
+    --co-corporate-line: #2a313c;
+    --co-corporate-accent: #7cb0ff;
+    --co-corporate-accent_soft: #16273d;
+  }
+}
+
+
+/* The reset is scoped to the active theme for the reason the tokens are: all ten sheets ship
+   in one bundle, and an unscoped `body` rule would let every one of them style every page. */
+html[data-theme="corporate"] *,
+html[data-theme="corporate"] *::before,
+html[data-theme="corporate"] *::after {
+  box-sizing: border-box;
+}
+
+html[data-theme="corporate"] {
+  background-color: var(--co-corporate-canvas);
+  color-scheme: light dark;
+}
+
+html[data-theme="corporate"] body {
+  margin: 0;
+  background: var(--co-corporate-canvas);
+  color: var(--co-corporate-ink);
+  font-family: var(--co-corporate-font-body);
+  font-size: var(--co-corporate-base-size);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+html[data-theme="corporate"] ::selection {
+  background-color: var(--co-corporate-accent-soft);
+}
+
+html[data-theme="corporate"] a {
+  color: var(--co-corporate-accent);
+  text-underline-offset: 3px;
+}
+
+/* The focus ring is the one rule every theme shares unscoped in spirit and scoped in practice:
+   a theme that removed it would fail the accessibility bar rather than look different. */
+html[data-theme="corporate"] :focus-visible {
+  outline: 3px solid var(--co-corporate-accent);
+  outline-offset: 2px;
+}
+
+html[data-theme="corporate"] img {
+  max-width: 100%;
+  height: auto;
+}
+
+
+/* The shell: a full-height column that pins the footer to the bottom on a short page. */
+.co-corporate-shell {
+  display: flex;
+  min-height: 100dvh;
+  flex-direction: column;
+}
+
+.co-corporate-header,
+.co-corporate-footer {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+}
+
+.co-corporate-header {
+  border-bottom: 1px solid var(--co-corporate-line);
+}
+
+.co-corporate-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--co-corporate-line);
+  color: var(--co-corporate-muted);
+  font-size: 0.8125rem;
+}
+
+.co-corporate-main {
+  width: 100%;
+  max-width: var(--co-corporate-container);
+  margin-inline: auto;
+  padding: 3rem 1.5rem 4rem;
+}
+
+.co-corporate-article {
+  max-width: var(--co-corporate-measure);
+}
+
+.co-corporate-title {
+  margin: 0;
+  font-family: var(--co-corporate-font-title);
+  font-size: var(--co-corporate-title-scale);
+  font-weight: var(--co-corporate-title-weight);
+  line-height: 1.1;
+  letter-spacing: var(--co-corporate-title-tracking);
+}
+
+.co-corporate-eyebrow {
+  margin: 0 0 0.75rem;
+  color: var(--co-corporate-accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.co-corporate-summary {
+  margin: 1rem 0 0;
+  color: var(--co-corporate-muted);
+  font-size: 1.15em;
+}
+
+.co-corporate-meta {
+  margin: 1.5rem 0 0;
+  color: var(--co-corporate-muted);
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+}
+
+.co-corporate-body {
+  margin-top: 2.5rem;
+}
+
+.co-corporate-body p {
+  margin: 0 0 1.25rem;
+  white-space: pre-line;
+}
+
+.co-corporate-body p:last-child {
+  margin-bottom: 0;
+}
+
+
+/* The full-width band above the masthead: the identity a company page leads with. */
+.co-corporate-band {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1.5rem;
+  background: var(--co-corporate-accent);
+  color: var(--co-corporate-canvas);
+  font-size: 0.8125rem;
+}
+
+.co-corporate-wordmark {
+  font-weight: 600;
+  text-decoration: none;
+  color: inherit;
+}
+
+.co-corporate-band-tag {
+  opacity: 0.85;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 0.6875rem;
+}
+
+.co-corporate-brand {
+  color: var(--co-corporate-ink);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+}
+
+.co-corporate-kind {
+  border: 1px solid var(--co-corporate-line);
+  border-radius: 999px;
+  padding: 0.125rem 0.625rem;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.co-corporate-rule {
+  width: 100%;
+  height: 2px;
+  background: var(--co-corporate-ink);
+}
+
+
+/* Blocks (REQ-063). The markup is the SDK's; everything here is this theme's styling of it. */
+.co-corporate-block {
+  margin: 0 0 1.75rem;
+}
+
+.co-corporate-block:last-child {
+  margin-bottom: 0;
+}
+
+.co-corporate-heading {
+  margin: 2.5rem 0 0.75rem;
+  font-family: var(--co-corporate-font-title);
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+.co-corporate-heading:first-child {
+  margin-top: 0;
+}
+
+.co-corporate-align-center {
+  text-align: center;
+}
+
+.co-corporate-align-right {
+  text-align: right;
+}
+
+.co-corporate-figure {
+  margin-inline: 0;
+}
+
+.co-corporate-figure figcaption {
+  margin-top: 0.5rem;
+  color: var(--co-corporate-muted);
+  font-size: 0.8125rem;
+}
+
+.co-corporate-testimonial {
+  margin-inline: 0;
+  padding: 1.25rem 1.5rem;
+  border-left: 3px solid var(--co-corporate-accent);
+  background: var(--co-corporate-surface);
+  border-radius: var(--co-corporate-radius);
+}
+
+.co-corporate-testimonial blockquote {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.co-corporate-testimonial figcaption {
+  margin-top: 0.5rem;
+  color: var(--co-corporate-muted);
+  font-size: 0.8125rem;
+}
+
+.co-corporate-gallery {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.co-corporate-gallery img {
+  border-radius: var(--co-corporate-radius);
+}
+
+.co-corporate-columns {
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.co-corporate-cta {
+  padding: 1.75rem;
+  border-radius: var(--co-corporate-radius);
+  background: var(--co-corporate-accent-soft);
+}
+
+.co-corporate-cta h2 {
+  margin: 0 0 0.5rem;
+}
+
+.co-corporate-cta p {
+  margin: 0 0 1rem;
+  color: var(--co-corporate-muted);
+}
+
+.co-corporate-cta-link {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: var(--co-corporate-radius);
+  background: var(--co-corporate-accent);
+  color: var(--co-corporate-canvas);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.co-corporate-cards {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.co-corporate-card {
+  padding: 1.25rem;
+  border: 1px solid var(--co-corporate-line);
+  border-radius: var(--co-corporate-radius);
+  background: var(--co-corporate-surface);
+}
+
+.co-corporate-card h3 {
+  margin: 0 0 0.5rem;
+}
+
+.co-corporate-card p {
+  margin: 0 0 0.75rem;
+  color: var(--co-corporate-muted);
+  font-size: 0.9375rem;
+}
+
+.co-corporate-plans {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.co-corporate-plans ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.co-corporate-plan {
+  padding: 1.25rem;
+  border: 1px solid var(--co-corporate-line);
+  border-radius: var(--co-corporate-radius);
+}
+
+.co-corporate-plan h3 {
+  margin: 0;
+}
+
+.co-corporate-price {
+  margin: 0.25rem 0 0.75rem;
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.co-corporate-plan ul li {
+  padding: 0.25rem 0;
+  color: var(--co-corporate-muted);
+  font-size: 0.9375rem;
+}
+
+.co-corporate-faq > div {
+  padding: 0.875rem 0;
+  border-bottom: 1px solid var(--co-corporate-line);
+}
+
+.co-corporate-faq dt {
+  font-weight: 600;
+}
+
+.co-corporate-faq dd {
+  margin: 0.35rem 0 0;
+  color: var(--co-corporate-muted);
+}
+
+.co-corporate-raw pre {
+  overflow-x: auto;
+  padding: 1rem;
+  border-radius: var(--co-corporate-radius);
+  background: var(--co-corporate-surface);
+  font-size: 0.875rem;
+}
+
+.co-corporate-raw-note {
+  margin: 0 0 0.5rem;
+  color: var(--co-corporate-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.co-corporate-unknown {
+  padding: 0.75rem 1rem;
+  border: 1px dashed var(--co-corporate-line);
+  border-radius: var(--co-corporate-radius);
+  color: var(--co-corporate-muted);
+  font-size: 0.9375rem;
+}
+
+@media (max-width: 720px) {
+  .co-corporate-gallery,
+  .co-corporate-columns,
+  .co-corporate-cards,
+  .co-corporate-plans {
+    grid-template-columns: 1fr;
+  }
+}

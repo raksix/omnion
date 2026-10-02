@@ -17,7 +17,6 @@
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use omnion_automation::loopguard::LoopGuard;
 use omnion_automation::{AutomationActions, MailSettings};
 use omnion_core::config::{Config, WorkflowConfig};
 use omnion_workflows::engine::{self, RunnerConfig};
@@ -66,23 +65,11 @@ pub fn action_handler(state: &AppState) -> Arc<AutomationActions> {
     ))
 }
 
-/// Build the run guard of this process.
-///
-/// Installed next to the action handler and for the same reason: the engine advances the
-/// steps, and the two things it cannot know on its own are what a *host* action does and
-/// what a *repeat* means. A process that installs neither still runs every synthetic
-/// action — the engine's own default lets every run through.
-#[must_use]
-pub fn run_guard(state: &AppState) -> LoopGuard {
-    LoopGuard::new(state.db().pool().clone())
-}
-
 /// Start the runner; the returned handle is kept by the binary (and ends with the process).
 #[must_use]
 pub fn spawn(state: AppState) -> JoinHandle<()> {
     let config = runner_config(&state.config().workflows);
     let actions = action_handler(&state);
-    let guard = run_guard(&state);
 
     if !state.config().mail.is_usable() {
         tracing::warn!(
@@ -119,14 +106,7 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
         loop {
             tokio::select! {
                 _ = ticks.tick() => {
-                    match engine::tick_with(
-                        state.db().pool(),
-                        &config,
-                        actions.as_ref(),
-                        &guard,
-                    )
-                    .await
-                    {
+                    match engine::tick_with(state.db().pool(), &config, actions.as_ref()).await {
                         Ok(report) if !report.is_idle() => {
                             tracing::debug!(?report, "workflow tick");
                         }

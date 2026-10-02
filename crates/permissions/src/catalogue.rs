@@ -58,6 +58,187 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "content",
         description: "Restore an earlier revision",
     },
+    // The block system (REQ-063). Reading the block registry and validating a block tree touch
+    // nothing, so they ride the read key a content editor already holds; the pattern library is
+    // its own surface because a pattern is a reusable asset other pages depend on.
+    PermissionDef {
+        key: "content.blocks.read",
+        category: "content",
+        description: "Read the block registry and validate block trees",
+    },
+    PermissionDef {
+        key: "content.patterns.manage",
+        category: "content",
+        description: "Create, edit and remove content patterns",
+    },
+    PermissionDef {
+        key: "content.templates.manage",
+        category: "content",
+        description: "Create and edit page templates",
+    },
+    // The headless content API (REQ-019). Reading tokens is separated from managing them on
+    // purpose: a person who may read the list may also read the per-token usage breakdown (both
+    // are "who is calling us"), while minting, rotating and revoking are what grant a stranger
+    // read access to published content and belong to a different person.
+    PermissionDef {
+        key: "content.api.read",
+        category: "content",
+        description: "View content API tokens and usage",
+    },
+    PermissionDef {
+        key: "content.api.manage",
+        category: "content",
+        description: "Create, rotate and revoke content API tokens",
+    },
+    // The CMS depth pack (REQ-064, slice 1). Menus and scheduled publishing are two separate
+    // powers: an account that may publish a page does not thereby gain the right to rewrite the
+    // site's header, and an account that may edit the header may not schedule a post. The
+    // publishing key is `content.pages.schedule`, which already existed — the queue is that
+    // permission's queue, and inventing a second one would have made "who may schedule a post"
+    // and "who may look at the schedule" different questions about the same rows.
+    PermissionDef {
+        key: "menus.read",
+        category: "content",
+        description: "Read site menus and their items",
+    },
+    PermissionDef {
+        key: "menus.manage",
+        category: "content",
+        description: "Create, edit and remove site menus",
+    },
+    // Forms (REQ-064, slice 2) are THREE powers, and the third is the point. `forms.read`
+    // draws the builder, `forms.manage` writes the definition — and `forms.submissions.read`
+    // reads what visitors sent. Somebody who may design a contact form has no business reading
+    // its answers: every owner of a site with a contact form is somebody who can edit it, and
+    // folding the inbox into `forms.read` would hand that person the inbox as a side effect of a
+    // permission whose name says "forms", not "answers".
+    PermissionDef {
+        key: "forms.read",
+        category: "content",
+        description: "Read form definitions and the builder vocabulary",
+    },
+    PermissionDef {
+        key: "forms.manage",
+        category: "content",
+        description: "Create, edit, publish and remove forms",
+    },
+    PermissionDef {
+        key: "forms.submissions.read",
+        category: "content",
+        description: "Read and moderate form submissions",
+    },
+    // SEO toolkit (REQ-064, slice 3). Same split as everything else in the CMS: reading a
+    // site's search setup is not the power to change it, and the public sitemap/robots/redirect
+    // routes need no key at all — a crawler has no account.
+    PermissionDef {
+        key: "seo.read",
+        category: "content",
+        description: "Read page SEO, redirect rules, sitemap and broken links",
+    },
+    PermissionDef {
+        key: "seo.manage",
+        category: "content",
+        description: "Edit page SEO, redirects, sitemap settings and robots.txt",
+    },
+    // Comments (REQ-064, slice 4a). Two powers, and the split is the same one the forms
+    // inbox drew for the same reason: reading the queue is not the power to approve what is in
+    // it. A site that hands the inbox to a community manager should be able to keep the policy
+    // — the blocked words, the link limit, whether comments are on at all — with somebody else,
+    // and a deployment that folds both into one key cannot offer that.
+    PermissionDef {
+        key: "comments.read",
+        category: "content",
+        description: "Read the comment inbox and the moderation policy",
+    },
+    PermissionDef {
+        key: "comments.manage",
+        category: "content",
+        description: "Approve, spam, trash, reply, ban and change the comment policy",
+    },
+    // Newsletter (REQ-064, slice 4b). The same split as the comment inbox, for the same
+    // reason, and the argument is sharper here: reading a subscriber table already shows every
+    // address on it, so "somebody may look at the list" must not imply "somebody may re-add the
+    // people who left". An operator who can import a CSV can undo an unsubscribe in one action,
+    // and that is a moderation power, not a reporting one.
+    // Themes (REQ-062). Three keys because the surface has three different powers: seeing the
+    // gallery, reading one manifest (what the renderer's preview frame does), and changing
+    // which theme a site renders with. The last one is deliberately not implied by the first:
+    // a theme switch changes every page a signed-out visitor sees, and an account that may
+    // only LOOK at the gallery is a very common setup.
+    PermissionDef {
+        key: "themes.read",
+        category: "content",
+        description: "Read the theme gallery and a theme manifest",
+    },
+    PermissionDef {
+        key: "themes.activate",
+        category: "content",
+        description: "Activate or roll back the theme of a site",
+    },
+    // Customizing a theme is a THIRD power, not a second spelling of activation, and the split
+    // is about who can change what a visitor sees rather than *which* theme. An account that
+    // may publish the settings is rewriting every page's typography, colour and header on a
+    // live site — that is a design power — while activation only chooses between designs that
+    // already ship. Splitting them lets a brand owner switch between a prepared pair of themes
+    // without being able to recolour the primary brand, which is the setup most teams actually
+    // want.
+    PermissionDef {
+        key: "themes.customize",
+        category: "content",
+        description: "Edit, publish and restore a site's theme settings",
+    },
+    // Packages (REQ-062 slice 3). Two more powers, and neither is implied by the three above —
+    // the argument is the one the whole surface is built on, applied to a resource that
+    // crosses sites.
+    //
+    // `themes.export` is separate from `themes.read` on purpose even though it looks like a
+    // read: an export carries every published token and every customised slot *off* the
+    // platform, and "may look at the gallery" is not a grant to take the site's look with you.
+    //
+    // `themes.install` is the strongest of the five: it writes a row every site in the
+    // installation can see, and an uploaded theme is the only one that can carry markup and
+    // tokens an operator did not write. It is deliberately NOT implied by `themes.activate`,
+    // because activating something you cannot install is harmless while installing something
+    // you cannot activate is how a package nobody vetted reaches the gallery.
+    PermissionDef {
+        key: "themes.export",
+        category: "content",
+        description: "Export a site's theme as a package",
+    },
+    PermissionDef {
+        key: "themes.install",
+        category: "content",
+        description: "Validate, install and remove uploaded theme packages",
+    },
+    PermissionDef {
+        key: "newsletter.read",
+        category: "content",
+        description: "Read newsletter lists, subscribers and the issue archive",
+    },
+    PermissionDef {
+        key: "newsletter.manage",
+        category: "content",
+        description: "Create lists, import and export subscribers, change states, send issues",
+    },
+    // Memberships (REQ-064, slice 4c). The split is the same one the comment and newsletter
+    // inboxes draw, and the argument is sharpest here: reading a member table already shows
+    // every address on the site AND every place they last signed in from. An account that may
+    // only look must not be able to unblock the one member it dislikes, mint a password reset
+    // for them, or delete them — those are powers over a person, not over a record.
+    //
+    // `memberships.manage` is also what changes the SITE's policy (signup on or off, whether
+    // verification is required, what a gated page answers). Gating decides who can read which
+    // published page, so whoever holds it can quietly make a page readable again.
+    PermissionDef {
+        key: "memberships.read",
+        category: "content",
+        description: "Read visitor accounts, their sign-in history and the membership policy",
+    },
+    PermissionDef {
+        key: "memberships.manage",
+        category: "content",
+        description: "Create, verify, block and delete members, send resets, change the site policy",
+    },
     // Media.
     PermissionDef {
         key: "media.read",
@@ -141,49 +322,6 @@ pub const CATALOGUE: &[PermissionDef] = &[
         key: "workflows.run",
         category: "workflows",
         description: "Start and cancel workflow runs",
-    },
-    // Deciding an approval is deliberately a *fourth* key rather than a variant of
-    // `workflows.run`: a person who may start a rule and a person who may let a parked run
-    // go on are two different powers. Folding them together would mean the editor who builds
-    // a rule can also wave through everything that rule asks for — which is exactly the
-    // "you approved your own automation" back door the separate key prevents.
-    PermissionDef {
-        key: "workflows.approve",
-        category: "workflows",
-        description: "Decide the approvals a rule is waiting for",
-    },
-    // The AI app builder (docs/requests/REQ-045). Four keys rather than two, and the split is
-    // the request's own: *"...and the app is actually created"* is a second act with a
-    // different blast radius from the sentence that proposed it.
-    //
-    // `read` and `generate` are the ordinary powers — reading plans and spending a generation
-    // are the same day's work. `review` is what a person does to an artifact: accepting,
-    // rejecting, editing, discarding. `apply` is the only key that can write a live table, and
-    // it is deliberately the *fourth* rather than a variant of `review`: a reviewer who
-    // tidies up proposals must not thereby be able to materialise them, because the apply
-    // runner also creates roles and permissions, so a single key would let a reviewer grant
-    // the power they just handed themselves. Four keys also mean the request's own acceptance
-    // line ("Keys … exist in the catalogue") is checkable — a key nothing is refused for is a
-    // key nobody holds.
-    PermissionDef {
-        key: "appbuilder.read",
-        category: "ai",
-        description: "Read AI app builder plans and their artifacts",
-    },
-    PermissionDef {
-        key: "appbuilder.generate",
-        category: "ai",
-        description: "Generate and regenerate app builder plans",
-    },
-    PermissionDef {
-        key: "appbuilder.review",
-        category: "ai",
-        description: "Accept, reject and edit generated app builder artifacts",
-    },
-    PermissionDef {
-        key: "appbuilder.apply",
-        category: "ai",
-        description: "Apply a reviewed app builder plan to the live platform",
     },
     // Users.
     PermissionDef {
@@ -816,25 +954,13 @@ mod tests {
     fn the_workflow_family_is_catalogued() {
         // P09: the automation surface is guarded by three keys — read, manage and run — so a
         // role can be trusted to trigger a workflow without letting it rewrite definitions.
-        for key in [
-            "workflows.read",
-            "workflows.manage",
-            "workflows.run",
-            "workflows.approve",
-        ] {
+        for key in ["workflows.read", "workflows.manage", "workflows.run"] {
             assert_eq!(
                 get(key).map(|entry| entry.category),
                 Some("workflows"),
                 "{key} belongs to the workflows category"
             );
         }
-        // Deciding an approval is not `workflows.run`: a role that may start a rule must not
-        // be able to wave through everything that rule parks, or the gate is a formality.
-        assert_ne!(
-            get("workflows.approve").map(|entry| entry.key),
-            get("workflows.run").map(|entry| entry.key),
-            "approving is its own power"
-        );
     }
 
     #[test]
@@ -849,43 +975,6 @@ mod tests {
                 "{key} belongs to the ai category"
             );
         }
-    }
-
-    #[test]
-    fn the_app_builder_family_is_catalogued_and_apply_is_its_own_power() {
-        // REQ-045 asks for four keys by name, and the acceptance line is checkable only if
-        // all four are here — so this walks the list rather than spot-checking one.
-        for key in [
-            "appbuilder.read",
-            "appbuilder.generate",
-            "appbuilder.review",
-            "appbuilder.apply",
-        ] {
-            let entry = get(key).unwrap_or_else(|| panic!("{key} is in the catalogue"));
-            assert_eq!(
-                entry.category, "ai",
-                "{key} groups with the other AI powers"
-            );
-            assert!(!entry.description.is_empty(), "{key} explains itself");
-        }
-
-        // `apply` writes live tables, creates roles and permissions, and is therefore the
-        // only key a *different* person should hold. Reviewing is not applying: a person who
-        // only tidies up proposals must not be able to materialise them, because the runner
-        // binds the permission keys the plan proposed — so one key would let a reviewer grant
-        // themselves exactly the power they were handed.
-        assert_ne!(
-            get("appbuilder.apply").map(|entry| entry.key),
-            get("appbuilder.review").map(|entry| entry.key),
-            "applying a plan is not reviewing it"
-        );
-        // Nor is it generation: spending a generation writes draft rows only, which are inert
-        // by construction, so the two must not be the same key.
-        assert_ne!(
-            get("appbuilder.apply").map(|entry| entry.key),
-            get("appbuilder.generate").map(|entry| entry.key),
-            "applying a plan is not generating it"
-        );
     }
 
     #[test]
@@ -945,6 +1034,27 @@ mod tests {
                 get(key).map(|entry| entry.category),
                 Some("analytics"),
                 "{key} belongs to the analytics category"
+            );
+        }
+    }
+
+    #[test]
+    fn the_block_system_family_is_catalogued() {
+        // REQ-063: the registry and its dry-run validator change nothing, so they read with the
+        // rest of the content surface; the pattern and template libraries are their own powers
+        // because a saved asset is depended on by pages other than the one that made it.
+        for key in [
+            "content.blocks.read",
+            "content.patterns.manage",
+            "content.templates.manage",
+            // A manager can see which integrations are calling the site; minting a new one is
+            // not in the same hand, because a token outlives the session that made it.
+            "content.api.read",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("content"),
+                "{key} belongs to the content category"
             );
         }
     }

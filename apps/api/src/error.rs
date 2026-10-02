@@ -140,20 +140,25 @@ impl ApiError {
         self.code
     }
 
-    /// The sentence a client reads.
+    /// The human-readable explanation, for assertions and for a log line.
     ///
     /// The companion of [`ApiError::code`]: the code is what a client branches on and the
     /// message is what a person reads, so a test that checks one without the other pins half
     /// the contract — and it is the message that has to name the field and the three legal
     /// values, which is the part a client cannot reconstruct.
-    ///
-    /// Public for the same reason it is worth asserting: a test that asserts "this 404 does
-    /// not name the gate" cannot reach a private field, and a test that only asserts the
-    /// *code* would not notice a sentence that started leaking the id. It is never used to
-    /// build a response — `IntoResponse` reads the field directly.
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// The structured explanation, when the refusal carries one.
+    ///
+    /// Read-only and borrowed so a caller can branch on `details.field` without cloning the
+    /// value — the Explorer's form highlights the offending input from that field, and a
+    /// `to_owned()` accessor would make every such check an allocation for no gain. `None` on
+    /// an error that explains itself in its message, which is most of them.
+    pub fn details(&self) -> Option<&Value> {
+        self.details.as_ref()
     }
 }
 
@@ -420,6 +425,320 @@ impl From<ContentError> for ApiError {
                 StatusCode::CONFLICT,
                 "no_draft_revision",
                 "this page has no draft revision to publish",
+            ),
+            // A block tree the store cannot accept is a bad request, and it is not generic: the
+            // message names the first failing block so the editor can put the cursor on it.
+            ContentError::InvalidBlock(message) => Self::bad_request("invalid_blocks", message),
+            // Patterns and page templates (REQ-063 slice 3) follow the same shape as pages: a
+            // missing row is a 404, a key an organization already uses is a 409 — not a 400,
+            // because nothing about the request is malformed, the name is simply taken.
+            ContentError::PatternNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "pattern_not_found",
+                "no such pattern",
+            ),
+            ContentError::PatternKeyTaken(key) => Self::new(
+                StatusCode::CONFLICT,
+                "pattern_key_taken",
+                format!("this organization already has a pattern with the key {key:?}"),
+            ),
+            ContentError::TemplateNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "template_not_found",
+                "no such page template",
+            ),
+            ContentError::TemplateKeyTaken(key) => Self::new(
+                StatusCode::CONFLICT,
+                "template_key_taken",
+                format!("this organization already has a page template with the key {key:?}"),
+            ),
+            ContentError::TemplateIsSystem => Self::new(
+                StatusCode::CONFLICT,
+                "template_is_system",
+                "this template ships with the platform and cannot be deleted",
+            ),
+            // Menus and scheduled publishing (REQ-064 slice 1). A location another menu holds
+            // is a 409 rather than a 400: nothing about the request is malformed, the location
+            // is simply taken — the same answer a taken slug gets, because it is the same
+            // situation. The holder travels in the message so the editor can be pointed at the
+            // menu to move rather than left guessing which of the site's menus it was.
+            ContentError::MenuNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "menu_not_found", "no such menu")
+            }
+            ContentError::MenuKeyTaken(key) => Self::new(
+                StatusCode::CONFLICT,
+                "menu_key_taken",
+                format!("this site already has a menu with the key {key:?}"),
+            ),
+            ContentError::MenuLocationTaken {
+                location,
+                holder_key,
+                ..
+            } => Self::new(
+                StatusCode::CONFLICT,
+                "menu_location_taken",
+                format!(
+                    "the {location} location is already held by the {holder_key:?} menu; \
+                     move it there first"
+                ),
+            ),
+            ContentError::PublishingEntryNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "publishing_entry_not_found",
+                "no such publishing entry",
+            ),
+            // Forms (REQ-064 slice 2). The two statuses here are load-bearing and both were
+            // wrong when the mapping was missing: without an arm, every ContentError fell
+            // through to 400, so "no such form" answered "your request was malformed" and the
+            // panel showed a validation error on a form that had been deleted. A missing row is
+            // 404 and a taken key is 409 — the same two answers `MenuNotFound` gives, for the
+            // same reason.
+            ContentError::FormNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "form_not_found", "no such form")
+            }
+            // A file the page cannot feature. 400 rather than 404: the row either exists and is
+            // unusable (in the trash, another site's, not an image) or does not exist, and the
+            // message says which — a 404 here would be indistinguishable from "no such page",
+            // which is the one answer an operator staring at a *working* page must not get.
+            ContentError::FeaturedMediaUnavailable(message) => {
+                Self::new(StatusCode::BAD_REQUEST, "featured_media_unavailable", message)
+            }
+            ContentError::FormKeyTaken(key) => Self::new(
+                StatusCode::CONFLICT,
+                "form_key_taken",
+                format!("this site already has a form with the key {key:?}"),
+            ),
+            ContentError::SubmissionNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "submission_not_found",
+                "no such submission in this form",
+            ),
+            ContentError::InvalidLocation(message) => {
+                Self::bad_request("invalid_location", message)
+            }
+            ContentError::InvalidVisibility(message) => {
+                Self::bad_request("invalid_visibility", message)
+            }
+            ContentError::InvalidMenuItem(message) => {
+                Self::bad_request("invalid_menu_item", message)
+            }
+            ContentError::TooDeep(message) => Self::bad_request("menu_too_deep", message),
+            ContentError::InvalidPublishAction(message) => {
+                Self::bad_request("invalid_publish_action", message)
+            }
+            ContentError::InvalidSchedule(message) => {
+                Self::bad_request("invalid_schedule", message)
+            }
+            // SEO toolkit (REQ-064 slice 3). A loop is 409, not 400: the request is well formed
+            // and the site is simply not in a state that allows it — the same "that is taken"
+            // shape a duplicate key gets, and the distinction matters because the panel offers a
+            // different next step for each.
+            ContentError::InvalidRedirect(message) => {
+                Self::bad_request("invalid_redirect", message)
+            }
+            ContentError::RedirectLoop(message) => {
+                Self::new(StatusCode::CONFLICT, "redirect_loop", message)
+            }
+            ContentError::RedirectNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "redirect_not_found",
+                "no such redirect rule",
+            ),
+            ContentError::InvalidSeo(message) => Self::bad_request("invalid_seo", message),
+            ContentError::BrokenLinkNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "broken_link_not_found",
+                "no such broken link",
+            ),
+            ContentError::SiteNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "site_not_found", "no such site")
+            }
+            // A comment-shaped refusal keeps its OWN code rather than falling through to
+            // `invalid_request`. This is the exact defect slice 2 recorded for the forms
+            // module — a `ContentError` variant with no arm is not "unmapped", it is 400 with
+            // the platform's least specific message, so a visitor who typed a bad address and a
+            // panel that turned comments off both answered "your request was malformed".
+            ContentError::InvalidComment(message) => {
+                Self::bad_request("invalid_comment", message)
+            }
+            // Comments (REQ-064, slice 4a). The three statuses are load-bearing in three
+            // different ways and the panel offers a different next step for each: a missing
+            // comment is 404, a comment that is ALREADY in the state the request asked for is a
+            // 409 (it is a stale page or a race, not an error to retry), and a banned sender is
+            // 403 — a person is being refused, and the message says which ban.
+            ContentError::CommentNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "comment_not_found", "no such comment")
+            }
+            ContentError::CommentAlreadyInState(message) => {
+                Self::new(StatusCode::CONFLICT, "comment_already_in_state", message)
+            }
+            ContentError::CommentBanned(message) => {
+                Self::new(StatusCode::FORBIDDEN, "comment_banned", message)
+            }
+            // 400, and the same code the trigger's `check_violation` translates to in
+            // `comments::api_error_from_comment_write` — the store's pre-check and the schema's
+            // trigger answer the same question and must answer it identically, or a client
+            // sees two codes for one rule depending on which half caught it.
+            ContentError::CommentThreadTooDeep => Self::bad_request(
+                "comment_thread_too_deep",
+                "a reply cannot answer another reply",
+            ),
+            // Newsletter / membership (REQ-064 slice 4b). The catch-all below turns every
+            // unmapped variant into `invalid_request`, which is exactly the trap slice 4a
+            // recorded: a new store error silently becomes "your request was malformed", so a
+            // token that matched nothing answers as a form mistake. These are the STATUS
+            // assignments, not the variants.
+            ContentError::InvalidNewsletter(message) => {
+                Self::bad_request("invalid_newsletter", message)
+            }
+            ContentError::NewsletterListNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "newsletter_list_not_found",
+                "no such newsletter list",
+            ),
+            ContentError::SubscriberNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "subscriber_not_found",
+                "no such subscriber",
+            ),
+            ContentError::IssueNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "newsletter_issue_not_found",
+                "no such newsletter issue",
+            ),
+            ContentError::SubscriberAlreadyConfirmed(email) => Self::new(
+                StatusCode::CONFLICT,
+                "subscriber_already_confirmed",
+                format!("{email} is already confirmed on this list"),
+            ),
+            ContentError::InvalidToken => Self::bad_request(
+                "invalid_token",
+                "that link is not valid — it may have expired or already been used",
+            ),
+            // Memberships (REQ-064, slice 4c). Every one of these is an explicit STATUS
+            // assignment rather than falling through to the catch-all's `invalid_request`,
+            // which is the trap the newsletter half above records: an unmapped variant turns a
+            // refused sign-in into "your request was malformed" and a cross-tenant member into a
+            // form mistake.
+            ContentError::InvalidMember(message) => Self::bad_request("invalid_member", message),
+            ContentError::MemberNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "member_not_found",
+                "no such member",
+            ),
+            // 409 and not 404, and the distinction matters: this variant is only ever returned
+            // by the PANEL's "add a member", where a signed-in operator has to be told their
+            // click did not work. The public signup catches it and answers 202 with the same
+            // body either way, so nothing is disclosed to a visitor.
+            ContentError::MemberEmailTaken(email) => Self::new(
+                StatusCode::CONFLICT,
+                "member_email_taken",
+                format!("{email} already has an account on this site"),
+            ),
+            // 401, not 403: the caller is not who they claim to be. And ONE message for the
+            // four refusals behind it (unknown address, wrong password, not verified,
+            // blocked) — a sign-in form that distinguishes them is a list of every address on
+            // the site and a way to find out which of them are members.
+            ContentError::InvalidCredentials => Self::unauthorized(
+                "invalid_credentials",
+                "that e-mail and password do not match an account here",
+            ),
+            ContentError::VerificationNotRequired => Self::bad_request(
+                "verification_not_required",
+                "this site does not require verification — turn it on in membership settings first",
+            ),
+            ContentError::WeakPassword(message) => Self::bad_request("weak_password", message),
+            // Theme settings (REQ-062 slice 2). Four separate arms, and each status is a
+            // different next step for the operator: a missing revision is a stale link (404),
+            // "no draft" means the Publish button was the wrong button (409 — it is not a
+            // malformed request, and a 400 would send the panel into a retry loop), a stale
+            // draft is a race between two tabs (409, with both numbers in the message), and a
+            // contrast failure is a legal payload the product wants acknowledged (422 — the
+            // request is well-formed and the answer is "yes, but confirm first").
+            ContentError::ThemeNotFound(key) => Self::new(
+                StatusCode::NOT_FOUND,
+                "theme_not_found",
+                format!("no installed theme has the key '{key}'"),
+            ),
+            ContentError::RollbackUnavailable => Self::new(
+                StatusCode::CONFLICT,
+                "theme_rollback_unavailable",
+                "this site has no theme activation to roll back from",
+            ),
+            ContentError::ThemeSettingsRevisionNotFound(revision_no) => Self::new(
+                StatusCode::NOT_FOUND,
+                "theme_settings_revision_not_found",
+                format!("this site has no settings revision numbered {revision_no}"),
+            ),
+            ContentError::ThemeSettingsNothingToPublish => Self::new(
+                StatusCode::CONFLICT,
+                "theme_settings_nothing_to_publish",
+                "this site has no saved draft to publish — save one first",
+            ),
+            ContentError::ThemeSettingsDraftStale {
+                draft_no,
+                published_no,
+            } => Self::new(
+                StatusCode::CONFLICT,
+                "theme_settings_draft_stale",
+                format!(
+                    "the draft is revision {draft_no} but revision {published_no} is the one that \
+                     is live; reload before publishing"
+                ),
+            ),
+            ContentError::ThemeSettingsContrastRefused(message) => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "theme_settings_contrast_required",
+                message,
+            ),
+            // Theme layouts and packages (REQ-062 slice 3). The statuses are three different
+            // next steps again: a slot the platform does not render is a bad request (the
+            // caller named something that cannot exist), a reset with no shipped default is a
+            // conflict (the request is well-formed; this site never had that default), a
+            // package with errors is 422 with the whole report in the message so the upload
+            // screen can point at the line — and a removal that is refused because the theme is
+            // bundled or in use is a CONFLICT, because nothing about the request was malformed:
+            // it is a resource in a state that forbids the write.
+            ContentError::ThemeUnknownSlot(slot) => Self::bad_request(
+                "theme_unknown_slot",
+                format!("'{slot}' is not a slot this platform renders"),
+            ),
+            ContentError::ThemeSlotTooLong(slot, max) => Self::bad_request(
+                "theme_slot_too_long",
+                format!("the slot name must stay under {max} characters ('{slot}')"),
+            ),
+            ContentError::ThemeSlotTooManyBlocks(max) => Self::bad_request(
+                "theme_slot_too_many_blocks",
+                format!("a slot may hold at most {max} blocks"),
+            ),
+            ContentError::ThemeSlotInvalid(message) => Self::bad_request(
+                "theme_slot_invalid",
+                format!("this slot cannot be stored: {message}"),
+            ),
+            ContentError::ThemeSlotNoDefault(slot) => Self::new(
+                StatusCode::CONFLICT,
+                "theme_slot_no_default",
+                format!("this theme ships no default layout for '{slot}'"),
+            ),
+            ContentError::ThemePackageInvalid(count) => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "theme_package_invalid",
+                format!("the package has {count} error(s) and was not installed"),
+            ),
+            ContentError::ThemeBundledCannotBeRemoved(key) => Self::new(
+                StatusCode::CONFLICT,
+                "theme_bundled_cannot_be_removed",
+                format!("'{key}' is a bundled theme and cannot be removed"),
+            ),
+            ContentError::ThemeInUse(key) => Self::new(
+                StatusCode::CONFLICT,
+                "theme_in_use",
+                format!("'{key}' is still in use and cannot be removed"),
+            ),
+            ContentError::ThemePackageTooLarge(max) => Self::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "theme_package_too_large",
+                format!("the package is larger than the {max} byte limit"),
             ),
             other => Self::bad_request("invalid_request", other.to_string()),
         }
@@ -951,14 +1270,6 @@ impl From<WorkflowError> for ApiError {
                 err.to_string(),
             ),
             WorkflowError::Audit(err) => err.into(),
-            // A stale `graph_version` is a `409`, not a `400`: the request was well formed and the
-            // row's *state* is what the author has to change first (reload, or choose to overwrite).
-            // A `400` tells them to fix their request, which is not the problem, and it is the
-            // status `workflow_graph.rs` documents for exactly this case. Every other invalid
-            // definition really is a `400` — the graph they sent is what has to change.
-            WorkflowError::Invalid { code, message } if code == "graph_version_conflict" => {
-                Self::new(StatusCode::CONFLICT, code, message)
-            }
             WorkflowError::Invalid { code, message } => Self::bad_request(code, message),
         }
     }
@@ -1190,26 +1501,6 @@ mod tests {
             ApiError::forbidden("account_disabled", "no").status(),
             StatusCode::FORBIDDEN
         );
-    }
-
-    // A stale `graph_version` answers `409` and every other invalid definition answers `400`.
-    // The two must not collapse: a `400` sends the author to fix a request that was already
-    // correct, and the module documentation for `workflow_graph.rs` promises the `409`.
-    #[test]
-    fn a_stale_graph_version_is_a_conflict_and_not_a_bad_request() {
-        let error = ApiError::from(WorkflowError::invalid(
-            "graph_version_conflict",
-            "it is now at version 3",
-        ));
-        assert_eq!(error.status(), StatusCode::CONFLICT);
-        assert_eq!(error.code(), "graph_version_conflict");
-    }
-
-    #[test]
-    fn an_invalid_definition_is_still_a_bad_request() {
-        let error = ApiError::from(WorkflowError::invalid("invalid_step_action", "no such action"));
-        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(error.code(), "invalid_step_action");
     }
 
     #[test]

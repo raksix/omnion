@@ -77,6 +77,13 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.publish",
             "content.pages.schedule",
             "content.pages.restore",
+            "content.blocks.read",
+            "content.patterns.manage",
+            "content.templates.manage",
+            // Navigation belongs to whoever runs the content: a manager can reshape the
+            // header, and reading the menus is part of doing that.
+            "menus.read",
+            "menus.manage",
             "media.read",
             "media.upload",
             "media.update",
@@ -89,7 +96,6 @@ const BASE_ROLES: &[BaseRole] = &[
             "workflows.read",
             "workflows.manage",
             "workflows.run",
-            "workflows.approve",
             "users.read",
             "users.update",
             "iam.permissions.read",
@@ -139,6 +145,10 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.publish",
             "content.pages.schedule",
             "content.pages.restore",
+            "content.blocks.read",
+            // Read-only: a moderator checks that the navigation points at live pages, but the
+            // header itself is the manager's to change.
+            "menus.read",
             "media.read",
             "media.update",
             "ai.chat",
@@ -167,6 +177,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.update",
             "content.pages.publish",
             "content.pages.schedule",
+            "content.blocks.read",
             "media.read",
             "media.upload",
             "media.update",
@@ -477,19 +488,10 @@ mod tests {
                 .keys()
         };
 
-        for key in [
-            "workflows.read",
-            "workflows.manage",
-            "workflows.run",
-            "workflows.approve",
-        ] {
+        for key in ["workflows.read", "workflows.manage", "workflows.run"] {
             assert!(keys_of("manager").contains(&key), "manager holds {key}");
         }
         assert!(keys_of("moderator").contains(&"workflows.run"));
-        assert!(
-            !keys_of("moderator").contains(&"workflows.approve"),
-            "a moderator may run a rule but may not wave through what it parks"
-        );
         assert!(!keys_of("moderator").contains(&"workflows.manage"));
         assert!(keys_of("editor").contains(&"workflows.read"));
         assert!(!keys_of("editor").contains(&"workflows.run"));
@@ -547,6 +549,10 @@ mod tests {
             !keys.contains(&"search.manage"),
             "running the index is not a member's power"
         );
+        assert!(
+            !keys.contains(&"content.blocks.read"),
+            "the block registry is not a member's power"
+        );
         // The member reads its own inbox — the bell is in the header of every screen, so a
         // member without the key is a member with a badge they cannot open — and that is the
         // whole of it. Reading an inbox is not deciding how it is delivered, so neither
@@ -579,6 +585,14 @@ mod tests {
         assert!(
             !keys.contains(&"users.read"),
             "editors do not read accounts"
+        );
+        assert!(
+            keys.contains(&"content.blocks.read"),
+            "editors read the block registry they author against"
+        );
+        assert!(
+            !keys.contains(&"content.patterns.manage"),
+            "a saved pattern is a library asset, not an editor's call"
         );
     }
 }

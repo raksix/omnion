@@ -1,0 +1,89 @@
+{
+  "key": "government",
+  "name": "Government",
+  "version": "1.0.0",
+  "description": "A public-sector portal: a three-part institutional header, high contrast and a visible focus ring.",
+  "author": "Omnion",
+  "engine": "omnion-web",
+  "modes": [
+    "light",
+    "dark"
+  ],
+  "pageTypes": [
+    "page"
+  ],
+  "layouts": [
+    "page"
+  ],
+  "slots": [
+    "header",
+    "footer",
+    "home",
+    "blog-list",
+    "single-page",
+    "product",
+    "404",
+    "search"
+  ],
+  "tokens": {
+    "canvas": {
+      "light": "#ffffff",
+      "dark": "#101418"
+    },
+    "surface": {
+      "light": "#f2f5f8",
+      "dark": "#181d23"
+    },
+    "ink": {
+      "light": "#14181d",
+      "dark": "#eef1f5"
+    },
+    "muted": {
+      "light": "#4d5866",
+      "dark": "#9aa5b2"
+    },
+    "line": {
+      "light": "#d3dae2",
+      "dark": "#2b333c"
+    },
+    "accent": {
+      "light": "#003a70",
+      "dark": "#79b2f0"
+    },
+    "accent_soft": {
+      "light": "#e6eef7",
+      "dark": "#132338"
+    }
+  },
+  "settingsSchema": {
+    "containerWidth": {
+      "type": "number",
+      "default": 1120,
+      "min": 720,
+      "max": 1600
+    },
+    "baseSize": {
+      "type": "number",
+      "default": 17,
+      "min": 14,
+      "max": 22
+    },
+    "radius": {
+      "type": "number",
+      "default": 2,
+      "min": 0,
+      "max": 28
+    }
+  },
+  "compatibility": {
+    "engine": "omnion-web",
+    "minVersion": "0.1.0"
+  },
+  "previewImage": "preview.svg",
+  "screenshots": [],
+  "aliases": [
+    "nonprofit",
+    "public",
+    "civic"
+  ]
+}

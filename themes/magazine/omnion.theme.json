@@ -1,0 +1,89 @@
+{
+  "key": "magazine",
+  "name": "Magazine",
+  "version": "1.0.0",
+  "description": "An editorial site: a serif display face, a rule above every section and a standfirst.",
+  "author": "Omnion",
+  "engine": "omnion-web",
+  "modes": [
+    "light",
+    "dark"
+  ],
+  "pageTypes": [
+    "page"
+  ],
+  "layouts": [
+    "page"
+  ],
+  "slots": [
+    "header",
+    "footer",
+    "home",
+    "blog-list",
+    "single-page",
+    "product",
+    "404",
+    "search"
+  ],
+  "tokens": {
+    "canvas": {
+      "light": "#fffdf9",
+      "dark": "#131110"
+    },
+    "surface": {
+      "light": "#f5f0e6",
+      "dark": "#1c1917"
+    },
+    "ink": {
+      "light": "#1a1714",
+      "dark": "#efe9df"
+    },
+    "muted": {
+      "light": "#6d6459",
+      "dark": "#a1968a"
+    },
+    "line": {
+      "light": "#d8cebd",
+      "dark": "#332d27"
+    },
+    "accent": {
+      "light": "#8a2f2f",
+      "dark": "#e08a8a"
+    },
+    "accent_soft": {
+      "light": "#f6e7e7",
+      "dark": "#371d1d"
+    }
+  },
+  "settingsSchema": {
+    "containerWidth": {
+      "type": "number",
+      "default": 1120,
+      "min": 720,
+      "max": 1600
+    },
+    "baseSize": {
+      "type": "number",
+      "default": 18,
+      "min": 14,
+      "max": 22
+    },
+    "radius": {
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 28
+    }
+  },
+  "compatibility": {
+    "engine": "omnion-web",
+    "minVersion": "0.1.0"
+  },
+  "previewImage": "preview.svg",
+  "screenshots": [],
+  "aliases": [
+    "editorial",
+    "news",
+    "blog"
+  ]
+}

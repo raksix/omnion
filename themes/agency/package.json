@@ -1,0 +1,22 @@
+{
+  "name": "@omnion/theme-agency",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Omnion's Agency theme \u2014 A studio site: an oversized display line, wide gutters and a card grid that breaks the measure.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles.css": "./styles/agency.css",
+    "./omnion.theme.json": "./omnion.theme.json"
+  },
+  "dependencies": {
+    "@omnion/theme-sdk": "workspace:*",
+    "@omnion/types": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=19"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0"
+  }
+}

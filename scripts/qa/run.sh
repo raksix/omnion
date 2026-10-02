@@ -13,13 +13,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 TS="$(date -u +%Y%m%d-%H%M%S)"
-# **`QA_OUT_ROOT` overrides where the artifacts land, because a full disk must not decide whether
-# a screen was measured.** The walkthrough screenshots on every click and every navigation; at
-# 1,007 clicks that is ~100MB of PNGs, and tick 74's pass recorded `ENOSPC` on every screenshot
-# after `/mnt/apopic` hit 100% — so the run *appeared* to have measured the panel while writing
-# nothing a reader could look at. Pointing this at tmpfs (`/dev/shm/…`) is the ledger's answer
-# for a busy box and needs no change to the harness.
-OUT="${QA_OUT_ROOT:-$ROOT/qa-artifacts}/$TS"
+# The artifacts are throwaway screenshots, and the volume the worktrees live on is shared with
+# every other writer (six of them, all building Rust and Next at once). QA_OUT_ROOT moves them to
+# another filesystem when there is one with room — a RAM-backed tmpfs, in practice — so a pass is
+# bounded by that filesystem instead of by a race nobody in this worktree can win. The report is
+# copied back into the worktree at the end, so the artifact layout is unchanged either way.
+OUT_ROOT="${QA_OUT_ROOT:-$ROOT/qa-artifacts}"
+OUT="$OUT_ROOT/$TS"
 mkdir -p "$OUT"
 
 API_PORT="${QA_API_PORT:-18080}"
@@ -38,6 +38,20 @@ QA_DB_NAME="omnion_qa"
 [ "$STACK" != "main" ] && QA_DB_NAME="omnion_qa_$STACK"
 QA_DB="$QA_DB_NAME"
 export QA_DB
+# The QA Postgres port. The default is the shared container every stack points at; a
+# writer whose own Postgres is unhealthy sets QA_PG_PORT and QA_PG_CONTAINER to run
+# against a private one (the container is already the knob in reset-db.sh and in the
+# `--only` filter test, so a pass could not reach a different server without this).
+# It is a port, not a credential: nothing here is a secret.
+DEFAULT_PG_PORT=5433
+export QA_PG_CONTAINER="${QA_PG_CONTAINER:-omnion-postgres}"
+# The database URL and the first account, in one place: `run.sh` and `walkthrough.cjs` must
+# agree on both. A pass that resets the database and then cannot sign in to it is a pass that
+# dies before its first screen.
+QA_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:${QA_PG_PORT:-$DEFAULT_PG_PORT}/$QA_DB_NAME"
+QA_ADMIN_EMAIL="qa-owner@omnion.test"
+QA_ADMIN_PASSWORD="OmnionQa-Passw0rd-2026!"
+export QA_DATABASE_URL QA_ADMIN_EMAIL QA_ADMIN_PASSWORD
 export NODE_PATH="${QA_NODE_PATH:-/root/test-hermes/node_modules}"
 export QA_CHROME="${QA_CHROME:-/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome}"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -48,26 +62,6 @@ export CARGO_BUILD_JOBS="${QA_CARGO_JOBS:-3}"
 export CARGO_SLOTS="${QA_CARGO_SLOTS:-2}"
 
 step() { printf '\n[qa] %s\n' "$*"; }
-
-# A dangling `target` symlink kills the pass before it walks a single screen.
-#
-# A worktree can point `target` at a tmpfs directory (`target -> /dev/shm/w3-target`) to keep a
-# multi-gigabyte build off a nearly full disk. That is a symlink, so it SURVIVES whatever emptied
-# /dev/shm — and the next `cargo build` then fails with
-#
-#     error: failed to create directory `/mnt/apopic/omnion-w3/target`
-#     Caused by: Not a directory (os error 20)
-#
-# which is not a disk-full and not a permission problem, and reads like neither. Ten ticks of
-# deferred passes came after the first one; this one queued for the slot, took it, and died on
-# this line. Recreating the link's destination is a second, so the pass repairs what a foreign
-# cleanup emptied and says so, instead of exiting where the next reader sees only an errno.
-# A real directory, or a symlink to a live directory, is left exactly as it is.
-if [ -L target ] && [ ! -d target ]; then
-  target_dest="$(readlink -f target 2>/dev/null || readlink target)"
-  step "target is a dangling symlink to ${target_dest} — recreating it"
-  mkdir -p "$target_dest"
-fi
 
 wait_http() { # url, seconds
   local url="$1" deadline=$(( $(date +%s) + ${2:-120} ))
@@ -86,21 +80,133 @@ wait_http() { # url, seconds
 # One pass at a time on this box: it is the difference between load 20 and load 6.
 QA_SLOT_PID=""
 if [ "${QA_SLOTS:-1}" != "0" ]; then
+  # The slot's own regression test, before the pass waits on the slot. It is a handful of seconds
+  # and it is the only thing in the harness that can tell us the semaphore still works: every
+  # other symptom (a pass that never starts, a pass that starts with no place) is silent, and both
+  # look identical to a box that is simply too loaded to walk anything.
+  step "testing the QA slot"
+  bash "$(dirname "${BASH_SOURCE[0]}")/test-qa-slot.sh" || echo "[qa] slot test reported failures (continuing: a broken test is not a reason to skip a pass)"
+  # The `--only` filter's own regression test, for the same reason and with more force.
+  #
+  # This one guards the instrument every scoped pass depends on, and its failure mode is the
+  # most expensive kind there is: a filter that silently matches nothing does not fail the pass,
+  # it makes the pass run something ELSE. For three ticks that made a scoped pass walk the whole
+  # box and write no report, and the only symptom was "the pass takes too long" — which reads as
+  # a scheduling fact, so nobody looked at the filter. The test extracts the REAL helpers out of
+  # `walkthrough.cjs` rather than reimplementing them, because a copy keeps passing after the
+  # original regresses, which is exactly the thing it exists to catch.
+  step "testing the --only filter"
+  node "$(dirname "${BASH_SOURCE[0]}")/test-only-filter.cjs" || echo "[qa] --only filter test reported failures (continuing: a broken test is not a reason to skip a pass)"
+  # The two screen inventories. This one is different from the others above, and the difference is
+  # the reason it is here: a screen in the desktop `routes` list and missing from `mobileRoutes`
+  # is measured at 1440 px and at no other width, by any pass, ever — and it does not error, does
+  # not print red and does not set a non-zero code. It simply never gets opened on a phone, so
+  # REQ-064's acceptance 18 ("all new screens render at 390 px") could not be answered for
+  # thirty-nine screens, including twelve this branch shipped. The gate runs `warn`-style like its
+  # neighbours rather than aborting the pass, because a wrong inventory must not cost a whole
+  # walkthrough — but unlike the others it is re-checked on every run, because the thing it
+  # catches is silent by construction.
+  step "testing the screen inventories"
+  node "$(dirname "${BASH_SOURCE[0]}")/screen-coverage.cjs" || echo "[qa] screen-coverage test reported failures (continuing: a broken test is not a reason to skip a pass)"
+  # Every `[data-*]` the walkthrough addresses must be a hook the product renders.
+  #
+  # The other gates above each guard a mechanism. This one guards the thing they all rest on: a
+  # pass can only assert against a hook the page draws. `runMembersDepth` asked for
+  # `[data-member-drawer-action="block"]` — a plausible name for a real control, rendered by no file
+  # in `apps/`. The `click()` threw into a `.catch()`, the block dialog never opened, and every
+  # step from there to `blockedInSql` reported on a member that was never blocked, on every run
+  # since the pass was written. The pass had never been executed; the review read as clean and the
+  # artifacts said nothing, because a swallowed refusal is not an error.
+  #
+  # It is a static read, so it costs milliseconds and needs no slot — which is what makes it useful
+  # on a tick when the shared slot is held and the browser pass cannot run at all.
+  step "testing the selector contract"
+  node "$(dirname "${BASH_SOURCE[0]}")/probe-selector-contract.cjs" || echo "[qa] selector-contract test reported failures (continuing: a broken test is not a reason to skip a pass)"
+  # The database this pass DROPS. This one runs before the reset rather than after it, because the
+  # operation is destructive: `reset-db.sh` defaults its name to `omnion_qa` — the MAIN writer's
+  # database — so a writer on its own stack who runs that script by hand (the natural thing to do
+  # while debugging a pass) drops the wrong one, and `run.sh` exports `QA_DB` so every pass through
+  # the harness was already right. That is exactly why only a test can catch it.
+  step "testing the QA database identity"
+  bash "$(dirname "${BASH_SOURCE[0]}")/test-reset-db-identity.sh" || echo "[qa] reset-db identity test reported failures (continuing: a broken test is not a reason to skip a pass)"
+  # The disk guard's tmpfs reading, for the same reason and because this box runs out of RAM
+  # before it runs out of disk: /dev/shm is a real tmpfs and every writer's CARGO_TARGET_DIR
+  # lands in it, so a guard that misreads how full it is leaves the box one build away from
+  # the OOM that took out the shared Postgres on 29 September. It shipped having reported the
+  # INVERSE of the truth ("free 98%" over a filesystem 98% full), which is the failure mode a
+  # test has to catch by asserting direction rather than by snapshotting the output.
+  step "testing the disk guard's tmpfs reading"
+  bash "$(dirname "${BASH_SOURCE[0]}")/test-disk-guard-shm.sh" || echo "[qa] disk-guard tmpfs test reported failures (continuing: a broken test is not a reason to skip a pass)"
+  # The renderer's document/page theme agreement, for the same reason.
+  #
+  # All ten bundled stylesheets ship in ONE bundle and every element rule in them is scoped to
+  # `html[data-theme="<key>"]`, so that one attribute decides whether a theme paints anything.
+  # It used to be written from the installation default rather than the addressed site's theme,
+  # which made every non-default site render as a colour-swapped copy of Minimal — a complete,
+  # valid, entirely wrong page that no request failed and no log line mentioned. That is the most
+  # expensive class of defect this harness can miss: the page is present, so every screen- and
+  # request-level check passes while the site shows the wrong design.
+  step "testing the renderer's per-site theme resolution"
+  node "$(dirname "${BASH_SOURCE[0]}")/probe-site-theme.cjs" || echo "[qa] site-theme probe reported failures (continuing: a broken test is not a reason to skip a pass)"
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
-  # `QA_SLOT_OWNER_PID=$$` is THIS shell, not the qa-slot.sh child, and that distinction is the
-  # fix: a pass killed with SIGKILL — the OOM killer, a terminal timeout — cannot run its EXIT
-  # trap, so the holder it left behind is reparented to init and holds the one place for the
-  # life of the box. The holder watches the pid it is given, so it exits on its own when the
-  # pass dies the way no trap can catch. (Main's qa-slot.sh reads the variable; only the call
-  # site here is mine.)
-  QA_SLOT_PID="$(QA_SLOT_OWNER_PID="$$" QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" \
-    bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
+  # QA_SLOT_OWNER_PID is THIS shell's pid, so the slot can tell a place whose pass is still alive
+  # from one whose pass was killed without running its EXIT trap. Without it the holder is the
+  # only evidence a place is owned, and a holder outlives the pass that kills it — so a SIGKILLed
+  # pass held the queue hostage until a human walked over and killed a stranger's holder.
+  QA_SLOT_PID="$(QA_SLOT_OWNER_PID="$$" QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
 fi
-# Free the place whenever this pass ends, however it ends.
-if [ -n "$QA_SLOT_PID" ]; then
-  trap 'kill "$QA_SLOT_PID" 2>/dev/null || true' EXIT INT TERM
+# A pass writes gigabytes of screenshots and six writers share this volume, so the two things
+# that go wrong are "the last pass's artifacts are still here" and "there is no room". Prune
+# first, then check: a full disk is often recoverable by pruning alone, and a check that runs
+# first would refuse a pass that had just made room for itself. Taking the slot first also means
+# the prune never races another pass that is already writing into the directory.
+KEEP="${QA_KEEP_PASSES:-2}"
+if [ "$KEEP" -gt 0 ] 2>/dev/null; then
+  while read -r old; do
+    [ -n "$old" ] || continue
+    case "$old" in "$TS") continue ;; esac
+    step "pruning the artifacts of $old"
+    rm -rf "$OUT_ROOT/$old"
+  done <<< "$(ls -1t "$OUT_ROOT" 2>/dev/null | tail -n +$((KEEP + 1)))"
 fi
+
+# A full-page PNG of a long admin page runs to megabytes, and a pass takes around a thousand of
+# them — on a volume several writers build on at once that is the whole difference between a pass
+# that completes and one that is deleted out from under itself twenty minutes in. The walkthrough
+# can drop to fewer, shorter shots, so the space check sizes the need from the shot budget instead
+# of assuming the richest pass: too little room shrinks the budget, and only a volume that cannot
+# hold even a minimal pass is refused (and says so) before anything is reset.
+SHOT_MODE="${QA_SHOT_MODE:-full}"
+AVAIL_MB=$(( $(df -Pk "$OUT_ROOT" | awk 'NR==2 {print $4}') / 1024 ))
+NEED_MB="${QA_MIN_FREE_MB:-6000}"
+# Viewport JPEG shots are roughly a tenth of a full-page PNG each, so the room a pass needs is a
+# property of the shot mode, not a constant: asking for the full-pass figure before deciding to
+# downgrade is what refused passes that would have fitted comfortably.
+[ "$SHOT_MODE" = "viewport" ] && NEED_MB="${QA_MIN_FREE_MB_VIEWPORT:-700}"
+if [ "$AVAIL_MB" -lt "$NEED_MB" ]; then
+  case "$SHOT_MODE" in
+    full)
+      # A full pass writes the deep full-page shots; viewport shots are an order of magnitude
+      # smaller and still visit every screen and click every control.
+      SHOT_MODE=viewport
+      step "only ${AVAIL_MB}MB free (wanted ${NEED_MB}); dropping to viewport-sized shots"
+      NEED_MB="${QA_MIN_FREE_MB_VIEWPORT:-700}"
+      if [ "$AVAIL_MB" -lt "$NEED_MB" ]; then
+        echo "[qa] only ${AVAIL_MB}MB free where the artifacts go; even a viewport pass needs about ${NEED_MB}MB." >&2
+        echo "[qa] free a worktree's target/ (regenerable) or lower QA_KEEP_PASSES, and re-run." >&2
+        exit 1
+      fi
+      ;;
+    viewport)
+      echo "[qa] only ${AVAIL_MB}MB free where the artifacts go; even a viewport pass needs about ${NEED_MB}MB." >&2
+      echo "[qa] free a worktree's target/ (regenerable) or lower QA_KEEP_PASSES, and re-run." >&2
+      exit 1
+      ;;
+  esac
+fi
+export QA_SHOT_MODE="$SHOT_MODE"
+step "free space: ${AVAIL_MB}MB"
 
 # The QA servers are disposable: a pass starts them, walks, and the next pass can
 # start them again. Leaving seven stacks of three servers running between passes cost
@@ -184,16 +290,42 @@ step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
 step "API on :$API_PORT (database omnion_qa)"
-# A stale binary replays the *old* SQL: sqlx embeds `database/migrations/*.sql` at compile time, so
-# a migration edited after the last build is silently the previous version — and a syntax error in
-# it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
-# than the newest migration, which is cheap when nothing changed and correct when something did.
-if [ ! -x target/debug/omnion-api ] \
-   || [ -n "$(find database/migrations -name '*.sql' -newer target/debug/omnion-api -print -quit)" ]; then
-  step "building the API (first pass, or a migration changed since the last build)"
+# Build when the binary is missing OR older than something it was built from. A pass that only
+# builds on a missing binary silently exercises the last binary that happened to be there: the
+# stack restarts fine, every request answers, and a route added this tick 404s — which reads as a
+# broken screen rather than as a stale build. Two things make a binary stale, and both are here:
+#
+#   * source — a route/handler edit that is not compiled in, and
+#   * migrations — sqlx embeds `database/migrations/*.sql` at compile time, so a migration edited
+#     after the last build silently replays the previous one, and a syntax error in it looks like
+#     a duplicate table on the next attempt.
+#
+# The source list must be the paths that actually exist in this workspace (apps, crates, modules,
+# database, the manifests). A `find` over paths that do not exist returns nothing and looks exactly
+# like "nothing changed" — the mtime check silently disabled itself. `-print -quit` keeps it cheap.
+NEEDS_BUILD=0
+if [ ! -x target/debug/omnion-api ]; then
+  NEEDS_BUILD=1
+  step "building the API (no binary yet)"
+elif [ -n "$(find apps crates modules database Cargo.toml -newer target/debug/omnion-api -print -quit 2>/dev/null)" ]; then
+  NEEDS_BUILD=1
+  step "building the API (sources or migrations are newer than the binary)"
+fi
+if [ "$NEEDS_BUILD" = "1" ]; then
   # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
   # compiling at once instead of every pass grabbing all six threads for itself.
   "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
+fi
+# A writer loop on a tight volume builds into a scratch target (CARGO_TARGET_DIR, usually a
+# tmpfs) to keep /mnt/apopic from filling — but pm2 is started from the fixed path below, and
+# a build that landed somewhere else left that path missing. The pass then died with
+# "Script not found: .../target/debug/omnion-api" and no report at all, which reads as a broken
+# harness rather than as a build that went to another directory. Copy it over whenever the two
+# differ; the binary is 140 MB and the scratch copy is already warm, so this costs a copy.
+QA_BUILD_TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
+if [ "$QA_BUILD_TARGET" != "$ROOT/target" ] && [ -x "$QA_BUILD_TARGET/debug/omnion-api" ]; then
+  mkdir -p "$ROOT/target/debug"
+  cp "$QA_BUILD_TARGET/debug/omnion-api" "$ROOT/target/debug/omnion-api"
 fi
 # `OMNION_CSRF_SECRET` decides whether a cookie-authenticated mutation is refused before its
 # handler runs. Without one the QA API refuses EVERY write with `csrf_unavailable`, so a
@@ -209,10 +341,20 @@ fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
 else
-  OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
+  # `OMNION_ADMIN_EMAIL` / `OMNION_ADMIN_PASSWORD` seed the FIRST account on an empty
+  # database (apps/api/src/main.rs `bootstrap_admin`). Without them the API boots onto a
+  # database `reset-db.sh` has just emptied, logs "no accounts exist yet", and the panel
+  # routes `/` to `/login` instead of `/setup` — so the walkthrough skips its wizard step as
+  # "installation already exists" and `ensureSignedIn` then cannot sign in, because the
+  # account the pass knows about is the one the reset deleted. It died on that on 2026-09-29
+  # before reaching a single screen. These are the same values `walkthrough.cjs` signs in
+  # with (`CREDS`), and both scripts must agree on them.
+  OMNION_DATABASE_URL="$QA_DATABASE_URL" \
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
+  OMNION_ADMIN_EMAIL="$QA_ADMIN_EMAIL" \
+  OMNION_ADMIN_PASSWORD="$QA_ADMIN_PASSWORD" \
   OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-pass-throwaway-secret-not-a-real-key}" \
     pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
 fi
@@ -237,121 +379,40 @@ else
   OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_WEB" --name "$WEB_NAME" --cwd "$ROOT/apps/web" --time -- dev --port "$WEB_PORT" --hostname 127.0.0.1 >/dev/null
 fi
-# **The renderer is gated by what the pass MEASURES, not by existing.**
-#
-# `wait_http` here used to be a hard gate: if the public renderer did not answer, the pass exited
-# 1 before the walkthrough ran at all. That is right for a full acceptance run and wrong for a
-# focused one, and the cost was measured twice: a `QA_ONLY=workflow-builder` pass on a box with no
-# room for Turbopack's cache died on `public renderer did not answer`, and the two minutes after
-# that went into reading a *web* defect in a branch whose *web* app was merely out of disk. The
-# walkthrough itself does not treat the renderer as required — it wraps its public-renderer
-# section in a try/catch and records `report.web.error` (`walkthrough.cjs`, the `webBase` block).
-# **So the gate was stricter than the thing it guards**, and the pass measured less than its own
-# harness would have let it: every admin-side row in that run is unmeasured because of a component
-# none of those rows touch.
-#
-# The two options are now named rather than implied. `QA_REQUIRE_WEB=1` keeps the old behaviour
-# for a full acceptance run, where "the public site renders" is itself a criterion. The default
-# starts the renderer and RECORDS whether it answered; a focused admin pass that did not need it
-# runs to completion and says `public renderer: DOWN` in the log, and a full pass opts back into
-# refusing to start.
-#
-# A failed renderer is never silent: `WEB_ANSWERED=0` is exported so a caller can act on it, and
-# the line is printed either way. "The pass ran" and "the renderer booted" stay two claims.
-if ! wait_http "http://127.0.0.1:$WEB_PORT/" 150; then
-  if [ "${QA_REQUIRE_WEB:-0}" = "1" ]; then
-    echo "[qa] public renderer did not answer (QA_REQUIRE_WEB=1 — refusing to run a pass that measures it)"
-    pm2 logs "$WEB_NAME" --lines 20 --nostream || true
-    exit 1
-  fi
-  echo "[qa] public renderer did not answer; continuing — this pass does not measure it (QA_REQUIRE_WEB=1 to make it fatal)"
-  export WEB_ANSWERED=0
-  pm2 logs "$WEB_NAME" --lines 20 --nostream || true
-else
-  echo "[qa] public renderer answered on :$WEB_PORT"
-  export WEB_ANSWERED=1
-fi
+wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
 # `QA_ONLY` narrows the pass to named routes and depth passes. The default runs every one of
 # them, which is the right thing for a full acceptance run and the wrong thing for a loop that
 # has just built two screens and needs them proven before the tick ends. It is a filter on the
 # walk, never on the harness around it: the stack, the reset, the vision review and the report
 # all run exactly as they do for a full pass.
-#
-# **`--only` is ALSO accepted on the command line, because a filter that can only be spelled one
-# way is a filter that gets missed.** Tick 74 ran `bash scripts/qa/run.sh --only=workflow-builder`
-# and got a full pass over all 55 routes instead -- the walkthrough received no `--only` at all and
-# walked the entire panel, which is why that pass had reached `iam-devices` after 36 minutes and
-# had not come near the builder. The script read `${QA_ONLY:-}` and never `$1`, so the argument
-# was not an error, not a warning and not in the log: **the one thing the flag exists to do was
-# the one thing it did not do, silently.** A narrow pass that silently runs wide costs more than
-# no pass at all, because the tick reports "no builder rows" and reads it as a product defect.
 QA_ONLY_ARGS=()
-QA_ONLY_FILTER="${QA_ONLY:-}"
-# A manual cursor rather than `shift` inside a `for arg in "$@"`: the loop iterates over a
-# snapshot of the argument list, so shifting inside it does not move what the loop sees and the
-# value after a bare `--only` would be read as an unknown option.
-_prev=""
-for arg in "$@"; do
-  case "$arg" in
-    --only=*) QA_ONLY_FILTER="${arg#--only=}" ;;
-    --only)   QA_ONLY_FILTER="" ;; # the value arrives as the next argument, seen on the next turn
-    *)
-      # `--only VALUE` is the one spelling that cannot be handled inside the loop, so it is
-      # repaired here: a bare `--only` is only ever followed by its own value.
-      if [ "$_prev" = "--only" ]; then QA_ONLY_FILTER="$arg"; fi
-      ;;
-  esac
-  _prev="$arg"
-done
-[ -n "$QA_ONLY_FILTER" ] && QA_ONLY_ARGS=(--only="$QA_ONLY_FILTER")
+[ -n "${QA_ONLY:-}" ] && QA_ONLY_ARGS=(--only="$QA_ONLY")
 
-# The tenant has to exist before the walkthrough runs, and this step is what puts it there.
-#
-# A freshly reset QA database holds a platform account with `organization_id IS NULL` and an EMPTY
-# organizations table -- the first-run wizard creates the owner and stops. Every rule belongs to a
-# tenant, so the editor refuses its own save with "Choose an organization before saving a rule",
-# the lists render empty, and each depth note downstream reads as a broken screen. The tenant
-# picker is gated on `organizations.length > 1`, so a probe does not even have a control to click.
-#
-# The script existed and nothing called it. The symptom that finally named it was the AI console's
-# fixture: `insert into ai_workflow_drafts (organization_id, …) values ('' …)` — a uuid column fed
-# an empty string — which read as a broken console on a database that had no tenant in it at all.
-step "ensure the QA organization exists"
-node scripts/qa/ensure-organization.mjs --url "http://127.0.0.1:$API_PORT" --admin "http://127.0.0.1:$ADMIN_PORT" \
-  || echo "[qa] the organization could not be created; the rule screens will report an empty tenant"
+# `--api` is not optional. `walkthrough.cjs` declares `URL_API = process.env.QA_API_URL ||
+# arg("api", URL_ADMIN)`, and the admin origin is NOT the API origin: the depth passes that POST
+# (headers, media, forms, SEO, comments) would answer 404 the whole way and report screens that
+# "work" because they never reached the API.
+step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
+node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --api "$API_URL" --out "$OUT" "${QA_ONLY_ARGS[@]}"
 
-# The two static sweeps run BEFORE the browser, and they are cheap. Both answer a question the
-# walkthrough's own notes keep re-deriving by hand: is every path the rows fetch a path the router
-# mounts (`probe-api-routes.mjs`), and is every field they read a field the handler actually sends
-# (`probe-api-fields.mjs`). Tick 89's defect — `/api/v1/workflows/{id}/runs`, `body.runs`,
-# `trigger_kind` — is the second sweep's whole reason to exist, and both were run by hand for two
-# ticks before anyone noticed they were not in this file, which is exactly how a gate stops being run.
-#
-# They are wired HERE rather than left in the tick's prose because a gate nobody invokes is a
-# paragraph. Neither starts a server, neither needs the database, and together they take about a
-# second — so there is no honest reason for a pass to reach the browser with a defect in it.
-step "static sweeps — every walkthrough path and field the server actually has"
-node scripts/qa/probe-api-routes.mjs
-node scripts/qa/probe-api-fields.mjs
-
-# The banner reads `QA_ONLY_FILTER`, not `QA_ONLY`. With the flag arriving on the command line
-# the env var is empty, so the old line announced a full pass over every route while a narrow
-# one ran -- a report that misstates its own scope is worse than no report, because it is the
-# line a reader trusts to know what was covered.
-step "browser walkthrough${QA_ONLY_FILTER:+ (focused: $QA_ONLY_FILTER)}"
-node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}"
-
-step "vision review"
-node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
+# The vision review reads the whole shot set and judges it against the product's visual rules.
+# On a scoped pass that set is a fraction of the screens, so its verdicts describe a product
+# state that does not exist — and it is the slowest step in the pass. Skipping it is honest;
+# running it is a report about a partial set.
+if [ -z "${QA_ONLY:-}" ]; then
+  step "vision review"
+  node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
+else
+  step "vision review (skipped: scoped pass, QA_ONLY=$QA_ONLY)"
+fi
 
 step "summary"
-WEB_ANSWERED="${WEB_ANSWERED:-unknown}" node -e '
+node -e '
 const fs = require("fs");
 const path = require("path");
 const out = process.argv[1];
 const label = process.argv[2] || "main";
-const webAnswered = process.env.WEB_ANSWERED || "unknown";
 const summary = JSON.parse(fs.readFileSync(path.join(out, "summary.json"), "utf8"));
 const visionPath = path.join(out, "findings", "vision.json");
 const vision = fs.existsSync(visionPath) ? JSON.parse(fs.readFileSync(visionPath, "utf8")) : { skipped: "not run" };
@@ -359,7 +420,6 @@ const doc = [
   `# Omnion QA — latest pass (${label})`,
   "",
   `- When: ${summary.startedAt || "?"} · artifacts: \`${path.relative(process.cwd(), out)}\``,
-  `- Public renderer: ${webAnswered === "1" ? "answered" : webAnswered === "0" ? "**DID NOT ANSWER** — the public-renderer rows below are UNMEASURED, not green" : "unknown"}`,
   `- Interactions: ${summary.counts?.clicks ?? 0} clicks · ${summary.counts?.filled ?? 0} field fills · ${summary.counts?.forms ?? 0} form submissions · ${summary.counts?.screenshots ?? 0} screenshots`,
   `- Console errors: ${summary.counts?.consoleErrors ?? 0} · failed requests: ${summary.counts?.failedRequests ?? 0} · dialogs: ${summary.counts?.dialogs ?? 0}`,
   `- Programmatic findings: ${summary.findings?.length ?? 0} (high ${summary.bySeverity?.high ?? 0} · medium ${summary.bySeverity?.medium ?? 0} · low ${summary.bySeverity?.low ?? 0})`,

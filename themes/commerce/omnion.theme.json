@@ -1,0 +1,89 @@
+{
+  "key": "commerce",
+  "name": "Commerce",
+  "version": "1.0.0",
+  "description": "A storefront: a compact utility header, product grids and a price set in a tabular figure.",
+  "author": "Omnion",
+  "engine": "omnion-web",
+  "modes": [
+    "light",
+    "dark"
+  ],
+  "pageTypes": [
+    "page"
+  ],
+  "layouts": [
+    "page"
+  ],
+  "slots": [
+    "header",
+    "footer",
+    "home",
+    "blog-list",
+    "single-page",
+    "product",
+    "404",
+    "search"
+  ],
+  "tokens": {
+    "canvas": {
+      "light": "#ffffff",
+      "dark": "#121110"
+    },
+    "surface": {
+      "light": "#f7f6f4",
+      "dark": "#1d1b19"
+    },
+    "ink": {
+      "light": "#1a1a1a",
+      "dark": "#efece8"
+    },
+    "muted": {
+      "light": "#6b6b6b",
+      "dark": "#9d9a95"
+    },
+    "line": {
+      "light": "#e5e2dd",
+      "dark": "#2e2b28"
+    },
+    "accent": {
+      "light": "#146c43",
+      "dark": "#6fd39b"
+    },
+    "accent_soft": {
+      "light": "#e6f4ec",
+      "dark": "#12291d"
+    }
+  },
+  "settingsSchema": {
+    "containerWidth": {
+      "type": "number",
+      "default": 1120,
+      "min": 720,
+      "max": 1600
+    },
+    "baseSize": {
+      "type": "number",
+      "default": 16,
+      "min": 14,
+      "max": 22
+    },
+    "radius": {
+      "type": "number",
+      "default": 8,
+      "min": 0,
+      "max": 28
+    }
+  },
+  "compatibility": {
+    "engine": "omnion-web",
+    "minVersion": "0.1.0"
+  },
+  "previewImage": "preview.svg",
+  "screenshots": [],
+  "aliases": [
+    "restaurant",
+    "shop",
+    "store"
+  ]
+}

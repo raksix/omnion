@@ -1,0 +1,88 @@
+{
+  "key": "tech",
+  "name": "Tech",
+  "version": "1.0.0",
+  "description": "A product site for software: a dark-canvas hero, a mono accent line and a dense type scale.",
+  "author": "Omnion",
+  "engine": "omnion-web",
+  "modes": [
+    "light",
+    "dark"
+  ],
+  "pageTypes": [
+    "page"
+  ],
+  "layouts": [
+    "page"
+  ],
+  "slots": [
+    "header",
+    "footer",
+    "home",
+    "blog-list",
+    "single-page",
+    "product",
+    "404",
+    "search"
+  ],
+  "tokens": {
+    "canvas": {
+      "light": "#fbfcfe",
+      "dark": "#0b0e14"
+    },
+    "surface": {
+      "light": "#f2f5fa",
+      "dark": "#141a25"
+    },
+    "ink": {
+      "light": "#0d1117",
+      "dark": "#e8edf5"
+    },
+    "muted": {
+      "light": "#57606f",
+      "dark": "#8b96a8"
+    },
+    "line": {
+      "light": "#e1e6ee",
+      "dark": "#222b39"
+    },
+    "accent": {
+      "light": "#5b3df5",
+      "dark": "#a394ff"
+    },
+    "accent_soft": {
+      "light": "#eeecfe",
+      "dark": "#1c1a3a"
+    }
+  },
+  "settingsSchema": {
+    "containerWidth": {
+      "type": "number",
+      "default": 1120,
+      "min": 720,
+      "max": 1600
+    },
+    "baseSize": {
+      "type": "number",
+      "default": 16,
+      "min": 14,
+      "max": 22
+    },
+    "radius": {
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 28
+    }
+  },
+  "compatibility": {
+    "engine": "omnion-web",
+    "minVersion": "0.1.0"
+  },
+  "previewImage": "preview.svg",
+  "screenshots": [],
+  "aliases": [
+    "saas",
+    "startup-soft"
+  ]
+}

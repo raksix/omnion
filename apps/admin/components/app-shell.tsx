@@ -6,7 +6,45 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, Code2, FileText, Fingerprint, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, WandSparkles, Workflow, X } from "lucide-react";
+import {
+  Activity,
+  BarChart3,
+  Bell,
+  Bot,
+  Boxes,
+  CalendarClock,
+  ClipboardCheck,
+  Code2,
+  FileStack,
+  FileText,
+  Fingerprint,
+  Globe,
+  HardDriveDownload,
+  HeartPulse,
+  Images,
+  Import,
+  KeyRound,
+  LayoutDashboard,
+  LayoutGrid,
+  ListTree,
+  LockKeyhole,
+  LogOut,
+  Mail,
+  Menu,
+  MessageSquare,
+  Palette,
+  Scale,
+  ScrollText,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sparkles,
+  Timer,
+  UserCog,
+  UserRoundCheck,
+  UsersRound,
+  Webhook,
+  X,
+} from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -19,8 +57,43 @@ import { useSession } from "@/lib/session";
 const NAV = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/pages", label: "Pages", icon: FileText },
+  { href: "/blocks", label: "Blocks", icon: Boxes },
+  { href: "/patterns", label: "Patterns", icon: LayoutGrid },
+  { href: "/page-templates", label: "Page templates", icon: FileStack },
+  // The navigation editor and the queue of scheduled publishes (REQ-064, slice 1). Both are
+  // content surfaces rather than settings, so they sit next to Pages rather than under it.
+  { href: "/menus", label: "Menus", icon: ListTree },
+  { href: "/publishing/queue", label: "Publishing queue", icon: CalendarClock },
+  // The SEO toolkit (REQ-064, slice 3). It sits beside Publishing queue because both answer
+  // "what does the outside world see about this site" — one about when, one about how.
+  { href: "/seo", label: "SEO", icon: Globe },
+  // The comment queue (REQ-064, slice 4a). It sits beside SEO rather than under Pages because
+  // it is the one content surface that is *inbound*: everything else in this shelf is
+  // something an editor wrote, and the queue is the only place an owner finds out what
+  // readers said about it.
+  { href: "/comments", label: "Comments", icon: MessageSquare },
+  // The mailing lists (REQ-064, slice 4b). It sits directly after Comments because both answer
+  // the same inbound question — what visitors sent us — and both are the places an owner has to
+  // decide about a stranger's address. Everything before them in this shelf is an outbound or
+  // authored surface.
+  { href: "/newsletter", label: "Newsletter", icon: Mail },
+  // Visitor accounts (REQ-064, slice 4c). It sits directly after Newsletter because both hold
+  // a stranger's address and both ask an operator to decide about one — and the icon differs on
+  // purpose: `UserCog` already means a PANEL user two rows down, and an operator who confuses
+  // the two is about to grant a visitor a set of platform permissions.
+  { href: "/members", label: "Members", icon: UserRoundCheck },
+  // The headless content API (REQ-019, slice 1). It sits AFTER Members rather than beside
+  // Settings because the thing it manages is a credential that leaves the building: an operator
+  // asking "who outside our org is reading our site" is the same question as "who is a member",
+  // asked about a stranger rather than an account. `KeyRound` rather than a settings key, because
+  // it is a credential and not a preference.
+  { href: "/content-api", label: "Content API", icon: KeyRound },
+  // The theme gallery (REQ-062). It sits directly BEFORE Media on purpose: the gallery decides
+  // what a visitor sees, and every row below it in this shelf — media, menus, pages — is content
+  // a theme then presents. `Palette` rather than `LayoutTemplate`, which the block editor
+  // already owns one screen over.
+  { href: "/themes", label: "Themes", icon: Palette },
   { href: "/media", label: "Media", icon: Images },
-  { href: "/automations", label: "Automations", icon: Workflow },
   // Backups sit beside Media rather than under Settings: an operator asking "where are my
   // files and can I get them back" is one question, and burying half of it under a
   // settings sub-path is what makes somebody believe the platform has no restore point.
@@ -44,15 +117,6 @@ const NAV = [
   { href: "/webhooks", label: "Webhooks", icon: Webhook },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
-  // The draft console (REQ-046). It sits directly UNDER the AI Hub rather than beside it:
-  // an operator who asked a model to write a rule is answering a question the Hub started,
-  // and burying the console under Automations would make it look like a separate product.
-  { href: "/ai/workflows", label: "AI workflows", icon: WandSparkles },
-  // The app builder (REQ-045) sits under the AI Hub too, for the same reason and one more:
-  // it is the Hub's question taken to its conclusion — a sentence becomes a plan here, where
-  // every artifact is reviewed before anything is created. It is a separate screen from
-  // Automations because nothing automates until a person has accepted it.
-  { href: "/app-builder", label: "App builder", icon: WandSparkles },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },

@@ -1,11 +1,39 @@
 {
   "key": "minimal",
   "name": "Minimal",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "A quiet, typographic theme: one column, generous spacing, light and dark.",
   "author": "Omnion",
   "engine": "omnion-web",
   "modes": ["light", "dark"],
   "pageTypes": ["page"],
-  "layouts": ["page"]
+  "layouts": ["page"],
+  "slots": [
+    "header",
+    "footer",
+    "home",
+    "blog-list",
+    "single-page",
+    "product",
+    "404",
+    "search"
+  ],
+  "tokens": {
+    "canvas": { "light": "#faf9f5", "dark": "#211f1d" },
+    "surface": { "light": "#ffffff", "dark": "#26241f" },
+    "ink": { "light": "#262624", "dark": "#edeae4" },
+    "muted": { "light": "#6b6560", "dark": "#a8a29a" },
+    "line": { "light": "#e8e4dc", "dark": "#3a3631" },
+    "accent": { "light": "#b0563a", "dark": "#d97b57" },
+    "accent_soft": { "light": "#f7e9e2", "dark": "#3a2a23" }
+  },
+  "settingsSchema": {
+    "containerWidth": { "type": "number", "default": 1120, "min": 720, "max": 1600 },
+    "baseSize": { "type": "number", "default": 17, "min": 14, "max": 22 },
+    "radius": { "type": "number", "default": 0, "min": 0, "max": 28 }
+  },
+  "compatibility": { "engine": "omnion-web", "minVersion": "0.1.0" },
+  "previewImage": "preview.svg",
+  "screenshots": [],
+  "aliases": []
 }

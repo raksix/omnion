@@ -39,6 +39,10 @@ tower = { version = "0.5", features = ["util"] }
 # password hashing, session-token generation and hashing.
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde-well-known"] }
+# The IANA timezone table, used to REFUSE a zone this build does not know rather than to
+# convert one: a schedule and a backup cadence that name a misspelled zone must both fail at
+# save time, not quietly run in UTC (crates/backup/src/cadence.rs, crates/content/src/publishing.rs).
+time-tz = "2.0.0"
 argon2 = "0.5"
 rand = "0.8"
 sha2 = "0.10"

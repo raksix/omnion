@@ -1,0 +1,22 @@
+{
+  "name": "@omnion/theme-documentation",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Omnion's Documentation theme \u2014 Docs: a sticky table of contents rail, a monospace affordance line and tight line height.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles.css": "./styles/documentation.css",
+    "./omnion.theme.json": "./omnion.theme.json"
+  },
+  "dependencies": {
+    "@omnion/theme-sdk": "workspace:*",
+    "@omnion/types": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=19"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0"
+  }
+}

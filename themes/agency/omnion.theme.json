@@ -1,0 +1,88 @@
+{
+  "key": "agency",
+  "name": "Agency",
+  "version": "1.0.0",
+  "description": "A studio site: an oversized display line, wide gutters and a card grid that breaks the measure.",
+  "author": "Omnion",
+  "engine": "omnion-web",
+  "modes": [
+    "light",
+    "dark"
+  ],
+  "pageTypes": [
+    "page"
+  ],
+  "layouts": [
+    "page"
+  ],
+  "slots": [
+    "header",
+    "footer",
+    "home",
+    "blog-list",
+    "single-page",
+    "product",
+    "404",
+    "search"
+  ],
+  "tokens": {
+    "canvas": {
+      "light": "#fffdf9",
+      "dark": "#141210"
+    },
+    "surface": {
+      "light": "#f6f1e8",
+      "dark": "#201c17"
+    },
+    "ink": {
+      "light": "#1b1815",
+      "dark": "#f2ede4"
+    },
+    "muted": {
+      "light": "#6d6459",
+      "dark": "#a89c8c"
+    },
+    "line": {
+      "light": "#e3dacb",
+      "dark": "#332d25"
+    },
+    "accent": {
+      "light": "#d94f2b",
+      "dark": "#ff8a5c"
+    },
+    "accent_soft": {
+      "light": "#fbeae3",
+      "dark": "#3a1d12"
+    }
+  },
+  "settingsSchema": {
+    "containerWidth": {
+      "type": "number",
+      "default": 1120,
+      "min": 720,
+      "max": 1600
+    },
+    "baseSize": {
+      "type": "number",
+      "default": 18,
+      "min": 14,
+      "max": 22
+    },
+    "radius": {
+      "type": "number",
+      "default": 4,
+      "min": 0,
+      "max": 28
+    }
+  },
+  "compatibility": {
+    "engine": "omnion-web",
+    "minVersion": "0.1.0"
+  },
+  "previewImage": "preview.svg",
+  "screenshots": [],
+  "aliases": [
+    "studio",
+    "creative"
+  ]
+}

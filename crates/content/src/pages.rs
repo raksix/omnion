@@ -15,6 +15,7 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::blocks::blocks_to_value;
 use crate::error::{ContentError, Result};
 use crate::model::{DEFAULT_PAGE_TYPE, NewPage, Page, PageChanges, PageRevision};
 use crate::validation::{
@@ -28,7 +29,7 @@ const PAGE_COLUMNS: &str = "id, site_id, slug, page_type, status, published_revi
 
 /// Column list for every `PageRevision` query.
 const REVISION_COLUMNS: &str = "id, page_id, revision_no, state, title, body, summary, \
-     restored_from_id, created_by, created_at, published_at";
+     blocks, restored_from_id, created_by, created_at, published_at";
 
 /// Create a page together with its first, draft revision.
 ///
@@ -62,14 +63,16 @@ pub async fn create_page(pool: &PgPool, new: NewPage) -> Result<(Page, PageRevis
         .map_err(map_page_write_error)?;
 
     let revision_sql = format!(
-        "insert into page_revisions (page_id, revision_no, state, title, body, summary, created_by) \
-         values ($1, 1, 'draft', $2, $3, $4, $5) returning {REVISION_COLUMNS}"
+        "insert into page_revisions \
+         (page_id, revision_no, state, title, body, summary, blocks, created_by) \
+         values ($1, 1, 'draft', $2, $3, $4, $5::jsonb, $6) returning {REVISION_COLUMNS}"
     );
     let revision: PageRevision = sqlx::query_as(&revision_sql)
         .bind(page.id)
         .bind(&title)
         .bind(&body)
         .bind(summary.as_deref())
+        .bind(blocks_to_value(&[]))
         .bind(new.created_by)
         .fetch_one(&mut *tx)
         .await?;
@@ -176,6 +179,32 @@ pub async fn update_page(
             Some(summary) => validate_summary(summary)?,
             None => base.summary.clone(),
         };
+        // Blocks (REQ-063): a new block tree is validated and normalized against the registry
+        // before it is written, so a stored payload is always one the renderer can draw. An
+        // edit that touches anything else keeps the base revision's tree.
+        let blocks = match &changes.blocks {
+            Some(payload) => {
+                // One path, not three: `blocks::prepare_tree` validates, sanitises and
+                // normalises in the order every other writer of a block tree uses. This code
+                // used to spell the sequence out itself, which is how a pattern save and a
+                // page save ended up producing different stored shapes for the same input.
+                let (normalized, report) = crate::blocks::prepare_tree(payload.clone())?;
+                // Only a payload the store cannot hold is refused here. An unfinished block —
+                // a heading with no text yet, an image with no alternative text — saves as a
+                // draft exactly like a half-written body does, because an author is allowed to
+                // be mid-sentence; `publish_page` is where such a page is turned away, and the
+                // editor shows the same issues live so the author never gets that far by
+                // accident.
+                if let Some(issue) = report.first_fatal() {
+                    return Err(ContentError::InvalidBlock(format!(
+                        "the block tree cannot be stored: {} at {}: {}",
+                        issue.code, issue.path, issue.message
+                    )));
+                }
+                normalized
+            }
+            None => base.blocks.clone(),
+        };
 
         sqlx::query(
             "update page_revisions set state = 'archived' \
@@ -186,8 +215,9 @@ pub async fn update_page(
         .await?;
 
         let insert_sql = format!(
-            "insert into page_revisions (page_id, revision_no, state, title, body, summary, created_by) \
-             values ($1, $2, 'draft', $3, $4, $5, $6) returning {REVISION_COLUMNS}"
+            "insert into page_revisions \
+             (page_id, revision_no, state, title, body, summary, blocks, created_by) \
+             values ($1, $2, 'draft', $3, $4, $5, $6::jsonb, $7) returning {REVISION_COLUMNS}"
         );
         let _draft: PageRevision = sqlx::query_as(&insert_sql)
             .bind(id)
@@ -195,6 +225,7 @@ pub async fn update_page(
             .bind(&title)
             .bind(&body)
             .bind(summary.as_deref())
+            .bind(blocks)
             .bind(editor)
             .fetch_one(&mut *tx)
             .await?;
@@ -267,6 +298,53 @@ pub async fn publish_page(pool: &PgPool, id: Uuid) -> Result<(Page, PageRevision
     Ok((page, published))
 }
 
+/// Take a published page back off the public site (REQ-064, slice 1).
+///
+/// Unpublishing archives the published revision and clears the page's pointer at it — the
+/// content is *not* deleted, because history is never rewritten and an unpublish is undoable by
+/// publishing the same revision again. The page falls back to `draft`, so a visitor gets the
+/// platform's not-found answer rather than a page whose revisions all say `published` and whose
+/// renderer would still find one.
+///
+/// Fails with [`ContentError::PageNotFound`] for a page that does not exist, and is a no-op
+/// returning `false` for a page that is not currently published: "unpublish something that is
+/// not published" is a state the row is already in, not an error a scheduler should fail over.
+pub async fn unpublish_page(pool: &PgPool, id: Uuid) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+
+    let page_sql = format!("select {PAGE_COLUMNS} from pages where id = $1 for update");
+    let Some(page) = sqlx::query_as::<_, Page>(&page_sql)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        return Err(ContentError::PageNotFound);
+    };
+    if page.published_revision_id.is_none() {
+        tx.commit().await?;
+        return Ok(false);
+    }
+
+    sqlx::query(
+        "update page_revisions set state = 'archived' \
+         where page_id = $1 and state = 'published'",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "update pages set status = 'draft', published_revision_id = null, updated_at = now() \
+         where id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Restore an earlier revision: copy it forward as a new draft.
 ///
 /// History is never rewritten — the older content becomes a new draft revision that records
@@ -310,10 +388,12 @@ pub async fn restore_revision(
     .execute(&mut *tx)
     .await?;
 
+    // The blocks travel with the content: a restore that brought back the text of an older
+    // revision and not its block tree would render a page that never existed.
     let insert_sql = format!(
         "insert into page_revisions \
-         (page_id, revision_no, state, title, body, summary, restored_from_id, created_by) \
-         values ($1, $2, 'draft', $3, $4, $5, $6, $7) returning {REVISION_COLUMNS}"
+         (page_id, revision_no, state, title, body, summary, blocks, restored_from_id, created_by) \
+         values ($1, $2, 'draft', $3, $4, $5, $6::jsonb, $7, $8) returning {REVISION_COLUMNS}"
     );
     let restored: PageRevision = sqlx::query_as(&insert_sql)
         .bind(page_id)
@@ -321,6 +401,7 @@ pub async fn restore_revision(
         .bind(&source.title)
         .bind(&source.body)
         .bind(source.summary.as_deref())
+        .bind(source.blocks.clone())
         .bind(source.id)
         .bind(restored_as)
         .fetch_one(&mut *tx)
