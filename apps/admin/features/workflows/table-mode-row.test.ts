@@ -105,12 +105,37 @@ const REVERSE_READ = (() => {
   // to one reports "the row is missing" when the row is right there.
   const readAt = BLOCK.indexOf("const holder = perNode.find");
   assert.notEqual(readAt, -1, "the reverse-direction read must exist");
-  const start = BLOCK.lastIndexOf(
-    "await page.goto(`${admin}/workflows/${workflowId}/builder`",
-    readAt,
-  );
+  // The anchor names the navigation, not the VARIABLE that held the base. It read
+  // ``await page.goto(`${admin}/workflows/${workflowId}/builder` ``, and `3c223c00` fixed that
+  // navigation to the module constant `URL_ADMIN` because `admin` is a local of a *sibling* pass
+  // — so the pass died on a `ReferenceError` before executing a single assertion (tick 81). The
+  // pin then went stale in the direction this file's own rule warns about five times above: the
+  // row is correct and the test reports "the row must navigate to the builder before reading it"
+  // with `actual: -1`, naming a defect that does not exist. **A harness test must pin the BEHAVIOUR
+  // it protects, and `goto(<the builder route>)` is the behaviour; the identifier in front of it is
+  // the row's choice.** So the anchor is the route, which both the buggy and the fixed navigation
+  // contain — and the assertion below keeps the constant itself pinned, so the fix cannot be
+  // silently reverted by writing `admin` back.
+  //
+  // The route, not `goto(`: this pass writes the call as a fluent chain with `.goto(` on its own
+  // line, so an anchor that included `goto(` and the template on ONE line never matched. Pinning
+  // the shape of the CALL rather than the shape of the LINE is the sixth instance of the same rule.
+  const start = BLOCK.lastIndexOf("/workflows/${workflowId}/builder`", readAt);
   assert.notEqual(start, -1, "the row must navigate to the builder before reading it");
   assert.ok(start < readAt, "the navigation must precede the read");
+  // The identifier in front of the route is the load-bearing half: `admin` is unbound in this
+  // pass, and an unbound name in a template string throws before `.catch` attaches, so the whole
+  // pass died at its first line rather than swallowing a navigation error. Asserted negatively so
+  // a future edit that reintroduces it fails here instead of in a 25-minute pass.
+  assert.equal(
+    BLOCK.includes("${admin}/workflows/"),
+    false,
+    "the builder pass must not navigate with a name borrowed from a sibling pass (tick 81)",
+  );
+  assert.ok(
+    BLOCK.includes("${URL_ADMIN}/workflows/"),
+    "the builder pass must navigate with the module constant, not a sibling's local",
+  );
   const end = BLOCK.indexOf('note({ step: "table-save-survives"', start);
   assert.notEqual(end, -1, "the reverse read must be followed by its note");
   assert.ok(end > start, "the window must not end before it begins");
@@ -354,15 +379,38 @@ test("the row navigates to the builder BEFORE reading it, in the same window", (
   // canvas has mounted, and every marker assertion would then be green against a page that
   // had not drawn yet. The `goto` and the read must be adjacent so the ordering is the claim,
   // and the read waits for the marker it needs rather than a fixed delay.
-  const goto = BLOCK.indexOf("await page.goto(`${admin}/workflows/${workflowId}/builder`", BLOCK.indexOf('step: "canvas-save-visible"'));
+  // The same stale anchor as `REVERSE_READ`, and the same fix: this one still searched for
+  // ``await page.goto(`${admin}/workflows/…` ``, which `3c223c00` replaced with `URL_ADMIN`
+  // (tick 81), so it reported "the row must open the builder before reading it" with
+  // `actual: -1` against a row that opens the builder just above the read. Two windows in one
+  // file carrying the same stale anchor is the failure mode this file exists to catch — and
+  // fixing only the first would have left the second red, reading like a product defect.
+  //
+  // **These two windows deliberately find DIFFERENT navigations and must keep doing so.** This
+  // pass opens the builder twice: once to read `canvas-save-visible` (offset 4739) and once to
+  // read `table-save-survives` (offset 13486), and each window is pinned to the navigation that
+  // belongs to ITS note. A first draft of this fix asserted the two windows agreed — which was
+  // the appealing claim to make and the wrong one: it is only true while the two notes sit on
+  // either side of a single navigation. Asserting it would have made the *correct* code red the
+  // day someone adds the second navigation this row will eventually need, and the failure would
+  // read "two windows disagree" rather than "the window lost its own navigation". Each window is
+  // bounded by ITS note, which is the only pairing that means something.
+  const goto = BLOCK.lastIndexOf(
+    "/workflows/${workflowId}/builder`",
+    BLOCK.indexOf('step: "canvas-save-visible"'),
+  );
   assert.notEqual(goto, -1, "the row must open the builder before reading it");
-  // The same anchor as `REVERSE_READ`, for the same reason: this window had `const canvasRead =
-  // await page` pinned and tick 59 replaced that statement, so it reported "the read must exist"
-  // with `actual: -1, expected: -1` against a read sitting twelve lines above it. Two windows in
-  // one file carrying the same stale anchor is the failure mode this file exists to catch, so
-  // the two windows now share the constant rather than repeating the search.
   const readAt = BLOCK.indexOf("const holder = perNode.find");
   assert.notEqual(readAt, -1, "the read must exist");
+  // The pairing that DOES hold: each window's navigation is the one nearest its own note, and
+  // both are distinct — a check that the two searches are not silently the same anchor, which is
+  // how a window silently widens until it covers something it was never about.
+  assert.notEqual(
+    goto,
+    REVERSE_READ.indexOf("/workflows/${workflowId}/builder`"),
+    "the two windows must be pinned to DIFFERENT navigations — a file with two windows on one " +
+      "anchor covers half the block twice and nothing of what it claims",
+  );
   assert.ok(
     goto < readAt,
     "the navigation must precede the read, or the read is of whatever was on screen before",
