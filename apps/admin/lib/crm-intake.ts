@@ -459,3 +459,109 @@ export function editorAfterRefresh<T extends { id: string }>(
     ? { action: "keep", editing }
     : { action: "close" };
 }
+
+/**
+ * How the inbox's **Source** column reads a lead, and what it says when it cannot.
+ *
+ * **The column the REQ names and the table never had.** The request's inbox row has listed
+ * `Source` since it was written; the filter above the table has carried the word since the same
+ * tick, so the two reads were already in the product — and neither was in the row, which means
+ * an operator who filtered by one source and then read the table could not tell what a row in
+ * front of them was without going back to the filter. The value is derived from the source
+ * roster the screen already holds, not from a join: the lead carries `source_id`, the panel
+ * already reads every source for the filter, and a join would make the inbox's page query
+ * depend on a second table for one cell of text.
+ *
+ * **A lead whose source is not in the roster is named by its short id rather than by a
+ * dash**, for the same reason `ownerLabel` does it: a source deleted behind a lead, or one
+ * another tab created after this page loaded, is a real row with a real cause, and a blank
+ * cell reads as "no source" — which sends the operator to the form side instead of the
+ * settings side, where the answer is.
+ */
+export function sourceLabel(
+  sources: Map<string, string>,
+  sourceId: string | null | undefined,
+): string | null {
+  if (!sourceId) {
+    // **No source at all is the one case with a blank cell.** An imported lead has no
+    // capture surface and `source_id` is null for a reason that is not a fault, so the
+    // honest cell is empty rather than a fabricated "Imported" the screen cannot back.
+    return null;
+  }
+  return sources.get(sourceId) ?? `Source ${sourceId.slice(0, 8)}`;
+}
+
+/**
+ * The **Duplicate hint** cell, and the rule that decides when it says anything.
+ *
+ * The inbox's column list has said `Duplicate hint` since the request was written and the
+ * duplicates queue has rendered the matched key and the score for a long time — but on
+ * `/crm/leads/duplicates`, one screen further along. An operator asking "is this the same
+ * person who wrote to me last week?" is standing on the **inbox**, and the only answer they
+ * could get was to filter by the `duplicate` status and walk to the queue.
+ *
+ * **Only a row that matched somebody shows a hint.** `decision = "linked"` is not a
+ * duplicate — it is the *good* outcome of the dedupe pass, the lead that now belongs to an
+ * existing contact — and a hint that fires on it tells an operator twenty ordinary leads are
+ * suspicious. So the cell reads the two facts together: a stored decision that means "filed as
+ * a duplicate", and the matched key beside it so the claim is checkable rather than an
+ * accusation.
+ */
+export type DuplicateHint = {
+  /**
+   * **Which of the two columns carried the verdict.**
+   *
+   * Recorded rather than collapsed into a boolean because the two answer different
+   * questions and an operator reads the difference: `verdict` is the dedupe pass's own
+   * decision ("matched somebody, filed, not linked"), while `status` is the row's terminal
+   * state — which is also how a `keep separate` decision in the duplicates queue leaves a
+   * row that never had a verdict recorded against it. Rendering both as the word
+   * "duplicate" would make a queue decision indistinguishable from a dedupe match.
+   */
+  from: "verdict" | "status";
+  /** The key the verdict matched on, when one was recorded. */
+  key: string | null;
+  /** The confidence, 0-1, when one was recorded. */
+  score: number | null;
+};
+
+/** Whether a lead's stored verdict means "this is somebody we already have". */
+export function isDuplicateVerdict(lead: {
+  decision?: string | null;
+  status?: string | null;
+}): boolean {
+  // Two columns carry this fact and they are not redundant. `status = "duplicate"` is the
+  // row's *terminal state* — the filter chip and every terminal-status gate read it — while
+  // `decision = "duplicate"` is the *dedupe pass's verdict*, which a `reject_duplicate`
+  // source files and a `keep separate` decision in the queue later clears. Reading only one
+  // of them produces a column that is right for one policy and silent for the other.
+  return lead.status === "duplicate" || lead.decision === "duplicate";
+}
+
+/** What the Duplicate hint cell renders, or `null` when the row is not a duplicate. */
+export function duplicateHint(lead: {
+  decision?: string | null;
+  dedupe_key?: string | null;
+  dedupe_score?: number | null;
+  status?: string | null;
+}): DuplicateHint | null {
+  if (lead.decision === "duplicate") {
+    return {
+      from: "verdict",
+      key: lead.dedupe_key ?? null,
+      score: lead.dedupe_score ?? null,
+    };
+  }
+  // The status arm is the row whose verdict was never recorded — a duplicate filed by an
+  // older source, or one whose `decision` was cleared by a `keep separate` that left the
+  // terminal status behind. Both are still duplicates to a reader, and the column says so
+  // rather than waiting for a dedupe pass to run again.
+  if (lead.status === "duplicate") {
+    return {
+      from: "status",
+      key: lead.dedupe_key ?? null,
+      score: lead.dedupe_score ?? null,
+    };
+  }
+  return null;
+}

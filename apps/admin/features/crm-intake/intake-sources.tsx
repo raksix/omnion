@@ -394,7 +394,31 @@ export function IntakeSources() {
               className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] transition hover:text-ink"
             >
               <Copy className="size-3.5" aria-hidden />
-              Copy
+              Copy key
+            </button>
+            {/* The REQ's inbox row has asked for `Copy intake URL` since it was written, and
+                the honest place for it is **here and only here**. The endpoint's URL is its
+                origin plus its path plus its key — and the key exists in this browser only
+                during this moment, because `endpoint_key_hash` is what the server stores and
+                the clear value is never re-issued. A `Copy intake URL` button anywhere else
+                would copy a URL that answers `401`, which is worse than no button: the
+                operator pastes it into their integration and spends an afternoon on a
+                capture path that cannot capture. So the word is honoured where it is true
+                and the source list's hints were corrected instead of promising a URL it
+                cannot rebuild. */}
+            <button
+              type="button"
+              data-key-copy-url
+              onClick={() => {
+                void navigator.clipboard?.writeText(intakeEndpointUrl(revealedKey.key));
+                setNotice(
+                  "The capture URL is on the clipboard. Paste it into your integration together with the key.",
+                );
+              }}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] transition hover:text-ink"
+            >
+              <Copy className="size-3.5" aria-hidden />
+              Copy intake URL
             </button>
             <button
               type="button"
@@ -418,7 +442,13 @@ export function IntakeSources() {
         ) : rows === null || rows.length === 0 ? (
           <EmptyState
             title="No intake source yet"
-            hint="A lead cannot arrive from nowhere. Create a keyed endpoint, or bind one of the site's forms to a source, and its capture URL appears here."
+            // **The hint used to promise a capture URL, and the screen cannot rebuild one.**
+            // The endpoint's URL *contains its key*; the server stores only the key's hash and
+            // the clear value is issued once and shown once. So the URL belongs to the one-time
+            // key panel above — which is exactly when an operator needs to paste it — and an
+            // empty state that said "it appears here" and then never showed one taught the
+            // operator that this screen had lost the value.
+            hint="A lead cannot arrive from nowhere. Create a keyed endpoint, or bind one of the site's forms to a source — its capture URL appears once, in the key panel above, together with the key."
             action={
               <button
                 type="button"

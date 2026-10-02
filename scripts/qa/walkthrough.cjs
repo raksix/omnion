@@ -6235,6 +6235,61 @@ async function runCrmIntakeDepth(page, report) {
     Array.from(document.querySelectorAll("#lead-owner option")).filter((o) => o.dataset.ownerFilter).length,
   );
 
+  // The two columns the inbox row has named since the request was written and the table did
+  // not have. Both are measured as **counts plus content**, because a column that renders for
+  // every row — including a blank cell for a row that is not a duplicate — is a column that
+  // passes a presence check while showing nothing, which is the shape the REQ forbids.
+  //
+  // The header count is asserted too: the column list and the body are written in two places
+  // and nothing forces them to agree, so a header with eight columns over a seven-cell row is
+  // a table that renders a ragged last column on every row.
+  steps.inboxColumns = await page.evaluate(() => ({
+    headers: Array.from(document.querySelectorAll("[data-lead-table] thead th"))
+      .map((th) => (th.textContent ?? "").trim())
+      .filter(Boolean),
+    rows: document.querySelectorAll("[data-lead-row]").length,
+  }));
+  steps.inboxHasSourceColumn = steps.inboxColumns.headers.includes("Source");
+  steps.inboxHasDuplicateColumn = steps.inboxColumns.headers.includes("Duplicate");
+  const firstRowCells = await page.evaluate(
+    () => document.querySelectorAll("[data-lead-table] tbody tr:first-child td").length,
+  );
+  // The header count excludes the select-all checkbox column (it has no header text), so it
+  // must be one *less* than the body's cell count. Both sides are measured from the DOM rather
+  // than written down, because a hard-coded eight is exactly the number that goes stale the
+  // next time a column is added — which is what this assertion exists to catch.
+  steps.inboxColumnCellsAligned =
+    steps.inboxColumns.rows > 0 && steps.inboxColumns.headers.length === firstRowCells - 1;
+  steps.inboxSourceCells = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("[data-lead-source-cell]")).map((cell) =>
+      (cell.textContent ?? "").trim(),
+    ),
+  );
+  // **The negative arm, and it is the one that matters.** A lead that matched an existing
+  // contact is *not* a duplicate — `decision = "linked"` is the dedupe pass's good outcome —
+  // and a hint that fires on it would tell an operator every ordinary lead is suspicious. So
+  // the count of hinted rows must never exceed the count of rows the page itself says are
+  // duplicates (status chip or the duplicate queue's own list), and every hinted row must
+  // carry a matched key rather than a bare word.
+  steps.inboxDuplicateHints = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("[data-lead-duplicate-hint]")).map((node) => ({
+      key: (node.textContent ?? "").trim(),
+      score: node.querySelector("[data-lead-duplicate-score]")?.textContent?.trim() ?? "",
+    })),
+  );
+  steps.inboxDuplicatesByStatus = (
+    await page.evaluate(() =>
+      Array.from(document.querySelectorAll("[data-lead-status]")).map((node) =>
+        node.getAttribute("data-lead-status"),
+      ),
+    )
+  ).filter((status) => status === "duplicate").length;
+  steps.inboxHintNeverExceedsDuplicates =
+    steps.inboxDuplicateHints.length <= steps.inboxDuplicatesByStatus;
+  steps.inboxEveryHintNamesItsKey = steps.inboxDuplicateHints.every(
+    (hint) => hint.key.length > 0,
+  );
+
   // The batch hand-over, on the inbox. Three claims, all measured:
   //
   //   1. The bar appears only when something is selected — a permanent control above the

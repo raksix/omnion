@@ -49,10 +49,12 @@ import {
   SLA_STATE_TONE,
   contactLabel,
   countdown,
+  duplicateHint,
   isOpenLeadStatus,
   ownerLabel,
   relativeInstant,
   slaState,
+  sourceLabel,
 } from "@/lib/crm-intake";
 import {
   BULK_ACTIONS,
@@ -303,6 +305,11 @@ export function LeadInbox() {
   };
 
   const ownersById = new Map(owners.map((owner) => [owner.id, owner.label]));
+  // The same roster the source filter renders from, indexed for the table's new `Source`
+  // column. One read, one source of names: a second fetch for the column would be able to
+  // disagree with the filter above it, and "the filter says X, the row says Y" is exactly the
+  // confusion this column exists to remove.
+  const sourcesById = new Map(sources.map((source) => [source.id, source.name]));
   const leads = inbox?.leads ?? [];
   const metrics = inbox?.metrics ?? null;
   const activeFilters =
@@ -516,7 +523,12 @@ export function LeadInbox() {
 
       <div className="overflow-hidden rounded-xl border border-line bg-surface">
         {loading && leads.length === 0 ? (
-          <LoadingTable columns={6} rows={6} />
+          // **Eight, and the count is the contract.** The skeleton is the only thing a reader
+          // sees while the page is in flight, and a six-column skeleton under an eight-column
+          // table is a layout that visibly jumps the moment the rows land. Counted from the
+          // header, not remembered: this is the third skeleton on the branch whose column
+          // count was written down once and never revisited when a column was added.
+          <LoadingTable columns={8} rows={6} />
         ) : leads.length === 0 ? (
           activeFilters > 0 ? (
             <EmptyState
@@ -548,7 +560,10 @@ export function LeadInbox() {
           ) : (
             <EmptyState
               title="No intake source yet"
-              hint="A lead arrives through a source — a website form or a keyed endpoint. Create the first one and its capture URL appears here."
+              // The same correction as the source screen's own empty state, for the same
+              // reason: the capture URL contains the source key, which exists once. Say where
+              // it is rather than promising a URL this screen cannot build.
+              hint="A lead arrives through a source — a website form or a keyed endpoint. Create the first one; its capture URL is shown once, with the key, on the intake sources screen."
               action={
                 <Link
                   href="/crm/settings/intake"
@@ -565,6 +580,7 @@ export function LeadInbox() {
           <LeadTable
             leads={leads}
             ownersById={ownersById}
+            sourcesById={sourcesById}
             selected={selected}
             onToggle={toggleSelected}
             onToggleAll={() =>
@@ -901,6 +917,7 @@ function Counter({
 function LeadTable({
   leads,
   ownersById,
+  sourcesById,
   selected,
   onToggle,
   onToggleAll,
@@ -908,6 +925,11 @@ function LeadTable({
 }: {
   leads: Lead[];
   ownersById: Map<string, string>;
+  /**
+   * The source roster by id — the very map the filter above the table renders from, so the
+   * `Source` column costs no join and cannot disagree with the filter's own names.
+   */
+  sourcesById: Map<string, string>;
   selected: string[];
   onToggle: (id: string) => void;
   onToggleAll: () => void;
@@ -930,16 +952,20 @@ function LeadTable({
             </th>
             <th scope="col" className="px-3 py-2.5 font-medium">Received</th>
             <th scope="col" className="px-3 py-2.5 font-medium">Contact</th>
+            <th scope="col" className="px-3 py-2.5 font-medium">Source</th>
             <th scope="col" className="px-3 py-2.5 font-medium">Product</th>
             <th scope="col" className="px-3 py-2.5 font-medium">Owner</th>
             <th scope="col" className="px-3 py-2.5 font-medium">First response</th>
             <th scope="col" className="px-3 py-2.5 font-medium">Status</th>
+            <th scope="col" className="px-3 py-2.5 font-medium">Duplicate</th>
           </tr>
         </thead>
         <tbody>
           {leads.map((lead) => {
             const state = slaState(lead);
             const remaining = countdown(lead.first_response_due_at);
+            const sourceCell = sourceLabel(sourcesById, lead.source_id);
+            const hint = duplicateHint(lead);
             return (
               <tr
                 key={lead.id}
@@ -970,6 +996,24 @@ function LeadTable({
                   {lead.email && (lead.first_name || lead.last_name) ? (
                     <span className="block max-w-56 truncate text-[11.5px] text-muted">{lead.email}</span>
                   ) : null}
+                </td>
+                {/* The `Source` column the request has named since it was written. It reads
+                    the roster the filter above already holds, so it cannot disagree with the
+                    filter's names and costs no join. The source's `title` is the id on the
+                    cell, which is what an operator pastes into a support ticket. */}
+                <td className="px-3 py-2.5 text-muted" data-lead-source-cell>
+                  {sourceCell ? (
+                    <span
+                      className="block max-w-32 truncate"
+                      title={lead.source_id ?? undefined}
+                    >
+                      {sourceCell}
+                    </span>
+                  ) : (
+                    // An imported lead has no capture surface. Blank is the honest cell: a
+                    // dash would read as "a source that is missing" rather than "there is none".
+                    <span className="block max-w-32 truncate" aria-label="No source" />
+                  )}
                 </td>
                 <td className="px-3 py-2.5 text-muted">
                   <span className="block max-w-32 truncate">{lead.product_interest ?? "—"}</span>
@@ -1012,6 +1056,32 @@ function LeadTable({
                   {lead.decision && lead.decision !== "created" ? (
                     <span className="mt-0.5 block text-[11px] text-muted">
                       {DECISION_LABEL[lead.decision] ?? lead.decision}
+                    </span>
+                  ) : null}
+                </td>
+                {/* The `Duplicate hint` column the request has named since it was written.
+                    **Not a second copy of the status chip above**, which already prints the
+                    decision's *word* — the hint is the part the chip cannot carry: the key the
+                    verdict matched on and how confidently. "Duplicate of a contact" is a claim;
+                    "`ayse@company.com` at 0.95" is something an operator can check before
+                    merging somebody's record. Empty for every row that is not a duplicate, and
+                    in particular for `decision = "linked"`, which is the dedupe pass's *good*
+                    outcome rather than a suspicion. */}
+                <td className="px-3 py-2.5">
+                  {hint ? (
+                    <span data-lead-duplicate-hint={lead.id} className="block">
+                      <span className="block max-w-40 truncate font-mono text-[11px] text-muted">
+                        {hint.key ?? "—"}
+                      </span>
+                      {hint.score !== null ? (
+                        <span
+                          data-lead-duplicate-score={lead.id}
+                          className="block text-[11px] text-muted/70"
+                          title={`matched with confidence ${hint.score.toFixed(2)}`}
+                        >
+                          {hint.score.toFixed(2)}
+                        </span>
+                      ) : null}
                     </span>
                   ) : null}
                 </td>
