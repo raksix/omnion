@@ -1154,6 +1154,27 @@ impl From<AiHubError> for ApiError {
             AiHubError::IdentityConflict(message) => {
                 Self::new(StatusCode::CONFLICT, "identity_conflict", message)
             }
+            // MCP clients (REQ-108 slice 1). The same three-way split the identities use, and
+            // the tenancy half matters most here: an MCP client id sits in a URL, and a status
+            // code that distinguishes "exists in another tenant" would make the clients table an
+            // existence oracle over every token prefix in the installation. `invalid_mcp_client`
+            // lands on a form field (the message names which), `mcp_client_not_found` is a
+            // deleted row or a foreign one, and `mcp_client_conflict` is a taken name the
+            // operator resolves by choosing another.
+            AiHubError::InvalidMcpClient(message) => {
+                Self::bad_request("invalid_mcp_client", message)
+            }
+            AiHubError::McpClientNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "mcp_client_not_found",
+                format!("no MCP client `{id}` in this organization"),
+            ),
+            AiHubError::McpClientConflict(message) => {
+                Self::new(StatusCode::CONFLICT, "mcp_client_conflict", message)
+            }
+            AiHubError::McpClientToolConflict(message) => {
+                Self::new(StatusCode::CONFLICT, "mcp_client_tool_conflict", message)
+            }
             // The data guard (REQ-105). The same four-way split, and for the same reason: the
             // rule form's bad field is a `400` naming the field, a rule id from another tenant
             // (or a platform row, for the update path) is a `404` — never a 403, or the rules
