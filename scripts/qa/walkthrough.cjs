@@ -1734,6 +1734,99 @@ async function runBackups(page, report) {
   const states = await page.locator('[data-testid="backup-state"]').allInnerTexts();
   note({ step: "list", rows, states: states.slice(0, 6) });
 
+  // ---- A `partial` run, and the reason the list shows for it (REQ-013) ------------------
+  //
+  // Every assertion above this line runs against a healthy run, because the drawer's create
+  // button always asks for all five parts and this stack's store answers. So the one state
+  // the screen exists to warn about — `partial`, and the sentence saying which part failed —
+  // was never exercised: not by the Rust walks (they assert the store's verdict) and not
+  // here (nothing on this screen fails). A screen that renders a green run perfectly and
+  // cannot say why a red one is red passes everything above.
+  //
+  // The fault is injected the way the platform itself would produce one, not by editing a
+  // run's status: a `media` row whose object is absent from the store. The media part's copy
+  // loop reads through the real `Storage`, gets a miss, records the failure and carries on —
+  // which is the documented behaviour (one bad object must not cost the other 4 998), and
+  // makes the run `partial` because the other four parts still succeed. Pointing a live row
+  // at a key nobody wrote is a one-line statement; rewriting `backups.status` would prove the
+  // list renders a word and nothing about why.
+  // `qaSql` is `execFileSync` — synchronous. It is not awaited anywhere else in this file for
+  // that reason, and an `await` on a non-promise here would read as though it were.
+  const partialProbe = qaSql(
+    `update media set storage_key = storage_key || '.absent-from-the-store' \
+     where id in (select id from media where deleted_at is null and purged_at is null limit 1)`,
+  );
+  note({ step: "partial-fault-injected", rows: partialProbe });
+
+  if (partialProbe === "UPDATE 1") {
+    await page.click('[data-testid="backup-create"]').catch(() => {});
+    await page
+      .waitForSelector('[data-testid="backup-create-drawer"]', { timeout: 5000 })
+      .catch(() => {});
+    await page.click('[data-testid="backup-create-confirm"]').catch(() => {});
+    await page.waitForTimeout(9000);
+
+    // Reload rather than trusting the current DOM: the run was created by the API after the
+    // panel had already drawn its table, and a panel that only refetches on a filter change
+    // would leave the new row invisible here — which is itself worth recording.
+    await page.goto(`${URL_ADMIN}/backups`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page
+      .waitForSelector('[data-testid="backups-overview"]', { timeout: 8000 })
+      .catch(() => {});
+    await page.waitForTimeout(1500);
+
+    const partialStates = await page
+      .locator('[data-testid="backup-state"]')
+      .allInnerTexts()
+      .catch(() => []);
+    // The reason is drawn on the ROW, not only in the detail panel. That is the whole claim:
+    // `run.error` has been on every list row since slice 1 and the table never drew it, so a
+    // red run was a coloured pill and the sentence an operator needs was one click away on a
+    // screen whose job is to tell them which run to click.
+    const reasons = await page
+      .locator('[data-testid="backup-row-reason"]')
+      .allInnerTexts()
+      .catch(() => []);
+    const reasonText = reasons.join(" | ").trim();
+    const sawPartial = partialStates.some((state) => /partial/i.test(state));
+    note({
+      step: "partial-run",
+      sawPartial,
+      states: partialStates.slice(0, 6),
+      reasonsRendered: reasons.length,
+      // A reason that names the failing part, in the operator's own words.
+      reasonNamesAFailingPart: /media/i.test(reasonText),
+      reason: reasonText.slice(0, 300),
+    });
+
+    // Open it, so the detail panel's own per-part messages are read too: the list sentence is
+    // a summary and the parts table is the record, and this pass is what proves both exist.
+    await page.locator('[data-testid="backup-row"]').first().click().catch(() => {});
+    await page.waitForTimeout(1500);
+    const detailRows = await page
+      .locator('[data-testid="backup-part-row"]')
+      .allInnerTexts()
+      .catch(() => []);
+    const failedPart = detailRows.find((text) => /failed/i.test(text)) ?? "";
+    note({
+      step: "partial-detail",
+      rows: detailRows.length,
+      failedPartShown: failedPart.trim().length > 0,
+      failedPart: failedPart.trim().slice(0, 240),
+    });
+
+    // Put the object back so the run this stack takes later is not permanently poisoned.
+    qaSql(
+      `update media set storage_key = replace(storage_key, '.absent-from-the-store', '') \
+       where storage_key like '%.absent-from-the-store'`,
+    );
+  } else {
+    note({
+      step: "partial-run",
+      reason: "this stack has no live media row to point at a missing object",
+    });
+  }
+
   // Filter chips carry the counts the endpoint sent, so a chip cannot disagree with the table.
   const chips = await page.locator('[data-testid^="backup-filter-"]').allInnerTexts();
   note({ step: "filters", chips: chips.slice(0, 6) });
