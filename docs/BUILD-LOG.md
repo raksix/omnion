@@ -13564,3 +13564,43 @@ inventory walks against per-walk databases are the pending item.
 **Next.** The CRM pass on `QA_STACK=w4` (18083/3103/3203) with `QA_ONLY=crm` — the reading that
 turns the three boxes into ticks or names the leg that broke. Then REQ-051 `done`, or a tick that
 says which of the three could not be produced.
+
+### Tick 76, continued — the box, not the branch
+
+Two blockers found after the merge, neither of them this branch's code, and **no acceptance box is
+ticked because of either**.
+
+**1. `/mnt/apopic` hit 100% mid-build.** `cargo build -p omnion-api --tests` died with
+`failed to create query cache at …/incremental/…/query-cache.bin: No such file or directory (os error 2)`
+— the disk-full signature that produces no `error[]` line, exactly as it did in an earlier tick.
+Retry with `CARGO_INCREMENTAL=0` compiled clean (the `hr_leave` failure in the first attempt was the
+disk, not the test file: building that one target alone reports no error). Disk is now 72%; the guard
+reclaimed ~15 GB. `target/debug/deps` holds **14 GB**, almost all of it the 70 integration-walk
+binaries at ~215 MB each. Reclaim order that was measured and NOT taken blindly: `lsof` first, the
+newest copy per stem, nothing modified in the last 30 minutes, and never `debug/omnion-api`.
+
+**2. The shared PostgreSQL has been in recovery since ~09:00 — 80+ minutes.**
+`docker ps` → `omnion-postgres Up About an hour (unhealthy)`; `pg_is_in_recovery()` answers the same
+from inside the container. Every gate that needs a database is blocked at the box level:
+`createdb` → `FATAL: the database system is in recovery mode`, which is why the CRM walk could not
+start and why the queued browser pass could not produce artifacts. **Not restarted on purpose:** that
+container is the main writer's and three sibling stacks' — bouncing it to unblock one branch's tick
+would destroy running passes that belong to somebody else. `omnion-postgres-w2` (5449, w2's own) is
+`Up`, so the container is fine and the shared *data directory* is what is unhappy.
+
+**The queue lesson, twice.** The CRM pass was launched with `QA_SLOT_WAIT=2400` and waited behind w2,
+then behind w6 after the slot turned over mid-tick. Both waits expired with **no artifacts at all** —
+a run that exits from a timeout has proved nothing and is not a "close enough" pass. Two rules:
+re-read the holder file during the tick (the holder changed while I worked), and set the wait above the
+queue you can actually see.
+
+**Also worth writing down, because it costs a minute next time:** `run-walks.sh` takes the test binary
+and **no filter argument** — it enumerates `--list` and runs every walk in the binary. Passing
+`--test crm` after the binary silently runs *all* of them and prints a summary for all of them, which
+reads exactly like a focused CRM gate. For one walk: run `target/debug/deps/crm-*` against a
+throwaway database directly. (The binary is already built.)
+
+**Next.** When PostgreSQL answers: the CRM walks on their own database, then
+`QA_STACK=w4 QA_ONLY=crm QA_HIGH_FAIL_ON=0 bash scripts/qa/run.sh` with a wait above the queue, then
+REQ-051 `done` — or a tick that names which of the three browser-only boxes could not be produced, and
+why.
