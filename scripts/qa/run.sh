@@ -278,6 +278,20 @@ if [ "$QA_SITE" != "1" ]; then
   exit 1
 fi
 
+step "QA fixture: a developer who cannot generate starters"
+# REQ-033 slice 4's done-when is "the read-only role sees no management controls", and the only
+# account a QA tenant has is the owner — who holds every permission. For that account a screen
+# whose controls are hidden by a permission check is indistinguishable from a screen with no
+# controls, and the two defects are opposite: the first hides buttons that should be there, the
+# second shows buttons that should not be. So the fixture creates the account the owner cannot
+# stand in for. It refuses to finish if that account holds the very key it exists to deny, and if
+# the role holds no reads at all — a role with no reads is refused by everything, which looks
+# exactly like a correct hiding.
+QA_DB_NAME="$QA_DB_NAME" QA_ADMIN_EMAIL="$QA_ADMIN_EMAIL" \
+  QA_PG_CONTAINER="${QA_PG_CONTAINER:-omnion-postgres}" \
+  node "$ROOT/scripts/qa/seed-readonly-developer.cjs" \
+  || { echo "[qa] the read-only developer fixture failed" >&2; exit 1; }
+
 step "admin panel on :$ADMIN_PORT"
 NEXT_ADMIN="$ROOT/apps/admin/node_modules/next/dist/bin/next"
 if pm2 describe "$ADMIN_NAME" >/dev/null 2>&1; then
