@@ -70,13 +70,7 @@ impl S3Storage {
         let path = self.object_path(key);
 
         let mut response = self
-            .execute(
-                "PUT",
-                &path,
-                Vec::new(),
-                Some((body, content_type)),
-                Vec::new(),
-            )
+            .execute("PUT", &path, Vec::new(), Some((body, content_type)))
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
             // A missing bucket is a first-run condition, not a failure: create it and retry once.
@@ -88,13 +82,7 @@ impl S3Storage {
             }
             self.ensure_bucket().await?;
             response = self
-                .execute(
-                    "PUT",
-                    &path,
-                    Vec::new(),
-                    Some((body, content_type)),
-                    Vec::new(),
-                )
+                .execute("PUT", &path, Vec::new(), Some((body, content_type)))
                 .await?;
         }
 
@@ -112,7 +100,7 @@ impl S3Storage {
     pub async fn get(&self, key: &str) -> Result<Vec<u8>> {
         validate_key(key)?;
         let response = self
-            .execute("GET", &self.object_path(key), Vec::new(), None, Vec::new())
+            .execute("GET", &self.object_path(key), Vec::new(), None)
             .await?;
 
         match response.status() {
@@ -127,64 +115,11 @@ impl S3Storage {
         }
     }
 
-    /// Read a window of an object back; a missing object is a `NotFound`.
-    ///
-    /// The `Range` header is sent to the store and the *store* returns the window, which is the
-    /// whole point: a four-hundred-megabyte video that a player asks for a hundred kilobytes of
-    /// must not be read into this process's memory to answer it. The caller decides the window
-    /// (`omnion_media::RangePlan`); this function only transports one.
-    ///
-    /// A store that ignores the header and answers `200` with the whole object is **still
-    /// accepted**, because MinIO and AWS both honour it and a store that did not would be an
-    /// object store that is not S3-compatible. What is not accepted is a `206` whose length
-    /// disagrees with what was asked for: that is a proxy rewriting a response, and returning
-    /// the short body would leave a player waiting for bytes that will never arrive.
-    pub async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>> {
-        validate_key(key)?;
-        let range = format!("bytes={start}-{end}");
-        let response = self
-            .execute(
-                "GET",
-                &self.object_path(key),
-                Vec::new(),
-                None,
-                vec![("range", range.as_str())],
-            )
-            .await?;
-
-        match response.status() {
-            status if status.is_success() => {
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|err| StorageError::Unavailable(err.to_string()))?;
-                Ok(bytes.to_vec())
-            }
-            StatusCode::NOT_FOUND => Err(StorageError::NotFound {
-                key: key.to_owned(),
-            }),
-            // RFC 9110 §15.5.17: a range the store cannot satisfy is a `416`. The caller asked
-            // for a window inside a length it computed, so this is a real disagreement between
-            // the row and the object rather than a client error — refused as such, and named.
-            StatusCode::RANGE_NOT_SATISFIABLE => Err(StorageError::RangeNotSatisfiable {
-                key: key.to_owned(),
-                requested: range,
-            }),
-            _ => Err(provider_error(response).await),
-        }
-    }
-
     /// Remove an object; `true` when one was there.
     pub async fn delete(&self, key: &str) -> Result<bool> {
         validate_key(key)?;
         let response = self
-            .execute(
-                "DELETE",
-                &self.object_path(key),
-                Vec::new(),
-                None,
-                Vec::new(),
-            )
+            .execute("DELETE", &self.object_path(key), Vec::new(), None)
             .await?;
 
         match response.status() {
@@ -197,9 +132,7 @@ impl S3Storage {
     /// Create the bucket when it does not exist yet.
     pub async fn ensure_bucket(&self) -> Result<()> {
         let path = self.bucket_path();
-        let response = self
-            .execute("PUT", &path, Vec::new(), None, Vec::new())
-            .await?;
+        let response = self.execute("PUT", &path, Vec::new(), None).await?;
 
         match response.status() {
             status if status.is_success() => Ok(()),
@@ -216,7 +149,7 @@ impl S3Storage {
     /// reached at all — the two answers a doctor or a test needs to tell apart.
     pub async fn probe(&self) -> Result<()> {
         let response = self
-            .execute("HEAD", &self.bucket_path(), Vec::new(), None, Vec::new())
+            .execute("HEAD", &self.bucket_path(), Vec::new(), None)
             .await?;
 
         match response.status() {
@@ -245,7 +178,6 @@ impl S3Storage {
         path: &str,
         query: Vec<(&str, &str)>,
         body: Option<(&[u8], &str)>,
-        extra_headers: Vec<(&str, &str)>,
     ) -> Result<reqwest::Response> {
         let host = origin_host(&self.endpoint)?;
         let payload = body.map_or_else(
@@ -253,12 +185,6 @@ impl S3Storage {
             |(bytes, _)| signing::payload_hash(bytes),
         );
         let mut headers: Vec<(&str, &str)> = Vec::new();
-        // The `Range` header is **signed**, not merely sent. SigV4 covers every header named in
-        // `SignedHeaders`, so a request that carries an unsigned `range` is refused by any store
-        // that verifies the set — the window is part of the signature rather than a polite
-        // addition to the request line. The published signing example in [`crate::signing`] is
-        // itself a ranged `GET`, which is the shape this makes reachable.
-        headers.extend(extra_headers.iter().copied());
         if let Some((_, content_type)) = body {
             headers.push(("content-type", content_type));
         }

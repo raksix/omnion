@@ -44,30 +44,109 @@ reap() {
   grace="${QA_SLOT_REAP_GRACE:-120}"
   for f in "$LOCKDIR"/*; do
     [ -e "$f" ] || continue
-    pid="$(basename "$f")"
-    # The holder file must yield ONE pid. `run.sh` reads it with `tail -n 1` on the captured
-    # stdout, which is correct; a file holding two pids on one line then fails `kill -0`,
-    # so the place is judged ownerless and reclaimed *while its owner is still running* — and
-    # it is also never reclaimable by its own owner, which is how a queue deadlocks. Taking
-    # the LAST whitespace-separated field makes the test answer the only question it asks
-    # (is that process alive?) whatever the file happens to contain.
-    holder="$(awk '{print $NF}' "${HOLDERDIR}/${pid}" 2>/dev/null || true)"
-    [ -n "${holder:-}" ] || holder="$(cat "${HOLDERDIR}/${pid}" 2>/dev/null || echo '')"
-    holder="$(printf '%s' "${holder}" | awk '{print $NF}')"
+    # The place file is named `$$-<timestamp>`. The whole name is the holder file's key.
+    #
+    # What must NOT be tested is the pid in that name. `$$` here is *this script's* pid, and this
+    # script exits the moment it takes the place — so the owner recorded in the file is dead within
+    # milliseconds of a perfectly healthy pass. A reaper that tested it would delete the lock of a
+    # pass that is running, every writer on the box would start a Chromium pass at once, and the
+    # "one pass at a time" would be a fiction nobody was told about. run.sh is the process that
+    # actually owns the place, and it records its own pid beside the holder's; that pair is the
+    # only liveness signal here that means anything.
+    name="$(basename "$f")"
+    # The holder file is TWO lines (holder child, then owner), so `cat` would hand `kill -0` a
+    # two-line string, which never matches a pid and reports *every* place as dead. Reading each
+    # line separately is the difference between a reaper that reclaims exactly the dead places
+    # and one that clears the whole queue.
+    holder="$(sed -n 1p "${HOLDERDIR}/${name}" 2>/dev/null || echo '')"
+    # The owner's pid is the second line, written by run.sh — the process that actually holds the
+    # place.
+    owner="$(sed -n 2p "${HOLDERDIR}/${name}" 2>/dev/null || echo '')"
     age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
     [ "$age" -gt "$grace" ] || continue
+    # Two tests, and the owner is the one that matters. A holder is an ordinary orphan the moment
+    # its pass ends badly: run.sh releases the place on EXIT INT TERM, and none of those arrive on
+    # a SIGKILL, an OOM kill, or a box that simply loses the process. The holder then answers
+    # `kill -0` for ever, so a reaper that tests only the holder is blind to precisely the case it
+    # was written for — which is what happened: one writer's crashed pass held four others for
+    # their whole 30-minute timeout, each printing "waiting for a QA slot" and reporting nothing.
+    #
+    # A missing owner line is NOT grounds for a reclaim on its own: it is what a place looks like
+    # in the second between being created and run.sh writing the file down. The grace period
+    # covers that race, and nothing else.
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$f" "${HOLDERDIR}/${name}" 2>/dev/null || true
+      [ -n "$holder" ] && kill "$holder" 2>/dev/null
+      echo "[qa-slot] reclaimed a place whose pass is gone: ${name} (${age}s old, owner ${owner}, holder ${holder:-none})" >&2
+      continue
+    fi
+    # A holder with no owner line is an **orphan**, and parentage is what tells it apart from the
+    # race case above. A holder spawned by a live `run.sh` has a bash parent; one whose pass was
+    # SIGKILLed or OOM-killed is reparented to init (pid 1, or a subreaper on a box with a
+    # systemd user manager), and that is the only observable difference between "written down a
+    # moment ago" and "left behind by a pass that is not coming".
+    #
+    # This is not a refinement of the owner line — it is what makes an **old-format** place
+    # reclaimable at all. A writer that has not taken the owner-line commit writes a ONE-line
+    # holder file, so `owner` is always empty for it, and the two rules above both decline: the
+    # holder is alive so nothing is stale, and there is no owner to test. On a box where several
+    # writers are on different revisions of this script that is not an edge case, it is a
+    # permanent deadlock: one orphaned place, every other writer printing "waiting for a QA slot"
+    # until its own timeout, with no pass anywhere.
+    #
+    # `QA_SLOT_REAP_ORPHAN` defaults on and exists so a writer can still opt out while its
+    # siblings merge. The test asserts BOTH directions — an orphan is reclaimed, a reparented-
+    # to-nothing case is not invented — because the failure mode of getting this wrong is
+    # deleting the lock of a pass that is running.
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && [ -z "$owner" ]; then
+      # Parentage is the WRONG signal, and the box proved it. This one reparents orphans to the
+      # systemd *user* manager (pid 338), not to init, so `ppid <= 1` is false for a perfectly
+      # orphaned holder — the test built a real orphan, got ppid 338, and skipped itself.
+      #
+      # The signal that holds is the **process-group leader**. run.sh starts the holder through a
+      # job-control pipeline, so the holder's pgid is the shell that created it; a SIGKILLed or
+      # OOM-killed pass takes that leader with it and the holder is left as the last member of a
+      # dead group. A live pass's group leader is alive, because it is the pass. That is the
+      # difference, and unlike `ppid` it does not depend on whether anything on the box is
+      # configured as a subreaper.
+      pgid="$(ps -o pgid= -p "$holder" 2>/dev/null | tr -d ' ' || echo '')"
+      if [ -n "$pgid" ] && ! kill -0 "$pgid" 2>/dev/null; then
+        if [ "${QA_SLOT_REAP_ORPHAN:-1}" = "1" ]; then
+          rm -f "$f" "${HOLDERDIR}/${name}" 2>/dev/null || true
+          kill "$holder" 2>/dev/null
+          echo "[qa-slot] reclaimed an orphaned place from ${name} (${age}s old, holder ${holder} in dead process group ${pgid})" >&2
+          continue
+        fi
+      else
+        continue
+      fi
+    fi
+
     # No holder file at all, this long after the place appeared, means the pass died between
     # taking the place and writing the holder down.
     if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
-      rm -f "$f" "${HOLDERDIR}/${pid}" 2>/dev/null || true
-      echo "[qa-slot] reclaimed a stale place from ${pid} (${age}s old, holder ${holder:-none})" >&2
+      rm -f "$f" "${HOLDERDIR}/${name}" 2>/dev/null || true
+      echo "[qa-slot] reclaimed a stale place from ${name} (${age}s old, holder ${holder:-none})" >&2
     fi
   done
 }
+# Reap, *then* wait — and reaping again on every turn of the wait loop, not only before it.
+#
+# Running `reap` once before the loop is right when every pass is healthy, and exactly wrong when
+# one dies: the place it left behind is already older than the grace period by the time the next
+# waiter looks, but nobody re-checks, so the queue waits out its whole timeout for a pass that is
+# not coming. The symptom is a line that says "waiting for a QA slot" forever and then a pass
+# that either proceeds unslotted or dies at its own timeout with no report — which is precisely
+# what happened here, on a box where one writer's crashed pass held four other writers hostage.
+#
+# Reaping per turn costs one `stat` and one `kill -0` per waiting pass every 15 seconds, which is
+# nothing next to a Chromium session, and the grace period already protects the only race there
+# is (a place created moments before its holder file is written).
 reap
 
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
+  reap
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
     : > "$mine"
@@ -78,7 +157,12 @@ while :; do
     # pipeline finish.
     while :; do sleep 30; done </dev/null >/dev/null 2>&1 &
     holder=$!
-    echo "$holder" > "${HOLDERDIR}/${mine##*/}"
+    # Two lines: the holder child, then the OWNER — the run.sh that is really holding this place.
+    # The owner is what a reaper must test, and it cannot be recovered from the place file: `$$`
+    # there is *this* script's pid, which exits immediately. Without this line a crashed pass
+    # (SIGKILL, OOM kill) leaves a holder that answers `kill -0` for ever, and every writer behind
+    # it waits out the full timeout behind a pass that is not coming.
+    printf '%s\n%s\n' "$holder" "${QA_SLOT_OWNER:-$$}" > "${HOLDERDIR}/${mine##*/}"
     echo "$holder"                                # stdout: the holder pid for run.sh
     echo "[qa-slot] place taken ($(( count + 1 ))/$MAX)" >&2
     exit 0

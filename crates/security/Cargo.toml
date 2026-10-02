@@ -8,18 +8,9 @@ publish = false
 
 [dependencies]
 hex.workspace = true
-# The IP access rules (REQ-012, slice 4). CIDR matching and prefix arithmetic for both address
-# families; the migration's `cidr` column is the second layer of the same validation.
-ipnet.workspace = true
 # The CSRF token is an HMAC over the session id (REQ-012, slice 2): derived rather than stored,
 # so there is no table to rotate and nothing to leak from a dump.
 hmac.workspace = true
-# The rate limiter's counter (REQ-012, slice 3). `omnion-core` owns the Redis handle, so the
-# limiter borrows it rather than opening a second connection or a second pool. A path dependency
-# like every other intra-workspace edge — not a workspace one, because this workspace does not
-# list its own crates in `[workspace.dependencies]`.
-omnion-core = { path = "../core" }
-redis.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

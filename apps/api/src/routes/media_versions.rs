@@ -391,7 +391,6 @@ pub async fn raw_version(
     State(state): State<AppState>,
     current: CurrentSession,
     Path((file_id, version_number)): Path<(Uuid, i32)>,
-    headers: axum::http::HeaderMap,
 ) -> std::result::Result<Response, ApiError> {
     let file = file_in_scope(&state, &current, file_id).await?;
     // An old version of a held file is still a held file: the scanner looked at these exact
@@ -408,7 +407,7 @@ pub async fn raw_version(
             )
         })?;
 
-    serve_bytes(&state, &version, &headers).await
+    serve_bytes(&state, &version).await
 }
 
 /// `GET /api/v1/media/{id}/versions/{version}/download` — the same bytes as an attachment.
@@ -416,7 +415,6 @@ pub async fn download_version(
     State(state): State<AppState>,
     current: CurrentSession,
     Path((file_id, version_number)): Path<(Uuid, i32)>,
-    headers: axum::http::HeaderMap,
 ) -> std::result::Result<Response, ApiError> {
     let existing = file_in_scope(&state, &current, file_id).await?;
     crate::routes::media::ensure_servable(&state, &current, &existing).await?;
@@ -430,7 +428,7 @@ pub async fn download_version(
             )
         })?;
 
-    let mut response = serve_bytes(&state, &version, &headers).await?;
+    let mut response = serve_bytes(&state, &version).await?;
     let name = version_filename(&existing.filename, version.version);
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
@@ -516,19 +514,7 @@ pub fn version_filename(filename: &str, version: i32) -> String {
 }
 
 /// Answer with one version's bytes under the serve plan of its content type.
-async fn serve_bytes(
-    state: &AppState,
-    version: &MediaVersion,
-    request_headers: &axum::http::HeaderMap,
-) -> Result<Response, ApiError> {
-    // Validated against the **version's** checksum, not the file's. A historical version has its
-    // own bytes at its own key, and answering it `304` against the current file's checksum would
-    // tell a caller it already holds a picture it has never seen.
-    let conditional =
-        crate::routes::media::conditional_headers(request_headers, &version.checksum, Some(version.created_at));
-    if conditional.verdict == omnion_media::validators::Conditional::NotModified {
-        return crate::routes::media::not_modified(&conditional);
-    }
+async fn serve_bytes(state: &AppState, version: &MediaVersion) -> Result<Response, ApiError> {
     let bytes = state.storage().get(&version.storage_key).await?;
     let plan = omnion_media::serve_plan(&version.content_type);
 
@@ -541,7 +527,6 @@ async fn serve_bytes(
     );
     headers.insert(header::CACHE_CONTROL, header_value("private, max-age=300")?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
-    crate::routes::media::apply_validators(headers, &conditional)?;
     Ok(response)
 }
 

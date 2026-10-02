@@ -593,3 +593,197 @@ async fn a_scim_round_trip_provisions_and_logs() {
 
     fixture.cleanup().await;
 }
+
+/// `iam.group_membership_synced` — the event a group-based role rule depends on.
+///
+/// A `when_group` rule grants its role through `group_members`, so somebody joining a directory
+/// group changes their effective permissions **without a sign-in**. Nothing observable records
+/// that unless the platform emits something, and the criterion the request names is exactly
+/// this event.
+///
+/// Three claims, pinned separately. Collapsing any two produces a subscriber that looks wired
+/// and is not:
+///
+/// 1. **A group created with members emits it.** The "before" is empty, and a listener that
+///    only watched PATCHes would never see the case a rule is most often waiting for.
+/// 2. **It fires on a change, not on a write.** A PATCH re-sending the member list it already
+///    has changes nothing, and a connector re-sends whole groups on a timer — an event for that
+///    trains a subscriber to ignore the name.
+/// 3. **The counts are the diff.** A PATCH that adds one and removes one is `added: 1,
+///    removed: 1`, not `members: 2`. A subscriber that only wants revocations cannot get them
+///    from a size.
+#[tokio::test]
+async fn a_group_write_emits_its_membership_change() {
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner_token = fixture.owner_token().await;
+
+    let minted = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/iam/provisioning/tokens",
+            Some((&owner_token, true)),
+            Some(json!({ "name": "Group events" })),
+        ),
+    )
+    .await;
+    let secret = minted.body["secret"]
+        .as_str()
+        .expect("a secret")
+        .to_owned();
+
+    // Two accounts, so the diff can be a real diff rather than an empty-to-one transition.
+    let mut members = Vec::new();
+    for label in ["a", "b"] {
+        let email = format!("scim-group-{label}-{}@omnion.test", Uuid::new_v4().simple());
+        fixture.remember(&email);
+        let created = call(
+            &fixture.state,
+            request(
+                Method::POST,
+                "/api/v1/scim/v2/Users",
+                Some((&secret, false)),
+                Some(json!({
+                    "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+                    "userName": email,
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "create: {}",
+            created.body
+        );
+        members.push(created.body["id"].as_str().expect("id").to_owned());
+    }
+    let (first, second) = (members[0].clone(), members[1].clone());
+
+    // How many of these events this organization has recorded, so "one more" is a measurement.
+    async fn event_count(fixture: &Fixture) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from events where organization_id = $1 \
+             and name = 'iam.group_membership_synced'",
+        )
+        .bind(fixture.organization_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the event count must read")
+    }
+
+    // The newest event for one group, read back through the real table.
+    async fn latest_for(fixture: &Fixture, group_id: &str) -> Value {
+        sqlx::query_scalar::<_, Value>(
+            "select payload from events where organization_id = $1 \
+             and name = 'iam.group_membership_synced' and payload ->> 'group_id' = $2 \
+             order by created_at desc limit 1",
+        )
+        .bind(fixture.organization_id)
+        .bind(group_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the event must exist")
+    }
+
+    let before = event_count(&fixture).await;
+
+    // ---- 1. A group created WITH a member announces the change -----------------------------
+    let name = format!("SCIM Group {}", Uuid::new_v4().simple());
+    let group = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/scim/v2/Groups",
+            Some((&secret, false)),
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+                "displayName": name,
+                "members": [{ "value": first }],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(group.status, StatusCode::CREATED, "group: {}", group.body);
+    let group_id = group.body["id"].as_str().expect("group id").to_owned();
+
+    let created_event = latest_for(&fixture, &group_id).await;
+    assert_eq!(
+        created_event["added"], json!(1),
+        "one person arrived with the group: {created_event}"
+    );
+    assert_eq!(created_event["removed"], json!(0));
+    assert_eq!(created_event["members"], json!(1));
+
+    // ---- 2. A write that changes nothing fires nothing --------------------------------------
+    let noop = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/scim/v2/Groups/{group_id}"),
+            Some((&secret, false)),
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                "Operations": [
+                    { "op": "add", "path": "members", "value": [{ "value": first }] }
+                ],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(noop.status, StatusCode::OK, "noop: {}", noop.body);
+    assert_eq!(
+        event_count(&fixture).await,
+        before + 1,
+        "re-sending the member list a group already has is not a change, and a connector does \
+         exactly that on a timer — an event for it trains a subscriber to ignore the name"
+    );
+
+    // ---- 3. A swap is a diff: one in, one out -----------------------------------------------
+    let swap = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/scim/v2/Groups/{group_id}"),
+            Some((&secret, false)),
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                "Operations": [
+                    { "op": "add", "path": "members", "value": [{ "value": second }] },
+                    { "op": "remove", "path": "members", "value": [{ "value": first }] }
+                ],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(swap.status, StatusCode::OK, "swap: {}", swap.body);
+    assert_eq!(swap.body["members"].as_array().map(Vec::len), Some(1));
+
+    let swap_event = latest_for(&fixture, &group_id).await;
+    assert_eq!(
+        swap_event["added"], json!(1),
+        "one person arrived: {swap_event}"
+    );
+    assert_eq!(
+        swap_event["removed"], json!(1),
+        "and one left — a size would read 1, and a subscriber that only cares about revocations \
+         would see nothing"
+    );
+    assert_eq!(
+        swap_event["members"], json!(1),
+        "and the group still holds one person, which is the size a snapshot would have carried"
+    );
+    assert_eq!(event_count(&fixture).await, before + 2, "exactly two real changes");
+
+    // The payload names the group and counts — never the people in it. A member list is the
+    // directory's most personal export, and an event is delivered outside the tenant.
+    let rendered = swap_event.to_string();
+    assert!(
+        !rendered.contains(&first) && !rendered.contains(&second),
+        "the event must not carry member ids: {rendered}"
+    );
+
+    fixture.cleanup().await;
+}

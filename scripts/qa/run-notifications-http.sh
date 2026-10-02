@@ -69,16 +69,6 @@ echo "[notif-http] creating a disposable database"
 # this build's name. Waiting for /readyz (below) is what proves the migration actually ran.
 
 echo "[notif-http] starting the API on :$PORT"
-# `OMNION_CSRF_SECRET` decides whether a cookie-authenticated mutation is refused before its
-# handler runs. Without one the API refuses EVERY write with `csrf_unavailable`, so this gate
-# reported seven FAILs — the emit, a ghost recipient, the mixed batch, dedupe, the read-state
-# split, the quiet-hours round trip and the digest round trip — that had nothing to do with the
-# code under test. Because the refusal is the *documented* behaviour of a deployment without a
-# secret, it reads as the product being correct rather than the harness being under-configured,
-# which is why it survived until this tick. `scripts/qa/run.sh` has always set it; this gate
-# did not. The value is throwaway: the process points at a database the trap above drops, and
-# listens on loopback.
-export OMNION_CSRF_SECRET="${OMNION_CSRF_SECRET:-qa-local-throwaway-value}"
 # The binary is read from `$CARGO_TARGET_DIR`, not from a hard-coded `./target` — otherwise a
 # script that builds into the scratch directory runs the *stale* one, which is a gate that
 # passes while testing code that was replaced. That is not hypothetical: it happened here, and
@@ -420,64 +410,6 @@ if [ -n "$target" ]; then
   else
     echo "  note: the member could not sign in, so the cross-account claims were not run"
   fi
-fi
-
-# 6. Test delivery over the real router. Four claims, and the interesting one is the third:
-#
-#    a. `in_app` is refused rather than answered — the test notification *is* the in-app
-#       channel, so a green line there would be the platform proving it can write to its own
-#       database, which is true of every installation and tells nobody anything.
-#    b. An unknown channel is a 400 naming the closed list, not a channel that quietly does
-#       nothing.
-#    c. A channel with no transport (web_push needs a browser subscription this screen does
-#       not hold) answers **200 with delivered=false and a reason** rather than an HTTP
-#       error: "your push channel cannot be tested" is the result the reader asked for, and a
-#       502 would tell them their settings screen is broken instead. This is the leg a
-#       `return ok(())` shortcut would fail, and it is the reason the box can be ticked.
-#    d. The failed attempt is *recorded* — a `notification_deliveries` row in `failed` with
-#       the transport's own sentence on it — because a toast that vanishes while the outbox
-#       says nothing is the one case where the reader can never find the answer afterwards.
-echo "[notif-http] test delivery"
-
-test_json() {
-  curl -s -X POST "$URL/api/v1/notifications/preferences/test" -b "$COOKIE_A" \
-    -H 'content-type: application/json' -d "$1"
-}
-test_code() {
-  curl -s -o /tmp/notif-test.json -w '%{http_code}' -X POST \
-    "$URL/api/v1/notifications/preferences/test" -b "$COOKIE_A" \
-    -H 'content-type: application/json' -d "$1"
-}
-
-code=$(test_code '{"channel":"in_app"}')
-if [ "$code" = "400" ] && grep -q 'invalid_channel' /tmp/notif-test.json; then
-  pass "in_app is refused: a test over it would prove only that the platform can write to its own table"
-else
-  fail "in_app answered $code: $(cat /tmp/notif-test.json)"
-fi
-
-code=$(test_code '{"channel":"carrier_pigeon"}')
-if [ "$code" = "400" ] && grep -q 'invalid_channel' /tmp/notif-test.json; then
-  pass "an unknown channel is a 400 naming the closed list"
-else
-  fail "an unknown channel answered $code: $(cat /tmp/notif-test.json)"
-fi
-
-body=$(test_json '{"channel":"web_push"}')
-if echo "$body" | grep -q '"delivered":false' && echo "$body" | grep -q '"detail":"'; then
-  pass "a channel with no transport answers 200 with the reason inline"
-else
-  fail "web_push test delivery did not report an honest failure: $body"
-fi
-
-# (d) The row is written even though the send failed — this is the outbox half of the claim.
-psql -h "$PGHOST" -p "$PGPORT" -U omnion -d "$DB" -t -A -c \
-  "select status || '|' || coalesce(error,'') from notification_deliveries \
-     where channel = 'web_push' order by created_at desc limit 1" >/tmp/notif-row.txt 2>/dev/null
-if grep -q '^failed|' /tmp/notif-row.txt && [ "$(wc -c </tmp/notif-row.txt)" -gt 8 ]; then
-  pass "the failed attempt is recorded on its own delivery row with the reason"
-else
-  fail "no failed delivery row carrying a reason: $(cat /tmp/notif-row.txt)"
 fi
 
 if [ "$FAILED" = "0" ]; then

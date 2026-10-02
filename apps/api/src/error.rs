@@ -1,8 +1,7 @@
 //! HTTP representation of core errors.
 
 use axum::Json;
-use axum::http::header;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use omnion_ai_hub::AiHubError;
 use omnion_audit::AuditError;
@@ -40,14 +39,6 @@ pub struct ApiError {
     code: &'static str,
     message: String,
     details: Option<Value>,
-    /// Seconds the caller should wait, for `Retry-After`.
-    ///
-    /// `None` on every error that is not a refusal with a wait attached, and it is a distinct
-    /// field rather than something dug out of `details` because the header has to be *absent*
-    /// rather than wrong: a `Retry-After: 0` on a 403 would tell a client to retry immediately,
-    /// and a `Retry-After` present on an error that is not a refusal teaches a client to wait on
-    /// things that never needed waiting. One field, set only by the layer that knows the wait.
-    retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -59,21 +50,7 @@ impl ApiError {
             code,
             message: message.into(),
             details: None,
-            retry_after: None,
         }
-    }
-
-    /// Attach a `Retry-After` in seconds.
-    ///
-    /// Zero is refused rather than clamped: "retry immediately" and "I do not know how long" are
-    /// different claims, and a layer that computes a wait knows which one it means. A `0` here
-    /// would be the platform telling every client to come straight back.
-    #[must_use]
-    pub fn with_retry_after(mut self, seconds: i64) -> Self {
-        if seconds > 0 {
-            self.retry_after = Some(seconds as u64);
-        }
-        self
     }
 
     /// Attach the structured explanation of a refusal.
@@ -101,6 +78,15 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, code, message)
     }
 
+    /// `409` — the request is well formed and the caller may do it, but the current state
+    /// refuses it. Distinct from `400` on purpose: `400` says "fix your request", `409` says
+    /// "your request is right and the world is not", and a client that conflates them either
+    /// gives up on a recoverable state or retries a malformed one forever.
+    #[must_use]
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, code, message)
+    }
+
     /// Map a core error onto the API surface.
     ///
     /// A dependency that did not answer becomes `503` (retryable); everything else is an
@@ -116,14 +102,12 @@ impl ApiError {
                 code: "dependency_unavailable",
                 message: format!("{dependency}: {message}"),
                 details: None,
-                retry_after: None,
             },
             other => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "internal_error",
                 message: other.to_string(),
                 details: None,
-                retry_after: None,
             },
         }
     }
@@ -329,6 +313,15 @@ impl From<IdentityError> for ApiError {
             IdentityError::InvalidOrganization(message)
             | IdentityError::InvalidSite(message)
             | IdentityError::InvalidHost(message) => Self::bad_request("invalid_request", message),
+            // A provisioning refusal is the *caller's* mistake: a token name that is too long, a
+            // lifetime outside the range, an attempt to rotate something already dead. Until this
+            // arm existed it fell through to the catch-all and answered `500 internal_error` —
+            // a status code that tells the operator the platform is broken when in fact they
+            // typed a zero, and (as the JIT-password defect in the same REQ showed) a
+            // distinguishable status on a credential path is a small tell worth closing.
+            IdentityError::InvalidProvisioning(message) => {
+                Self::bad_request("invalid_provisioning", message)
+            }
             // Security policy, second factors and stored secrets (REQ-006, slice 3). A policy
             // refused by a range check names the control the reader has to fix, so the panel can
             // point at the field instead of printing a sentence.
@@ -508,7 +501,6 @@ impl From<PermissionsError> for ApiError {
                 code: "system_role",
                 message: "platform roles are managed by the platform".to_owned(),
                 details: None,
-                retry_after: None,
             },
             // REQ-006 role depth: the field-level refusals carry the field they belong to, so the
             // matrix screen can point at `inherits_role_id` instead of showing a generic message.
@@ -519,7 +511,6 @@ impl From<PermissionsError> for ApiError {
                     "the role cannot inherit from itself or one of its own descendants (inherits_role_id)"
                         .to_owned(),
                 details: None,
-                retry_after: None,
             },
             PermissionsError::InheritanceDepthExceeded { max } => Self::bad_request(
                 "role_inheritance_depth",
@@ -532,7 +523,6 @@ impl From<PermissionsError> for ApiError {
                     "the role still carries {count} live binding(s); revoke them before deleting it"
                 ),
                 details: None,
-                retry_after: None,
             },
             PermissionsError::VersionConflict { expected, current } => Self {
                 status: StatusCode::CONFLICT,
@@ -541,7 +531,6 @@ impl From<PermissionsError> for ApiError {
                     "the role changed since it was read: expected version {expected}, current version {current}"
                 ),
                 details: None,
-                retry_after: None,
             },
             PermissionsError::InvalidEntries { unknown, duplicates } => {
                 let mut parts: Vec<String> = Vec::new();
@@ -626,47 +615,6 @@ impl From<PermissionsError> for ApiError {
     }
 }
 
-impl From<omnion_backup::BackupError> for ApiError {
-    fn from(error: omnion_backup::BackupError) -> Self {
-        use omnion_backup::BackupError as B;
-        match error {
-            // A missing run or schedule is a 404, and it is a 404 rather than a 403 even
-            // when the row exists in another tenant: a 403 confirms the id is real, and a
-            // backup's existence is itself information about the platform.
-            B::NotFound => Self::new(StatusCode::NOT_FOUND, "backup_not_found", "no such backup"),
-            B::ScheduleNotFound => Self::new(
-                StatusCode::NOT_FOUND,
-                "backup_schedule_not_found",
-                "no such backup schedule",
-            ),
-            // A refusal is a 409, not a 400: the request was legal and the platform has
-            // moved on. That is the same split the permissions and media modules use, and
-            // the two answer different questions for the caller.
-            B::Rejected(message) => Self::new(StatusCode::CONFLICT, "backup_rejected", message),
-            B::Invalid(message) => Self::bad_request("invalid_backup", message),
-            B::Partial {
-                failed,
-                total,
-                message,
-            } => Self::new(
-                StatusCode::CONFLICT,
-                "backup_partial",
-                format!("{failed} of {total} parts failed: {message}"),
-            ),
-            B::Database(err) if dependency_unavailable(&err) => Self::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "dependency_unavailable",
-                "database is unavailable",
-            ),
-            B::Database(err) => Self::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                err.to_string(),
-            ),
-        }
-    }
-}
-
 impl From<MediaError> for ApiError {
     fn from(error: MediaError) -> Self {
         match error {
@@ -728,13 +676,6 @@ impl From<MediaError> for ApiError {
             MediaError::InvalidFolderName(message) => {
                 Self::bad_request("invalid_folder_name", message)
                     .with_details(serde_json::json!({ "field": "name" }))
-            }
-            // A browser filter that contradicts itself is a `400` with its own code and the
-            // offending field, so the toolbar can put the sentence under the box that produced
-            // it instead of showing "no files match" for a filter nobody typed.
-            MediaError::InvalidFilter { field, reason } => {
-                Self::bad_request("invalid_filter", format!("`{field}`: {reason}"))
-                    .with_details(serde_json::json!({ "field": field }))
             }
             MediaError::FolderCycle { path } => Self::new(
                 StatusCode::CONFLICT,
@@ -850,13 +791,6 @@ impl From<MediaError> for ApiError {
                 Self::bad_request("invalid_retention_setting", reason)
                     .with_details(serde_json::json!({ "field": field }))
             }
-            // Same rule for the custom metadata pairs, with its own code: the pair editor puts
-            // the message under the row that caused it, and `metadata.<key>` means a refusal
-            // about a licence number cannot land under the campaign field beside it.
-            MediaError::InvalidMetadata { field, reason } => {
-                Self::bad_request("invalid_metadata", reason)
-                    .with_details(serde_json::json!({ "field": field }))
-            }
             // A missing policy is a `404`, and the tenancy scope lives *inside* the lookup
             // rather than being applied afterwards — the same lesson `media_grants::delete_one`
             // learned from a walk that got a `403` for another tenant's grant id and thereby
@@ -913,17 +847,6 @@ impl From<StorageError> for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "storage_error",
                 format!("the object store refused the request (status {status}): {message}"),
-            ),
-            // A `409`, not a `503`: nothing is unavailable and retrying will not help, because
-            // the object and the row disagree about its length and only a repair fixes that. A
-            // retryable status here would have a client — or a media player — asking for ever.
-            StorageError::RangeNotSatisfiable { key, requested } => Self::new(
-                StatusCode::CONFLICT,
-                "object_range_not_satisfiable",
-                format!(
-                    "the stored object is shorter than the range that was asked for \
-                     ({requested} of {key:?})"
-                ),
             ),
         }
     }
@@ -1129,16 +1052,7 @@ impl IntoResponse for ApiError {
                 details: self.details,
             },
         };
-        let mut response = (self.status, Json(body)).into_response();
-        // Only ever set when the error carries a wait. Absent is not the same as zero: a client
-        // that sees no `Retry-After` retries on its own schedule, which is the correct behaviour
-        // for every error that is not a refusal with a window behind it.
-        if let Some(seconds) = self.retry_after {
-            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
-                response.headers_mut().insert(header::RETRY_AFTER, value);
-            }
-        }
-        response
+        (self.status, Json(body)).into_response()
     }
 }
 

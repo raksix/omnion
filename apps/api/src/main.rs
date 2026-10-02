@@ -11,8 +11,7 @@ use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, backup_schedule_runner, backup_sweep_runner,
-    event_retention_runner, event_runner, notification_runner, restore_job_runner, search_runner,
+    analytics_runner, automation_runner, event_retention_runner, event_runner, search_runner,
     workflow_runner,
 };
 use omnion_core::config::Config;
@@ -100,21 +99,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("the webhook delivery runner is disabled (OMNION_EVENTS_RUNNER=false)");
     }
 
-    // The notification delivery runner ticks here for the same reason and under the same flag
-    // (REQ-021, slice 4): `notification_deliveries` is a durable queue with a claim lease, so a
-    // tick that cannot reach the database is logged and the next one picks the work up. It
-    // shares the events cadence rather than growing a second set of knobs, because the two
-    // queues are drained by the same kind of work at the same kind of rate — and a second
-    // `*_POLL_MS` variable would be one more thing an operator has to match between a
-    // web node and a dedicated worker.
-    if state.config().events.runner_enabled {
-        if notification_runner::spawn(state.clone()).is_none() {
-            tracing::warn!("the notification delivery runner is not running");
-        }
-    } else {
-        tracing::info!("the notification delivery runner is disabled (OMNION_EVENTS_RUNNER=false)");
-    }
-
     // The event-retention sweeper ticks in this process too (REQ-016, slice 3), under its own
     // flag: it deletes history rather than sending it, so an installation that drains the
     // queue from a dedicated worker and not at all from the web nodes still wants retention
@@ -159,56 +143,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("the retention worker is disabled (OMNION_RETENTION_RUNNER=false)");
     }
 
-    // The health runner publishes this process's heartbeat and runs the scheduled probes
-    // (REQ-014, slice 4). Both halves of it were missing before: `worker_heartbeats` had a
-    // reader and no writer, so the `n/m` worker card could only ever say "no worker has
-    // registered a heartbeat", and `run_and_record` was reached from the four route handlers
-    // and nowhere else, so samples existed only while somebody was looking at the panel.
-    let _health = omnion_api::health_runner::spawn(state.clone());
-
-    // The backup retention sweep removes expired runs from the destination, artifacts first
-    // (REQ-013, slice 3). It is gated by its own flag rather than by `OMNION_RETENTION_RUNNER`
-    // because the two sweep different things: an installation that keeps every backup for
-    // ever must be able to keep its media sweeper. `prune_candidates` shipped in slice 1 and
-    // had no caller at all, so this is the tick that gives it one.
-    // The schedule worker takes the backups a `backup_schedules` row asked for. The table,
-    // the `next_due_schedules` query and the `cadence` sentence in the API all shipped in
-    // slice 1 and slice 2a; nothing wrote `next_run_at` and nothing called that query, so a
-    // schedule could be created, listed and rendered with an empty next-run cell for ever.
-    // This is the tick that gives both a writer and a reader.
-    let _backup_schedules = backup_schedule_runner::spawn(state.clone());
-    // The queued-restore worker. Deliberately ungated: a restore queued by an operator is a
-    // person watching a screen, and a feature that only runs when a flag is set is a restore
-    // that silently never happens on the installation that forgot to set it. It is cheap —
-    // one indexed query per poll, and a tick that finds nothing costs nothing.
-    let _restore_jobs = restore_job_runner::spawn(state.clone());
-
-    if state.config().retention.backup_sweep_enabled {
-        let _backup_sweep = backup_sweep_runner::spawn(state.clone());
-    } else {
-        tracing::info!(
-            "the backup retention sweep is disabled (OMNION_BACKUP_SWEEP=false) — expired runs \
-             and their artifacts stay on the destination"
-        );
-    }
-
     if state.config().analytics.runner_enabled {
         let _rollups = analytics_runner::spawn(state.clone());
     } else {
         tracing::info!("the analytics rollup worker is disabled (OMNION_ANALYTICS_RUNNER=false)");
     }
 
-    // The rate-limit document is read here, once, and handed to the layer the router is about to
-    // install (REQ-012, slice 3). Reading it per request would make every request's cost depend on
-    // the database, which is how a settings screen turns into an outage; reading it here and
-    // failing open on the shipped defaults means a platform whose database is briefly unreachable
-    // still limits, instead of answering every caller in the world.
-    let limiter = omnion_api::rate_limit_middleware::RateLimiter::from_store(&state).await;
-    let _ = omnion_api::rate_limit_middleware::install(limiter);
-
-    // The runner spawns each got a clone; this one is kept so the shutdown path can still
-    // reach `state` after `router(state)` has taken the original by value.
-    let state_for_runners = state.clone();
     let app = routes::router(state);
     axum::serve(
         listener,
@@ -216,11 +156,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
-
-    // Mark this worker's heartbeat stopped on the way out, so a clean stop is distinguishable
-    // from a crash. Without it the panel says "stale" for a worker that was deliberately
-    // restarted, and those are the two answers an operator needs apart.
-    omnion_api::health_runner::stopped(&state_for_runners).await;
 
     tracing::info!("shutdown complete");
     telemetry.shutdown();

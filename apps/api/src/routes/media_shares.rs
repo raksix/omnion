@@ -61,17 +61,14 @@ pub struct ShareBody {
     /// The file this link hands over.
     pub media_id: Uuid,
     /// When the link stops working; null means "until revoked".
-    #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
     /// Whether the link needs a password.
     pub has_password: bool,
     /// Downloads that produced bytes.
     pub download_count: i32,
     /// When the link was made.
-    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// When it was revoked; null while it is live.
-    #[serde(with = "time::serde::rfc3339::option")]
     pub revoked_at: Option<OffsetDateTime>,
     /// Why it was revoked.
     pub revoked_reason: String,

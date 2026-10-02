@@ -1,16 +1,15 @@
 # Omnion QA — latest pass (main)
 
-- When: 2026-10-01T18:18:28.615Z · artifacts: `qa-artifacts/20261001-175422`
-- Interactions: 1819 clicks · 115 field fills · 58 form submissions · 1851 screenshots
-- Console errors: 78 · failed requests: 77 · dialogs: 3
-- Programmatic findings: 198 (high 192 · medium 6 · low 0)
-- Vision issues: skipped (no vision API key found (env VISION_MCP_API_KEY or config.yaml))
+- When: 2026-09-28T23:52:20.232Z · artifacts: `qa-artifacts/20260928-235158`
+- Interactions: 1095 clicks · 88 field fills · 39 form submissions · 1138 screenshots
+- Console errors: 44 · failed requests: 43 · dialogs: 3
+- Programmatic findings: 84 (high 79 · medium 5 · low 0)
+- Vision issues: 0
 
 ## Top findings
 
-- **[high] broken-image** — media-settings: http://127.0.0.1:3100/api/v1/media/6faaf5ab-37fa-47f9-b4b7-3bda0955b2b5/raw?preset=standard
-- **[medium] low-contrast** — security-events: 1 text node(s) under WCAG AA, e.g. {"text":"Apply","ratio":1.19,"min":4.5,"fontSize":12.5}
-- **[high] console-error** — main http://127.0.0.1:3100/media?folder=4d75a807-d548-41e9-9c56-665ffebcab75: Failed to load resource: the server responded with a status of 404 (Not Found)
+- **[high] broken-image** — media-settings: http://127.0.0.1:3100/api/v1/media/6ab13b55-d35b-428a-a451-fa7dee164753/raw?preset=standard
+- **[high] console-error** — main http://127.0.0.1:3100/media?folder=c70e15e4-b692-4e67-86d2-bdbb9d90c90b: Failed to load resource: the server responded with a status of 404 (Not Found)
 - **[high] console-error** — main http://127.0.0.1:3100/media/settings: Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)
 - **[high] console-error** — main http://127.0.0.1:3100/media/settings: Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)
 - **[high] console-error** — main http://127.0.0.1:3100/media/settings: Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)
@@ -33,3 +32,4 @@
 - **[high] console-error** — main http://127.0.0.1:3100/media/settings: Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)
 - **[high] console-error** — main http://127.0.0.1:3100/media/settings: Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)
 - **[high] console-error** — main http://127.0.0.1:3100/media/settings: Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)
+- **[high] console-error** — main http://127.0.0.1:3100/media?folder=nonexistent-folder: Failed to load resource: the server responded with a status of 400 (Bad Request)

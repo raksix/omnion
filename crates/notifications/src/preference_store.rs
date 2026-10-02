@@ -180,46 +180,19 @@ pub async fn write_settings(pool: &PgPool, user_id: Uuid, settings: &Settings) -
     Ok(())
 }
 
-/// Which channels a notification of this category may go out over, for one person, and which
-/// ones their own configuration has switched off.
+/// Which channels a notification of this category may go out over, for one person.
 ///
 /// The one place a delivery decision is made, so the runner and the settings form cannot
 /// disagree: a reader who turned ticket e-mail off gets no ticket e-mail, and the drawer shows
 /// the delivery as `skipped` with the reason rather than as a failure.
-///
-/// **Two lists rather than one, and that is what `enqueue` is for.** A caller that only learned
-/// the *allowed* channels would have to derive the disabled ones itself, and the derivation is
-/// `CHANNELS − allowed` — which silently forgets `chat`, whose transport is REQ-015's and which
-/// therefore never appears in the runner's transport map, and would enqueue it `pending` for a
-/// runner that re-queues it to the cap and then writes `failed`. So the store answers the
-/// question both halves of, and `enqueue` decides what each one means.
 pub async fn allowed_channels(pool: &PgPool, user_id: Uuid, category: &str) -> Result<Vec<String>> {
-    Ok(split_channels(&read_preferences(pool, user_id).await?, category)
-        .0)
-}
-
-/// The other half of [`allowed_channels`]: the channels this person has switched off.
-///
-/// Split out so the emit path and the router cannot each write their own subtraction — and
-/// because the answer is needed for *every* category the moment a notification exists, which is
-/// what makes a caller's "enabled list" incomplete rather than merely wrong.
-pub async fn disabled_channels(pool: &PgPool, user_id: Uuid, category: &str) -> Result<Vec<String>> {
-    Ok(split_channels(&read_preferences(pool, user_id).await?, category)
-        .1)
-}
-
-/// The two lists, computed once.
-fn split_channels(preferences: &crate::preferences::Preferences, category: &str) -> (Vec<String>, Vec<String>) {
-    let mut allowed = Vec::new();
-    let mut disabled = Vec::new();
-    for channel in CHANNELS {
-        if preferences.allows(category, channel) {
-            allowed.push((*channel).to_owned());
-        } else {
-            disabled.push((*channel).to_owned());
-        }
-    }
-    (allowed, disabled)
+    let preferences = read_preferences(pool, user_id).await?;
+    Ok(CHANNELS
+        .iter()
+        .copied()
+        .filter(|channel| preferences.allows(category, channel))
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Drop every stated cell of a person, returning them to the platform defaults.

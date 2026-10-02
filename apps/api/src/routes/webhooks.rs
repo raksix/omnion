@@ -283,15 +283,12 @@ pub struct RetentionRunBody {
     /// The organization swept; `null` is the platform's own events.
     pub organization_id: Option<Uuid>,
     /// When the sweep began.
-    #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     /// When it finished.
-    #[serde(with = "time::serde::rfc3339::option")]
     pub finished_at: Option<OffsetDateTime>,
     /// The window that was applied, days.
     pub window_days: i32,
     /// The instant older rows were swept.
-    #[serde(with = "time::serde::rfc3339")]
     pub cutoff: OffsetDateTime,
     /// Events removed.
     pub events_deleted: i32,
@@ -346,7 +343,6 @@ pub struct SweepBody {
     /// The window that was applied.
     pub window_days: i32,
     /// The instant older rows were swept.
-    #[serde(with = "time::serde::rfc3339")]
     pub cutoff: OffsetDateTime,
     /// Events removed.
     pub events_deleted: i64,

@@ -115,26 +115,6 @@ pub const DEFAULT_RETENTION_MAX_SITES: i64 = 50;
 /// parses into a `u64` and refuses a negative or zero value.
 const DEFAULT_RETENTION_MAX_SITES_U64: u64 = 50;
 
-/// How often the backup retention sweep runs (REQ-013, slice 3).
-///
-/// Six hours, and the number is chosen from the feature rather than from taste: the sweep
-/// only removes runs whose own `retain_until` has passed, the shortest window the panel
-/// allows is a day, and the *newest successful* run is exempt whatever the window. So an
-/// hourly sweep would find the same set as a six-hourly one almost every time — six times
-/// the statements for an identical answer — and a nightly sweep would leave a run whose day
-/// ended at 04:00 sitting on the destination for twenty hours. Six hours sits between the two
-/// and keeps the unattended deletes to one a few hours per site.
-pub const DEFAULT_BACKUP_SWEEP_POLL_MS: u64 = 21_600_000;
-
-/// Tenants one backup sweep walks before the rest waits for the next tick.
-pub const DEFAULT_BACKUP_SWEEP_MAX_TENANTS: i64 = 50;
-
-/// The same bound as a `u64`, for the same reason as [`DEFAULT_RETENTION_MAX_SITES_U64`].
-const DEFAULT_BACKUP_SWEEP_MAX_TENANTS_U64: u64 = 50;
-
-/// How often the schedule worker looks for a backup whose time has come: every minute.
-pub const DEFAULT_BACKUP_SCHEDULE_POLL_MS: u64 = 60_000;
-
 /// Default SMTP host the email action sends through (`OMNION_SMTP_HOST`): Mailpit in the
 /// development stack, which is where `infra/compose/mailpit.yml` publishes it.
 pub const DEFAULT_SMTP_HOST: &str = "127.0.0.1";
@@ -505,33 +485,6 @@ pub struct RetentionConfig {
     pub poll_ms: u64,
     /// How many sites one tick may walk (`OMNION_RETENTION_MAX_SITES`).
     pub max_sites: i64,
-    /// Whether this process sweeps expired backups off the destination (`OMNION_BACKUP_SWEEP`).
-    ///
-    /// A **separate** flag from `runner_enabled` on purpose. The media sweeper removes
-    /// library files and the backup sweeper removes restore points, and an installation
-    /// that wants to keep every backup for ever — an air-gapped archive, a compliance
-    /// deployment that manages retention itself — must be able to stop the second without
-    /// stopping the first. One flag for both would make "never delete my backups" mean "never
-    /// purge my trash" as well, and the only way out would be to turn the whole worker off.
-    pub backup_sweep_enabled: bool,
-    /// Delay between two backup sweeps (`OMNION_BACKUP_SWEEP_POLL_MS`).
-    ///
-    /// The default is long on purpose and it is a **conservative** one: the sweep is
-    /// unattended and its deletes are the only ones in this feature no operator asked for.
-    /// A tick that finds nothing costs one grouped query, so the interval can be hours
-    /// without cost — and an installation that has just restored something and wants the
-    /// space back does not have to wait for a manual sweep to be offered in the panel.
-    pub backup_sweep_poll_ms: u64,
-    /// How many tenants one backup sweep may walk (`OMNION_BACKUP_SWUP_MAX_TENANTS`).
-    pub backup_sweep_max_tenants: i64,
-    /// Delay between two schedule checks (`OMNION_BACKUP_SCHEDULE_POLL_MS`).
-    ///
-    /// A minute, and for a different reason than the sweep's six hours: the sweep's interval
-    /// comes from the feature (retention is measured in days, so a tick that finds nothing
-    /// changes no answer), while a schedule's is measured in minutes — an hourly schedule that
-    /// fires at :37 because the worker happened to wake at :37 is a schedule the operator did
-    /// not write, and every operator notices.
-    pub backup_schedule_poll_ms: u64,
 }
 
 impl Default for RetentionConfig {
@@ -540,10 +493,6 @@ impl Default for RetentionConfig {
             runner_enabled: true,
             poll_ms: DEFAULT_RETENTION_POLL_MS,
             max_sites: DEFAULT_RETENTION_MAX_SITES,
-            backup_sweep_enabled: true,
-            backup_sweep_poll_ms: DEFAULT_BACKUP_SWEEP_POLL_MS,
-            backup_sweep_max_tenants: DEFAULT_BACKUP_SWEEP_MAX_TENANTS,
-            backup_schedule_poll_ms: DEFAULT_BACKUP_SCHEDULE_POLL_MS,
         }
     }
 }
@@ -622,153 +571,6 @@ impl std::fmt::Debug for MailConfig {
                 },
             )
             .field("timeout_ms", &self.timeout_ms)
-            .finish()
-    }
-}
-
-/// The installation's Web Push identity (`OMNION_PUSH_*`, REQ-021 slice 6).
-///
-/// One P-256 key pair per installation, generated at deploy time. The request says it is
-/// "generated at deploy time and kept only in the platform secret store", and this is the
-/// honest form of that for a platform whose secret store is REQ-125's and not yet built: the
-/// key material is read from the environment, **write-only in every rendering**, and the
-/// public half is derived from it so the two can never disagree.
-///
-/// **The private half is a key that can push to every subscribed browser in this
-/// installation.** It is `Debug`-redacted for the same reason the SMTP password is: a
-/// process that logs its own VAPID private key is a process whose subscribers can be
-/// spammed by anybody who can read the log.
-///
-/// `is_usable` is the whole point of the struct and it is deliberately strict. A push service
-/// checks that the JWT's `aud` names the endpoint host and that the signature verifies against
-/// the `public_key` the browser was told to trust; a pair where only one half is present, or
-/// where the public half does not match the private one, produces a token that is refused on
-/// every send. Reporting such an installation as ready is the same green light wired to nothing
-/// that the webhook readiness branch was.
-#[derive(Clone, PartialEq, Eq)]
-pub struct PushConfig {
-    /// The P-256 private key, base64url without padding (`OMNION_PUSH_PRIVATE_KEY`).
-    ///
-    /// Raw scalar bytes when decoded, so the value an operator pastes is the one the
-    /// Web Push specification describes and not a DER wrapper around it.
-    private_key: Option<String>,
-    /// The contact address a push service uses to reach an operator about a failing
-    /// subscription (`OMNION_PUSH_CONTACT`), conventionally `mailto:`.
-    ///
-    /// Not a secret and not optional in the specification: a token whose `sub` is not a
-    /// `mailto:` or `https:` URL is rejected outright by some push services.
-    contact: Option<String>,
-}
-
-impl PushConfig {
-    /// The private key, raw 32 bytes, when one is configured and well-formed.
-    ///
-    /// `None` for absent, for empty, and for a value that is not base64url — the third case
-    /// matters because a truncated or padded paste would otherwise be *some* 32 bytes and
-    /// produce a key that signs correctly and matches nobody's expectation.
-    #[must_use]
-    pub fn private_key_bytes(&self) -> Option<Vec<u8>> {
-        let raw = self.private_key.as_deref()?.trim();
-        if raw.is_empty() {
-            return None;
-        }
-        let bytes = crate::base64url::decode(raw)?;
-        (bytes.len() == 32).then_some(bytes)
-    }
-
-    /// Whether a send could be attempted at all: a usable key **and** a contact address.
-    #[must_use]
-    pub fn is_usable(&self) -> bool {
-        self.private_key_bytes().is_some() && self.contact().is_some()
-    }
-
-    /// The contact address, when it is one a push service accepts.
-    ///
-    /// The check is on the *scheme* because the specification requires one and because the
-    /// alternative is a token rejected at send time, days after the operator believed push
-    /// was configured.
-    #[must_use]
-    pub fn contact(&self) -> Option<&str> {
-        let raw = self.contact.as_deref()?.trim();
-        let ok = (raw.starts_with("mailto:") || raw.starts_with("https://"))
-            && !raw.contains(char::is_whitespace);
-        ok.then_some(raw)
-    }
-
-    /// Whether a private key was given at all, well-formed or not.
-    ///
-    /// Separate from [`Self::is_usable`] so the settings screen can tell "no push key was
-    /// configured" from "the push key is configured but unusable", which are different fixes.
-    #[must_use]
-    pub fn has_private_key(&self) -> bool {
-        self.private_key
-            .as_deref()
-            .is_some_and(|v| !v.trim().is_empty())
-    }
-
-    /// A copy with the private key set, base64url without padding.
-    ///
-    /// **The one writer, and it exists because the fields are private on purpose.** A private
-    /// key is a credential, and a struct whose fields can be built from anywhere is a struct
-    /// that gets one assembled in a test, a fixture and a config file without anybody deciding
-    /// that. But "generated at deploy time" means something has to hand the platform a key it
-    /// did not read from the environment: `vapid::VapidKeys::generate` mints one, and this is
-    /// how it is handed over.
-    ///
-    /// No validation happens here, deliberately. A malformed key is still *present*, and
-    /// [`Self::has_private_key`] is exactly the distinction the settings screen renders against
-    /// [`Self::private_key_bytes`]. Keeping "what was configured" and "what would a push
-    /// service accept" as two separate questions is what lets that screen name which of the two
-    /// problems it has.
-    #[must_use]
-    pub fn with_private_key(mut self, private_key: impl Into<String>) -> Self {
-        self.private_key = Some(private_key.into());
-        self
-    }
-
-    /// A copy with the contact address set.
-    ///
-    /// Same reasoning as [`Self::with_private_key`]; validated on read in [`Self::contact`].
-    #[must_use]
-    pub fn with_contact(mut self, contact: impl Into<String>) -> Self {
-        self.contact = Some(contact.into());
-        self
-    }
-
-    /// The base64url public key, derived from the private half.
-    ///
-    /// Derived rather than configured, because a pair supplied as two strings can disagree and
-    /// the failure is invisible until every send is refused.
-    #[must_use]
-    pub fn public_key(&self) -> Option<String> {
-        let bytes = self.private_key_bytes()?;
-        Some(crate::vapid::public_key_from_private(&bytes)?)
-    }
-}
-
-impl Default for PushConfig {
-    fn default() -> Self {
-        Self {
-            private_key: None,
-            contact: None,
-        }
-    }
-}
-
-/// Render the push settings without the private key.
-impl std::fmt::Debug for PushConfig {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PushConfig")
-            .field(
-                "private_key",
-                &if self.has_private_key() {
-                    "<redacted>"
-                } else {
-                    "<none>"
-                },
-            )
-            .field("contact", &self.contact.as_deref().unwrap_or("<none>"))
             .finish()
     }
 }
@@ -860,8 +662,6 @@ pub struct Config {
     pub retention: RetentionConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
-    /// The installation's Web Push identity (REQ-021, slice 6).
-    pub push: PushConfig,
     /// The secret CSRF tokens are derived from (REQ-012, slice 2).
     pub csrf: CsrfSecret,
     /// Logging.
@@ -1043,31 +843,6 @@ impl Config {
                 DEFAULT_RETENTION_MAX_SITES_U64,
             )?)
             .unwrap_or(DEFAULT_RETENTION_MAX_SITES),
-            // The backup sweep reads its own root out of `backup_settings` every tick, so a
-            // malformed value here would be a worker that kept its default and a destination
-            // that quietly changed. Both knobs get the boot-time treatment every other one gets.
-            backup_sweep_enabled: read_flag(&read, "OMNION_BACKUP_SWEEP", true)?,
-            backup_sweep_poll_ms: read_positive(
-                &read,
-                "OMNION_BACKUP_SWEEP_POLL_MS",
-                DEFAULT_BACKUP_SWEEP_POLL_MS,
-            )?,
-            backup_sweep_max_tenants: i64::try_from(read_positive(
-                &read,
-                "OMNION_BACKUP_SWEEP_MAX_TENANTS",
-                DEFAULT_BACKUP_SWEEP_MAX_TENANTS_U64,
-            )?)
-            .unwrap_or(DEFAULT_BACKUP_SWEEP_MAX_TENANTS),
-            // No `enabled` flag of its own: the schedule worker is the thing an installation
-            // with no schedules wants off, and an installation with no schedules pays one
-            // grouped query a minute for it. `OMNION_BACKUP_SCHEDULE_POLL_MS` is the lever —
-            // set it to an hour and the worker costs nothing measurable, and every schedule
-            // still fires within the hour.
-            backup_schedule_poll_ms: read_positive(
-                &read,
-                "OMNION_BACKUP_SCHEDULE_POLL_MS",
-                DEFAULT_BACKUP_SCHEDULE_POLL_MS,
-            )?,
         };
 
         let analytics = AnalyticsConfig {
@@ -1090,15 +865,6 @@ impl Config {
             timeout_ms: read_positive(&read, "OMNION_SMTP_TIMEOUT_MS", DEFAULT_SMTP_TIMEOUT_MS)?,
         };
 
-        // Web Push (REQ-021 slice 6). Read, never generated: a key the platform invents at
-        // boot would change on every restart, and every browser holding a subscription to the
-        // previous key would be silently unreachable. `generate` exists for the deploy-time
-        // step the request describes, and an operator pastes its output into the environment.
-        let push = PushConfig {
-            private_key: read("OMNION_PUSH_PRIVATE_KEY"),
-            contact: read("OMNION_PUSH_CONTACT"),
-        };
-
         // The CSRF secret is the one piece of configuration the platform refuses to invent: a
         // deployment that sets none still boots, and every cookie-authenticated mutation then
         // answers 403 rather than skipping the check. Failing open would turn a missing key into
@@ -1118,7 +884,6 @@ impl Config {
             analytics,
             retention,
             mail,
-            push,
             csrf,
             log,
         };
@@ -1159,7 +924,6 @@ impl Default for Config {
             analytics: AnalyticsConfig::default(),
             retention: RetentionConfig::default(),
             mail: MailConfig::default(),
-            push: PushConfig::default(),
             // No secret by default, which is the honest default: a default key would be a key
             // every deployment shares, and a shared CSRF secret is no CSRF secret.
             csrf: CsrfSecret::default(),
@@ -1230,7 +994,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::base64url;
 
     fn config_from(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
         let map: std::collections::HashMap<String, String> = pairs
@@ -1475,145 +1238,6 @@ mod tests {
         assert_eq!(config.mail.timeout_ms, DEFAULT_SMTP_TIMEOUT_MS);
         assert!(!config.mail.authenticates(), "no credentials by default");
         assert!(config.mail.is_usable());
-
-        // **Push is off by default, and the reason is that it cannot be on by default.**
-        // Readiness has to report "no push key is configured" rather than inventing a key at
-        // boot: a key the platform mints per process would invalidate every existing browser
-        // subscription on every restart.
-        assert!(!config.push.has_private_key());
-        assert!(!config.push.is_usable());
-        assert!(config.push.public_key().is_none());
-    }
-
-    /// A 32-byte private key, base64url — the same 0x01..=0x20 scalar `vapid`'s tests use, so
-    /// the fixture is one the signing code has already proved is a valid P-256 key.
-    const PUSH_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA";
-    /// A contact address the specification accepts.
-    const PUSH_CONTACT: &str = "mailto:push@omnion.invalid";
-
-    #[test]
-    fn a_configured_push_key_is_usable_and_derives_its_own_public_half() {
-        let config = config_from(&[
-            ("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY),
-            ("OMNION_PUSH_CONTACT", PUSH_CONTACT),
-        ])
-        .expect("a valid key must load");
-
-        assert!(config.push.has_private_key());
-        assert!(config.push.is_usable());
-        assert_eq!(
-            config.push.public_key().as_deref(),
-            crate::vapid::public_key_from_private(&base64url::decode(PUSH_KEY).expect("b64"))
-                .as_deref(),
-            "the public half is derived, never configured — the two cannot disagree"
-        );
-        // And the derived key is one a browser can actually subscribe with.
-        let point =
-            base64url::decode(config.push.public_key().expect("derived").as_str()).expect("b64");
-        assert_eq!(point.len(), 65);
-        assert_eq!(point[0], 0x04, "the uncompressed SEC1 point tag");
-    }
-
-    #[test]
-    fn a_malformed_push_key_is_not_a_usable_key_but_is_still_reported_as_present() {
-        // The distinction is the whole point of `has_private_key`: "you pasted something that
-        // is not a key" and "you pasted nothing" are different fixes, and a readiness screen
-        // that says "no push key configured" for the first one sends the operator looking in
-        // the wrong place.
-        for bad in ["not-base64!", "AAAA", "c2hvcnQ=", "not-a-key-at-all"] {
-            let config = config_from(&[
-                ("OMNION_PUSH_PRIVATE_KEY", bad),
-                ("OMNION_PUSH_CONTACT", PUSH_CONTACT),
-            ])
-            .expect("a bad value must not stop the process booting");
-            assert!(!config.push.is_usable(), "{bad:?} must not be a usable key");
-            assert!(
-                config.push.has_private_key(),
-                "{bad:?} is present but unusable — the operator needs to be told which"
-            );
-            assert!(config.push.public_key().is_none());
-        }
-
-        // **Whitespace is absence, not malformedness.** An environment variable holding
-        // spaces is what a templated deployment file produces when the value was never
-        // substituted, and reporting "a push key is configured but broken" for that sends the
-        // operator to debug a key that does not exist. It reads as nothing configured, which
-        // is the truth.
-        for blank in ["", "   ", "\t"] {
-            let config = config_from(&[
-                ("OMNION_PUSH_PRIVATE_KEY", blank),
-                ("OMNION_PUSH_CONTACT", PUSH_CONTACT),
-            ])
-            .expect("loads");
-            assert!(
-                !config.push.has_private_key(),
-                "{blank:?} is an absent key, not a broken one"
-            );
-            assert!(!config.push.is_usable());
-        }
-    }
-
-    #[test]
-    fn a_key_without_a_contact_is_present_but_not_usable() {
-        // A push service rejects a token whose `sub` is not a mailto: or https: URL, so a
-        // half-configured installation must not claim readiness.
-        let config = config_from(&[("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY)]).expect("loads");
-        assert!(config.push.has_private_key());
-        assert!(config.push.contact().is_none());
-        assert!(!config.push.is_usable());
-    }
-
-    #[test]
-    fn a_contact_without_a_scheme_is_refused() {
-        for bad in [
-            "ops@example.com",
-            "mailto:ops@example .com",
-            "ftp://ops@x.test",
-        ] {
-            let config = config_from(&[
-                ("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY),
-                ("OMNION_PUSH_CONTACT", bad),
-            ])
-            .expect("loads");
-            assert!(config.push.contact().is_none(), "{bad:?} must be refused");
-            assert!(!config.push.is_usable());
-        }
-        let good = config_from(&[
-            ("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY),
-            ("OMNION_PUSH_CONTACT", "https://ops.example.com/push"),
-        ])
-        .expect("loads");
-        assert_eq!(
-            good.push.contact(),
-            Some("https://ops.example.com/push"),
-            "an https contact is as valid as a mailto one"
-        );
-    }
-
-    #[test]
-    fn the_push_private_key_is_never_rendered() {
-        // The value that can push to every subscriber must not appear in a log line, a panic
-        // message or a test failure. This is the SMTP password's rule, applied to the key that
-        // outranks it.
-        let config = config_from(&[
-            ("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY),
-            ("OMNION_PUSH_CONTACT", PUSH_CONTACT),
-        ])
-        .expect("loads");
-
-        let rendered = format!("{config:?}");
-        assert!(
-            !rendered.contains(PUSH_KEY),
-            "the private key reached a Debug rendering: {rendered}"
-        );
-        assert!(rendered.contains("<redacted>"), "{rendered}");
-        // The whole config renders, and the key is absent from all of it.
-        assert!(!format!("{:?}", config.push).contains(PUSH_KEY));
-        // The public half is not a secret — and it is *not* in the Debug output either,
-        // because `Config`'s own rendering is a field list that names the push section and
-        // nothing more. The browser gets it from the API, which is where it belongs: it is
-        // per-installation data, not a boot log.
-        assert!(!rendered.contains(&config.push.public_key().expect("derived")));
     }
 
     #[test]
@@ -1698,47 +1322,6 @@ mod tests {
         // answer is that the platform starts and refuses cookie-authenticated mutations.
         let config = config_from(&[]).expect("the platform boots without a CSRF secret");
         assert!(!config.csrf.is_usable());
-    }
-
-    /// The backup sweep is gated by its OWN flag, and that is the property worth pinning: an
-    /// installation that wants to keep every backup for ever must be able to stop the sweep
-    /// without stopping the media sweeper, and the reverse must hold too. If these two ever
-    /// share a flag again, this test is the one that notices.
-    #[test]
-    fn the_backup_sweep_has_its_own_switch() {
-        let on = config_from(&[]).expect("the platform boots");
-        assert!(on.retention.backup_sweep_enabled);
-        assert!(on.retention.runner_enabled);
-
-        let media_only = config_from(&[("OMNION_BACKUP_SWEEP", "false")])
-            .expect("stopping the backup sweep is a valid configuration");
-        assert!(!media_only.retention.backup_sweep_enabled);
-        assert!(
-            media_only.retention.runner_enabled,
-            "stopping the backup sweep must not stop the media sweeper"
-        );
-
-        let backups_only = config_from(&[("OMNION_RETENTION_RUNNER", "false")])
-            .expect("stopping the media sweeper is a valid configuration");
-        assert!(!backups_only.retention.runner_enabled);
-        assert!(
-            backups_only.retention.backup_sweep_enabled,
-            "stopping the media sweeper must not stop the backup sweep"
-        );
-    }
-
-    /// A malformed sweep interval is a boot failure, not a worker that quietly kept its
-    /// default — the same treatment every other interval gets, and the reason it matters most
-    /// here is that the interval is how often unattended deletes happen.
-    #[test]
-    fn a_broken_backup_sweep_interval_fails_at_boot() {
-        let error = config_from(&[("OMNION_BACKUP_SWEEP_POLL_MS", "0")])
-            .expect_err("a zero interval is refused");
-        assert_eq!(error.key, "OMNION_BACKUP_SWEEP_POLL_MS");
-
-        let error = config_from(&[("OMNION_BACKUP_SWEEP_MAX_TENANTS", "plenty")])
-            .expect_err("a non-numeric bound is refused");
-        assert_eq!(error.key, "OMNION_BACKUP_SWEEP_MAX_TENANTS");
     }
 
     #[test]

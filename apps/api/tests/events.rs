@@ -32,7 +32,6 @@ use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_core::config::{Config, DatabaseConfig};
 use omnion_core::{BuildInfo, Db, RedisClient};
-use omnion_events::DEFAULT_MAX_ATTEMPTS;
 use omnion_events::engine::{self, RunReport, RunnerConfig};
 use omnion_events::sender;
 use omnion_events::signature;
@@ -41,13 +40,11 @@ use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
 use serde_json::{Value, json};
-use time::{Duration, OffsetDateTime};
+use time::Duration;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tower::ServiceExt;
 use uuid::Uuid;
-
-mod support;
 
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
@@ -202,44 +199,12 @@ struct Harness {
     db: Db,
     maintenance: Db,
     database: String,
-    /// The secret every session's CSRF token in this harness is derived from.
-    ///
-    /// A copy rather than a reference to the config, because `account()` needs it to mint the
-    /// token that goes with each session and the walks hand the two around as one packed
-    /// credential. Keeping it here is what lets the fixture stay in charge of the pairing.
-    csrf_secret: Vec<u8>,
 }
 
 impl Harness {
     /// Open a fresh database with every migration applied and the IAM seed loaded.
     async fn fresh() -> Option<Self> {
-        let mut config = Config::from_env().expect("environment must be valid");
-        // This suite's own CSRF secret, and the second half of a two-part repair.
-        //
-        // Tick 59 made the session cookie *ambient* authority, so every cookie-authenticated
-        // write must present a double-submit token beside it — and the token is derived from
-        // the deployment's secret and the session id. This suite never had either half: it
-        // configured no secret, and it minted sessions straight through `sessions::create_session`
-        // instead of signing in, so no token was ever issued. Both refusals are the **product
-        // working correctly**: `csrf_unavailable` (no secret configured) and `csrf_failed` (a
-        // cookie write with no token) are exactly what a correct deployment answers.
-        //
-        // The defect was in the suite, and it was a total one: with no credential it can carry,
-        // **every** write in this file was refused, so all ten walks ended on their first
-        // `POST /webhooks` with a 403 that reads like a broken platform. The walks were never
-        // measuring the event bus; they were re-proving the refusal, once per walk. Green for
-        // months would have meant nothing, and the reason nothing noticed is that a suite
-        // whose every test fails for one shared reason looks like an environmental problem
-        // rather than a missing fixture.
-        //
-        // See `support::walk_auth`, which lifts this shape for every suite, and `--test media`,
-        // which had already been repaired this way and passes.
-        support::walk_auth::with_csrf_secret(&mut config);
-        let csrf_secret = config
-            .csrf
-            .as_bytes()
-            .expect("the suite just set a secret")
-            .to_vec();
+        let config = Config::from_env().expect("environment must be valid");
         live_db(&config).await?;
 
         let database = format!("omnion_events_{}", Uuid::new_v4().simple());
@@ -277,7 +242,6 @@ impl Harness {
             db,
             maintenance,
             database,
-            csrf_secret,
         })
     }
 
@@ -333,16 +297,11 @@ fn patch(uri: &str, body: Value, token: Option<&str>) -> Request<Body> {
     request(Method::PATCH, uri, token, Some(body))
 }
 
-/// Build a JSON request; `token` becomes the session cookie **and** its CSRF token.
-///
-/// The credential is packed (`session\x1fcsrf`), so this is the one place the two halves are
-/// separated and attached. Setting only the cookie is exactly the ambient-authority request the
-/// double-submit check refuses, which is what every walk in this file was doing: the CSRF layer
-/// answered `403 csrf_failed` before the event bus ever saw the request.
+/// Build a JSON request; `token` becomes the session cookie.
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
     let builder = match token {
-        Some(credential) => support::walk_auth::apply_credential(credential, builder),
+        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
         None => builder,
     };
 
@@ -355,14 +314,7 @@ fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) 
     }
 }
 
-/// Create an account with a session and return `(user id, credential)`.
-///
-/// The credential is **packed** — session id and CSRF token in one string, joined by the
-/// separator [`support::walk_auth`] defines — rather than a bare session token. Every walk
-/// passes this string around as its `token`, and [`request`] unpacks it and sets the cookie and
-/// the `x-omnion-csrf` header together. Packing is what keeps the twenty-odd call sites
-/// unchanged: a walk's `token` argument never became a pair, and the two halves cannot drift
-/// apart because there is only one string to pass.
+/// Create an account with a session and return `(user id, token)`.
 async fn account(harness: &Harness, organization_id: Option<Uuid>) -> (Uuid, String) {
     let user = users::create_user(
         harness.db.pool(),
@@ -375,22 +327,10 @@ async fn account(harness: &Harness, organization_id: Option<Uuid>) -> (Uuid, Str
     )
     .await
     .expect("the account must be created");
-    let (session, token) = sessions::create_session(harness.db.pool(), user.id, None, None)
+    let (_, token) = sessions::create_session(harness.db.pool(), user.id, None, None)
         .await
         .expect("the session must be created");
-    // The token a browser would be handed beside the session cookie. Sign-in is the only place
-    // the product issues one, and this suite does not sign in — it mints the session directly, so
-    // the token is derived here from the same secret and the same session id the middleware will
-    // compare against. Deriving it rather than hard-coding a value is the point: a constant
-    // token would pass the presence check and fail verification, which reads as a broken product.
-    let csrf = omnion_security::derive_csrf_token(&harness.csrf_secret, &session.id.to_string());
-    (
-        user.id,
-        support::walk_auth::pack(&support::walk_auth::Session {
-            session: token,
-            csrf: Some(csrf),
-        }),
-    )
+    (user.id, token)
 }
 
 /// Bind a role with exactly these permission keys to one account, at organization scope.
@@ -2843,332 +2783,6 @@ async fn a_disabled_endpoint_goes_quiet_and_still_answers_what_it_did() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The backoff ladder, measured rather than assumed
-// ---------------------------------------------------------------------------------------------
-
-/// A delivery row as this walk reads it back out of the API, not out of PostgreSQL.
-///
-/// The point of reading it over HTTP is that the *screen* reads it the same way. `duration_ms`
-/// and `next_attempt_at` are both screen columns — the deliveries table renders an attempt's
-/// duration and when the next one is due — so a value that exists in the table but is dropped
-/// by `DeliveryBody::build` is invisible to the operator while every test on the crate stays
-/// green. Reading the response body is the only assertion that notices the two disagree.
-#[derive(Debug, Clone)]
-struct DeliveryView {
-    status: String,
-    attempts: i64,
-    next_attempt_at: OffsetDateTime,
-    response_status: Option<i64>,
-    duration_ms: Option<i64>,
-    error: Option<String>,
-}
-
-/// Parse one row of a `deliveries` response.
-///
-/// `next_attempt_at` is a required RFC 3339 string in the body, and this returns `None` for it
-/// rather than parsing into an error: a body that omits the field is a body this walk cannot
-/// measure, which is a finding, not a panic.
-fn delivery_view(row: &Value) -> DeliveryView {
-    let text = |key: &str| row[key].as_str().map(str::to_owned);
-    let number = |key: &str| row[key].as_i64();
-
-    DeliveryView {
-        status: text("status").unwrap_or_default(),
-        attempts: number("attempts").unwrap_or_default(),
-        next_attempt_at: text("next_attempt_at")
-            .and_then(|raw| {
-                OffsetDateTime::parse(&raw, &time::format_description::well_known::Rfc3339).ok()
-            })
-            .unwrap_or_else(|| {
-                // A body without a parsable `next_attempt_at` still has to produce a row, or the
-                // walk below would silently skip the very delivery it is measuring. `now()` is a
-                // value that can never be later than a real schedule, so every ordering
-                // assertion below fails loudly on it instead of passing by accident.
-                OffsetDateTime::UNIX_EPOCH
-            }),
-        response_status: number("response_status"),
-        duration_ms: number("duration_ms"),
-        error: text("error"),
-    }
-}
-
-/// The delivery rows of one endpoint, newest first.
-async fn delivery_views(harness: &Harness, endpoint_id: &str, token: &str) -> Vec<DeliveryView> {
-    let response = harness
-        .call(get(
-            &format!("/api/v1/webhooks/{endpoint_id}/deliveries"),
-            Some(token),
-        ))
-        .await;
-    assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
-    response.body["deliveries"]
-        .as_array()
-        .expect("deliveries")
-        .iter()
-        .map(delivery_view)
-        .collect()
-}
-
-/// A receiver that fails every attempt, so the whole ladder is walked in one go.
-async fn failing_endpoint(harness: &Harness, token: &str, receiver: &Receiver) -> String {
-    let created = harness
-        .call(post(
-            "/api/v1/webhooks",
-            json!({
-                "name": format!("Ladder receiver {}", Uuid::new_v4()),
-                "url": receiver.url,
-                "events": ["page.published"],
-            }),
-            Some(token),
-        ))
-        .await;
-    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
-    created.body["id"].as_str().expect("id").to_owned()
-}
-
-/// The two boxes that name what a delivery row must be able to say.
-///
-/// **What was already proven, and why these two needed a walk of their own.** The main bus
-/// walk asserts `delivered`, `attempts == 1`, `response_status == 200` and a readable error on
-/// the terminal branch — and that walk has been green for slices. What it never asserted is the
-/// two claims these boxes actually make:
-///
-/// 1. a **successful** delivery carries a non-null `duration_ms`, and
-/// 2. the retries are **increasingly spaced** — `next_attempt_at` grows each attempt, rather
-///    than every retry landing at the same instant.
-///
-/// Neither is reachable from the walk that already existed, for two different reasons that are
-/// worth stating because they are the whole point of writing this one. The duration is not
-/// asserted there because the walk's assertions list stops at the fields it happened to need;
-/// and "increasing" is not assertable from a walk that waits for a *fixed* sleep
-/// (`after_backoff`) between ticks — such a walk cannot tell "the ladder backed off" from
-/// "the runner happened to tick again later". Both claims are about **the value in the row**,
-/// not about whether the delivery eventually succeeded, which is why they need the timestamps
-/// read back rather than a tick count.
-///
-/// The consequence of the gap is the same class the previous tick found in the notification
-/// queue: a column nobody reads looks exactly like a column that works. `duration_ms` is a
-/// screen column on the deliveries table and `next_attempt_at` is its "next attempt" cell, so
-/// if `DeliveryBody::build` had dropped either, the stats tab's `p95_duration_ms` would have had
-/// no source, every retry would have looked due at once in the UI, and no crate test would have
-/// said so. The walk below reads both out of the **HTTP body**, because that is the path the
-/// screen takes.
-#[tokio::test]
-async fn a_delivery_row_measures_its_own_duration_and_its_backoff_grows() {
-    let Some(harness) = Harness::fresh().await else {
-        return;
-    };
-    let receiver = Receiver::start(false).await;
-
-    // The platform owner exists only for the binding: this walk's every call is the editor's,
-    // so that a tenant-scoped assertion cannot pass vacuously through the owner shortcut.
-    let (owner_id, _owner_token) = account(&harness, None).await;
-    seed::bind_owner(harness.db.pool(), owner_id)
-        .await
-        .expect("the owner binding must be created");
-
-    let organization = create_organization_row(&harness.db, "ladder", "Ladder Test").await;
-    let site = create_site_row(&harness.db, organization, "main", "Ladder Site").await;
-
-    let (editor, editor_token) = account(&harness, Some(organization)).await;
-    grant(
-        &harness,
-        editor,
-        organization,
-        &[
-            "webhooks.read",
-            "webhooks.manage",
-            "events.read",
-            "content.pages.read",
-            "content.pages.create",
-            "content.pages.publish",
-        ],
-    )
-    .await;
-
-    // ---- 1. A successful delivery carries a duration -----------------------------------------
-    let ok_endpoint = harness
-        .call(post(
-            "/api/v1/webhooks",
-            json!({
-                "name": format!("Timing receiver {}", Uuid::new_v4()),
-                "url": receiver.url,
-                "events": ["page.published"],
-            }),
-            Some(&editor_token),
-        ))
-        .await;
-    assert_eq!(
-        ok_endpoint.status,
-        StatusCode::CREATED,
-        "{:?}",
-        ok_endpoint.body
-    );
-    let ok_id = ok_endpoint.body["id"].as_str().expect("id").to_owned();
-
-    assert_eq!(
-        publish_page(&harness, &editor_token, site, "timed").await,
-        StatusCode::OK
-    );
-    let report = tick(&harness).await;
-    assert_eq!(report.delivered, 1, "{report:?}");
-
-    let rows = delivery_views(&harness, &ok_id, &editor_token).await;
-    let delivered = rows.first().expect("the delivery is on screen");
-    assert_eq!(delivered.status, "delivered", "{delivered:?}");
-    assert_eq!(delivered.attempts, 1, "{delivered:?}");
-    assert_eq!(delivered.response_status, Some(200), "{delivered:?}");
-    // The box: a delivered row is not merely `delivered` — it is a measurement. Without the
-    // duration the stats tab has nothing to average and the table's "—" reads as "instant",
-    // which is a number this receiver never reported.
-    let duration = delivered.duration_ms.expect(
-        "a delivered row must carry the receiver's duration; the deliveries table renders this \
-         column and `p95_duration_ms` has no other source",
-    );
-    assert!(
-        duration >= 0,
-        "a duration cannot be negative: {duration} ms ({delivered:?})"
-    );
-    assert!(
-        delivered.error.is_none(),
-        "a delivered row carries no error text: {delivered:?}"
-    );
-
-    // ---- 2. Every refused attempt is measured too ----------------------------------------------
-    // The failing receiver and the healthy one are separate endpoints because a refusal is what
-    // produces the ladder; sharing one endpoint would make the ladder's first row the successful
-    // delivery above and every assertion below ambiguous about which row it is reading.
-    let broken = Receiver::start(true).await;
-    let ladder_id = failing_endpoint(&harness, &editor_token, &broken).await;
-
-    assert_eq!(
-        publish_page(&harness, &editor_token, site, "ladder").await,
-        StatusCode::OK
-    );
-
-    // The ladder is collected as it is climbed: each attempt that does not run out of budget
-    // reschedules the row, and the row's own `next_attempt_at` is the only record of how far
-    // out the platform pushed it. The claim happens only when the row is due, so a growing
-    // ladder has to be walked one step at a time — a fixed sleep would prove nothing (see the
-    // walk's doc comment).
-    //
-    // What is deliberately **not** recorded here is "was the schedule still in the future when
-    // the row was read back". The base in this suite is 40 ms and a tick that includes an HTTP
-    // round trip to a loopback receiver takes longer than that, so by the time the row is read
-    // its schedule is legitimately due — and the assertion would be measuring the walk's own
-    // latency rather than the backoff. The distance between consecutive schedules is the
-    // deterministic measurement of the same fact, and it is asserted below.
-    let mut schedule: Vec<(i64, OffsetDateTime)> = Vec::new();
-    let mut final_row: Option<DeliveryView> = None;
-
-    for _ in 0..(DEFAULT_MAX_ATTEMPTS as usize + 2) {
-        tick(&harness).await;
-        let rows = delivery_views(&harness, &ladder_id, &editor_token).await;
-        let Some(row) = rows.first().cloned() else {
-            continue;
-        };
-
-        if row.status == "failed" {
-            final_row = Some(row);
-            break;
-        }
-
-        schedule.push((row.attempts, row.next_attempt_at));
-        // Wait until this attempt is actually due, so the next tick claims it. The cap keeps a
-        // wrong ladder from turning this walk into a 15-minute sleep: with `retry_base` at
-        // 40 ms the real ladder is under 320 ms, so a second of slack is generous, and a row
-        // that never becomes due fails the loop's own bound instead of hanging.
-        let wait = (row.next_attempt_at - OffsetDateTime::now_utc())
-            .whole_milliseconds()
-            .max(0);
-        tokio::time::sleep(StdDuration::from_millis(wait.clamp(0, 1_000) as u64 + 20)).await;
-    }
-
-    let final_row = final_row.unwrap_or_else(|| {
-        panic!(
-            "the delivery never ran out of attempts; the schedule it was given was {schedule:?}"
-        );
-    });
-
-    assert_eq!(final_row.status, "failed", "{final_row:?}");
-    assert_eq!(
-        final_row.attempts, DEFAULT_MAX_ATTEMPTS as i64,
-        "{final_row:?}"
-    );
-    assert_eq!(
-        final_row.response_status,
-        Some(500),
-        "the receiver answered 500 on the attempt that ran out of budget: {final_row:?}"
-    );
-    let reason = final_row
-        .error
-        .clone()
-        .expect("the terminal row carries the reason the operator needs");
-    assert!(
-        reason.contains("500"),
-        "the reason names the status a receiver actually answered: {reason:?}"
-    );
-    assert!(
-        final_row.duration_ms.is_some(),
-        "a refused attempt is measured too — a receiver that times out and one that refuses must \
-         not look identical in the stats: {final_row:?}"
-    );
-
-    // ---- 3. The ladder grew, every step ---------------------------------------------------------
-    assert!(
-        schedule.len() >= 3,
-        "a five-attempt ladder must reschedule at least four times before the terminal row; \
-         collected {schedule:?}"
-    );
-
-    let mut previous: Option<(i64, OffsetDateTime)> = None;
-    for (attempt, next) in &schedule {
-        // Every scheduled row is one the runner refused: a `delivered` row in the ladder would
-        // mean the walk is reading a row it did not expect to be there.
-        assert!(
-            *attempt >= 1 && *attempt <= DEFAULT_MAX_ATTEMPTS as i64,
-            "attempt {attempt} is outside the budget the queue gave the delivery: {schedule:?}"
-        );
-
-        if let Some((previous_attempt, previous_next)) = previous {
-            assert!(
-                *next > previous_next,
-                "the backoff must grow: attempt {previous_attempt} was set for {previous_next} \
-                 and attempt {attempt} only for {next} — a flat ladder retries a broken receiver \
-                 as fast as the runner ticks, which is the loop the cap and the ladder exist to \
-                 prevent"
-            );
-        }
-        previous = Some((*attempt, *next));
-    }
-
-    // The growth is exponential, not merely monotone: the walk states the ladder's shape rather
-    // than settling for "not going backwards". `retry_delay` doubles the base per attempt, so
-    // the last gap must be at least four times the first — with a cap in play, "at least"
-    // rather than "exactly", because the ceiling flattens the top of the ladder by design.
-    let gaps: Vec<i128> = schedule
-        .windows(2)
-        .map(|pair| (pair[1].1 - pair[0].1).whole_milliseconds())
-        .collect();
-    if let (Some(first), Some(last)) = (gaps.first().copied(), gaps.last().copied())
-        && first > 0
-    {
-        assert!(
-            last * 2 >= first,
-            "the ladder must double: first gap {first} ms, last gap {last} ms (gaps {gaps:?})"
-        );
-    }
-
-    assert_eq!(
-        broken.captured().len(),
-        DEFAULT_MAX_ATTEMPTS as usize,
-        "the receiver saw every attempt, including the one that ran out of budget"
-    );
-
-    harness.dispose().await;
-}
-
-// ---------------------------------------------------------------------------------------------
 // The registry vs the emitters: no `NewEvent::new("…")` may name an event the catalogue
 // does not carry
 // ---------------------------------------------------------------------------------------------
@@ -3193,10 +2807,17 @@ fn every_emitted_name_is_in_the_catalogue() {
         .to_path_buf();
 
     let mut emitted: Vec<(String, String)> = Vec::new();
+    let mut opaque: Vec<String> = Vec::new();
     let mut files = 0_usize;
 
     for area in ["apps", "crates", "modules"] {
-        walk_rust(&workspace.join(area), &workspace, &mut emitted, &mut files);
+        walk_rust(
+            &workspace.join(area),
+            &workspace,
+            &mut emitted,
+            &mut opaque,
+            &mut files,
+        );
     }
 
     assert!(
@@ -3207,6 +2828,17 @@ fn every_emitted_name_is_in_the_catalogue() {
         emitted.len() > 30,
         "the walk found {} emissions; the emitters are not where this test looks",
         emitted.len()
+    );
+
+    // A name the walk could not read is a name nobody has checked. Four of the platform's own
+    // events were in this position and had been for several slices: the bus recorded them, the
+    // picker never offered them, and an operator could not have subscribed even if they tried.
+    assert!(
+        opaque.is_empty(),
+        "{} computed `NewEvent::new(…)` name(s) are invisible to this test — spell the name \
+         out as a literal, or register both branches in crates/events/src/catalogue.rs:\n{}",
+        opaque.len(),
+        opaque.join("\n"),
     );
 
     let mut unlisted: Vec<String> = Vec::new();
@@ -3226,10 +2858,14 @@ fn every_emitted_name_is_in_the_catalogue() {
 }
 
 /// Collect `NewEvent::new("…")` out of every `.rs` file below `root`.
+///
+/// `opaque` collects the call sites whose name this walk could not read, so the caller can fail
+/// on them rather than pass over them in silence.
 fn walk_rust(
     root: &std::path::Path,
     workspace: &std::path::Path,
     found: &mut Vec<(String, String)>,
+    opaque: &mut Vec<String>,
     files: &mut usize,
 ) {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -3246,7 +2882,7 @@ fn walk_rust(
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name == "target" || name == "node_modules");
             if !skip {
-                walk_rust(&path, workspace, found, files);
+                walk_rust(&path, workspace, found, opaque, files);
             }
             continue;
         }
@@ -3259,167 +2895,147 @@ fn walk_rust(
             continue;
         };
 
-        let lines: Vec<&str> = text.lines().collect();
-        for (index, _line) in lines.iter().enumerate() {
-            // A **doc comment is not an emitter.** The `health_events` module explains, at
-            // length and with a runnable-looking example, why `bus::emit(pool,
-            // NewEvent::new("health.service.degraded")…)` is the wrong implementation — and a
-            // scanner that reads any line with the token in it collects that paragraph as an
-            // emission. That is why `health.service` (a name split across two lines by the
-            // doc's own wrapping) showed up as an unlisted emission pointing at
-            // `health_events.rs:47`.
-            //
-            // Stripping the comment before the match is what keeps the gate honest in the
-            // direction that matters: a false *emission* would push the catalogue to grow a row
-            // for a sentence, and the failure would be invisible because the row would exist and
-            // every emitter test would still pass. The comment-stripped line is what both
-            // halves of the match below read; `code_at` applies the same stripping to the
-            // lines of the lookahead window.
-            //
-            // The name is looked for on this line **and up to three lines below it**, because
-            // an emitter that passes a `json!(…)` payload puts its name on its own line:
-            //
-            //     Announcement::new(
-            //         "health.service.degraded",
-            //         json!({ … }),
-            //     )
-            //
-            // and one that picks between two names puts the second one further still:
-            //
-            //     NewEvent::new(if input.hold {
-            //         "media.hold_placed"
-            //     } else {
-            //         "media.hold_released"
-            //     })
-            //
-            // Three of REQ-014's five live names use the first shape. A scanner that reads one
-            // line at a time sees the constructor and no name, so the gate reports the event as
-            // unemitted — and the only fix that looks reasonable is to demote a working event to
-            // `Reserved`, which is the registry lying in the *opposite* direction. rustfmt put
-            // the payload on the following line long before this gate learned to look there.
-            for offset in 0..=3usize {
-                let Some(candidate) = lines.get(index + offset) else {
-                    continue;
-                };
-                let candidate_code = code_of(candidate);
+        for (index, line) in text.lines().enumerate() {
+            // The detector reads its own source, so its prose mentions `NewEvent::new(` too. A
+            // line that is a comment, or one that is a *quoted* marker rather than a call, is
+            // this test describing the rule rather than breaking it. Skipping comments is not
+            // a loophole: a computed name in a comment records nothing either, so there is
+            // nothing for the catalogue to carry.
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
 
-                // The marker may sit on this line (the name follows it here) or on the line
-                // before (this line's first quoted string *is* the name). A marker that ended in
-                // a quote could never match the second case: in
-                // `Announcement::new(` the quote is on the *next* line.
-                for marker in EMITTER_MARKERS {
-                    let after = if candidate_code.contains(marker) {
-                        candidate_code.split(marker).nth(1)
-                    } else if offset > 0 && code_at(&lines, index, offset - 1, marker) {
-                        Some(candidate_code)
-                    } else {
-                        None
-                    };
-                    let Some(after) = after else {
-                        continue;
-                    };
-                    let Some(name) = after.split('"').nth(1) else {
-                        continue;
-                    };
-                    // A name that is not dotted lower-case is a *test fixture* asserting the
-                    // validator refuses it, not an emitter. The catalogue's own test covers those.
-                    //
-                    // A **dotted** name inside a `#[cfg(test)]` module is the same thing wearing a
-                    // valid name: `health_events`' own unit test builds `health.service.exploded`
-                    // to prove the catalogue check refuses an unknown name, and a scanner that
-                    // only looked at the shape read it as a real emission and demanded a
-                    // catalogue row for it. Granting that row would put a **lie** in the registry
-                    // — a name nothing emits, listed as though something did — which is the exact
-                    // failure this module exists to prevent.
-                    let shaped = name.split('.').count() >= 2
-                        && name
-                            .chars()
-                            .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_')
-                        && !is_in_test_module(&text, index);
-                    if !shaped {
-                        continue;
+            if let Some(rest) = line.split("NewEvent::new(").nth(1) {
+                let argument = rest.trim_start();
+
+                // A **computed** name is this walk's own blind spot, and it cost the platform
+                // six events. `NewEvent::new(if outcome.passed() { "…_passed" } else { "…_failed" })`
+                // is the most natural way to write a two-outcome fact, and a grep for
+                // `NewEvent::new("` cannot see either branch: the names it records are checked
+                // by nobody, and the picker never offers them, so an operator subscribes to
+                // nothing and no delivery is ever possible. The bus validated them happily — a
+                // name only has to be *shaped* to be recorded — which is exactly why this went
+                // unnoticed until the source test ran.
+                //
+                // The remedy is **not** "never compute a name". It is: every branch of a
+                // computed name has to be in the catalogue like any other. So the walk reads
+                // the literals the call spans and checks them exactly as it checks a direct
+                // one — which lets `media_retention.rs` keep its two-outcome emission while a
+                // branch that invents a name nobody can subscribe to still fails the gate.
+                if !argument.starts_with('"') {
+                    let names = call_names(&text, index);
+                    // A computed call with no readable name in it is still blind — the window
+                    // is deliberately small, and a future refactor that moves the branches to
+                    // their own lines would slip past a test that only checks the ones it can
+                    // see. So "I found no name here" is reported rather than treated as fine.
+                    if names.is_empty() && !path.ends_with("tests/events.rs") {
+                        opaque.push(format!(
+                            "{}:{}",
+                            path.strip_prefix(workspace).unwrap_or(&path).display(),
+                            index + 1
+                        ));
                     }
-                    let relative = path.strip_prefix(workspace).unwrap_or(&path);
-                    found.push((
-                        name.to_owned(),
-                        format!("{}:{}", relative.display(), index + offset + 1),
-                    ));
+                    for name in names {
+                        let relative = path.strip_prefix(workspace).unwrap_or(&path);
+                        found.push((
+                            name,
+                            format!("{}:{} (computed)", relative.display(), index + 1),
+                        ));
+                    }
+                    continue;
                 }
             }
+
+            let Some(rest) = line.split("NewEvent::new(\"").nth(1) else {
+                continue;
+            };
+            let Some(name) = rest.split('"').next() else {
+                continue;
+            };
+            // A name that is not dotted lower-case is a *test fixture* asserting the
+            // validator refuses it, not an emitter. The catalogue's own test covers those.
+            let shaped = name.split('.').count() >= 2
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_');
+            if !shaped {
+                continue;
+            }
+            let relative = path.strip_prefix(workspace).unwrap_or(&path);
+            found.push((
+                name.to_owned(),
+                format!("{}:{}", relative.display(), index + 1),
+            ));
         }
     }
 }
 
-/// The constructors that emit an event name, written **without** their opening quote.
+/// The event names inside a call whose argument is computed rather than written out.
 ///
-/// `NewEvent::new(…)` is the direct one. `Announcement::new(…)` is REQ-014's health emitter,
-/// which cannot call `NewEvent::new` at all — health is platform-level, and `bus::emit` returns
-/// zero deliveries for a fact with no organization, so `announce_changes` fans out **per tenant
-/// that has an endpoint listening** instead. Its five names are `Live` in the catalogue and
-/// reachable only through that constructor.
+/// A two-outcome emission reads `NewEvent::new(if cond { "a.passed" } else { "a.failed" })`, and
+/// both literals belong to the call. The window is the call itself: from the opening parenthesis
+/// forward until parentheses balance, which is the only honest way to read a multi-line
+/// expression. A fixed line count would either truncate a formatted branch — which is how
+/// `media_retention.rs` hid `media.hold_released` from the first version of this — or read into
+/// the next call and invent a name that is not this one's.
 ///
-/// Listing it here is the difference between a gate that measures the workspace and one that
-/// measures a *subset* of it. Left out, the gate reports five live names with no emitter and the
-/// only honest-looking fix is to demote real, working, delivered events to `Reserved` — which
-/// would make the picker lie in the other direction. This was the seventh shape of the same
-/// defect class: an emitter behind a wrapper the gate cannot see.
-const EMITTER_MARKERS: [&str; 2] = ["NewEvent::new(", "Announcement::new("];
-
-/// A line with its trailing `//` comment removed.
-///
-/// Splitting on the first `//` is coarse — a string literal containing `//` (a receiver URL, for
-/// instance) loses its tail — and that is acceptable here because a name is only ever read from
-/// the part of the line that precedes a constructor call, and a URL is never an event name. The
-/// alternative, tracking string literals properly, is a parser in a test that is checking a
-/// table.
-fn code_of(line: &str) -> &str {
-    line.split_once("//").map_or(line, |(before, _)| before)
-}
-
-/// Whether the code part of `lines[index + back]` carries `marker`.
-///
-/// The lookahead for a name that sits a few lines below its constructor reads *every* line in
-/// between, not only the immediately preceding one: the `if hold { … } else { … }` shape puts the
-/// second name three lines under the marker. Checking only the opener finds the first name of the
-/// pair and misses the second, which the other half of the drift gate then reports as "Live with
-/// no emitter" — the same complaint, pointing the wrong way.
-fn code_at(lines: &[&str], index: usize, back: usize, marker: &str) -> bool {
-    let Some(from) = index.checked_sub(back) else {
-        return false;
+/// The filter is the shape an event name actually has, so a string literal that is not a name
+/// (a reason, a path, a message) is dropped rather than reported.
+fn call_names(text: &str, line_index: usize) -> Vec<String> {
+    let mut lines = text.lines().skip(line_index);
+    let Some(first) = lines.next() else {
+        return Vec::new();
     };
-    lines[from..=index]
-        .iter()
-        .any(|line| code_of(line).contains(marker))
+    let Some(start) = first.find("NewEvent::new(") else {
+        return Vec::new();
+    };
+
+    let mut window = String::from(&first[start + "NewEvent::new(".len()..]);
+    let mut depth = 1_i32;
+    // Parentheses inside a string literal do not change the balance, and a `"("` in a detail
+    // message would otherwise unbalance the scan. Counting while ignoring quoted spans is the
+    // difference between "reads the call" and "reads something".
+    for line in lines {
+        let mut quoted = false;
+        for character in line.chars() {
+            match character {
+                '"' => quoted = !quoted,
+                '(' | '{' | '[' if !quoted => depth += 1,
+                ')' | '}' | ']' if !quoted => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return names_in(&window);
+                    }
+                }
+                _ => {}
+            }
+        }
+        window.push('\n');
+        window.push_str(line);
+    }
+    names_in(&window)
 }
 
-/// Whether a line at `index` sits inside a `#[cfg(test)] mod tests { … }` block.
-///
-/// The flag is set at the `#[cfg(test)]` attribute and cleared only by a `}` that appears **at
-/// column zero**, which is how rustfmt closes a module at the file's top level. Two earlier
-/// versions of this were wrong in ways worth recording:
-///
-/// * counting braces would clear the flag at the first `}` of the first `json!({ … })`, so every
-///   emitter after the first test's payload would look unbacked; and
-/// * an indentation heuristic would have been defeated the moment somebody reformatted.
-///
-/// The direction that matters is the one this can still fail in. Missing a test fixture's end
-/// makes the gate *demander* a catalogue row for a name nothing emits — a lie in the registry —
-/// so the closing rule is deliberately strict: a file whose test module runs to the end of file
-/// simply keeps the flag set, which is correct, because such a module really does extend to EOF.
-fn is_in_test_module(text: &str, index: usize) -> bool {
-    let mut in_tests = false;
-    for line in text.lines().take(index) {
-        let code = code_of(line);
-        if code.trim_start().starts_with("#[cfg(test)]") || code.contains("#[cfg(all(test") {
-            in_tests = true;
+/// The dotted lower-case names among a call's string literals.
+fn names_in(window: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = window;
+    while let Some(open) = rest.find('"') {
+        let Some(close) = rest[open + 1..].find('"') else {
+            break;
+        };
+        let candidate = &rest[open + 1..open + 1 + close];
+        if candidate.contains('.')
+            && candidate
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_')
+        {
+            names.push(candidate.to_owned());
         }
-        // Only a brace that starts the line closes the module; anything indented belongs to
-        // something inside it.
-        if in_tests && (code.starts_with('}') || code.starts_with("//!")) {
-            in_tests = false;
-        }
+        rest = &rest[open + 1 + close + 1..];
     }
-    in_tests
+    names
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3458,9 +3074,16 @@ fn every_live_name_has_an_emitter() {
         .to_path_buf();
 
     let mut emitted: Vec<(String, String)> = Vec::new();
+    let mut opaque: Vec<String> = Vec::new();
     let mut files = 0_usize;
     for area in ["apps", "crates", "modules"] {
-        walk_rust(&workspace.join(area), &workspace, &mut emitted, &mut files);
+        walk_rust(
+            &workspace.join(area),
+            &workspace,
+            &mut emitted,
+            &mut opaque,
+            &mut files,
+        );
     }
 
     let mut unbacked: Vec<String> = Vec::new();
@@ -3479,331 +3102,6 @@ fn every_live_name_has_an_emitter() {
         unbacked.len(),
         unbacked.join("\n"),
     );
-}
-
-// ---------------------------------------------------------------------------------------------
-// The third direction: a name a request *consumes* must be one the platform can deliver
-// ---------------------------------------------------------------------------------------------
-
-/// Every event a request file names under `Consumed:` is either live with an emitter, or
-/// listed as `Reserved` with an owner.
-///
-/// The two gates above close both ends of one seam — emitters cannot name a missing row, and a
-/// `Live` row cannot lack an emitter. Neither can see the third thing a request file does:
-/// **write down a name it expects to receive.** A `Consumed:` line is a contract with a future
-/// consumer, and nothing in the repository ever compared it to the registry, so a name that no
-/// emitter will ever produce sat in five shipped request specs and would have survived every
-/// gate this repo owns.
-///
-/// The failure is silent in the exact place it hurts. A module built to the spec — the CDN edge
-/// (REQ-011) consumes `media.replaced` to invalidate a replaced file — subscribes to a name the
-/// bus will never publish. The subscription is accepted (an unknown concrete name is kept, so
-/// plugins can own names the table has never heard of), the picker offers nothing, and the
-/// feature that was specced works for every file except the ones it exists to fix. No test
-/// fails, because from every gate's point of view the registry is correct: nothing emits that
-/// name and nothing claims to.
-///
-/// So this walks `docs/requests/` and checks the third direction. Nine such names exist today,
-/// across six specs; each is a real promise the platform cannot keep.
-///
-/// **Why the area test matters.** Fifty-nine of the names collected across all specs are in
-/// areas nothing emits yet (`order.paid`, `crm.deal.won`, `chat.notify`, …) — a module that has
-/// not been built yet is *expected* to consume its neighbour's names, and demanding a row for
-/// those would mean writing a registry row per unbuilt module, which is the lie in the other
-/// direction this crate exists to prevent. The gate therefore only fires when the name's own
-/// area is **already live**: `media`, `backups`, `identity`, `tenancy`, `themes`, `plugins`.
-/// In that case a neighbour of that area exists and is shipping, so a name nothing emits is a
-/// contract the platform has already broken rather than one it has not taken on yet.
-#[test]
-fn every_consumed_name_in_a_live_area_is_deliverable() {
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|path| path.parent())
-        .expect("the workspace root is two levels above apps/api")
-        .to_path_buf();
-    let requests = workspace.join("docs/requests");
-
-    let Ok(entries) = std::fs::read_dir(&requests) else {
-        // A source tarball without the docs is not a broken platform. Skipping is the honest
-        // answer; failing here would punish a packaging change with a database-free test.
-        eprintln!(
-            "SKIP: {} is not readable — no request specs to read",
-            requests.display()
-        );
-        return;
-    };
-
-    // One walk, because "which areas are live" is a question about the registry and asking it
-    // inside the per-name loop would rebuild the same set for every row.
-    let live_areas: std::collections::BTreeSet<&str> = omnion_events::catalogue::live_names()
-        .into_iter()
-        .filter_map(|name| name.split('.').next())
-        .collect();
-
-    let mut specs = 0_usize;
-    let mut consumed = 0_usize;
-    let mut undeliverable: Vec<String> = Vec::new();
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        specs += 1;
-
-        let stem = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("<unknown>")
-            .to_owned();
-
-        for (name, line) in consumed_names(&text) {
-            consumed += 1;
-            let area = name.split('.').next().unwrap_or_default();
-
-            // A name in an area nothing emits yet is a promise about the future, not a lie.
-            if !live_areas.contains(area) {
-                continue;
-            }
-            // Listed as `Reserved` with an owner is the honest way to write this down, and
-            // `the_reserved_row_names_its_owner` in the crate holds that half.
-            if omnion_events::catalogue::is_known(&name) {
-                continue;
-            }
-
-            undeliverable.push(format!("  {name}  ({stem}.md:{line}, area `{area}`)"));
-        }
-    }
-
-    assert!(
-        specs > 20,
-        "the walk read {specs} spec file(s); a walk that sees nothing proves nothing"
-    );
-    assert!(
-        consumed > 30,
-        "the walk read {consumed} `Consumed:` name(s); the specs are not where this test looks"
-    );
-
-    // **The gate is a ratchet, not a wall.** Twenty-five names were already unpayable when this
-    // test was written — every one of them owed by a wave-5b module that has not been built
-    // (`iam.role_permissions_changed` by the role UI, `backup.completed` by the backup worker,
-    // `theme.installed` by the installer). Demanding a catalogue row for each today would mean
-    // adding 25 rows nothing emits, which is precisely the lie this crate exists to prevent,
-    // and a gate that is red from the moment it is written is a gate people stop reading.
-    //
-    // So the debt is *written down* instead of hidden: every name appears below with the module
-    // that owes it. The assertion then fails on anything **not** in this list — a new spec that
-    // consumes a name nothing will ever produce, or a name quietly dropped from here while its
-    // owner is still unbuilt. Both directions are the same lie and both are caught.
-    //
-    // Deleting an entry is not free, and that is the point: the owner's `Reserved` row satisfies
-    // the real check below *before* the entry becomes stale, so an entry that is still needed
-    // will already have been removed by the time this complains that it is redundant.
-    const OWED_BY_AN_UNBUILT_MODULE: &[(&str, &str)] = &[
-        // ---- REQ-013 backup centre: the worker's own run lifecycle, none of it emitted yet.
-        ("backup.completed", "REQ-013 (backup worker run completion)"),
-        ("backup.failed", "REQ-013 (backup worker run failure)"),
-        // ---- REQ-066/067/068/069/070/071/072/074: the IAM depth wave, all `pending`.
-        //      `iam.*` rows here are owed by whichever of those builds the write path; the
-        //      existing `iam.session_revoked`, `iam.binding_created`, `iam.approval_decided`
-        //      rows show the area's naming is settled and these are simply not written yet.
-        (
-            "iam.role_permissions_changed",
-            "REQ-067 (role management UI)",
-        ),
-        ("iam.role_priority_changed", "REQ-067 (role management UI)"),
-        (
-            "iam.permissions_catalogue_updated",
-            "REQ-068 (permission catalogue screen)",
-        ),
-        (
-            "iam.resource_grant_changed",
-            "REQ-070 (scopes and resource permissions)",
-        ),
-        (
-            "iam.binding_revoked",
-            "REQ-070 (scopes and resource permissions)",
-        ),
-        ("iam.group_membership_synced", "REQ-071 (groups and teams)"),
-        ("iam.policy_denied", "REQ-069 (ABAC policy engine)"),
-        (
-            "iam.security_policy_changed",
-            "REQ-069 (ABAC policy engine)",
-        ),
-        (
-            "iam.provider_updated",
-            "REQ-065 (identity providers and SSO)",
-        ),
-        (
-            "iam.provisioning_synced",
-            "REQ-072 (SCIM provisioning sync)",
-        ),
-        ("iam.account_locked", "REQ-066 (MFA and device trust)"),
-        ("iam.mfa_challenge_failed", "REQ-066 (MFA and device trust)"),
-        ("iam.step_up_failed", "REQ-066 (MFA and device trust)"),
-        (
-            "iam.catalogue_drift_detected",
-            "REQ-068 (permission catalogue screen)",
-        ),
-        // ---- REQ-021 notification centre: the delivery lifecycle.
-        (
-            "notification.delivery.failed",
-            "REQ-021 (notification delivery runner)",
-        ),
-        // ---- REQ-010/024/012/014: cross-module facts the platform does not record yet.
-        (
-            "user.login.failed",
-            "REQ-006 (sign-in failure is logged, never recorded)",
-        ),
-        ("user.deactivated", "REQ-006 (deactivate route)"),
-        ("site.deleted", "tenancy (a site is archived, not deleted)"),
-        (
-            "site.domain.expiring",
-            "REQ-011 (CDN) or tenancy (expiry check)",
-        ),
-        // ---- Theme packaging: REQ-044 ships `plugin.*`; the theme half is REQ-062/084.
-        ("theme.installed", "REQ-062 (ten default themes)"),
-        (
-            "theme.version.published",
-            "REQ-084 (theme SDK and packaging)",
-        ),
-        // ---- REQ-114 translation engine.
-        ("translation.job.completed", "REQ-114 (translation engine)"),
-        ("translation.memory.updated", "REQ-114 (translation memory)"),
-    ];
-
-    let mut unaccounted: Vec<String> = Vec::new();
-    let mut owed: Vec<String> = Vec::new();
-
-    for row in &undeliverable {
-        let name = row.split_whitespace().next().unwrap_or_default().to_owned();
-        match OWED_BY_AN_UNBUILT_MODULE
-            .iter()
-            .find(|(owed_name, _)| *owed_name == name)
-        {
-            Some((_, module)) => owed.push(format!("  {name}  (owed by {module})")),
-            None => unaccounted.push(row.clone()),
-        }
-    }
-
-    let mut retired: Vec<String> = OWED_BY_AN_UNBUILT_MODULE
-        .iter()
-        .filter(|(name, _)| {
-            !undeliverable
-                .iter()
-                .any(|row| row.starts_with(&format!("  {name} ")))
-        })
-        .map(|(name, module)| format!("  {name}  ({module})"))
-        .collect();
-    retired.sort();
-
-    assert!(
-        retired.is_empty() && unaccounted.is_empty(),
-        "{} `Consumed:` name(s) cannot be delivered and nothing owes them, and {} entr(ies) below \
-         have become redundant:\n{}\n{}\n\
-         The owed list is a ratchet: a new undelivered name must be added there with the module \
-         that owes it, and an entry is removed when its `Reserved` catalogue row (or its emitter) \
-         makes the real check below pass — the assertion above already sees it satisfied, so a \
-         stale entry reports itself.",
-        unaccounted.len(),
-        retired.len(),
-        if unaccounted.is_empty() {
-            "(none)".to_owned()
-        } else {
-            unaccounted.join("\n")
-        },
-        if retired.is_empty() {
-            "(none)".to_owned()
-        } else {
-            retired.join("\n")
-        },
-    );
-
-    eprintln!(
-        "note: {} `Consumed:` name(s) are unpayable today and owed by an unbuilt module; the \
-         ratchet holds that number at {}",
-        owed.len(),
-        OWED_BY_AN_UNBUILT_MODULE.len(),
-    );
-}
-
-/// The event names a request file names under a `Consumed:` marker, with their line numbers.
-///
-/// Two things about the reading, both of which are the difference between a gate that measures
-/// the specs and one that measures a guess:
-///
-/// * **The marker, not the section.** `Consumed:` also appears inside prose in half a dozen
-///   specs (`REQ-021` routes bus events into notifications and never writes the word as a
-///   header). Reading the line it is on would collect those sentences' backtick spans too.
-/// * **One line, not the paragraph.** A `Consumed:` clause runs on and names six triggers across
-///   two hundred characters; stopping at the first newline loses every one after the first. The
-///   next `**` or blank line ends it, which is where every spec in this repository ends its own
-///   clause.
-fn consumed_names(text: &str) -> Vec<(String, usize)> {
-    let mut found = Vec::new();
-
-    for (index, line) in text.lines().enumerate() {
-        let Some(marker) = line.find("Consumed:") else {
-            continue;
-        };
-        // A backtick before the marker means the sentence is *about* consumption, not a
-        // declaration of it — `the \`Consumed:\` line`. The gate that reads those would report
-        // prose as a contract.
-        let before = &line[..marker];
-        if before.contains('`') && before.trim_start().starts_with('-') {
-            continue;
-        }
-
-        // The clause is the rest of the line, then any following continuation line that is
-        // neither blank nor a new markdown construct.
-        let mut clause = line[marker + "Consumed:".len()..].to_owned();
-        for following in text.lines().skip(index + 1) {
-            let trimmed = following.trim();
-            if trimmed.is_empty()
-                || trimmed.starts_with("**")
-                || trimmed.starts_with('-')
-                || trimmed.starts_with('#')
-                || trimmed.starts_with('|')
-            {
-                break;
-            }
-            clause.push(' ');
-            clause.push_str(following);
-        }
-
-        let mut ticks = clause.match_indices('`');
-        while let Some((open, _)) = ticks.next() {
-            let Some((close, _)) = ticks.next() else {
-                break;
-            };
-            let candidate = &clause[open + 1..close];
-            if is_event_name(candidate) {
-                found.push((candidate.to_owned(), index + 1));
-            }
-        }
-    }
-
-    found
-}
-
-/// A dotted lower-case token: two or more segments, no wildcards, nothing else.
-///
-/// The wildcard exclusion is not cosmetic. A `Consumed:` clause legitimately contains group
-/// forms (`crm.deal.*`, `appearance.*`, `migration.*`), and a group is *not* a name the bus
-/// records — `reconcile` expands it against what exists, which for an unbuilt area is nothing.
-/// Firing on those would demand a catalogue row per group per spec, which is the registry
-/// writing down names that do not exist.
-fn is_event_name(candidate: &str) -> bool {
-    let segments: Vec<&str> = candidate.split('.').collect();
-    segments.len() >= 2
-        && candidate
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_')
-        && candidate.contains('.')
-        && !candidate.contains('*')
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -385,10 +385,37 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
         Some(0),
         "a fresh organization has no provider"
     );
-    assert_eq!(
-        empty.body["kinds"].as_array().map(Vec::len),
-        Some(3),
-        "the form offers exactly the three protocols the platform speaks"
+    // The catalogue grew when directory support landed: `0051` widened the `kind` check from
+    // three protocols to five kinds, because a directory is not a protocol and refusing one here
+    // would have made the whole LDAP/AD half unreachable. The assertion is on the *contents*,
+    // not a count — a count is a thing that silently rots the next time a kind is added, which
+    // is the opposite of what a test is for. Each entry is an object (`value`, `label`, `family`),
+    // so the assertion reads `value`: the panel's picker keys off that and nothing else.
+    let kinds: Vec<&str> = empty.body["kinds"]
+        .as_array()
+        .expect("the form is told which kinds exist")
+        .iter()
+        .filter_map(|kind| kind["value"].as_str())
+        .collect();
+    for expected in ["ldap", "active_directory", "oidc", "oauth2", "saml"] {
+        assert!(
+            kinds.contains(&expected),
+            "`{expected}` is a kind this platform speaks and the form must offer it: {kinds:?}"
+        );
+    }
+    // And the families are the reason the panel groups its form: a directory is a live
+    // connection with a service account, not a redirect, so it must not sit under "protocol".
+    let directory_family: Vec<&str> = empty.body["kinds"]
+        .as_array()
+        .expect("kinds")
+        .iter()
+        .filter(|kind| matches!(kind["value"].as_str(), Some("ldap" | "active_directory")))
+        .filter_map(|kind| kind["family"].as_str())
+        .collect();
+    assert!(
+        directory_family.iter().all(|family| *family == "directory"),
+        "the directory kinds are grouped as directories, so the wizard never offers them an \
+         OAuth scope: {directory_family:?}"
     );
 
     // ---- 2. Connect a provider; it is created switched off, and JIT off ---------------------
@@ -798,9 +825,23 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     );
 
     // ---- 13. An ambiguous public sign-in is refused rather than guessed ---------------------
-    // The database holds several organizations at this point, so a host that belongs to none of
-    // them cannot be resolved to one. Guessing would let a sign-in link for one tenant complete
-    // against another, so the answer names the fix instead.
+    // The refusal only exists on a **multi-organization** installation: with exactly one, the
+    // sign-in knows its organization without asking anybody, and the walk's fixture makes exactly
+    // one. This assertion therefore failed red on a fresh database and passed on a developer's
+    // machine that happened to hold a second tenant — a test whose truth depends on what else
+    // happens to be in the database is a test that measures the database, not the code.
+    //
+    // So the walk *creates* the second organization rather than assuming one. That also makes the
+    // refusal reachable on CI, which is the only place a missing premise is ever noticed.
+    let second_organization: Uuid = sqlx::query_scalar(
+        "insert into organizations (name, slug) values ($1, $2) returning id",
+    )
+    .bind("Second Test Organization")
+    .bind(format!("sso-second-{}", Uuid::new_v4().simple()))
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("a second organization must be created for the ambiguity to exist");
+
     let ambiguous = call(
         &fixture.state,
         public_request(
@@ -820,6 +861,18 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     assert_eq!(
         ambiguous.body["error"]["code"],
         json!("organization_required")
+    );
+
+    // …and the premise is asserted rather than assumed, so a fixture that stopped creating the
+    // second tenant would fail here with a sentence instead of confusing the next reader.
+    let organizations: i64 = sqlx::query_scalar("select count(*) from organizations")
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the count must run");
+    assert!(
+        organizations > 1,
+        "the ambiguity above is only meaningful with more than one organization, and there are \
+         {organizations}"
     );
 
     // The resolved host still works, so the refusal is about the host and not about the route.
@@ -858,7 +911,11 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
             }),
         )
         .await;
-    call(
+    // The reconnection is switched on the way a working installation would: tested first. The
+    // gate refuses an untested provider — including one whose issuer is an `.invalid` host that
+    // cannot answer — so this walk asserts the gate rather than routing around it, and the
+    // discovery failure below is then reached through a *marked* row rather than a live one.
+    let enable = call(
         &fixture.state,
         request(
             Method::PATCH,
@@ -868,7 +925,57 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
         ),
     )
     .await;
+    assert_eq!(
+        enable.status,
+        StatusCode::BAD_REQUEST,
+        "an untested provider cannot be switched on, and the refusal names the reason: {}",
+        enable.body
+    );
+    assert_eq!(enable.body["error"]["code"], json!("provider_not_ready"));
 
+    // A test against an unreachable issuer is `incomplete`, not `ok` — a sound configuration with
+    // a host that does not resolve is a configuration that has not been proven, and reporting it
+    // as a pass is exactly what would let the gate be satisfied by a form nobody filled in.
+    let untested = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/iam/providers/{reconnected}/test"),
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(untested.status, StatusCode::OK, "test: {}", untested.body);
+    assert_ne!(
+        untested.body["status"],
+        json!("ok"),
+        "discovery against an unresolvable issuer must never report a pass: {}",
+        untested.body
+    );
+
+    // And the gate still holds after a test that did not pass: a `partial` result is not a pass.
+    let still_off = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/iam/providers/{reconnected}"),
+            Some(&cookie),
+            Some(json!({ "enabled": true })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        still_off.status,
+        StatusCode::BAD_REQUEST,
+        "a test that did not pass leaves the provider off: {}",
+        still_off.body
+    );
+    assert_eq!(still_off.body["error"]["code"], json!("provider_not_ready"));
+
+    // The start route is therefore asked about a provider that is *off*. It answers `404` with
+    // the same code as an unknown provider: the sign-in surface must not let somebody discover
+    // which provider slugs exist by watching which ones say "switched off".
     let redirect = call(
         &fixture.state,
         public_request(
@@ -879,28 +986,23 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
         ),
     )
     .await;
-    assert!(
-        matches!(redirect.status, StatusCode::FOUND | StatusCode::BAD_GATEWAY),
-        "a provider that cannot be discovered answers a refusal, never a redirect to nowhere: {}",
+    assert_eq!(
+        redirect.status,
+        StatusCode::NOT_FOUND,
+        "an unreachable, unproven provider is refused at the start route: {}",
         redirect.body
     );
-    if let Some(location) = redirect.location.as_deref() {
-        // Only reached when the discovery document *was* readable (a local stub in a future
-        // extension of this walk); then the URL must carry our own parameters.
-        assert!(
-            location.contains("client_id=omnion-workspace"),
-            "{location}"
-        );
-        assert!(
-            location.contains("state="),
-            "the challenge must ride the URL: {location}"
-        );
-        assert!(
-            location.contains("code_challenge="),
-            "PKCE must ride it too: {location}"
-        );
-    }
-
+    assert_eq!(
+        redirect.body["error"]["code"],
+        json!("provider_disabled"),
+        "and the refusal names the cause for the operator while the status stays indistinguishable \
+         from an unknown provider"
+    );
+    assert!(
+        redirect.location.is_none(),
+        "and it never redirects: a redirect into a discovery that cannot answer is how a sign-in \
+         ends on a provider's own error page"
+    );
     // A `return_to` outside the known panel paths is dropped rather than followed: the callback
     // must not be able to become an open redirect.
     let foreign = call(
@@ -936,6 +1038,196 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     assert!(
         !html.contains("evil.example"),
         "the SAML page must sanitise its return path too"
+    );
+
+    // The second organization is deleted explicitly rather than left to a sweep: it is the only
+    // row this walk creates outside its own fixture, and a test that leaves the database in a
+    // state its own next run depends on has made its result depend on run order.
+    sqlx::query("delete from organizations where id = $1")
+        .bind(second_organization)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the second organization must be removable");
+
+    fixture.cleanup().await;
+}
+
+/// The local-password half of the local-sign-in invariant, against an account that has none.
+///
+/// `sso_attribute_map.rs` proves the *provider-shaped* half: a provider with no attribute map
+/// still signs people in. This file proves the half that was still unproven, and it is the half
+/// that hurts: **an account created by a provider must not be able to come in through the
+/// password form**, because it has no password — and the answer to a wrong password there has to
+/// be the same `invalid_credentials` a typo against a local account gets.
+///
+/// The shape of the account is what makes this worth a walk rather than a unit test. A JIT row
+/// stores the literal `!jit:no-password` in `password_hash`, which is not an Argon2 hash, so the
+/// password verifier cannot parse it. A verifier that is handed an unparseable hash has two
+/// honest options — refuse, or burn the same work and refuse — and the difference between them is
+/// what a person sees: a `401` naming the wrong password, or a `500` that says the server is
+/// broken. Worse, the `500` is a **tell**: an address that answers `401` has a local account and
+/// an address that answers `500` is an SSO account, which turns the password form into a way to
+/// enumerate the directory.
+///
+/// So the walk asserts the refusal a person would see, twice — once for the JIT account and once
+/// for the local owner — and then asserts the two answers are *identical*, because "a password
+/// form tells you which addresses are local" is the whole failure this guards against.
+#[tokio::test]
+async fn a_provisioned_account_refuses_a_local_password_like_any_other() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let cookie = fixture.owner_session().await;
+
+    // A provider that provisions on first sight, and one signed-in identity it has never met.
+    let provider_id = fixture
+        .connect(
+            &cookie,
+            json!({
+                "slug": "local-invariant",
+                "kind": "oidc",
+                "name": "Local Invariant Provider",
+                "config": { "client_id": "local-invariant-client" },
+                "group_claim": "groups",
+                "jit_enabled": true,
+            }),
+        )
+        .await;
+    let provider = omnion_identity::sso::providers::find_provider(fixture.db.pool(), provider_id)
+        .await
+        .expect("the provider must be readable")
+        .expect("the provider exists");
+    // The address is unique per run, like this file's owner address, and it keeps the
+    // `sso-subject-` prefix the fixture's cleanup matches. A *fixed* address is a trap: the first
+    // run of this walk failed (it did, on the 500), and the account it provisioned was written in
+    // its own organization — which the *other* walk's scoped cleanup never touches. So the second
+    // run found the row, `provision()` returned `Existing` instead of `Created`, and the walk
+    // failed for a reason that had nothing to do with what it tests. A fixture that cannot be
+    // re-run after a failure is a fixture that hides failures.
+    let provisioned_email = format!(
+        "sso-subject-local-invariant-{}@omnion.test",
+        Uuid::new_v4().simple()
+    );
+    let identity = omnion_identity::sso::claims::Identity {
+        subject: "local-invariant-subject".into(),
+        email: provisioned_email.clone(),
+        display_name: Some("Local Invariant Person".into()),
+        groups: vec![],
+        attributes: json!({ "email": provisioned_email })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    };
+    let provisioned =
+        omnion_identity::sso::provisioning::provision(fixture.db.pool(), &provider, &identity)
+            .await
+            .expect("JIT provisions the first sign-in");
+    assert_eq!(
+        provisioned.outcome,
+        omnion_identity::sso::ProvisionOutcome::Created,
+        "the fixture has to be a fresh account, or the walk is testing the wrong row"
+    );
+
+    // The precondition, asserted rather than assumed: this account really has no password. A
+    // test that passes because the fixture provisioned a *local* account would prove nothing,
+    // and the only way to know which row answered is to look at the row.
+    let stored: String = sqlx::query_scalar("select password_hash from users where id = $1")
+        .bind(provisioned.user.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the hash must be readable");
+    assert!(
+        omnion_identity::sso::providers::is_jit_account(&stored),
+        "the account under test carries the JIT marker, not a password: {stored:?}"
+    );
+
+    // A guessed password against it, and the same guess against a real local account.
+    let guessed = json!({
+        "email": provisioned.user.email,
+        "password": "whatever the directory password might be",
+    });
+    let against_jit = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/auth/login",
+            None,
+            Some(guessed.clone()),
+        ),
+    )
+    .await;
+    let against_local = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/auth/login",
+            None,
+            Some(json!({ "email": fixture.owner_email, "password": guessed["password"].clone() })),
+        ),
+    )
+    .await;
+
+    // 1. It is refused — and as a *credential*, not as a server fault.
+    assert_eq!(
+        against_jit.status,
+        StatusCode::UNAUTHORIZED,
+        "an account with no password is a wrong password, not a broken server: {}",
+        against_jit.body
+    );
+    assert_eq!(
+        against_jit.body["error"]["code"],
+        json!("invalid_credentials"),
+        "the refusal is the ordinary one: {}",
+        against_jit.body
+    );
+
+    // 2. It is refused the *same way*. A different status or code on the two rows is the
+    //    enumeration oracle, and it is the only part of this walk that is not obvious.
+    assert_eq!(
+        against_jit.status, against_local.status,
+        "a provisioned account and a local account must answer a wrong password identically"
+    );
+    assert_eq!(
+        against_jit.body["error"]["code"], against_local.body["error"]["code"],
+        "and with the same code — a different code is a tell"
+    );
+    assert_eq!(
+        against_jit.body["error"]["message"], against_local.body["error"]["message"],
+        "and with the same message — the sign-in form may not name which kind of account it is"
+    );
+
+    // 3. The local account still works, so "refuse a password-less account" did not cost the
+    //    platform the sign-in the invariant is about.
+    let local = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/auth/login",
+            None,
+            Some(json!({ "email": fixture.owner_email, "password": PASSWORD })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        local.status,
+        StatusCode::OK,
+        "a local account signs in with its password while an SSO provider is connected: {}",
+        local.body
+    );
+
+    // 4. The JIT account is not merely refused — it is refused *without* being locked out. A
+    //    password-less account cannot be brute-forced, so counting its failures would let anyone
+    //    lock a colleague out of the account their provider still works for.
+    let locked_until: Option<time::OffsetDateTime> =
+        sqlx::query_scalar("select locked_until from users where id = $1")
+            .bind(provisioned.user.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the lockout column must be readable");
+    assert!(
+        locked_until.is_none(),
+        "a guess against a password-less account must not lock the person out of the one they \
+         can still use"
     );
 
     fixture.cleanup().await;

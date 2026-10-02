@@ -282,6 +282,18 @@ catalogue! {
     "media.retention_applied", "media", Live,
     "A retention rule changed or removed items.",
     [("rule", String, req), ("affected", Integer, opt)];
+    // The hold pair is `Live` because both branches are emitted and `call_names` below reads
+    // them out of the computed call — the drift walk sees a computed name, not a hole. Before
+    // this tick `NewEvent::new(if input.hold { … } else { … })` was invisible to every gate, and
+    // the pair shipped unlisted: the bus recorded them, the picker never offered them.
+    "media.hold_placed", "media", Live,
+    "A legal hold was put on an item, so retention must leave it alone.",
+    [("media_id", Uuid, req), ("site_id", Uuid, opt), ("filename", String, opt),
+     ("reason", String, opt)];
+    "media.hold_released", "media", Reserved,
+    "A legal hold was lifted and the item became eligible for retention again.",
+    [("media_id", Uuid, req), ("site_id", Uuid, opt), ("filename", String, opt),
+     ("reason", String, opt)];
     "media.duplicate_merged", "media", Live,
     "A duplicate item was merged into the one that was kept.",
     [("kept_media_id", Uuid, req), ("merged_media_id", Uuid, req), ("affected", Integer, opt)];
@@ -297,24 +309,6 @@ catalogue! {
     "media.grant_removed", "media", Live,
     "Access to a media item was taken away.",
     [("media_id", Uuid, req), ("subject", String, req)];
-
-    // The retention route emits this pair from one `NewEvent::new(if hold { … } else { … })`, so
-    // the two names never appear as a plain string literal beside the constructor — which is why
-    // the drift gate only found them once it learned to read a name that follows the marker on
-    // the same line rather than inside it. The rows are `Live` because the route has been
-    // recording them since legal hold shipped.
-    //
-    // `reason` is **required** on both: a hold with no stated reason is a retention decision
-    // nobody can defend later, and the pair is how an outside system learns that a file it asked
-    // to delete is not going to be deleted.
-    "media.hold_placed", "media", Live,
-    "A legal hold was placed on a file: retention will not touch it until the hold is released.",
-    [("media_id", Uuid, req), ("site_id", Uuid, req), ("filename", String, opt),
-     ("reason", String, req)];
-    "media.hold_released", "media", Live,
-    "A legal hold was released; retention may now apply to the file again.",
-    [("media_id", Uuid, req), ("site_id", Uuid, req), ("filename", String, opt),
-     ("reason", String, req)];
 
     // ---- Identity ------------------------------------------------------------------------------
     "user.created", "identity", Live,
@@ -344,84 +338,78 @@ catalogue! {
     "iam.user_provisioned", "identity", Live,
     "An account was created or updated by an identity provider.",
     [("user_id", Uuid, req), ("provider", String, req)];
+    "iam.user_deprovisioned", "identity", Reserved,
+    "An account a directory had provisioned was deactivated.",
+    [("user_id", Uuid, req), ("external_id", String, opt)];
     "iam.provider_connected", "identity", Live,
     "An identity provider was connected or disconnected.",
     [("provider", String, req), ("connected", Boolean, req)];
+    "iam.provider_enabled", "identity", Live,
+    "An identity provider was switched on, so its button appears on the sign-in page.",
+    [("provider_id", Uuid, req), ("slug", String, opt)];
+    "iam.provider_test_passed", "identity", Live,
+    "A connection test walked every step of a provider and reached the end.",
+    [("provider_id", Uuid, req), ("kind", String, opt), ("step", String, opt)];
+    "iam.provider_test_failed", "identity", Live,
+    "A connection test stopped at one step. `step` names it, so a subscriber learns which check refused.",
+    [("provider_id", Uuid, req), ("kind", String, opt), ("step", String, opt)];
+    "iam.provider_created", "identity", Reserved,
+    "A provider draft was created.",
+    [("provider_id", Uuid, req), ("kind", String, req)];
+    "iam.provider_updated", "identity", Reserved,
+    "A provider's settings changed. The payload names the changed fields, never their values.",
+    [("provider_id", Uuid, req), ("fields", Json, opt)];
+    "iam.provider_disabled", "identity", Reserved,
+    "A provider was switched off, so its button leaves the sign-in page.",
+    [("provider_id", Uuid, req), ("slug", String, opt)];
+    "iam.directory_sync_started", "identity", Reserved,
+    "A directory sweep began.",
+    [("provider_id", Uuid, req), ("run_id", Uuid, req)];
+    "iam.directory_sync_completed", "identity", Reserved,
+    "A directory sweep finished; the counts are in the payload.",
+    [("provider_id", Uuid, req), ("run_id", Uuid, req), ("status", String, opt)];
+    "iam.directory_sync_failed", "identity", Reserved,
+    "A directory sweep could not finish.",
+    [("provider_id", Uuid, req), ("run_id", Uuid, opt), ("reason", String, opt)];
+    "iam.sso_signin_succeeded", "identity", Reserved,
+    "A single sign-on round trip ended in a session. Claims values never appear in the payload.",
+    [("provider_id", Uuid, req), ("subject_id", Uuid, opt)];
+    "iam.sso_signin_failed", "identity", Reserved,
+    "A single sign-on round trip was refused. `reason` is a stable code, never a raw IdP response.",
+    [("provider_id", Uuid, opt), ("reason", String, opt)];
+    "iam.group_membership_synced", "identity", Reserved,
+    "A directory or SCIM write changed who belongs to a group, so the mapped role can now differ.",
+    [("group_id", Uuid, req), ("added", Integer, opt), ("removed", Integer, opt)];
+    "iam.provisioning_token_issued", "identity", Reserved,
+    "A SCIM provisioning token was minted. Its secret is never in the payload.",
+    [("token_id", Uuid, req), ("prefix", String, req), ("expires_at", Timestamp, opt)];
+    "iam.provisioning_token_revoked", "identity", Reserved,
+    "A SCIM provisioning token was revoked and no longer authenticates.",
+    [("token_id", Uuid, req), ("prefix", String, opt)];
+    "iam.provisioning.token_rotated", "identity", Live,
+    "A SCIM provisioning token was rotated: the old secret is refused from the next request on.",
+    [("old_token_id", Uuid, req), ("new_token_id", Uuid, req),
+     ("old_prefix", String, opt), ("new_prefix", String, opt)];
+    "iam.sync_retry_requested", "identity", Live,
+    "An operator asked to reprocess the subjects one sync run refused.",
+    [("provider_id", Uuid, req), ("retry_run_id", Uuid, req),
+     ("source_run_id", Uuid, req), ("subject_count", Integer, req)];
+    "iam.role_rule_matched", "identity", Live,
+    "A sign-in was given a role by an SSO role rule. `rule_position` is the `#N` the panel shows.",
+    [("subject_id", Uuid, req), ("provider_id", Uuid, opt), ("rule_position", Integer, req),
+     ("role_id", Uuid, req), ("scope_type", String, opt)];
+    "iam.role_permissions_changed", "identity", Reserved,
+    "A role's permission set changed, so cached rule results have to be dropped.",
+    [("role_id", Uuid, opt), ("action", String, opt)];
+    "iam.security_policy_changed", "identity", Reserved,
+    "The sign-in security policy changed and the sign-in path has to reload it.",
+    [("policy", String, opt), ("action", String, opt)];
     "iam.approval_requested", "identity", Live,
     "Somebody asked for access they do not have.",
     [("subject", String, req), ("permission", String, opt)];
     "iam.approval_decided", "identity", Live,
     "An access request was approved or refused.",
     [("subject", String, req), ("permission", String, opt), ("approved", Boolean, opt)];
-
-    // ---- Security (REQ-012) -------------------------------------------------------------------
-    //
-    // Four names, and the reason they are all here rather than one is that they answer four
-    // different questions an operator subscribes to separately: *did the platform check itself*,
-    // *what does it now send on the wire*, *what does it refuse* and *somebody released a lock*.
-    //
-    // The payloads deliberately carry no policy **values**. `security.headers.updated` names the
-    // CSP directive *names* and the mode; it does not carry the origins, because a header
-    // policy travels to every webhook receiver and is still configuration somebody considers
-    // sensitive. `security.rate_limits.updated` carries the *count* of scopes, not the numbers —
-    // the numbers are in the audit entry and in the panel, and a bus event is the wrong place to
-    // publish a limit to.
-    "security.scan.completed", "security", Live,
-    "The posture checks were re-run and a fresh result set was recorded.",
-    [("run_id", Uuid, req), ("checks", Integer, req)];
-    "security.headers.updated", "security", Live,
-    "The response-header policy was saved; the next response already carries it.",
-    [("csp_mode", String, req), ("directives", String, opt)];
-    "security.rate_limits.updated", "security", Live,
-    "The rate-limit document was saved, so the limiter is deciding by the new numbers.",
-    [("scopes", Integer, req)];
-    // `user_id` is the account that was locked, NOT the actor: the release is the unlock, and an
-    // operator subscribing to it wants to know which account was let back in. The actor already
-    // rides the envelope, so repeating it here would be a second place for the two to disagree.
-    "security.lockout.released", "security", Live,
-    "An operator released an account's brute-force lockout before it expired.",
-    [("user_id", Uuid, req)];
-    // `user_id` is the account that was locked, NOT the actor, for the same reason as the
-    // release above, and there is no actor to name here at all: the lock is applied by an
-    // anonymous caller guessing a password. `attempts` is the threshold that fired and
-    // `lockout_minutes` how long it lasts — both are configuration an operator subscribed here
-    // wants, and neither is a credential. What is deliberately absent is the attempted password
-    // and the address: an event bus is a fan-out to third-party receivers, and a brute-force
-    // attempt is exactly the payload nobody should be copying anywhere.
-    "security.lockout.triggered", "security", Live,
-    "An account reached its brute-force threshold and is now locked out.",
-    [("user_id", Uuid, req), ("attempts", Integer, req), ("lockout_minutes", Integer, opt)];
-    // A finding that *opens* is the one security fact an operator wires to a third party, so
-    // this is the name REQ-012's Events section promises them. Two payload decisions, and both
-    // are about the same thing — **the scan's content must not travel**:
-    //
-    // * `title` and `description` are absent. A dependency title is a package name and a
-    //   description is whatever the CI vendor wrote, which is attacker-influenced free text
-    //   being copied to every receiver the operator has. The finding is *identifiable* from
-    //   `finding_id` alone, because the panel reads it back with the same guard it protects.
-    // * `evidence` is absent for the same reason with more force: it is the raw report entry,
-    //   and the ingest path's own heuristic for "this document carries a credential" is a
-    //   heuristic. A bus is not the place to test it again.
-    //
-    // `severity` IS carried, because the receiver's decision is "page me or file a ticket",
-    // and that decision is unreadable from a finding id alone.
-    "security.finding.opened", "security", Live,
-    "A new finding was raised — a check that found something, or a report that was ingested.",
-    [("finding_id", Uuid, req), ("severity", String, req), ("source", String, req),
-     ("component", String, opt), ("component_version", String, opt), ("fixed_in", String, opt)];
-    // `action` is what makes this one event rather than two: a receiver that has to infer
-    // whether a network was opened or closed from a diff of `cidr` lists is reimplementing this
-    // module. `note` is the operator's own free text and is deliberately absent for the same
-    // reason a finding's title is — this one fans out to third-party receivers.
-    //
-    // This row was MISSING while slice 4(a) shipped, and `every_emitted_name_is_in_the_catalogue`
-    // is what said so: an emitter whose name is not in the catalogue records an event no
-    // endpoint can subscribe to, so the rule an operator believes they are running applies to
-    // nobody. It went unnoticed because nothing in the workspace asserts that gate is green on
-    // the branch it was written on.
-    "security.ip_rule.changed", "security", Live,
-    "An IP access rule was added or removed, and the next request is judged by the new set.",
-    [("action", String, req), ("rule_id", Uuid, req), ("kind", String, req), ("cidr", String, req)];
 
     // ---- Tenancy -------------------------------------------------------------------------------
     "site.created", "tenancy", Live,
@@ -531,59 +519,6 @@ catalogue! {
     "notification.preferences.changed", "notifications", Live,
     "Somebody changed how or whether they are notified.",
     [("user_id", Uuid, req), ("field", String, opt)];
-
-    // ---- System health --------------------------------------------------------------------------
-    // The five names REQ-014's Events section names, and the reason this area exists at all is
-    // the sentence "an operations endpoint subscribes to degraded and recovered" — which was,
-    // until the emitters shipped, a sentence with no name behind it: the table had no `health`
-    // area, so there was nothing to subscribe to and nothing for a receiver to wait on.
-    //
-    // `degraded` and `recovered` are a **pair on purpose**, and they are what the request calls
-    // the two an operations endpoint listens for. A receiver that gets only `degraded` cannot
-    // tell a resolved outage from a deleted endpoint, and one that gets only `recovered` has no
-    // idea what came back.
-    "health.service.degraded", "health", Live,
-    "A dependency stopped answering, or answered too slowly.",
-    [("service", String, req), ("from_state", String, req), ("to_state", String, req),
-     ("message", String, opt), ("incident_id", Uuid, opt), ("suppressed", Boolean, opt)];
-    "health.service.recovered", "health", Live,
-        "A dependency that had been unhealthy is answering again.",
-        [("service", String, req), ("from_state", String, req), ("to_state", String, req),
-         ("duration_seconds", Integer, opt), ("incident_id", Uuid, opt)];
-    "health.threshold.breached", "health", Live,
-    "A metric went past its configured critical limit. Fires once per metric per window.",
-    [("metric", String, req), ("value", Integer, opt), ("crit_limit", Integer, opt),
-     ("window_start", Timestamp, opt)];
-    "health.incident.acknowledged", "health", Live,
-    "An operator claimed an incident.",
-    [("incident_id", Uuid, req), ("service", String, req), ("actor", Uuid, req),
-     ("note", String, opt)];
-    "health.checks.completed", "health", Live,
-    "A probe run finished; the worst state it concluded is on the payload.",
-    [("state", String, req), ("services", Integer, req), ("worst_service", String, opt),
-     ("samples", Integer, opt)];
-
-    // ---- Backups and restoration -----------------------------------------------------------------
-    // The two rows the backup centre's own routes emit, added when the drift gate started
-    // naming them. Both are **Live and emitted**; what was missing was the row, which is the same
-    // failure as any other unlisted name — an operator cannot subscribe to an event the picker
-    // has never heard of, and the route has been recording it for every restore all along.
-    "backup.restored", "backups", Live,
-    "A restore finished. Carries what came back and what did not, so a receiver can tell a clean \
-     restore from a partial one.",
-    [("backup_id", Uuid, req), ("parts", Integer, opt), ("objects_restored", Integer, opt),
-     ("objects_failed", Integer, opt), ("safety_backup_id", Uuid, opt)];
-
-    // `notification.delivery.succeeded` is deliberately *not* here as a second row: the delivery
-    // lifecycle already publishes `notification.created` and the per-channel state lives in
-    // `notification_deliveries`. A "test delivery succeeded" audit fact is what this name is —
-    // one key says whether it was a test — and `test` is required rather than optional precisely
-    // so a receiver cannot read "succeeded" as a production delivery and page somebody for a
-    // message a person deliberately asked the platform to send.
-    "notification.delivery.succeeded", "notifications", Live,
-    "A channel accepted a notification the reader asked to be sent, one attempt at a time.",
-    [("notification_id", Uuid, req), ("channel", String, req), ("test", Boolean, req),
-     ("delivered", Boolean, opt)];
 
     // ---- Commerce (reserved: the module is not shipped yet) -------------------------------------
     "order.created", "commerce", Reserved,
@@ -939,10 +874,7 @@ mod tests {
         assert_eq!(order.area, "commerce");
         assert_eq!(order.group(), "order");
 
-        assert!(
-            group_members("commerce").is_empty(),
-            "no event is emitted as commerce.*"
-        );
+        assert!(group_members("commerce").is_empty(), "no event is emitted as commerce.*");
         assert!(!group_members("order").is_empty());
         assert!(lookup("commerce.*").is_none());
     }
@@ -957,10 +889,7 @@ mod tests {
         .expect("valid");
 
         assert_eq!(
-            stored
-                .iter()
-                .filter(|name| *name == "page.published")
-                .count(),
+            stored.iter().filter(|name| *name == "page.published").count(),
             1,
             "the same subscription twice is one subscription"
         );
@@ -986,18 +915,9 @@ mod tests {
     fn an_empty_or_broken_subscription_is_refused() {
         assert!(reconcile(&[]).is_err());
         assert!(reconcile(&["   ".to_owned()]).is_err());
-        assert!(
-            reconcile(&["page".to_owned()]).is_err(),
-            "a bare name is not a name"
-        );
-        assert!(
-            reconcile(&["*".to_owned()]).is_err(),
-            "an empty group is not a group"
-        );
-        assert!(
-            reconcile(&["PAGE.*".to_owned()]).is_err(),
-            "a group is lower-case"
-        );
+        assert!(reconcile(&["page".to_owned()]).is_err(), "a bare name is not a name");
+        assert!(reconcile(&["*".to_owned()]).is_err(), "an empty group is not a group");
+        assert!(reconcile(&["PAGE.*".to_owned()]).is_err(), "a group is lower-case");
     }
 
     #[test]
@@ -1017,10 +937,7 @@ mod tests {
     #[test]
     fn areas_are_listed_once_in_table_order() {
         let areas = areas();
-        assert_eq!(
-            areas.len(),
-            BTreeSet::from_iter(areas.iter().copied()).len()
-        );
+        assert_eq!(areas.len(), BTreeSet::from_iter(areas.iter().copied()).len());
         assert!(areas.contains(&"content"));
         assert!(areas.contains(&"commerce"));
         assert!(
@@ -1033,10 +950,7 @@ mod tests {
     fn the_ceiling_counts_what_the_operator_typed_not_what_it_expanded_to() {
         // Eight groups covering every member of the catalogue: forty-odd names once expanded,
         // eight selections as typed.
-        let typed: Vec<String> = areas()
-            .into_iter()
-            .map(|area| format!("{area}.*"))
-            .collect();
+        let typed: Vec<String> = areas().into_iter().map(|area| format!("{area}.*")).collect();
         assert!(
             typed.len() <= crate::validation::MAX_SUBSCRIPTIONS,
             "the table has more areas than the ceiling allows, so this test cannot say what it means"
@@ -1065,71 +979,6 @@ mod tests {
     }
 
     #[test]
-    fn the_health_area_carries_the_five_names_the_request_names() {
-        // REQ-014's Events section lists exactly these five, and the reason this test exists is
-        // that for four of the REQ's slices the sentence "an operations endpoint subscribes to
-        // degraded and recovered" had nothing behind it. A name that is emitted but not listed
-        // is refused by the drift test; a name that is listed but never emitted is invisible to
-        // every green gate in the workspace, so it needs an assertion of its own.
-        let in_health = in_area("health");
-        let health = names_of(&in_health);
-        assert_eq!(
-            health.len(),
-            5,
-            "the health area is {:?}; the request names five",
-            health
-        );
-        for name in [
-            "health.service.degraded",
-            "health.service.recovered",
-            "health.threshold.breached",
-            "health.incident.acknowledged",
-            "health.checks.completed",
-        ] {
-            let entry = lookup(name).unwrap_or_else(|| panic!("{name} must be listed"));
-            assert_eq!(entry.area, "health");
-            assert_eq!(entry.status, Status::Live, "{name} is emitted today");
-            // All five share one group, so a single `health.*` subscription reaches all of them.
-            // That is the subscription the request describes an operations endpoint making, and
-            // it only works if every name sits behind the same first segment.
-            assert_eq!(entry.group(), "health", "{name} is not behind health.*");
-        }
-        // The pair the request calls out, stated as a pair.
-        assert!(subscribed_to(
-            &["health.*".to_owned()],
-            "health.service.degraded"
-        ));
-        assert!(subscribed_to(
-            &["health.*".to_owned()],
-            "health.service.recovered"
-        ));
-    }
-
-    #[test]
-    fn the_health_names_carry_the_fields_a_receiver_needs() {
-        // What makes an operations subscription usable rather than decorative: a receiver that
-        // gets `health.service.degraded` with only a name cannot decide anything, and the
-        // required fields are the promise in the picker that it can.
-        for (name, field) in [
-            ("health.service.degraded", "service"),
-            ("health.service.degraded", "to_state"),
-            ("health.service.recovered", "service"),
-            ("health.service.recovered", "from_state"),
-            ("health.threshold.breached", "metric"),
-            ("health.incident.acknowledged", "actor"),
-            ("health.checks.completed", "state"),
-        ] {
-            let entry = lookup(name).expect("listed");
-            let found = entry
-                .payload_fields
-                .iter()
-                .find(|candidate| candidate.name == field)
-                .unwrap_or_else(|| panic!("{name} must declare {field}"));
-            assert!(found.required, "{name}.{field} is required in the test");
-        }
-    }
-
-    #[test]
     fn required_fields_are_documented_where_they_are_claimed() {
         // Every required field of a live name the emitter shape is known for.
         for (name, field) in [
@@ -1149,9 +998,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} must declare {field}"));
             assert!(found.required, "{name}.{field} is required in the test");
             assert!(
-                entry
-                    .required_fields()
-                    .any(|candidate| candidate.name == field),
+                entry.required_fields().any(|candidate| candidate.name == field),
                 "{name}.{field} must be reachable through required_fields()"
             );
         }

@@ -23,11 +23,13 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
-use omnion_identity::sso::oidc::{self, Discovery, HttpClient};
+use omnion_identity::sso::oidc::{self, Discovery, HttpClient, Jwk};
 use omnion_identity::sso::providers::{
     self, AuthProvider, NewProvider, ProviderChanges, ProviderKind, default_scopes,
 };
-use omnion_identity::sso::provisioning;
+use omnion_identity::sso::{connection, directory, protocol_steps, provisioning};
+use omnion_identity::error::IdentityError;
+use omnion_identity::provenance;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
@@ -42,6 +44,13 @@ use crate::state::AppState;
 
 /// Largest provider event page the list answers.
 const MAX_EVENT_PAGE: i64 = 100;
+
+/// Largest reassign batch one request may carry.
+///
+/// A refusal rather than a silent truncation: a panel that asked for 5,000 and quietly did 500
+/// would report a success, and an operator who read it would believe 4,500 people had just
+/// become local sign-ins.
+const MAX_REASSIGN_BATCH: usize = 500;
 
 /// Record an event without letting a webhook problem fail the caller's request.
 async fn emit(state: &AppState, event: NewEvent) {
@@ -89,12 +98,16 @@ pub struct NewProviderBody {
     /// Role every successful sign-in gets.
     #[serde(default)]
     pub default_role_id: Option<Uuid>,
-    /// Provision an account on first sign-in?
+    /// Provision on first sign-in?
     #[serde(default)]
     pub jit_enabled: Option<bool>,
     /// Organization to create in (platform accounts only).
     #[serde(default)]
     pub organization_id: Option<Uuid>,
+    /// How often to sync, in minutes. Omitted keeps the default; `0` means "never on a
+    /// schedule", which is a real answer for a directory used only interactively.
+    #[serde(default)]
+    pub sync_interval_minutes: Option<i32>,
 }
 
 /// The body of a provider update; every field is optional and `None` leaves the column alone.
@@ -124,6 +137,9 @@ pub struct ProviderPatchBody {
     /// New reachable flag.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// New sync interval, in minutes.
+    #[serde(default)]
+    pub sync_interval_minutes: Option<i32>,
 }
 
 /// One provider as the panel reads it.
@@ -156,6 +172,23 @@ pub struct ProviderBody {
     pub jit_enabled: bool,
     /// Reachable?
     pub enabled: bool,
+    /// When a connection test last ran, and whether it passed. `null` on `last_test_ok` means
+    /// *never tested* — a third state the panel renders differently from a failure.
+    pub last_test_at: Option<String>,
+    pub last_test_ok: Option<bool>,
+    /// How often this provider syncs, in minutes. Zero means "not on a schedule".
+    pub sync_interval_minutes: i32,
+    /// When it last synced, and how that went. Both null for a kind that does not sync.
+    pub last_sync_at: Option<String>,
+    pub last_sync_status: Option<String>,
+    /// The plugin declaration that produced this row, when it was not a platform kind.
+    pub plugin_key: Option<String>,
+    /// The connection status the list's chip column shows, derived rather than stored.
+    ///
+    /// Four states, and the distinction between the last two is the whole reason this is a
+    /// function: `disabled` and `degraded` both look like "not working" but need opposite
+    /// responses — one needs a click, the other a fix.
+    pub status: &'static str,
     /// When it was created.
     pub created_at: String,
     /// When it last changed.
@@ -189,12 +222,45 @@ impl ProviderBody {
             default_role_id: provider.default_role_id,
             jit_enabled: provider.jit_enabled,
             enabled: provider.enabled,
+            last_test_at: stamp(provider.last_test_at),
+            last_test_ok: provider.last_test_ok,
+            sync_interval_minutes: provider.sync_interval_minutes,
+            last_sync_at: stamp(provider.last_sync_at),
+            last_sync_status: provider.last_sync_status.clone(),
+            plugin_key: provider.plugin_key.clone(),
+            status: connection_status(provider),
             created_at: provider.created_at.format(&Rfc3339).unwrap_or_default(),
             updated_at: provider.updated_at.format(&Rfc3339).unwrap_or_default(),
             sign_in_count,
             last_sign_in_at,
         }
     }
+}
+
+/// The four states the registry's status chip can be in.
+///
+/// The order of the checks *is* the meaning: a disabled provider is disabled whatever its test
+/// said, because a person cannot reach it. A `degraded` provider is the interesting one — it is
+/// enabled and therefore load-bearing, and something about it is wrong. A registry that reported
+/// that as "failed" would send an operator looking for an outage that is not there; one that
+/// reported it as "ok" would hide it.
+#[must_use]
+pub fn connection_status(provider: &AuthProvider) -> &'static str {
+    if !provider.enabled {
+        return "disabled";
+    }
+    if provider.last_test_ok == Some(false) {
+        return "degraded";
+    }
+    if provider.last_sync_status.as_deref() == Some("failed") {
+        return "degraded";
+    }
+    "enabled"
+}
+
+/// Format a timestamp for the panel, or `None` when there is nothing to show.
+fn stamp(value: Option<time::OffsetDateTime>) -> Option<String> {
+    value.map(|moment| moment.format(&Rfc3339).unwrap_or_default())
 }
 
 /// The answer of the discovery test.
@@ -215,6 +281,216 @@ pub struct ProviderTestBody {
     pub endpoints: Option<Value>,
     /// Whether the client secret is readable in this installation.
     pub secret_present: bool,
+    /// The step ladder, for every kind. A directory walks six checks, a protocol provider walks
+    /// four — the two ladders have different steps, which is the point, but the same *shape*, so
+    /// the panel renders one list and an operator reads one kind of answer whatever they
+    /// configured. Skipped rather than sent empty, so a result without a ladder cannot render as
+    /// grey rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<StepRow>>,
+    /// Configuration problems, each attached to the field that owns it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problems: Option<Vec<directory::ConfigProblem>>,
+}
+
+/// One row of a step ladder, whichever kind produced it.
+///
+/// Two ladders with two Rust types is the right shape in the crate — a directory's step is a
+/// DNS resolution and a protocol's is a signature check, and pretending otherwise is how a
+/// `TestStep::Dns` ends up meaning "the JWKS was unreadable". But the panel needs one list, so
+/// the row is flattened to the three fields it actually renders.
+#[derive(Debug, Serialize)]
+pub struct StepRow {
+    /// The step's machine name, which the panel's label table keys on.
+    pub step: String,
+    /// `ok`, `failed` or `pending`.
+    pub status: &'static str,
+    /// The sentence beside the step.
+    pub detail: String,
+}
+
+impl From<&directory::StepReport> for StepRow {
+    fn from(step: &directory::StepReport) -> Self {
+        Self {
+            step: step.step.as_str().to_owned(),
+            status: step.status,
+            detail: step.detail.clone(),
+        }
+    }
+}
+
+impl From<&protocol_steps::StepReport> for StepRow {
+    fn from(step: &protocol_steps::StepReport) -> Self {
+        Self {
+            step: step.step.as_str().to_owned(),
+            status: step.status,
+            detail: step.detail.clone(),
+        }
+    }
+}
+
+/// The answer of the enable action.
+#[derive(Debug, Serialize)]
+pub struct ProviderEnabledBody {
+    /// The provider that was switched.
+    pub id: Uuid,
+    /// Its new state.
+    pub enabled: bool,
+    /// Whether the stored test result satisfied the gate. `false` on a disable, where there is
+    /// nothing to satisfy — so the panel does not imply a test was run.
+    pub gate_passed: bool,
+}
+
+/// The body of a bulk action over a selection of providers.
+#[derive(Debug, Deserialize)]
+pub struct BulkProvidersBody {
+    /// The action to apply to every id. `enable` and `disable` are the only two, and they are
+    /// the two the panel offers — there is no bulk delete and no bulk test, because a delete
+    /// needs the affected count per provider and a test is a round trip a person has to watch.
+    pub action: String,
+    /// The providers to act on.
+    pub ids: Vec<Uuid>,
+}
+
+/// What one bulk action did to one provider.
+///
+/// A bulk action is not one answer: switching three providers on and having the gate refuse two
+/// of them is the ordinary case, not an error, and a single `200 { enabled: 1 }` would leave
+/// the operator believing all three are live. So the answer is a row per requested id, and a
+/// refusal is a **row with a code**, not a hole in the list — a missing id is indistinguishable
+/// from one that was never sent.
+#[derive(Debug, Serialize)]
+pub struct BulkProviderRow {
+    /// The provider the row is about.
+    pub id: Uuid,
+    /// Its slug, so the panel names the connector rather than an id.
+    pub slug: String,
+    /// Its state after the action, or `null` when the action was refused.
+    pub enabled: Option<bool>,
+    /// The stable code when the row was refused, absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The sentence a refusal explains itself with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// The answer of a bulk action.
+#[derive(Debug, Serialize)]
+pub struct BulkProvidersBodyOut {
+    /// The action that was applied, echoed so a panel that queued two cannot mix their rows.
+    pub action: String,
+    /// One row per requested id, in the order the ids arrived.
+    pub results: Vec<BulkProviderRow>,
+    /// How many rows changed a stored state.
+    pub applied: i64,
+    /// How many rows were refused, each with its own reason in `results`.
+    pub refused: i64,
+    /// Ids that named no provider this caller may see.
+    ///
+    /// Reported apart from `results` because they are a *different* failure: a provider in
+    /// another tenant is not refused for the gate, it simply does not exist for this caller, and
+    /// folding it into `refused` with `provider_not_found` would suggest the gate was the reason.
+    pub missing: Vec<Uuid>,
+}
+
+/// How many providers one bulk request may carry.
+///
+/// A refusal rather than a silent truncation, for the reason the reassign batch has one: a panel
+/// that asked for 5,000 and quietly did 500 reports a success, and the operator who read it
+/// believes 4,500 directories are still live for people to sign in with.
+const MAX_BULK_PROVIDERS: usize = 200;
+
+/// How many accounts one provider deletion would reassign, read before anything is removed.
+#[derive(Debug, Serialize)]
+pub struct ImpactBody {
+    /// The provider that would be removed.
+    pub provider_id: Uuid,
+    /// Its slug, so the dialog names the connector rather than an id.
+    pub slug: String,
+    /// Accounts that would lose their provider link.
+    pub affected_accounts: i64,
+    /// The same number grouped by the system that owns each account.
+    pub by_source: Vec<provenance::SourceCount>,
+    /// A bounded sample of the affected accounts, for the dialog.
+    pub accounts: Vec<AccountRow>,
+    /// Whether a source string in the table is not one this build knows.
+    ///
+    /// Carried so the panel can say "and some we could not name" rather than showing a total
+    /// that does not add up — a count nobody can reconcile is a count nobody trusts.
+    pub unknown_sources: bool,
+    /// `true` when the delete would be refused, so the panel does not re-derive the rule.
+    pub blocked: bool,
+}
+
+impl ImpactBody {
+    fn new(
+        provider_id: Uuid,
+        impact: &provenance::Impact,
+        accounts: &[provenance::Provenance],
+        slug: String,
+    ) -> Self {
+        Self {
+            provider_id,
+            slug,
+            affected_accounts: impact.total,
+            by_source: impact.by_source.clone(),
+            accounts: accounts.iter().map(AccountRow::from).collect(),
+            unknown_sources: impact.unknown_sources,
+            blocked: impact.total > 0,
+        }
+    }
+}
+
+/// One account in the deletion dialog.
+///
+/// The address is included because an operator deciding to delete a directory needs to know
+/// *whose* access is affected; nothing else about the row crosses this surface.
+#[derive(Debug, Serialize)]
+pub struct AccountRow {
+    /// The account.
+    pub user_id: Uuid,
+    /// Its address.
+    pub email: String,
+    /// Which system owns it.
+    pub source: String,
+    /// What the directory calls it, when it has said.
+    pub external_id: Option<String>,
+}
+
+impl From<&provenance::Provenance> for AccountRow {
+    fn from(row: &provenance::Provenance) -> Self {
+        Self {
+            user_id: row.user_id,
+            email: row.email.clone(),
+            source: row.identity_source.clone(),
+            external_id: row.external_id.clone(),
+        }
+    }
+}
+
+/// The body of the reassign action.
+#[derive(Debug, Deserialize)]
+pub struct ReassignBody {
+    /// The accounts to fall back to local sign-in.
+    pub user_ids: Vec<Uuid>,
+}
+
+/// The answer of the reassign action: four numbers, not one.
+#[derive(Debug, Serialize)]
+pub struct ReassignResultBody {
+    /// How many ids the request asked for.
+    pub requested: usize,
+    /// How many accounts actually moved.
+    pub reassigned: u64,
+    /// How many of this provider's accounts the batch named but the update did not move.
+    ///
+    /// Always zero in this implementation, and carried anyway: an update that reported fewer
+    /// rows than the scope query matched would mean something moved concurrently, and a caller
+    /// that could not see that difference would report a success that is one account short.
+    pub not_moved: u64,
+    /// How many ids named no account of this provider in this organization.
+    pub skipped: usize,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -265,9 +541,14 @@ pub async fn list_providers(
         "organization_id": organization_id,
         "providers": rows,
         "kinds": [
-            { "value": "oidc", "label": "OpenID Connect", "default_scopes": default_scopes(ProviderKind::Oidc) },
-            { "value": "oauth2", "label": "OAuth 2.0", "default_scopes": default_scopes(ProviderKind::Oauth2) },
-            { "value": "saml", "label": "SAML 2.0", "default_scopes": Vec::<String>::new() },
+            { "value": "oidc", "label": "OpenID Connect", "default_scopes": default_scopes(ProviderKind::Oidc), "family": "protocol" },
+            { "value": "oauth2", "label": "OAuth 2.0", "default_scopes": default_scopes(ProviderKind::Oauth2), "family": "protocol" },
+            { "value": "saml", "label": "SAML 2.0", "default_scopes": Vec::<String>::new(), "family": "protocol" },
+            // The directory kinds are not a variation on the protocol half: they are a live
+            // connection with a service account, a search filter and a test ladder, so the
+            // panel groups them separately and never offers them an OAuth scope.
+            { "value": "ldap", "label": "LDAP", "default_scopes": Vec::<String>::new(), "family": "directory" },
+            { "value": "active_directory", "label": "Active Directory", "default_scopes": Vec::<String>::new(), "family": "directory" },
         ],
     })))
 }
@@ -344,6 +625,7 @@ pub async fn create_provider(
             // A provider is created switched off. The `test` action is how it is proved, and
             // `enabled` is how it is published.
             enabled: false,
+            sync_interval_minutes: body.sync_interval_minutes,
         },
     )
     .await?;
@@ -389,14 +671,56 @@ pub async fn update_provider(
     address: ClientAddress,
     Json(body): Json<ProviderPatchBody>,
 ) -> Result<Json<ProviderBody>, ApiError> {
-    load(&state, &current, id).await?;
+    let before = load(&state, &current, id).await?;
 
     if let Some(config) = body.config.as_ref() {
         omnion_identity::sso::claims::mappings_from_config(config)
             .map_err(|error| ApiError::bad_request("invalid_request", error.to_string()))?;
     }
 
-    let updated = providers::update_provider(
+    // An `enabled: true` arriving through the generic PATCH must not be a way around the gate —
+    // otherwise the checkbox on the edit form and the Enable button are two doors, and only one
+    // of them is locked. The refusal names the gate rather than looking like a validation error.
+    if body.enabled == Some(true) && !before.enabled {
+        providers::enable_gate(&before)
+            .map_err(|error| ApiError::bad_request("provider_not_ready", error.to_string()))?;
+    }
+
+    // Names of the fields actually supplied, so the audit trail says what changed rather than
+    // echoing a whole row. Values never appear — an audit log that carries a config is an audit
+    // log that eventually carries a secret reference and then a secret.
+    let mut changed: Vec<&str> = Vec::new();
+    if body.name.is_some() {
+        changed.push("name");
+    }
+    if body.config.is_some() {
+        changed.push("config");
+    }
+    if body.secret_ref.is_some() {
+        changed.push("secret_ref");
+    }
+    if body.scopes.is_some() {
+        changed.push("scopes");
+    }
+    if body.group_claim.is_some() {
+        changed.push("group_claim");
+    }
+    if body.default_role_id.is_some() {
+        changed.push("default_role_id");
+    }
+    if body.jit_enabled.is_some() {
+        changed.push("jit_enabled");
+    }
+    if body.enabled.is_some() {
+        changed.push("enabled");
+    }
+    if body.sync_interval_minutes.is_some() {
+        changed.push("sync_interval_minutes");
+    }
+
+    // The row is read back rather than taken from the update's `returning` clause, because the
+    // invalidation below may have changed it again.
+    providers::update_provider(
         state.db().pool(),
         id,
         ProviderChanges {
@@ -408,6 +732,7 @@ pub async fn update_provider(
             default_role_id: body.default_role_id,
             jit_enabled: body.jit_enabled,
             enabled: body.enabled,
+            sync_interval_minutes: body.sync_interval_minutes,
         },
     )
     .await?
@@ -419,6 +744,23 @@ pub async fn update_provider(
         )
     })?;
 
+    // A test proves a *configuration*. Repointing the host, the base DN or the secret reference
+    // makes the stored answer untrue, and leaving it would let a provider whose connection was
+    // just broken keep a green "Last test" and an enabled checkbox. The stored *timestamp* stays:
+    // "tested before the last edit" is useful, "tested against what is configured now" is not.
+    if providers::edit_invalidates_test(&changed) {
+        providers::invalidate_test(state.db().pool(), id).await?;
+    }
+    let updated = providers::find_provider(state.db().pool(), id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "provider_not_found",
+                "no such provider",
+            )
+        })?;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "iam.provider_updated")
@@ -427,6 +769,7 @@ pub async fn update_provider(
                 "slug": updated.slug,
                 "kind": updated.kind.as_str(),
                 "enabled": updated.enabled,
+                "changed_fields": changed,
             }))
             .ip_address(address.as_text())
             .organization(Some(updated.organization_id)),
@@ -437,6 +780,16 @@ pub async fn update_provider(
 }
 
 /// Remove a provider. Its challenges and event log go with it (the migration cascades them).
+///
+/// The guard is the point of this handler, and it is a **count read before the delete**, not a
+/// foreign key. `0127` declares `provisioned_by_provider_id … on delete set null`, which is the
+/// safe direction and also the quiet one: deleting a provider whose accounts are still
+/// provisioned turns every one of them into a local account, keeping their sessions and their
+/// role grants while losing every record of which directory vouched for them. So the request
+/// names the count and the panel has to show it before anything is removed.
+///
+/// The audit line records the count on success too, not only on refusal: "we removed the Okta
+/// connector and 12 accounts kept their access" is a fact somebody will be asked about later.
 pub async fn delete_provider(
     State(state): State<AppState>,
     current: CurrentSession,
@@ -444,19 +797,151 @@ pub async fn delete_provider(
     address: ClientAddress,
 ) -> Result<StatusCode, ApiError> {
     let provider = load(&state, &current, id).await?;
+
+    let impact = provenance::deletion_impact(state.db().pool(), id).await?;
+    if impact.total > 0 {
+        // Mapped to `AccountRow` rather than embedded as `Provenance`: the store type carries
+        // columns the dialog has no use for, and a store type that grew a field would then
+        // silently widen this error body.
+        let accounts: Vec<AccountRow> = provenance::affected_accounts(state.db().pool(), id, 50)
+            .await?
+            .iter()
+            .map(AccountRow::from)
+            .collect();
+        return Err(ApiError::conflict("provider_in_use", impact.refusal()).with_details(json!({
+            "provider_id": id,
+            "slug": provider.slug,
+            "affected_accounts": impact.total,
+            "by_source": impact.by_source,
+            "unknown_sources": impact.unknown_sources,
+            "accounts": accounts,
+        })));
+    }
+
     providers::delete_provider(state.db().pool(), id).await?;
 
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "iam.provider_removed")
             .target("auth_provider", id.to_string())
-            .metadata(json!({ "slug": provider.slug, "kind": provider.kind.as_str() }))
+            .metadata(json!({
+                "slug": provider.slug,
+                "kind": provider.kind.as_str(),
+                "provisioned_accounts_at_removal": impact.total,
+            }))
             .ip_address(address.as_text())
             .organization(Some(provider.organization_id)),
     )
     .await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// What deleting this provider would do, so the panel can say it *before* the button is pressed.
+///
+/// A dialog that discovers the block only after the click is a dialog that failed; this is the
+/// same count the refusal carries, read on a route that can answer `200` with zero accounts.
+pub async fn provider_deletion_impact(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ImpactBody>, ApiError> {
+    let provider = load(&state, &current, id).await?;
+    let impact = provenance::deletion_impact(state.db().pool(), id).await?;
+    let accounts = provenance::affected_accounts(state.db().pool(), id, 50).await?;
+    Ok(Json(ImpactBody::new(
+        id,
+        &impact,
+        &accounts,
+        provider.slug,
+    )))
+}
+
+/// Fall accounts back to local — the other half of the criterion, and the action the refusal
+/// tells the operator to take.
+///
+/// Every id is checked against the caller's organization and the provider's, so a batch cannot
+/// quietly take an account from a *different* tenant that happens to be in the list. The answer
+/// is the number that actually moved, read back from the update rather than from the request
+/// length: a list of a hundred ids where three exist elsewhere is a batch of 97, and printing
+/// "97 reassigned" would be the lie.
+///
+/// No client address is recorded on this one. Four extractors is the ceiling axum's handler
+/// tuple allows alongside a body, and the actor — who inside the tenant pressed the button — is
+/// the fact an audit reader needs; the network path of an administrator's own session is not.
+pub async fn reassign_provisioned_accounts(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ReassignBody>,
+) -> Result<Json<ReassignResultBody>, ApiError> {
+    let provider = load(&state, &current, id).await?;
+
+    let requested = body.user_ids.len();
+    if requested == 0 {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "name at least one account to fall back to a local sign-in",
+        ));
+    }
+    if requested > MAX_REASSIGN_BATCH {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            format!("fall back at most {MAX_REASSIGN_BATCH} accounts at a time — the panel can carry more in several batches"),
+        ));
+    }
+
+    // Which of the requested ids are actually this provider's, in this organization. Answered by
+    // a query rather than by filtering in Rust, so an id from another tenant is *absent* from
+    // the result rather than silently reassigned.
+    let scope = scoped_accounts(&state, id, provider.organization_id, &body.user_ids).await?;
+    let moved = provenance::reassign(state.db().pool(), &scope).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "iam.provider_accounts_reassigned")
+            .target("auth_provider", id.to_string())
+            .metadata(json!({
+                "slug": provider.slug,
+                "requested": requested,
+                "reassigned": moved,
+            }))
+            .organization(Some(provider.organization_id)),
+    )
+    .await?;
+
+    Ok(Json(ReassignResultBody {
+        requested,
+        reassigned: moved,
+        // Measured against the scope query, not against the update's row count. A local account
+        // in the list is a caller mistake the operator needs to hear about; subtracting the
+        // request length from the rows moved would report it as "not found", which is a
+        // different claim about a different kind of mistake.
+        not_moved: scope.len() as u64 - moved,
+        skipped: requested - scope.len(),
+    }))
+}
+
+/// Keep only the requested ids that belong to this provider in this organization.
+async fn scoped_accounts(
+    state: &AppState,
+    provider_id: Uuid,
+    organization_id: Uuid,
+    requested: &[Uuid],
+) -> Result<Vec<Uuid>, ApiError> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "select id from users \
+          where id = any($1) \
+            and organization_id = $2 \
+            and (provisioned_by_provider_id = $3 or identity_source = 'scim')",
+    )
+    .bind(requested)
+    .bind(organization_id)
+    .bind(provider_id)
+    .fetch_all(state.db().pool())
+    .await
+    .map_err(|error| ApiError::from(IdentityError::Database(error)))?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 /// Ask the provider what it is.
@@ -472,26 +957,511 @@ pub async fn test_provider(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ProviderTestBody>, ApiError> {
     let provider = load(&state, &current, id).await?;
+    // A directory asks a different question — can this host be bound to? — so it keeps its own
+    // six-step ladder and its own sentence. The protocol kinds now walk theirs: the argument that
+    // they "fail in exactly one place" was wrong, and a single result for three different repairs
+    // is a panel that names none of them.
+    if provider.kind.is_directory() {
+        let config = directory::DirectoryConfig::from_value(&provider.config)
+            .map_err(|error| ApiError::bad_request("invalid_request", error.to_string()))?;
+        // A directory's secret is the *bind* password, named by its own reference in the config
+        // rather than by the provider's `secret_ref` — the two are different credentials and
+        // conflating them is how a directory ends up authenticating with a client secret.
+        //
+        // Resolved to its value here and handed to the ladder as an argument. The value never
+        // reaches the response, and a directory whose reference names nothing runs the reachable
+        // half of the ladder and stops at `bind` with the sentence saying why — which is a
+        // result, and a better one than the previous behaviour of reporting the whole
+        // configuration as sound.
+        let bind_secret = std::env::var(config.bind_secret_ref.trim()).ok();
+        let bind_present = bind_secret.is_some();
+        // The ladder is live. It was `test_steps` — the decidable half, which never opened a
+        // socket and so could never report `ok` — until this slice, which means every directory
+        // an operator had ever added read "incomplete" however well configured it was, and the
+        // enable gate, which requires a passing test, refused to switch on a directory that
+        // worked. The criterion that described a bind and a search had no implementation at all.
+        let report = connection::run_test(&config, bind_secret.as_deref()).await;
+        let outcome = connection::outcome_from(&report);
+        let endpoints = Some(json!({
+            "host": config.hostname(),
+            "port": config.port(),
+            "encrypted": config.is_secure(),
+            "login_attribute": config.login_attribute(),
+            "bind_within_base": config.bind_within_base(),
+            // What the ladder actually read, so the panel can show the operator what the server
+            // returned rather than only what was configured. Naming contexts in particular are
+            // how a wrong base DN becomes obvious: the operator can see what the server does
+            // publish.
+            "naming_contexts": report.naming_contexts,
+            "attributes": report.sample_attributes,
+            "entries_read": report.entries_read,
+            "pages_read": report.pages_read,
+        }));
+
+        // Recorded on the row either way: a failed test is a result, and the enable gate reads
+        // it. Not recording failures is how a provider ends up enabled with a red "Last test".
+        providers::record_test(state.db().pool(), provider.id, outcome.passed()).await?;
+
+        emit(
+            &state,
+            // Spelled as two literal branches, not one computed name. A `NewEvent::new(if …)`
+            // is invisible to the catalogue drift test, and these two events were unlisted for
+            // that reason: the bus recorded them and the picker never offered them, so nobody
+            // could subscribe to a provider test failure. Two names also let a subscriber take
+            // only the failures instead of every test it then has to filter.
+            if outcome.passed() {
+                NewEvent::new("iam.provider_test_passed")
+                    .organization(Some(provider.organization_id))
+                    .actor(Some(current.user.id))
+                    .payload(json!({
+                        "provider_id": provider.id,
+                        "kind": provider.kind.as_str(),
+                        "step": outcome.failing_step().map(|step| step.as_str()),
+                    }))
+            } else {
+                NewEvent::new("iam.provider_test_failed")
+                    .organization(Some(provider.organization_id))
+                    .actor(Some(current.user.id))
+                    .payload(json!({
+                        "provider_id": provider.id,
+                        "kind": provider.kind.as_str(),
+                        "step": outcome.failing_step().map(|step| step.as_str()),
+                    }))
+            },
+        )
+        .await;
+
+        return Ok(Json(ProviderTestBody {
+            provider_id: provider.id,
+            slug: provider.slug.clone(),
+            kind: provider.kind.as_str(),
+            status: outcome.status,
+            detail: directory_detail(&outcome, &report, bind_present),
+            endpoints,
+            secret_present: bind_present,
+            steps: Some(outcome.steps.iter().map(StepRow::from).collect()),
+            problems: if outcome.problems.is_empty() {
+                None
+            } else {
+                Some(outcome.problems)
+            },
+        }));
+    }
+
     let client = HttpClient::new();
     let secret_present = provisioning::resolve_client_secret(&provider)
         .map(|value| value.is_some())
         .unwrap_or(false);
 
-    let (status, detail, endpoints) = match provider.kind {
+    let outcome = match provider.kind {
         ProviderKind::Oidc | ProviderKind::Oauth2 => {
             test_oidc(&client, &provider, secret_present).await
         }
-        ProviderKind::Saml => test_saml(&provider, secret_present),
+        ProviderKind::Saml => test_saml(&provider),
+        // A directory is handled above, so this arm is unreachable — but `match` on an enum
+        // without it would be a compile error the day a sixth kind lands, which is the right
+        // moment to be interrupted and not one second later.
+        _ => protocol_steps::TestOutcome::unconfigured(&provider.kind.as_str(), &["kind"]),
     };
+
+    // The failing step rides on the event for every kind. A webhook subscriber deciding whether
+    // to page somebody needs to know *which check* refused — "the provider is broken" at 3am is
+    // not actionable and a step name is.
+    let failing_step = outcome.failing_step().map(|step| step.as_str());
+
+    // The protocol kinds record their outcome too, so the registry's column and the gate mean
+    // the same thing for every kind rather than only for directories.
+    providers::record_test(state.db().pool(), provider.id, outcome.passed()).await?;
+
+    emit(
+        &state,
+        // Two literal branches for the same reason as the directory ladder above: a computed
+        // name is invisible to the catalogue drift test, and these are the *only* two events a
+        // protocol provider produces.
+        if outcome.passed() {
+            NewEvent::new("iam.provider_test_passed")
+                .organization(Some(provider.organization_id))
+                .actor(Some(current.user.id))
+                .payload(json!({
+                    "provider_id": provider.id,
+                    "kind": provider.kind.as_str(),
+                    "step": failing_step,
+                }))
+        } else {
+            NewEvent::new("iam.provider_test_failed")
+                .organization(Some(provider.organization_id))
+                .actor(Some(current.user.id))
+                .payload(json!({
+                    "provider_id": provider.id,
+                    "kind": provider.kind.as_str(),
+                    "step": failing_step,
+                }))
+        },
+    )
+    .await;
 
     Ok(Json(ProviderTestBody {
         provider_id: provider.id,
         slug: provider.slug.clone(),
         kind: provider.kind.as_str(),
-        status,
-        detail,
-        endpoints,
+        status: outcome.status,
+        detail: outcome.headline(),
+        endpoints: outcome.endpoints,
         secret_present,
+        steps: Some(outcome.steps.iter().map(StepRow::from).collect()),
+        problems: None,
+    }))
+}
+
+/// One sentence for the top of a directory test result.
+///
+/// The ladder below carries the detail; this is what the panel shows before it, and it has to
+/// say the *same* thing the ladder says. `incomplete` gets its own sentence rather than being
+/// folded into "failed", because "not tested yet" and "tested and broken" call for different
+/// actions and a screen that conflates them sends the operator to the wrong one.
+fn directory_detail(
+    outcome: &directory::TestOutcome,
+    report: &connection::ConnectionReport,
+    bind_present: bool,
+) -> String {
+    // A configuration that was refused locally is a *form* answer, and it says so with the field
+    // names — which is what the wizard underlines.
+    if !outcome.problems.is_empty() {
+        let count = outcome.problems.len();
+        return format!(
+            "{count} configuration {} to fix before this directory can be tested: {}",
+            if count == 1 { "problem" } else { "problems" },
+            outcome
+                .problems
+                .iter()
+                .map(|problem| problem.field)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    // A live failure is named by its step, because "connection failed" is what an operator cannot
+    // act on and "the bind step was refused" is what they can. The sentence on the step itself
+    // carries the detail; this one says which step and what it means.
+    //
+    // **A step that never ran is not a step that failed**, and saying so is what tells the
+    // operator which of the two they are looking at. A configuration with no bind secret reaches
+    // the host, gets a green DNS/TCP/TLS ladder, and then has nothing to authenticate with — the
+    // ladder is `pending` at `bind` and the sentence has to say that, because "the bind step did
+    // not pass" reads as "your bind DN is wrong" and sends somebody to edit a DN that is fine.
+    if let Some(step) = report.failing_step {
+        let ran = report
+            .steps
+            .iter()
+            .find(|row| row.step == step && row.status == "failed");
+        let mut sentence = match ran {
+            Some(detail) => {
+                let mut sentence = format!("the {} step did not pass — ", step.as_str());
+                sentence.push_str(detail.detail.trim());
+                sentence
+            }
+            None => format!(
+                "the {} step could not be attempted",
+                step.as_str()
+            ),
+        };
+        // The missing secret is the operator's next action and belongs in the sentence wherever
+        // the ladder stopped, not only on the path that reaches the end.
+        if !bind_present {
+            sentence.push_str(
+                " — the bind password is not defined in this installation, so the bind step \
+                 cannot succeed until it is",
+            );
+        }
+        return sentence;
+    }
+
+    let mut sentence = match outcome.status {
+        "incomplete" => "the configuration is sound; the directory itself has not been reached \
+                         yet, so this is not a passing test"
+            .to_owned(),
+        _ => format!(
+            "every step passed — {} entr{} read across {} page{}",
+            report.entries_read,
+            if report.entries_read == 1 { "y" } else { "ies" },
+            report.pages_read,
+            if report.pages_read == 1 { "" } else { "s" },
+        ),
+    };
+    if !bind_present {
+        sentence.push_str(
+            " — the bind password is not defined in this installation, so the bind \
+                           step cannot succeed until it is",
+        );
+    }
+    sentence
+}
+
+/// Switch a provider on.
+///
+/// Refused until the stored test says it passed. The gate lives in the crate rather than here so
+/// it cannot be bypassed by a second route that forgets to ask — and the error says which of the
+/// three states it is, because "enable failed" is not an action anybody can take.
+pub async fn enable_provider(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(id): Path<Uuid>,
+    address: ClientAddress,
+) -> Result<Json<ProviderEnabledBody>, ApiError> {
+    set_enabled(&state, &current, id, true, address).await
+}
+
+/// Switch a provider off. Always allowed, gate or no gate: turning something off is never the
+/// dangerous direction, and an operator staring at a broken provider must be able to stop it.
+pub async fn disable_provider(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(id): Path<Uuid>,
+    address: ClientAddress,
+) -> Result<Json<ProviderEnabledBody>, ApiError> {
+    set_enabled(&state, &current, id, false, address).await
+}
+
+async fn set_enabled(
+    state: &AppState,
+    current: &CurrentSession,
+    id: Uuid,
+    enabled: bool,
+    address: ClientAddress,
+) -> Result<Json<ProviderEnabledBody>, ApiError> {
+    let provider = load(state, current, id).await?;
+    if enabled {
+        providers::enable_gate(&provider).map_err(|error| {
+            ApiError::bad_request("provider_not_ready", error.to_string())
+                .with_details(json!({ "provider_id": provider.id }))
+        })?;
+    }
+    if provider.enabled == enabled {
+        // Idempotent on purpose: a double-click on a checkbox is not a state change, and
+        // answering it with a second audit row makes the trail claim something happened twice.
+        return Ok(Json(ProviderEnabledBody {
+            id: provider.id,
+            enabled,
+            gate_passed: provider.last_test_ok == Some(true),
+        }));
+    }
+
+    let updated = providers::update_provider(
+        state.db().pool(),
+        id,
+        ProviderChanges {
+            enabled: Some(enabled),
+            ..ProviderChanges::default()
+        },
+    )
+    .await?
+    .ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "provider_not_found",
+            "no such provider",
+        )
+    })?;
+
+    record(
+        state,
+        NewAuditEntry::by_user(current.user.id, "iam.provider_enabled")
+            .target("auth_provider", id.to_string())
+            .metadata(json!({ "slug": updated.slug, "enabled": true }))
+            .ip_address(address.as_text())
+            .organization(Some(updated.organization_id)),
+    )
+    .await?;
+
+    emit(
+        state,
+        NewEvent::new("iam.provider_enabled")
+            .organization(Some(updated.organization_id))
+            .actor(Some(current.user.id))
+            .payload(json!({ "provider_id": updated.id, "slug": updated.slug })),
+    )
+    .await;
+
+    Ok(Json(ProviderEnabledBody {
+        id: updated.id,
+        enabled: true,
+        gate_passed: updated.last_test_ok == Some(true),
+    }))
+}
+
+/// Apply one action to a selection of providers.
+///
+/// **Why a batch at all**, when `POST /{id}/enable` and `/{id}/disable` already exist: the
+/// ordinary case is an operator who has just inherited an installation with nine directories
+/// connected and needs them all *off* this afternoon, or a migration that has to be reversed
+/// in one move. Nine round trips with nine spinners is not a refusal, it is just a worse tool.
+///
+/// **Why it is not a loop over the single verbs.** Three reasons, and each one is a claim the
+/// walk has to be able to fail on:
+///
+/// 1. **A partial success is the normal answer, not an error.** Switching four providers on
+///    when two have never passed a test does three things and refuses one. Answering `200` with
+///    a count would leave the operator believing four are live, and the two that are not are
+///    the ones nobody is looking at. So a refusal is a **row with a code**, in the same list as
+///    the successes, in the order the ids arrived.
+/// 2. **The gate is asked per row, and the rows are independent.** One provider being untested
+///    must not stop the other three, or the operator cannot turn off a broken directory without
+///    first fixing the four that are fine.
+/// 3. **A missing id is not a refused id.** A provider in another tenant does not exist for this
+///    caller; reporting it in `results` with the gate's code would blame the gate for a
+///    tenancy decision. It gets its own list.
+///
+/// The audit and the events are written per row rather than once for the batch: an operator
+/// reading the trail for one directory must find that directory, and a single "bulk enabled 3"
+/// line is a trail that answers none of the questions anybody actually asks of it.
+pub async fn bulk_update_providers(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Json(body): Json<BulkProvidersBody>,
+) -> Result<Json<BulkProvidersBodyOut>, ApiError> {
+    let action = body.action.trim().to_ascii_lowercase();
+    if action != "enable" && action != "disable" {
+        return Err(ApiError::bad_request(
+            "unknown_bulk_action",
+            format!(
+                "the only bulk actions are `enable` and `disable`; `{action}` is not one of them"
+            ),
+        ));
+    }
+    let enabled = action == "enable";
+
+    // A duplicate id in one request is a panel bug, not a request to do the work twice. The
+    // rows are deduplicated *preserving first-seen order* so the answer still lines up with what
+    // the operator ticked, and so a repeated id cannot produce two audit rows for one change.
+    let mut ids: Vec<Uuid> = Vec::with_capacity(body.ids.len());
+    for id in body.ids {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Err(ApiError::bad_request(
+            "no_providers",
+            "select at least one provider",
+        ));
+    }
+    if ids.len() > MAX_BULK_PROVIDERS {
+        return Err(ApiError::bad_request(
+            "too_many_providers",
+            format!(
+                "a bulk action carries at most {MAX_BULK_PROVIDERS} providers; this one asked for \
+                 {}",
+                ids.len()
+            ),
+        )
+        .with_details(json!({ "requested": ids.len(), "limit": MAX_BULK_PROVIDERS })));
+    }
+
+    let mut results = Vec::with_capacity(ids.len());
+    let mut applied = 0i64;
+    let mut refused = 0i64;
+    let mut missing = Vec::new();
+
+    for id in ids {
+        // A provider this caller may not see is reported apart, and *not* as a gate refusal.
+        let provider = match providers::find_provider(state.db().pool(), id).await? {
+            Some(provider) => {
+                if resolve_organization(&current, Some(provider.organization_id)).is_err() {
+                    missing.push(id);
+                    continue;
+                }
+                provider
+            }
+            None => {
+                missing.push(id);
+                continue;
+            }
+        };
+
+        if enabled {
+            if let Err(error) = providers::enable_gate(&provider) {
+                refused += 1;
+                results.push(BulkProviderRow {
+                    id: provider.id,
+                    slug: provider.slug.clone(),
+                    enabled: None,
+                    error: Some("provider_not_ready".to_owned()),
+                    message: Some(error.to_string()),
+                });
+                continue;
+            }
+        }
+
+        // Idempotent on purpose, and for the same reason the single verb is: a re-tick of a
+        // bulk action is a person asking the same question twice, not two changes.
+        let changed = provider.enabled != enabled;
+        if changed {
+            let updated = providers::update_provider(
+                state.db().pool(),
+                id,
+                ProviderChanges {
+                    enabled: Some(enabled),
+                    ..ProviderChanges::default()
+                },
+            )
+            .await?
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "provider_not_found",
+                    "no such provider",
+                )
+            })?;
+
+            record(
+                &state,
+                NewAuditEntry::by_user(current.user.id, "iam.provider_enabled")
+                    .target("auth_provider", updated.id.to_string())
+                    .metadata(json!({
+                        "slug": updated.slug,
+                        "enabled": enabled,
+                        // The batch is named so a trail of nine rows for nine directories can be
+                        // told apart from nine separate decisions.
+                        "bulk": true,
+                    }))
+                    .ip_address(address.as_text())
+                    .organization(Some(updated.organization_id)),
+            )
+            .await?;
+
+            emit(
+                &state,
+                NewEvent::new("iam.provider_enabled")
+                    .organization(Some(updated.organization_id))
+                    .actor(Some(current.user.id))
+                    .payload(json!({
+                        "provider_id": updated.id,
+                        "slug": updated.slug,
+                        "bulk": true,
+                    })),
+            )
+            .await;
+        }
+
+        if changed {
+            applied += 1;
+        }
+        results.push(BulkProviderRow {
+            id: provider.id,
+            slug: provider.slug.clone(),
+            enabled: Some(enabled),
+            error: None,
+            message: None,
+        });
+    }
+
+    Ok(Json(BulkProvidersBodyOut {
+        action,
+        results,
+        applied,
+        refused,
+        missing,
     }))
 }
 
@@ -554,6 +1524,19 @@ pub async fn list_provider_events(
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
+/// Read a provider for a *sub*-surface, refusing one outside the caller's organization.
+///
+/// This is [`load`] with a name other modules can reach, and it is the same function: the tenant
+/// check is the one place that answers "may this caller touch this provider", and a second copy
+/// of it is a second answer to that question.
+pub async fn load_for_sync(
+    state: &AppState,
+    current: &CurrentSession,
+    id: Uuid,
+) -> Result<AuthProvider, ApiError> {
+    load(state, current, id).await
+}
+
 /// Read a provider and refuse one outside the caller's organization.
 async fn load(
     state: &AppState,
@@ -589,15 +1572,20 @@ async fn sign_in_summary(
 }
 
 /// The `code` flows: discovery first, then the key set the discovery document points at.
+///
+/// This is the *fetch* half only. Deciding what the fetch means — including the issuer check that
+/// makes a discovery document belonging to somebody else a refusal rather than a result — lives in
+/// [`protocol_steps`], so the sign-in path and this button cannot disagree about whether a provider
+/// is the one it was configured to be.
 async fn test_oidc(
     client: &HttpClient,
     provider: &AuthProvider,
     secret_present: bool,
-) -> (&'static str, String, Option<Value>) {
+) -> protocol_steps::TestOutcome {
     // A SAML provider stores its endpoints explicitly; an OIDC one may either name an issuer to
     // discover, or name the endpoints outright for a provider that publishes no discovery
     // document. Both are supported, and which one is in use is visible in the row.
-    let issuer = provider
+    let configured_issuer = provider
         .config
         .get("issuer")
         .and_then(Value::as_str)
@@ -605,33 +1593,37 @@ async fn test_oidc(
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
 
-    let discovery = match issuer.as_deref() {
+    let (document, keys) = match configured_issuer.as_deref() {
         Some(issuer) => {
             let url = format!(
                 "{}/.well-known/openid-configuration",
                 issuer.trim_end_matches('/')
             );
             match client.get_json(&url).await {
-                Ok(document) => match Discovery::from_value(&document) {
-                    Ok(discovery) => discovery,
-                    Err(error) => {
-                        return (
-                            "failed",
-                            format!("the discovery document is incomplete: {error}"),
-                            None,
-                        );
+                Ok(value) => match Discovery::from_value(&value) {
+                    // The keys are read *before* the document is moved into the tuple: a tuple
+                    // evaluates its elements left to right, so writing `(Ok(discovery),
+                    // fetch_keys(&discovery))` borrows a value that is already gone.
+                    Ok(discovery) => {
+                        let keys = fetch_keys(client, &discovery).await;
+                        (Ok(discovery), keys)
                     }
+                    // An incomplete document is a discovery failure, not a transport one: the
+                    // server answered, and what it answered cannot be used. The ladder says so.
+                    Err(error) => (
+                        Err(invalid(format!(
+                            "the discovery document is incomplete: {error}"
+                        ))),
+                        Ok(Vec::new()),
+                    ),
                 },
-                Err(error) => {
-                    return (
-                        "failed",
-                        format!("the discovery document could not be read: {error}"),
-                        None,
-                    );
-                }
+                Err(error) => (Err(error), Ok(Vec::new())),
             }
         }
         None => {
+            // Endpoints entered by hand: there is no document to fetch and therefore no issuer to
+            // compare against. The keys still have to be readable, so the JWKS the row names is
+            // fetched and the issuer step is told rather than failed.
             let text = |field: &str| {
                 provider
                     .config
@@ -647,69 +1639,61 @@ async fn test_oidc(
                 text("token_endpoint"),
                 text("jwks_uri"),
             ) else {
-                return (
-                    "failed",
-                    "the provider names no issuer, so nothing can be discovered — set `issuer` \
-                     in the configuration to discover the rest"
-                        .to_owned(),
-                    None,
+                return protocol_steps::TestOutcome::unconfigured(
+                    "oidc",
+                    &[
+                        "issuer",
+                        "authorization_endpoint",
+                        "token_endpoint",
+                        "jwks_uri",
+                    ],
                 );
             };
-            Discovery {
+            let discovery = Discovery {
                 issuer,
                 authorization_endpoint,
                 token_endpoint,
                 jwks_uri,
                 userinfo_endpoint: text("userinfo_endpoint"),
-            }
+            };
+            let keys = fetch_keys(client, &discovery).await;
+            (Ok(discovery), keys)
         }
     };
 
-    let jwks = match client.get_json(&discovery.jwks_uri).await {
-        Ok(document) => document,
-        Err(error) => {
-            return (
-                "failed",
-                format!(
-                    "the discovery document is fine, but its signing keys are not readable: {error}"
-                ),
-                Some(endpoints_json(&discovery)),
-            );
-        }
-    };
-    let keys = oidc::parse_jwks(&jwks);
-    if keys.is_empty() {
-        return (
-            "failed",
-            "the provider publishes no RSA signing key this platform can verify".to_owned(),
-            Some(endpoints_json(&discovery)),
-        );
+    protocol_steps::test_oidc(protocol_steps::OidcProbe {
+        configured_issuer: configured_issuer.as_deref(),
+        document,
+        keys,
+        secret_present,
+    })
+}
+
+/// The signing keys the discovery document points at.
+///
+/// Returns the *reason* on failure rather than an empty vector: a provider that publishes no key
+/// this platform trusts and a provider whose key set cannot be read are different failures with
+/// different repairs, and the ladder is what keeps them apart.
+async fn fetch_keys(client: &HttpClient, discovery: &Discovery) -> Result<Vec<Jwk>, String> {
+    match client.get_json(&discovery.jwks_uri).await {
+        Ok(document) => Ok(oidc::parse_jwks(&document)),
+        Err(error) => Err(error.to_string()),
     }
+}
 
-    let note = if secret_present {
-        String::new()
-    } else {
-        " (the client secret is not defined in this installation, so a sign-in will be refused \
-         until it is)"
-            .to_owned()
-    };
-    (
-        "ok",
-        format!(
-            "discovery answered and {} usable signing key(s) were published{note}",
-            keys.len()
-        ),
-        Some(endpoints_json(&discovery)),
-    )
+/// A configuration problem, as the provider layer names it.
+fn invalid(message: impl Into<String>) -> omnion_identity::IdentityError {
+    omnion_identity::IdentityError::InvalidProvider(message.into())
 }
 
 /// SAML has no discovery: every endpoint is entered, so the test is a *parse* of what is
 /// configured — which is exactly the failure an operator hits first (a certificate copied with
 /// its BEGIN line missing, or a base64 blob that lost its wrapping).
-fn test_saml(
-    provider: &AuthProvider,
-    secret_present: bool,
-) -> (&'static str, String, Option<Value>) {
+///
+/// A missing field is refused by name rather than fed to the ladder as an empty string, because
+/// "you did not fill this in" and "the certificate is broken" are different messages and the
+/// wizard underlines a different input for each.
+fn test_saml(provider: &AuthProvider) -> protocol_steps::TestOutcome {
     let text = |field: &str| {
         provider
             .config
@@ -719,83 +1703,25 @@ fn test_saml(
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
     };
-    let (Some(issuer), Some(audience), Some(certificate)) =
-        (text("issuer"), text("audience"), text("certificate_pem"))
-    else {
-        return (
-            "failed",
-            "a SAML provider needs `issuer`, `audience` and `certificate_pem` in its \
-             configuration"
-                .to_owned(),
-            None,
-        );
-    };
-
-    let email_attribute = text("email_attribute").unwrap_or_else(|| "email".to_owned());
-    let group_attribute = text("group_attribute");
-    let display_name_attribute = text("display_name_attribute");
-
-    // A configuration is proved by asking the *real* parser whether the certificate is usable,
-    // not by a second implementation of the parse that could drift from it. The earlier version
-    // fed a probe response to `verify_response` and inferred the answer from the error text —
-    // and because the probe carried a self-closing `<saml:Assertion/>` (which the reader never
-    // parses at all), the button reported every certificate as broken and could never succeed.
-    if let Err(error) = omnion_identity::sso::saml::certificate_is_readable(&certificate) {
-        return (
-            "failed",
-            format!("the configured certificate could not be read: {error}"),
-            None,
-        );
+    let required = ["issuer", "audience", "certificate_pem"];
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|field| text(field).is_none())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return protocol_steps::TestOutcome::unconfigured("saml", &missing);
     }
 
-    // The attribute names are configuration too, and a typo in one is invisible until a real
-    // assertion arrives carrying no address the reader recognises. So the probe runs the whole
-    // reader over a document that has *every* attribute the configuration names — which is the
-    // last check that needs no signature, and it proves the wiring end to end.
-    let probe = omnion_identity::sso::saml::probe_document(
-        &issuer,
-        &audience,
-        &email_attribute,
-        group_attribute.as_deref(),
-        display_name_attribute.as_deref(),
-    );
     let config = omnion_identity::sso::saml::SamlConfig {
-        issuer: issuer.clone(),
-        audience: audience.clone(),
-        certificate_pem: certificate,
-        email_attribute,
-        group_attribute,
-        display_name_attribute,
+        issuer: text("issuer").unwrap_or_default(),
+        audience: text("audience").unwrap_or_default(),
+        certificate_pem: text("certificate_pem").unwrap_or_default(),
+        email_attribute: text("email_attribute").unwrap_or_else(|| "email".to_owned()),
+        group_attribute: text("group_attribute"),
+        display_name_attribute: text("display_name_attribute"),
     };
-    if let Err(error) = omnion_identity::sso::saml::probe_claims(&probe, &config) {
-        return (
-            "failed",
-            format!("the assertion reader cannot read this configuration: {error}"),
-            None,
-        );
-    }
-
-    let note = if secret_present {
-        String::new()
-    } else {
-        " (SAML usually needs no client secret — the certificate is the credential)".to_owned()
-    };
-    (
-        "ok",
-        format!("the assertion reader accepts this configuration{note}"),
-        Some(json!({ "issuer": issuer, "audience": audience })),
-    )
-}
-
-/// The endpoints the panel shows next to a successful test.
-fn endpoints_json(discovery: &Discovery) -> Value {
-    json!({
-        "issuer": discovery.issuer,
-        "authorization_endpoint": discovery.authorization_endpoint,
-        "token_endpoint": discovery.token_endpoint,
-        "jwks_uri": discovery.jwks_uri,
-        "userinfo_endpoint": discovery.userinfo_endpoint,
-    })
+    protocol_steps::test_saml(&config)
 }
 
 #[cfg(test)]
@@ -825,6 +1751,12 @@ mod tests {
             default_role_id: None,
             jit_enabled: false,
             enabled: false,
+            last_test_at: None,
+            last_test_ok: None,
+            sync_interval_minutes: 60,
+            last_sync_at: None,
+            last_sync_status: None,
+            plugin_key: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             updated_at: time::OffsetDateTime::UNIX_EPOCH,
         };
@@ -849,6 +1781,12 @@ mod tests {
             default_role_id: None,
             jit_enabled: true,
             enabled: true,
+            last_test_at: None,
+            last_test_ok: None,
+            sync_interval_minutes: 60,
+            last_sync_at: None,
+            last_sync_status: None,
+            plugin_key: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             updated_at: time::OffsetDateTime::UNIX_EPOCH,
         };
@@ -860,6 +1798,326 @@ mod tests {
         );
         let encoded = serde_json::to_string(&body).expect("the body serializes");
         assert!(!encoded.contains("client_secret"));
+    }
+
+    /// A provider row with the three test states, because the gate is the whole feature and it
+    /// has to be provable without a database.
+    fn provider_with(last_test_ok: Option<bool>, enabled: bool) -> AuthProvider {
+        AuthProvider {
+            id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            slug: "dir".into(),
+            kind: ProviderKind::Ldap,
+            name: "Directory".into(),
+            config: json!({}),
+            secret_ref: None,
+            scopes: vec![],
+            group_claim: None,
+            default_role_id: None,
+            jit_enabled: false,
+            enabled,
+            last_test_at: None,
+            last_test_ok,
+            sync_interval_minutes: 60,
+            last_sync_at: None,
+            last_sync_status: None,
+            plugin_key: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// The requirement is "a provider cannot be enabled while its last test has never passed".
+    /// "Never" is the case that gets skipped, because `Some(false)` is the one that looks like a
+    /// bug report.
+    #[test]
+    fn an_untested_provider_cannot_be_switched_on() {
+        assert!(
+            providers::enable_gate(&provider_with(None, false)).is_err(),
+            "never tested is not a passing test"
+        );
+        assert!(
+            providers::enable_gate(&provider_with(Some(false), false)).is_err(),
+            "tested and failed is not a passing test"
+        );
+        assert!(
+            providers::enable_gate(&provider_with(Some(true), false)).is_ok(),
+            "a passing test is the whole requirement"
+        );
+    }
+
+    /// Turning something *off* is never gated. An operator staring at a broken provider has to
+    /// be able to stop it without first making it pass anything.
+    #[test]
+    fn an_enabled_provider_is_never_re_refused_by_the_gate() {
+        assert!(
+            providers::enable_gate(&provider_with(None, true)).is_ok(),
+            "already-enabled is a state the gate does not second-guess"
+        );
+    }
+
+    /// The three states must not collapse. A registry that rendered `null` and `false` the same
+    /// way would tell an operator a brand-new provider is broken.
+    #[test]
+    fn the_status_chip_distinguishes_disabled_from_degraded() {
+        assert_eq!(connection_status(&provider_with(None, false)), "disabled");
+        assert_eq!(
+            connection_status(&provider_with(Some(false), false)),
+            "disabled"
+        );
+        // Enabled and failing is the state worth seeing: it is load-bearing and broken.
+        assert_eq!(
+            connection_status(&provider_with(Some(false), true)),
+            "degraded"
+        );
+        assert_eq!(
+            connection_status(&provider_with(Some(true), true)),
+            "enabled"
+        );
+        // Never tested but enabled can only happen through a hand-edited row; it is not
+        // "degraded" because nothing is known to be wrong.
+        assert_eq!(connection_status(&provider_with(None, true)), "enabled");
+
+        let mut failed_sync = provider_with(Some(true), true);
+        failed_sync.last_sync_status = Some("failed".into());
+        assert_eq!(
+            connection_status(&failed_sync),
+            "degraded",
+            "a failed sync is also a reason an operator has to look at this"
+        );
+    }
+
+    /// A test proves a configuration, not a provider id. Repointing the host has to drop it.
+    #[test]
+    fn an_edit_that_moves_the_connection_drops_the_stored_test() {
+        for field in ["config", "secret_ref", "kind"] {
+            assert!(
+                providers::edit_invalidates_test(&[field]),
+                "`{field}` changes what a test would prove"
+            );
+        }
+        for field in [
+            "name",
+            "default_role_id",
+            "jit_enabled",
+            "sync_interval_minutes",
+        ] {
+            assert!(
+                !providers::edit_invalidates_test(&[field]),
+                "renaming a provider does not make its last test untrue: `{field}`"
+            );
+        }
+        assert!(
+            !providers::edit_invalidates_test(&[]),
+            "a PATCH with no fields is not a change"
+        );
+    }
+
+    /// The sentence above the ladder has to agree with the ladder underneath it.
+    #[test]
+    fn the_summary_sentence_agrees_with_the_status() {
+        let broken = directory::TestOutcome {
+            status: "failed",
+            steps: vec![],
+            problems: vec![omnion_identity::sso::directory::ConfigProblem {
+                field: "host",
+                message: "required".into(),
+                kind: omnion_identity::sso::directory::Problem::Missing,
+            }],
+            reached_server: None,
+        };
+        let sentence = directory_detail(&broken, &no_report(), true);
+        assert!(sentence.contains("1 configuration problem"), "{sentence}");
+        assert!(sentence.contains("host"), "it names the field: {sentence}");
+
+        // A configuration problem short-circuits the summary even when a report is present: the
+        // two cannot happen together, and a summary that preferred the report would name a
+        // network step for a form that was never filled in.
+        let both = connection::ConnectionReport {
+            steps: vec![],
+            failing_step: Some(directory::TestStep::Bind),
+            sample_attributes: vec![],
+            problems: broken.problems.clone(),
+            entries_read: 0,
+            pages_read: 0,
+            groups: None,
+            naming_contexts: vec![],
+        };
+        assert!(
+            directory_detail(&broken, &both, true).contains("configuration problem"),
+            "a form problem outranks a transport step: {}",
+            directory_detail(&broken, &both, true)
+        );
+    }
+
+    /// A live failure names its **step**, and a passing ladder reports what it read.
+    ///
+    /// This is the sentence the whole ladder exists for, and the first version of this test
+    /// could not exist: `directory_detail` took no report, so there was no way to ask what it
+    /// would say about a bind that was refused on a live directory.
+    #[test]
+    fn a_live_failure_names_its_step_and_its_sentence() {
+        let refused = connection::ConnectionReport {
+            steps: vec![
+                directory::StepReport {
+                    step: directory::TestStep::Dns,
+                    status: "ok",
+                    detail: "the host name resolved".into(),
+                },
+                directory::StepReport {
+                    step: directory::TestStep::Tcp,
+                    status: "ok",
+                    detail: "connected to dir.example.com:636".into(),
+                },
+                directory::StepReport {
+                    step: directory::TestStep::Tls,
+                    status: "ok",
+                    detail: "TLS negotiated".into(),
+                },
+                directory::StepReport {
+                    step: directory::TestStep::Bind,
+                    status: "failed",
+                    detail: "the server refused this service account — check the bind DN and the \
+                              password behind its reference, since it reports both the same way"
+                        .into(),
+                },
+                directory::StepReport {
+                    step: directory::TestStep::Search,
+                    status: "pending",
+                    detail: String::new(),
+                },
+            ],
+            failing_step: Some(directory::TestStep::Bind),
+            sample_attributes: vec![],
+            problems: vec![],
+            entries_read: 0,
+            pages_read: 0,
+            groups: None,
+            naming_contexts: vec![],
+        };
+        let outcome = connection::outcome_from(&refused);
+        let sentence = directory_detail(&outcome, &refused, true);
+        assert!(sentence.contains("bind step"), "it names the step: {sentence}");
+        assert!(
+            sentence.contains("bind DN"),
+            "it carries the step's own sentence, which is the fix: {sentence}"
+        );
+        assert!(
+            !sentence.contains("every step passed"),
+            "a refused bind must never read as a pass: {sentence}"
+        );
+    }
+
+    /// A green ladder reports the figures, because "it works" and "it read 4,000 people in 8
+    /// pages" are different confidences and an operator configuring a directory wants the second.
+    #[test]
+    fn a_passing_ladder_reports_what_it_actually_read() {
+        let passed = connection::ConnectionReport {
+            steps: vec![directory::StepReport {
+                step: directory::TestStep::Dns,
+                status: "ok",
+                detail: "resolved".into(),
+            }],
+            failing_step: None,
+            sample_attributes: vec!["uid".into()],
+            problems: vec![],
+            entries_read: 1,
+            pages_read: 1,
+            groups: None,
+            naming_contexts: vec!["dc=example,dc=com".into()],
+        };
+        let outcome = connection::outcome_from(&passed);
+        let sentence = directory_detail(&outcome, &passed, true);
+        assert!(sentence.contains("1 entry read"), "{sentence}");
+        assert!(sentence.contains("1 page"), "{sentence}");
+
+        // Pluralisation is asserted because a summary that says "1 entries" is the kind of
+        // sentence that makes an operator stop reading the rest of it.
+        let plural = connection::ConnectionReport {
+            entries_read: 4_000,
+            pages_read: 8,
+            ..passed.clone()
+        };
+        let sentence = directory_detail(&outcome, &plural, true);
+        assert!(sentence.contains("4000 entries read"), "{sentence}");
+        assert!(sentence.contains("8 pages"), "{sentence}");
+    }
+
+    /// A report with no bind secret stops at `bind` and says why, rather than claiming a pass on
+    /// the strength of a reachable host. This is the state an operator lands in after typing a
+    /// configuration and before the platform has been given the secret, and it is the one that
+    /// used to read as sound.
+    #[test]
+    fn a_missing_bind_secret_is_its_own_state() {
+        let without = connection::ConnectionReport {
+            steps: vec![directory::StepReport {
+                step: directory::TestStep::Bind,
+                status: "pending",
+                detail: String::new(),
+            }],
+            failing_step: Some(directory::TestStep::Bind),
+            sample_attributes: vec![],
+            problems: vec![],
+            entries_read: 0,
+            pages_read: 0,
+            groups: None,
+            naming_contexts: vec![],
+        };
+        let outcome = connection::outcome_from(&without);
+        assert!(
+            !outcome.passed(),
+            "a directory whose bind step never ran has NOT passed"
+        );
+        assert_eq!(outcome.reached_server, Some(true), "a host was reached");
+        let sentence = directory_detail(&outcome, &without, false);
+        assert!(sentence.contains("bind password"), "{sentence}");
+        // And the distinction that matters: a step that never ran is not reported as a step that
+        // failed, because the two send an operator to different fields.
+        assert!(
+            sentence.contains("could not be attempted"),
+            "a pending step must not read as a failed one: {sentence}"
+        );
+        assert!(
+            !sentence.contains("did not pass"),
+            "nothing was tried, so nothing failed: {sentence}"
+        );
+    }
+
+    /// A helper so the tests that only care about a *form* answer do not have to spell out an
+    /// empty report. A report with no steps and no failing step is the shape `outcome_from` is
+    /// never handed in production, which is exactly why it is confined to the test module.
+    fn no_report() -> connection::ConnectionReport {
+        connection::ConnectionReport {
+            steps: vec![],
+            failing_step: None,
+            sample_attributes: vec![],
+            problems: vec![],
+            entries_read: 0,
+            pages_read: 0,
+            groups: None,
+            naming_contexts: vec![],
+        }
+    }
+
+    /// A directory has no OAuth scopes. Offering them would write values into a column the
+    /// sign-in path cannot act on.
+    #[test]
+    fn a_directory_kind_is_told_apart_from_a_protocol_one() {
+        assert!(ProviderKind::Ldap.is_directory());
+        assert!(ProviderKind::ActiveDirectory.is_directory());
+        assert!(!ProviderKind::Oidc.is_directory());
+        assert!(
+            !ProviderKind::Ldap.uses_scopes(),
+            "a directory requests no scopes"
+        );
+        assert!(ProviderKind::Oidc.uses_scopes());
+        // A directory has no authorization-code flow, and naming one anyway would be a lie the
+        // challenge table cannot even store.
+        assert_eq!(
+            omnion_identity::sso::oidc::flow_of(ProviderKind::Ldap),
+            "directory"
+        );
+        assert!(default_scopes(ProviderKind::ActiveDirectory).is_empty());
     }
 
     #[test]

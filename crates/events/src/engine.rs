@@ -26,7 +26,10 @@ const MAX_ERROR_CHARS: usize = 500;
 /// cannot grow without limit; it is still clamped, because the delivery row's own check demands
 /// a non-negative integer and a saturated conversion would be a value the column refuses.
 fn elapsed_millis(started: StdInstant) -> Option<i32> {
-    let millis = started.elapsed().as_millis().min(i32::MAX as u128);
+    let millis = started
+        .elapsed()
+        .as_millis()
+        .min(i32::MAX as u128);
     i32::try_from(millis).ok()
 }
 
@@ -120,8 +123,13 @@ async fn deliver_one(
 
     match outcome {
         DeliveryOutcome::Delivered { status } => {
-            store::mark_delivered(pool, job.delivery_id, Some(i32::from(status)), duration_ms)
-                .await?;
+            store::mark_delivered(
+                pool,
+                job.delivery_id,
+                Some(i32::from(status)),
+                duration_ms,
+            )
+            .await?;
             report.delivered += 1;
 
             tracing::info!(

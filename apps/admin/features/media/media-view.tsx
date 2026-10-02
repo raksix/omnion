@@ -44,7 +44,6 @@ import {
   deleteMediaFolder,
   fetchMediaFiles,
   fetchMediaFolders,
-  fetchMediaUploaders,
   mediaBulkAction,
   mediaRawUrl,
   moveMediaFolder,
@@ -54,13 +53,7 @@ import {
 } from "@/lib/api";
 import { formatBytes, formatTimestamp } from "@/lib/format";
 import { useSites } from "@/lib/sites";
-import type {
-  MediaFile,
-  MediaFilePage,
-  MediaFolder,
-  MediaFilters,
-  MediaUploader,
-} from "@/lib/types";
+import type { MediaFile, MediaFilePage, MediaFolder, MediaFilters } from "@/lib/types";
 
 /** How the content area is laid out. */
 type ViewMode = "list" | "grid";
@@ -76,29 +69,6 @@ const SORTS: { value: string; label: string }[] = [
 ];
 
 /** Kind filter, with the label each one shows. */
-/**
- * A typed size in bytes, or `undefined` when the field is empty or half-typed.
- *
- * The unit is written in the label beside the field, so the operator types digits and the field
- * stays a number input: a `type="number"` is what stops a stray `e` and `+` from reaching the
- * store, and `Number.parseInt` alone would turn `12abc` into `12`.
- *
- * A negative value is clamped to nothing rather than sent: the store clamps negatives to zero
- * too, but "the smallest size" of `-1` is not a filter anybody means, and a `0` bound would
- * quietly match the whole library.
- */
-function parseSize(raw: string): number | undefined {
-  const trimmed = raw.trim();
-  if (trimmed === "") {
-    return undefined;
-  }
-  const bytes = Number(trimmed);
-  if (!Number.isFinite(bytes) || bytes < 0) {
-    return undefined;
-  }
-  return Math.floor(bytes);
-}
-
 const KINDS: { value: string; label: string }[] = [
   { value: "", label: "All kinds" },
   { value: "image", label: "Images" },
@@ -139,25 +109,8 @@ export function MediaView() {
   const [search, setSearch] = useState("");
   const [kind, setKind] = useState("");
   const [scanStatus, setScanStatus] = useState("");
-  const [metadataTerm, setMetadataTerm] = useState("");
   const [hasVersions, setHasVersions] = useState(false);
   const [recursive, setRecursive] = useState(true);
-  // The size, uploader and date filters arrived in the store with slice 1 and reached the toolbar
-  // only now. They are separate state per field rather than one free-text term because they are
-  // *structured* ranges: "between these two days" cannot be typed into a search box without the
-  // panel guessing which half the operator meant, and a guess that narrows the wrong way is a
-  // listing that changes under the hands of the person typing it.
-  const [tagTerm, setTagTerm] = useState("");
-  const [minSize, setMinSize] = useState("");
-  const [maxSize, setMaxSize] = useState("");
-  const [uploadedBy, setUploadedBy] = useState("");
-  const [createdAfter, setCreatedAfter] = useState("");
-  const [createdBefore, setCreatedBefore] = useState("");
-  const [uploaders, setUploaders] = useState<MediaUploader[] | null>(null);
-  // A range typed the wrong way round is refused by the store with a message naming the field.
-  // It is held here so the sentence lands under the box that caused it rather than in the
-  // page-level error banner, which is where a listing failure belongs.
-  const [rangeError, setRangeError] = useState<{ field: string; message: string } | null>(null);
   const [showFilters, setShowFilters] = useState(false);
   const [selection, setSelection] = useState<string[]>([]);
   const [newFolderName, setNewFolderName] = useState("");
@@ -169,9 +122,6 @@ export function MediaView() {
 
   const siteId = selectedSite?.id ?? null;
 
-  // A half-typed number is not a filter: `min=1` while the operator is on their way to `10` must
-  // not narrow the library to one byte, and the same rule the metadata field follows applies to
-  // every field here. `parseSize` is the single place a size becomes a number.
   const filters: MediaFilters = useMemo(
     () => ({
       folder_id: folderId,
@@ -179,66 +129,16 @@ export function MediaView() {
       search: search.trim() || undefined,
       kind: kind || undefined,
       scan_status: scanStatus || undefined,
-      metadata: metadataTerm || undefined,
       has_versions: hasVersions || undefined,
-      tag: tagTerm.trim() || undefined,
-      min_bytes: parseSize(minSize),
-      max_bytes: parseSize(maxSize),
-      uploaded_by: uploadedBy || undefined,
-      created_after: createdAfter || undefined,
-      created_before: createdBefore || undefined,
       sort,
       limit: 200,
     }),
-    [
-      folderId,
-      recursive,
-      search,
-      kind,
-      scanStatus,
-      metadataTerm,
-      hasVersions,
-      tagTerm,
-      minSize,
-      maxSize,
-      uploadedBy,
-      createdAfter,
-      createdBefore,
-      sort,
-    ],
+    [folderId, recursive, search, kind, scanStatus, hasVersions, sort],
   );
 
   const reload = useCallback(() => {
     reloadToken.current += 1;
   }, []);
-
-  // The uploader filter's candidates. Read once per site rather than per keystroke: the list
-  // changes only when somebody uploads, and the listing it feeds already re-runs on every
-  // filter change, so a re-read here would double the calls for a list that cannot have moved.
-  useEffect(() => {
-    if (!siteId) {
-      setUploaders(null);
-      return;
-    }
-    let cancelled = false;
-    fetchMediaUploaders(siteId)
-      .then((answer) => {
-        if (!cancelled) {
-          setUploaders(answer);
-        }
-      })
-      .catch(() => {
-        // The dropdown is a convenience, not a gate: a library with one uploader filters fine
-        // with the control empty, so a failure here narrows nothing and blocks nothing. A
-        // message under the field would be a lie about a filter that still works.
-        if (!cancelled) {
-          setUploaders([]);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [siteId, reloadToken.current]);
 
   // The tree.
   useEffect(() => {
@@ -278,29 +178,12 @@ export function MediaView() {
         .then((answer) => {
           if (!cancelled) {
             setPage(answer);
-            setRangeError(null);
           }
         })
         .catch((cause: unknown) => {
           if (cancelled) {
             return;
           }
-          // A filter that contradicts itself is a message *under its own field*, not a page
-          // error. The store answers `invalid_filter` with `details.field` naming the box, and
-          // the two ranges are the only filters that can contradict each other — so the field
-          // decides where the sentence goes, and anything else stays a page error.
-          if (cause instanceof ApiError && cause.code === "invalid_filter") {
-            const field = typeof cause.details?.field === "string" ? cause.details.field : "";
-            // The wire message is "`min_bytes`: the smallest size cannot be above the largest".
-            // The label beside the field already says what field this is, so the sentence is
-            // shown without it — "`min_bytes`: …" under a control labelled *Smallest size* is
-            // the same word twice, once in a code font and once in a label.
-            const message = cause.message.replace(/^`[a-z_]+`:\s*/, "");
-            setRangeError({ field, message });
-            setPage(null);
-            return;
-          }
-          setRangeError(null);
           setError(
             cause instanceof ApiError ? cause.message : "This folder could not be listed.",
           );
@@ -314,43 +197,9 @@ export function MediaView() {
     // `reloadToken.current` is a ref, so it is read rather than watched; `reload` bumps it.
   }, [siteId, filters, reloadToken.current]);
 
-  // What the filter badge counts. Every field that narrows the listing is on this list, and it
-  // is the same list the Clear button resets: a badge that counts a filter Clear does not reset
-  // (or the reverse) tells the operator their filters are still on after they cleared them.
-  const activeFilters = [
-    kind,
-    scanStatus,
-    metadataTerm,
-    hasVersions ? "versions" : "",
-    search.trim(),
-    tagTerm.trim(),
-    parseSize(minSize) === undefined ? "" : "min",
-    parseSize(maxSize) === undefined ? "" : "max",
-    uploadedBy,
-    createdAfter,
-    createdBefore,
-  ].filter(Boolean).length;
-
-  const clearFilters = useCallback(() => {
-    setSearch("");
-    setKind("");
-    setScanStatus("");
-    setMetadataTerm("");
-    setHasVersions(false);
-    setTagTerm("");
-    setMinSize("");
-    setMaxSize("");
-    setUploadedBy("");
-    setCreatedAfter("");
-    setCreatedBefore("");
-    setRangeError(null);
-  }, []);
-
-  /** The message for a field, if the last refusal named that one. */
-  const fieldError = useCallback(
-    (field: string) => (rangeError?.field === field ? rangeError.message : null),
-    [rangeError],
-  );
+  const activeFilters = [kind, scanStatus, hasVersions ? "versions" : "", search.trim()].filter(
+    Boolean,
+  ).length;
 
   const openFolder = useCallback(
     (id: string | null) => {
@@ -928,182 +777,6 @@ export function MediaView() {
                 ))}
               </select>
             </div>
-            <div>
-              <label
-                htmlFor="media-metadata"
-                className="mb-1 block text-[11.5px] font-medium text-muted"
-              >
-                Custom pair
-              </label>
-              <input
-                id="media-metadata"
-                data-testid="media-metadata-filter"
-                value={metadataTerm}
-                placeholder="campaign=spring-2026"
-                onChange={(event) => setMetadataTerm(event.target.value)}
-                className="w-56 rounded-lg border border-line bg-surface px-2 py-1.5 font-mono text-[12.5px]"
-              />
-              <p className="mt-1 text-[11px] text-muted">
-                One pair, exactly. A half-typed <code className="font-mono">key=</code> filters
-                nothing until it is finished.
-              </p>
-            </div>
-            <div>
-              <label
-                htmlFor="media-tag"
-                className="mb-1 block text-[11.5px] font-medium text-muted"
-              >
-                Tag
-              </label>
-              <input
-                id="media-tag"
-                data-testid="media-tag-filter"
-                value={tagTerm}
-                placeholder="hero"
-                onChange={(event) => setTagTerm(event.target.value)}
-                className="w-40 rounded-lg border border-line bg-surface px-2 py-1.5 text-[12.5px]"
-              />
-              <p className="mt-1 text-[11px] text-muted">
-                One exact tag, not a substring. Tags are stored as a set, so{" "}
-                <code className="font-mono">hero</code> finds{" "}
-                <code className="font-mono">hero</code> and not <code className="font-mono">hero-2</code>.
-              </p>
-            </div>
-            <fieldset className="flex items-end gap-2">
-              <legend className="mb-1 block text-[11.5px] font-medium text-muted">
-                Size (bytes)
-              </legend>
-              <div>
-                <label htmlFor="media-min-size" className="sr-only">
-                  Smallest size in bytes
-                </label>
-                <input
-                  id="media-min-size"
-                  data-testid="media-min-size"
-                  type="number"
-                  min={0}
-                  inputMode="numeric"
-                  value={minSize}
-                  placeholder="min"
-                  onChange={(event) => setMinSize(event.target.value)}
-                  aria-invalid={fieldError("min_bytes") !== null}
-                  aria-describedby={
-                    fieldError("min_bytes") ? "media-min-size-error" : undefined
-                  }
-                  className={`w-28 rounded-lg border bg-surface px-2 py-1.5 text-[12.5px] ${
-                    fieldError("min_bytes") ? "border-accent-strong" : "border-line"
-                  }`}
-                />
-              </div>
-              <span aria-hidden className="pb-2 text-[12px] text-muted">
-                –
-              </span>
-              <div>
-                <label htmlFor="media-max-size" className="sr-only">
-                  Largest size in bytes
-                </label>
-                <input
-                  id="media-max-size"
-                  data-testid="media-max-size"
-                  type="number"
-                  min={0}
-                  inputMode="numeric"
-                  value={maxSize}
-                  placeholder="max"
-                  onChange={(event) => setMaxSize(event.target.value)}
-                  className={`w-28 rounded-lg border bg-surface px-2 py-1.5 text-[12.5px] ${
-                    fieldError("max_bytes") ? "border-accent-strong" : "border-line"
-                  }`}
-                />
-              </div>
-              {fieldError("min_bytes") || fieldError("max_bytes") ? (
-                <p
-                  id="media-min-size-error"
-                  role="alert"
-                  className="w-full text-[11.5px] text-accent-strong"
-                >
-                  {fieldError("min_bytes") ?? fieldError("max_bytes")}
-                </p>
-              ) : null}
-            </fieldset>
-            <div>
-              <label
-                htmlFor="media-uploader"
-                className="mb-1 block text-[11.5px] font-medium text-muted"
-              >
-                Uploaded by
-              </label>
-              <select
-                id="media-uploader"
-                data-testid="media-uploader-filter"
-                value={uploadedBy}
-                onChange={(event) => setUploadedBy(event.target.value)}
-                className="rounded-lg border border-line bg-surface px-2 py-1.5 text-[12.5px]"
-              >
-                <option value="">Anyone</option>
-                {uploaders?.map((uploader) => (
-                  <option key={uploader.id} value={uploader.id}>
-                    {uploader.label} ({uploader.files})
-                  </option>
-                ))}
-              </select>
-              {uploaders?.length === 0 ? (
-                <p className="mt-1 text-[11px] text-muted">
-                  Nobody has uploaded to this library yet, so there is nobody to filter by.
-                </p>
-              ) : null}
-            </div>
-            <fieldset className="flex items-end gap-2">
-              <legend className="mb-1 block text-[11.5px] font-medium text-muted">
-                Uploaded between
-              </legend>
-              <div>
-                <label htmlFor="media-created-after" className="sr-only">
-                  Earliest upload day
-                </label>
-                <input
-                  id="media-created-after"
-                  data-testid="media-created-after"
-                  type="date"
-                  value={createdAfter}
-                  onChange={(event) => setCreatedAfter(event.target.value)}
-                  aria-invalid={fieldError("created_after") !== null}
-                  aria-describedby={
-                    fieldError("created_after") ? "media-created-after-error" : undefined
-                  }
-                  className={`rounded-lg border bg-surface px-2 py-1.5 text-[12.5px] ${
-                    fieldError("created_after") ? "border-accent-strong" : "border-line"
-                  }`}
-                />
-              </div>
-              <span aria-hidden className="pb-2 text-[12px] text-muted">
-                –
-              </span>
-              <div>
-                <label htmlFor="media-created-before" className="sr-only">
-                  Latest upload day
-                </label>
-                <input
-                  id="media-created-before"
-                  data-testid="media-created-before"
-                  type="date"
-                  value={createdBefore}
-                  onChange={(event) => setCreatedBefore(event.target.value)}
-                  className={`rounded-lg border bg-surface px-2 py-1.5 text-[12.5px] ${
-                    fieldError("created_after") ? "border-accent-strong" : "border-line"
-                  }`}
-                />
-              </div>
-              {fieldError("created_after") ? (
-                <p
-                  id="media-created-after-error"
-                  role="alert"
-                  className="w-full text-[11.5px] text-accent-strong"
-                >
-                  {fieldError("created_after")}
-                </p>
-              ) : null}
-            </fieldset>
             <label className="flex items-center gap-1.5 text-[12.5px]">
               <input
                 type="checkbox"
@@ -1125,8 +798,12 @@ export function MediaView() {
             {activeFilters > 0 ? (
               <button
                 type="button"
-                id="media-clear-filters"
-                onClick={clearFilters}
+                onClick={() => {
+                  setSearch("");
+                  setKind("");
+                  setScanStatus("");
+                  setHasVersions(false);
+                }}
                 className="rounded-lg border border-line px-2.5 py-1.5 text-[12px] transition hover:bg-surface"
               >
                 Clear filters
@@ -1175,7 +852,6 @@ export function MediaView() {
                     setSearch("");
                     setKind("");
                     setScanStatus("");
-                    setMetadataTerm("");
                     setHasVersions(false);
                   }}
                   className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"

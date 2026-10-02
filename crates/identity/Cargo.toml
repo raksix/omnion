@@ -12,19 +12,13 @@ sqlx.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 time.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 argon2.workspace = true
 rand.workspace = true
 sha2.workspace = true
 hex.workspace = true
 tracing.workspace = true
-
-# The enforced brute-force thresholds (REQ-012, slice 3). `omnion-security` owns the lockout
-# document `/security/sign-in-protection` edits, and it depends on nothing in this crate — so the
-# edge runs this way and not the other. Before it, this crate carried its own copy of the
-# thresholds against `security_policies`, the one document of the two that nothing on the request
-# path read.
-omnion-security = { path = "../security" }
 
 # TOTP (RFC 6238) needs HMAC over SHA-1 — the RFC's PRF and what authenticator apps implement.
 # Secret envelopes are encrypt-then-MAC with HMAC-SHA256 (crates/identity/src/secrets.rs).
@@ -46,3 +40,13 @@ reqwest = { workspace = true, features = ["json"] }
 rsa.workspace = true
 url.workspace = true
 xmltree = "0.11"
+regex = "1.13.1"
+
+# Directory providers (REQ-065, slice 4 part 14): `ldaps://` and StartTLS need a TLS stack the
+# rest of the crate does not use, because `reqwest` is a client for framed HTTP messages and an
+# LDAP connection is a raw byte stream the platform negotiates itself. These are the same
+# versions the workspace already resolves for `reqwest`, so nothing new enters the build graph.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+webpki-roots = "1"

@@ -241,10 +241,8 @@ pub struct RunBody {
     /// What stopped the run; empty when nothing did.
     pub error: String,
     /// When it started.
-    #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     /// When it finished; null while it is running.
-    #[serde(with = "time::serde::rfc3339::option")]
     pub finished_at: Option<OffsetDateTime>,
     /// One sentence — a number without a word is not an answer an operator can act on.
     pub summary: String,
@@ -753,37 +751,6 @@ pub async fn run_once(
 
     let mut error = String::new();
     if totals.versions_removed > 0 || totals.purged > 0 {
-        // The audit row is written **before** the event, and for the same reason the event is
-        // recorded as a run error rather than a failed request: the work is already done and the
-        // rows are already gone. A purge is the most destructive thing this module does, so the
-        // two halves must not be able to disagree — an event bus an operator is not subscribed to
-        // is not a record, and the hand-emptied trash next door writes `media.trash_emptied` for
-        // exactly the operation the nightly sweep performs unattended.
-        //
-        // The actor is the account that asked for the sweep when there is one, and the platform
-        // itself when the runner started it — an unattended run has no user to attribute, and
-        // inventing one would put a person's name on a deletion they did not perform.
-        let entry = match actor {
-            Some(user) => NewAuditEntry::by_user(user, "media.retention_applied"),
-            None => NewAuditEntry::system("media.retention_applied"),
-        }
-        .target("media_retention_run", run_id.to_string())
-        .metadata(json!({
-            "site_id": site_id,
-            "run_id": run_id,
-            "versions_removed": totals.versions_removed,
-            "versions_bytes": totals.versions_bytes,
-            "purged": totals.purged,
-            "purged_bytes": totals.purged_bytes,
-            "refused": totals.refused,
-            "held_back": totals.held_back,
-        }))
-        .organization(site.organization_id);
-        if let Err(failure) = omnion_audit::record(pool, entry).await {
-            error =
-                format!("the work was done but the audit entry could not be written: {failure}");
-        }
-
         if let Err(failure) = bus::emit(
             pool,
             NewEvent::new("media.retention_applied")

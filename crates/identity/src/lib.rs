@@ -18,6 +18,7 @@ pub mod error;
 pub mod mfa;
 pub mod organizations;
 pub mod password;
+pub mod provenance;
 pub mod provisioning;
 pub mod secrets;
 pub mod security;
@@ -51,6 +52,7 @@ pub use sites::{
     set_primary_domain, update_site, validate_theme,
 };
 pub use users::{
-    BootstrapOutcome, NewUser, User, bootstrap_first_admin, count_users, create_user,
+    BootstrapOutcome, NewUser, StatusChange, User, bootstrap_first_admin, count_users, create_user,
     earliest_active, find_by_id, find_credentials, has_any, normalize_email, set_status,
+    set_status_and_end_sessions,
 };

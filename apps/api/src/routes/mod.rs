@@ -73,20 +73,19 @@ pub mod ai;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
-pub mod backups;
 pub mod commands;
 pub mod content;
 pub mod health;
-pub mod health_incidents;
-pub mod health_panel;
 pub mod iam;
 pub mod iam_approvals;
+pub mod iam_attribute_mappings;
 pub mod iam_policy;
 pub mod iam_providers;
 pub mod iam_provisioning;
-pub mod developer;
+pub mod iam_role_rules;
 pub mod iam_security;
 pub mod iam_subjects;
+pub mod iam_sync;
 pub mod me;
 pub mod media;
 pub mod media_duplicates;
@@ -101,19 +100,13 @@ pub mod media_usage;
 pub mod media_versions;
 pub mod notifications;
 pub mod notifications_admin;
-pub mod notifications_test;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
-pub mod restore_jobs;
 pub mod scim;
 pub mod search;
 pub mod security;
-pub mod security_events;
 pub mod security_headers;
-pub mod security_ip;
-pub mod security_limiter;
-pub mod security_secrets;
 pub mod sso;
 pub mod tenancy;
 pub mod webauthn;
@@ -266,6 +259,7 @@ pub fn router(state: AppState) -> Router {
         .merge(post(iam_provisioning::create_token))
         .layer(guards::require(&state, "iam.provisioning.manage"));
     let iam_provisioning_token = delete(iam_provisioning::revoke_token)
+        .merge(post(iam_provisioning::rotate_token))
         .layer(guards::require(&state, "iam.provisioning.manage"));
     let iam_provisioning_log =
         get(iam_provisioning::list_log).layer(guards::require(&state, "iam.provisioning.manage"));
@@ -291,12 +285,77 @@ pub fn router(state: AppState) -> Router {
         .merge(
             delete(iam_providers::delete_provider)
                 .layer(guards::require(&state, "iam.providers.manage")),
-        );
+        )
+        // Two more verbs on the same guard, and the split is the design: reading the impact is
+        // a *read*, and a dialog that had to press Delete to learn that Delete is refused is a
+        // dialog that failed. The reassign action writes accounts, so it stays under `manage` —
+        // an account that can read the provider list must not be able to strip a directory's
+        // claim on somebody's identity.
+        ;
+
+    let iam_provider_deletion_impact = get(iam_providers::provider_deletion_impact)
+        .layer(guards::require(&state, "iam.providers.read"));
+
+    let iam_provider_reassign = post(iam_providers::reassign_provisioned_accounts)
+        .layer(guards::require(&state, "iam.providers.manage"));
 
     let iam_provider_test =
         post(iam_providers::test_provider).layer(guards::require(&state, "iam.providers.manage"));
 
+    // Enable and disable are their own verbs rather than a PATCH with a boolean, because the
+    // difference is the *gate*: switching on is refused until a test has passed, switching off
+    // never is. Folding them into the generic update would mean either bypassing the gate or
+    // blocking the safe direction as well (REQ-065).
+    let iam_provider_enable =
+        post(iam_providers::enable_provider).layer(guards::require(&state, "iam.providers.manage"));
+    let iam_provider_disable = post(iam_providers::disable_provider)
+        .layer(guards::require(&state, "iam.providers.manage"));
+
     let iam_provider_events = get(iam_providers::list_provider_events)
+        .layer(guards::require(&state, "iam.providers.read"));
+
+    // Bulk enable/disable (REQ-065, slice 4 part 11). One guard, the same `manage` the single
+    // verbs sit behind: a batch is not a cheaper way to do something the caller could not do one
+    // at a time, and the moment it is, the batch is the privilege escalation. It is a *separate
+    // route* rather than a `POST /{id}` with a list, because a list in the path is a shape a
+    // router and an audit log both have to be able to read.
+    let iam_providers_bulk = post(iam_providers::bulk_update_providers)
+        .layer(guards::require(&state, "iam.providers.manage"));
+
+    // The sync ledger (REQ-065, slice 4 part 2). Reading a run and its failures is `read`; asking
+    // for a retry is `manage`, because a retry re-walks a live directory and writes a run row
+    // an operator will later read as evidence that somebody asked.
+    let iam_provider_sync_runs = get(iam_sync::list_sync_runs)
+        .layer(guards::require(&state, "iam.providers.read"));
+    let iam_provider_sync_run = get(iam_sync::get_sync_run)
+        .layer(guards::require(&state, "iam.providers.read"));
+    let iam_provider_sync_retry = post(iam_sync::retry_sync_run)
+        .layer(guards::require(&state, "iam.providers.manage"));
+    let iam_provider_sync_groups = get(iam_sync::list_group_links)
+        .layer(guards::require(&state, "iam.providers.read"));
+
+    // The attribute map (REQ-065, slice 2). Reading it and rehearsing it is `read` — a preview
+    // writes nothing — while replacing it is `manage`, because the map decides which claim becomes
+    // somebody's email address.
+    let iam_provider_attribute_mappings = get(iam_attribute_mappings::get_attribute_mappings)
+        .layer(guards::require(&state, "iam.providers.read"))
+        .merge(
+            put(iam_attribute_mappings::replace_attribute_mappings)
+                .layer(guards::require(&state, "iam.providers.manage")),
+        );
+    let iam_provider_attribute_preview = post(iam_attribute_mappings::preview_attribute_mappings)
+        .layer(guards::require(&state, "iam.providers.read"));
+
+    // The role rules (REQ-065, slice 3). Same split as the attribute map and for the same reason:
+    // reading the set and rehearsing it write nothing, so they are `read`, while replacing it is
+    // `manage`, because the rules decide which role a verified directory identity is granted.
+    let iam_provider_role_rules = get(iam_role_rules::get_role_rules)
+        .layer(guards::require(&state, "iam.providers.read"))
+        .merge(
+            put(iam_role_rules::replace_role_rules)
+                .layer(guards::require(&state, "iam.providers.manage")),
+        );
+    let iam_provider_role_rule_preview = post(iam_role_rules::preview_role_rules)
         .layer(guards::require(&state, "iam.providers.read"));
 
     // The public sign-in surface: no guard, because there is no session yet — the same reason
@@ -478,11 +537,6 @@ pub fn router(state: AppState) -> Router {
 
     let media_files_route =
         get(media_files::list_files).layer(guards::require(&state, "media.read"));
-    // The uploader filter's candidates, on the same key as the listing they filter. It is a
-    // separate route because it is a separate question, and because a `media.read` account must
-    // not need `users.read` to see who uploaded the files it is already allowed to read.
-    let media_uploaders =
-        get(media_files::list_uploaders).layer(guards::require(&state, "media.read"));
     let media_file = get(media_files::get_file)
         .layer(guards::require(&state, "media.read"))
         .merge(patch(media_files::update_file).layer(guards::require(&state, "media.update")))
@@ -499,30 +553,10 @@ pub fn router(state: AppState) -> Router {
     // The version history (REQ-010, slice 2). Reading a version is `media.read`; replacing the
     // bytes and restoring an old one are `media.upload` / `media.update`, the same power an
     // ordinary upload carries — a restore *is* an upload of bytes that already exist.
-    //
-    // The replace route carries the same body limit as the upload route, and without it it does
-    // not: axum's `DefaultBodyLimit` is 2 MB, so a replacement larger than that is refused
-    // `413 payload_too_large` **before** `create_version` is ever entered. The library's own
-    // limit is `MAX_UPLOAD_BYTES` (25 MB) and the settings screen lets an operator raise it, so
-    // without this line the panel could store a 20 MB file and then be unable to replace it — and
-    // the handler's own size check, which names the real limit and its own number, was unreachable
-    // for every file above 2 MB. Two limits for one operation, and the smaller one is neither
-    // documented nor intentional.
-    let media_version_create = Router::new()
-        // The path is the **full** one, because this router is merged into `v1` and not nested
-        // under `/media/{id}/versions`. `media_upload` above is mounted the same way for the same
-        // reason; a bare `/` here registers the handler at the v1 root and the replace answers
-        // `405` for its own path, which reads as "the route is gone" rather than "the route is
-        // mounted one level too high".
-        .route(
-            "/media/{id}/versions",
-            post(media_versions::create_version).layer(guards::require(&state, "media.upload")),
-        )
-        .layer(DefaultBodyLimit::max(
-            omnion_media::MAX_UPLOAD_BYTES as usize + media::UPLOAD_BODY_SLACK,
-        ));
     let media_versions =
         get(media_versions::list_versions).layer(guards::require(&state, "media.read"));
+    let media_version_create =
+        post(media_versions::create_version).layer(guards::require(&state, "media.upload"));
     let media_version_restore =
         post(media_versions::restore_version).layer(guards::require(&state, "media.update"));
     let media_version_raw =
@@ -635,72 +669,6 @@ pub fn router(state: AppState) -> Router {
     // question. Writing a policy, running a sweep, setting a hold and repairing references are
     // `media.settings.manage`, the key slice 3 already gave the storage screen: retention is
     // the destructive half of the same screen, so it is the same key.
-    // Backup centre (REQ-013). Four keys, and the split is the point: reading the list is
-    // `backup.read`, taking one and verifying one is `backup.create`, and schedules,
-    // retention and settings are `backup.manage` — which deliberately does NOT include
-    // `backup.restore`, so the schedule editor cannot overwrite live content.
-    let backups_read: MethodRouter<AppState, Infallible> =
-        get(backups::list).layer(guards::require(&state, "backup.read"));
-    let backups_create: MethodRouter<AppState, Infallible> =
-        post(backups::create).layer(guards::require(&state, "backup.create"));
-    let backups_status: MethodRouter<AppState, Infallible> =
-        get(backups::status).layer(guards::require(&state, "backup.read"));
-    let backups_detail: MethodRouter<AppState, Infallible> =
-        get(backups::detail).layer(guards::require(&state, "backup.read"));
-    let backups_manifest: MethodRouter<AppState, Infallible> =
-        get(backups::manifest).layer(guards::require(&state, "backup.read"));
-    let backups_verify: MethodRouter<AppState, Infallible> =
-        post(backups::verify).layer(guards::require(&state, "backup.create"));
-    let backups_delete: MethodRouter<AppState, Infallible> =
-        delete(backups::delete).layer(guards::require(&state, "backup.manage"));
-    // The manual retention sweep. `backup.manage`, not `backup.create`: this removes data,
-    // and the key that lets an operator take a backup is not the key that lets one remove it.
-    // The preview is a GET that writes nothing, so it sits under `backup.read`: reading a
-    // warning is free and non-destructive, and gating it behind `backup.restore` would mean
-    // the first time an operator meets this screen is a 403 that never showed them what
-    // they were agreeing to.
-    let backups_restore_preview: MethodRouter<AppState, Infallible> =
-        get(backups::restore_preview).layer(guards::require(&state, "backup.read"));
-    // The destructive call, and the only route in this file behind `backup.restore`. The
-    // preview stays under `backup.read` because reading a warning changes nothing; pressing
-    // the button overwrites live data, so it needs the key that means that. A platform
-    // where the schedule editor can also overwrite content is one where the nightly job and
-    // an operator's button are the same authority.
-    let backups_restore: MethodRouter<AppState, Infallible> =
-        post(backups::restore).layer(guards::require(&state, "backup.restore"));
-    let backups_sweep: MethodRouter<AppState, Infallible> =
-        post(backups::sweep).layer(guards::require(&state, "backup.manage"));
-    // Slice 2c. Three routes, and the key split is the point: queueing and cancelling are
-    // `backup.restore` (the same authority as pressing the button — a permission that lets an
-    // operator *un*press something they could never press is a way to deny the service to
-    // somebody who can only see the job), while *listing* the jobs is `backup.read`, because
-    // seeing that a restore is queued changes nothing.
-    let backups_restore_queue: MethodRouter<AppState, Infallible> =
-        post(restore_jobs::queue_restore).layer(guards::require(&state, "backup.restore"));
-    let backups_restore_jobs: MethodRouter<AppState, Infallible> =
-        get(restore_jobs::list_jobs).layer(guards::require(&state, "backup.read"));
-    let restore_job_cancel: MethodRouter<AppState, Infallible> =
-        post(restore_jobs::cancel_job).layer(guards::require(&state, "backup.restore"));
-    let backup_schedules_read: MethodRouter<AppState, Infallible> =
-        get(backups::list_schedules).layer(guards::require(&state, "backup.read"));
-    // Editing a schedule is `backup.manage`, the same key as the settings screen: both are
-    // unattended decisions about what the platform will do on its own at 02:00. And "run now"
-    // is `backup.create`, NOT `backup.manage` — pressing it produces a backup and changes
-    // nothing else, so it is the same power as the drawer's own button. An operator who may
-    // take a backup must be able to test that their schedule works.
-    let backup_schedules_write: MethodRouter<AppState, Infallible> =
-        post(backups::create_schedule).layer(guards::require(&state, "backup.manage"));
-    let backup_schedule: MethodRouter<AppState, Infallible> =
-        put(backups::update_schedule).layer(guards::require(&state, "backup.manage"));
-    let backup_schedule_delete: MethodRouter<AppState, Infallible> =
-        delete(backups::delete_schedule).layer(guards::require(&state, "backup.manage"));
-    let backup_schedule_run: MethodRouter<AppState, Infallible> =
-        post(backups::run_schedule_now).layer(guards::require(&state, "backup.create"));
-    let backup_settings_read: MethodRouter<AppState, Infallible> =
-        get(backups::read_settings).layer(guards::require(&state, "backup.read"));
-    let backup_settings_write: MethodRouter<AppState, Infallible> =
-        put(backups::write_settings).layer(guards::require(&state, "backup.manage"));
-
     let media_retention: MethodRouter<AppState, Infallible> =
         get(media_retention::read).layer(guards::require(&state, "media.read"));
     let media_retention_create: MethodRouter<AppState, Infallible> =
@@ -985,20 +953,6 @@ pub fn router(state: AppState) -> Router {
         .route_layer(guards::require(&state, "notifications.manage"));
     let notifications_channels =
         get(notifications_admin::channels).layer(guards::require(&state, "notifications.manage"));
-    // The installation's VAPID public key: what a browser subscribes with. `notifications.manage`
-    // for the same reason the device list is — a person who can manage their own notifications
-    // needs the key to register the browser they are sitting in front of, and the key is public
-    // by definition (it is the half the push service sees). Declared beside `channels` and
-    // before the `{id}` routes so the literal segment wins the rank.
-    let notifications_push_key =
-        get(notifications_admin::push_key).layer(guards::require(&state, "notifications.manage"));
-    // The settings screen's per-channel `Test delivery`. Declared next to the other
-    // `notifications.manage` surface and, like `preferences` above, before the `{id}` routes:
-    // `POST /notifications/preferences/test` is two static segments, and axum ranks static
-    // ahead of parameter, so the order only matters as a promise that the literal keeps
-    // winning. Guarded by the same key as the preferences it tests.
-    let notifications_test = post(notifications_test::test_delivery)
-        .layer(guards::require(&state, "notifications.manage"));
     let notifications_outbox = Router::new()
         .route(
             "/notifications/outbox",
@@ -1040,95 +994,7 @@ pub fn router(state: AppState) -> Router {
     // one out as a file is the separate `analytics.export` — a screen that may read a report and
     // an account that may walk away with the data are two different powers. The page series rides
     // with the read key: it is one page's numbers, nothing more than the table already shows.
-    // The security centre (REQ-012, slice 1) is its OWN router, and it is no longer a child
-    // of the analytics reports router it was written inside.
-    //
-    // **What the nesting cost.** `analytics_reports` ends in
-    // `route_layer(guards::require(&state, "analytics.read"))`, and a `route_layer` applies to
-    // every route declared on that router *including the ones declared above it in the same
-    // builder*. So `/security/overview` — which declares its own, correct `security.read` guard
-    // on the handler — additionally required `analytics.read`. An account holding `security.read`
-    // and nothing else was refused with `403 this action requires the "analytics.read"
-    // permission`, on the screen whose entire purpose is to be readable by the person doing the
-    // diagnosing. A deployment that granted the least would have found the security centre
-    // unreadable, and the natural response to that is to grant more.
-    //
-    // **Why it is invisible.** Every walk that read the posture screen signed in as an account
-    // holding *both* keys — the platform owner's role is granted everything, and a walk that
-    // also touches analytics needs them. A guard that is only ever satisfied is not a guard that
-    // was checked. The only way to see it is an account that holds one key and refuses the
-    // other, which is the account the backup walk that found this signs in as: `security.read`
-    // and no backup key at all, being the operator who is told their backups are stale and
-    // cannot take one.
-    //
-    // **The rule this re-establishes, for the next group added here.** A `route_layer` is a
-    // property of the router it is written on, and it reaches every route that router declares —
-    // including routes a later commit appends above the analytics block by accident. A new group
-    // gets its own `let ... = Router::new()` and its own `merge`, or it inherits a key that has
-    // nothing to do with it. Nesting routers is how the security centre ended up behind a key
-    // named for a different feature.
-    // The developer portal (REQ-022, slice 1) is its own router for the same reason the
-    // security centre is (see the comment above): every one of its routes declares the key it
-    // actually needs, so nesting it under a broader builder would add a permission the route
-    // never asked for. The guards are split by blast radius — reading a key list is not
-    // issuing a credential, and neither is reading the traffic record.
-    let developer_routes = Router::new()
-        // The overview's card row (REQ-022, slice 2). `developer.read` rather than a narrower
-        // key: the screen exists to be the first thing a key author sees, and a permission
-        // named after nothing the screen does would be a second thing to look up.
-        .route(
-            "/developer/overview",
-            get(developer::overview).layer(guards::require(&state, "developer.read")),
-        )
-        // The scope catalogue is what the create-key picker is built from, so it is the one
-        // read a key author needs before they have a key.
-        .route(
-            "/developer/scopes",
-            get(developer::list_scopes).layer(guards::require(&state, "developer.read")),
-        )
-        .route(
-            "/developer/api-keys",
-            get(developer::list_keys).layer(guards::require(&state, "developer.keys.read")),
-        )
-        .route(
-            "/developer/api-keys",
-            post(developer::create_key).layer(guards::require(&state, "developer.keys.manage")),
-        )
-        .route(
-            "/developer/api-keys/{id}",
-            get(developer::get_key).layer(guards::require(&state, "developer.keys.read")),
-        )
-        .route(
-            "/developer/api-keys/{id}",
-            delete(developer::revoke_key).layer(guards::require(&state, "developer.keys.manage")),
-        )
-        .route(
-            "/developer/api-keys/{id}/rotate",
-            post(developer::rotate_key).layer(guards::require(&state, "developer.keys.manage")),
-        )
-        .route(
-            "/developer/logs",
-            get(developer::list_logs).layer(guards::require(&state, "developer.logs.read")),
-        )
-        .route(
-            "/developer/logs/{id}",
-            get(developer::get_log).layer(guards::require(&state, "developer.logs.read")),
-        );
-    // One guarded route deliberately accepts a developer key, because the REQ's own acceptance
-    // criterion is "a key authenticates on a guarded endpoint and is rejected after
-    // revocation" — and a criterion with no route behind it is a criterion about nothing. The
-    // permission chosen is `content.pages.read` because it is a real, catalogued read that a
-    // publisher's integration genuinely needs, so the walk exercises the production shape
-    // rather than a purpose-made one.
-    let developer_guarded = Router::new().route(
-        "/developer/sandbox/probe",
-        get(developer::sandbox_probe).layer(guards::require_or_developer_key(
-            &state,
-            "content.pages.read",
-        )),
-    );
-
-    let security_reports = Router::new()
+    let analytics_reports = Router::new()
         // Security centre (docs/requests/REQ-012, slice 1). The split is by *power*, not by
         // verb: `security.read` sees the posture and the findings, `security.scan` re-runs the
         // checks and ingests a report, and `security.manage` changes a finding's status.
@@ -1139,110 +1005,6 @@ pub fn router(state: AppState) -> Router {
         // deployment that grants both lets an account that can only look also dismiss what it
         // saw. The static segments come first so axum ranks them ahead of
         // `/security/findings/{id}`.
-        // System health (REQ-014, slice 1). Two keys, and the split is the one the request
-        // draws: seeing that a dependency is unhappy is `health.read`, and everything that
-        // *writes* is `health.manage`.
-        //
-        // `POST /health/checks/run` rides `health.manage` rather than `health.read` even
-        // though it "only runs probes", because it is a mutation: it records a sample per
-        // metric. An account that could trigger a run on demand could fill the retention
-        // window with rows of its own choosing, one press at a time, and the trends would
-        // become a fiction nobody could audit. Reading a status screen and *causing* the
-        // platform to record something are different powers.
-        //
-        // `/healthz` and `/readyz` are NOT here and must not be: they stay unversioned and
-        // unguarded so an orchestrator's probe never depends on a session or a permission
-        // (see `crate::routes::health` and `crate::routes::readyz`).
-        .route(
-            "/health/overview",
-            get(health_panel::overview).layer(guards::require(&state, "health.read")),
-        )
-        .route(
-            "/health/checks/run",
-            post(health_panel::run_checks).layer(guards::require(&state, "health.manage")),
-        )
-        .route(
-            "/health/services/{key}",
-            get(health_panel::service).layer(guards::require(&state, "health.read")),
-        )
-        .route(
-            "/health/samples",
-            get(health_panel::samples).layer(guards::require(&state, "health.read")),
-        )
-        .route(
-            "/health/host",
-            get(health_panel::host_metrics).layer(guards::require(&state, "health.read")),
-        )
-        .route(
-            "/health/summary",
-            get(health_panel::summary).layer(guards::require(&state, "health.read")),
-        )
-        .route(
-            "/health/metrics",
-            get(health_panel::metrics).layer(guards::require(&state, "health.read")),
-        )
-        .route(
-            "/health/metrics.csv",
-            get(health_panel::metrics_csv).layer(guards::require(&state, "health.read")),
-        )
-        // Pruning is destructive and irreversible, so it is a POST behind the managing key
-        // and not a side effect of a settings save.
-        .route(
-            "/health/maintenance/prune",
-            post(health_panel::prune).layer(guards::require(&state, "health.manage")),
-        )
-        // -------------------------------------------------------------------------------------
-        // Incidents and threshold policy (REQ-014 slice 3).
-        //
-        // Every write here is `health.manage` and every read is `health.read`, which is why
-        // the two live on separately-built method routers that get `.merge()`d: axum applies
-        // `.layer()` to the routers it is chained onto, so a single `route_layer` over a path
-        // that serves both a GET and a PATCH would demand the *managing* key from the reader
-        // who only opens an incident to read it. `guards::require` resolves its name from the
-        // permission catalogue, so both keys must exist there (`crates/permissions`).
-        // -------------------------------------------------------------------------------------
-        .route(
-            "/health/incidents",
-            get(health_incidents::incidents).layer(guards::require(&state, "health.read")),
-        )
-        .route(
-            "/health/incidents/{id}",
-            get(health_incidents::incident)
-                .layer(guards::require(&state, "health.read"))
-                .merge(
-                    patch(health_incidents::patch_incident)
-                        .layer(guards::require(&state, "health.manage")),
-                ),
-        )
-        // Settings split the same way: `GET` shows the policy, `PUT` changes it. A single
-        // route cannot, because the reader is exactly the person who should see *which*
-        // thresholds are configured without being able to rewrite them.
-        .route(
-            "/health/settings",
-            get(health_incidents::get_settings)
-                .layer(guards::require(&state, "health.read"))
-                .merge(
-                    put(health_incidents::put_settings)
-                        .layer(guards::require(&state, "health.manage")),
-                ),
-        )
-        .route(
-            "/health/maintenance-windows",
-            get(health_incidents::list_windows)
-                .layer(guards::require(&state, "health.read"))
-                // Creating a window is a write even though it only *suppresses* alerts: an
-                // operator who can silence a whole service has to be the operator who can
-                // change its thresholds, or the screen is a mute button for anyone with a
-                // login.
-                .merge(
-                    post(health_incidents::create_window)
-                        .layer(guards::require(&state, "health.manage")),
-                ),
-        )
-        .route(
-            "/health/maintenance-windows/{id}",
-            delete(health_incidents::delete_window).layer(guards::require(&state, "health.manage")),
-        )
         .route(
             "/security/overview",
             get(security::overview).layer(guards::require(&state, "security.read")),
@@ -1281,104 +1043,6 @@ pub fn router(state: AppState) -> Router {
             "/security/headers",
             put(security_headers::put).layer(guards::require(&state, "security.manage")),
         )
-        // Rate limiting and sign-in protection (REQ-012, slice 3).
-        //
-        // Reading either document is `security.read` — the same read the overview already makes,
-        // and a deployment where a viewer could not see its own limits would make the screen
-        // useless to the person diagnosing a refusal. Writing is `security.manage`, the same
-        // power that dismisses a finding, because raising a limit until nothing is refused is
-        // the same act as making the refusals stop mattering.
-        //
-        // The tester is `security.read`, not `security.scan`: it changes nothing, and it is the
-        // screen an operator has open at 3am with a client being refused. Requiring a write power
-        // to *look* at why something was refused would make the screen unusable exactly when it
-        // is needed.
-        .route(
-            "/security/rate-limits",
-            get(security_limiter::get_rate_limits)
-                .layer(guards::require(&state, "security.read"))
-                .merge(
-                    put(security_limiter::put_rate_limits)
-                        .layer(guards::require(&state, "security.manage")),
-                ),
-        )
-        .route(
-            "/security/rate-limits/test",
-            post(security_limiter::test_rate_limit).layer(guards::require(&state, "security.read")),
-        )
-        .route(
-            "/security/sign-in-protection",
-            get(security_limiter::get_sign_in_protection)
-                .layer(guards::require(&state, "security.read"))
-                .merge(
-                    put(security_limiter::put_sign_in_protection)
-                        .layer(guards::require(&state, "security.manage")),
-                ),
-        )
-        .route(
-            "/security/sign-in-protection/probe",
-            post(security_limiter::probe_lockout).layer(guards::require(&state, "security.read")),
-        )
-        .route(
-            "/security/locked-accounts",
-            get(security_limiter::get_locked_accounts)
-                .layer(guards::require(&state, "security.read")),
-        )
-        .route(
-            "/security/locked-accounts/{user_id}/unlock",
-            post(security_limiter::unlock).layer(guards::require(&state, "security.manage")),
-        )
-        // IP access lists (REQ-012 slice 4). Reading them is `security.read` — the same read the
-        // overview's IP-allow-list check already makes, and the same read an operator needs to
-        // understand a refusal. Changing them is `security.ip.manage`, its OWN key rather than
-        // `security.manage`, because an allow/deny list is the one screen in the centre that can
-        // lock every administrator out of the platform at once. Splitting it means holding the
-        // "manage findings and settings" power does not silently confer the power to deny the
-        // CEO's office — a grant nobody would think twice about.
-        .route(
-            "/security/ip-rules",
-            get(security_ip::get)
-                .layer(guards::require(&state, "security.read"))
-                .merge(
-                    post(security_ip::post).layer(guards::require(&state, "security.ip.manage")),
-                ),
-        )
-        .route(
-            "/security/ip-rules/test",
-            // The tester changes nothing, so it is `security.read` — the same reasoning as the
-            // rate-limit tester: an operator diagnosing a refusal must not need the power to
-            // change the policy in order to be told what the policy says.
-            post(security_ip::test).layer(guards::require(&state, "security.read")),
-        )
-        .route(
-            "/security/ip-rules/{id}",
-            delete(security_ip::delete).layer(guards::require(&state, "security.ip.manage")),
-        )
-        // Security-event timeline (REQ-012 slice 4). `security.read` for both, including the
-        // CSV: an export changes nothing, and an operator who is allowed to read the trail must
-        // be allowed to take it away with them — a separate `security.manage` on the download
-        // would make the read-only auditor unable to do the one thing their role exists for.
-        //
-        // The static `.csv` segment is registered before nothing else on this path (there is no
-        // `/security/events/{id}`), and the events route carries no `{id}` for the same reason
-        // `/findings/{id}` sits below `/findings/import`: axum ranks a static segment ahead of
-        // a parameter, and a `events.csv` served as JSON is a client that has to guess.
-        // The secret inventory (REQ-012 slice 4). Read-only by design: management of secrets
-        // belongs to the secrets manager request, so there is deliberately no PUT or DELETE
-        // here — a screen that can edit a reference invites an operator to believe it can rotate
-        // a secret, and rotating one means replacing a value in an environment and redeploying.
-        .route(
-            "/security/secrets",
-            get(security_secrets::get).layer(guards::require(&state, "security.read")),
-        )
-        .route(
-            "/security/events",
-            get(security_events::get).layer(guards::require(&state, "security.read")),
-        )
-        .route(
-            "/security/events.csv",
-            get(security_events::export).layer(guards::require(&state, "security.read")),
-        )
         .route(
             "/security/findings/{id}",
             get(security::get)
@@ -1386,8 +1050,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(
                     patch(security::patch_status).layer(guards::require(&state, "security.manage")),
                 ),
-        );
-    let analytics_reports = Router::new()
+        )
         .route("/analytics/overview", get(analytics::overview))
         .route("/analytics/pages", get(analytics::pages))
         .route("/analytics/pages/series", get(analytics::page_series))
@@ -1494,13 +1157,11 @@ pub fn router(state: AppState) -> Router {
         // as a `PUT` on an id called "preferences" — which is a `400` a reader would report
         // as "the settings screen is broken".
         .route("/notifications/preferences", notifications_preferences)
-        .route("/notifications/preferences/test", notifications_test)
         // Slice 3's four sub-routers, merged rather than spelled out route by route. Each is a
         // `Router` with its own `route_layer`, so the guard travels with the group and a future
         // fifth endpoint joins the right one by being added inside its block.
         .merge(notifications_push)
         .route("/notifications/channels", notifications_channels)
-        .route("/notifications/push-key", notifications_push_key)
         .merge(notifications_outbox)
         .merge(notifications_routes)
         .route("/notifications/{id}", notifications_entry)
@@ -1510,9 +1171,6 @@ pub fn router(state: AppState) -> Router {
             analytics_settings_read.merge(analytics_settings_write),
         )
         .route("/analytics/snippet", analytics_snippet)
-        .merge(developer_routes)
-        .merge(developer_guarded)
-        .merge(security_reports)
         .merge(analytics_reports)
         .route("/analytics/export", analytics_export)
         .merge(analytics_goals_read)
@@ -1562,7 +1220,46 @@ pub fn router(state: AppState) -> Router {
         .route("/iam/providers", iam_providers)
         .route("/iam/providers/{id}", iam_provider)
         .route("/iam/providers/{id}/test", iam_provider_test)
+        // Separate routes, not verbs merged onto `/iam/providers/{id}`. The deletion impact is a
+        // GET on a *sub*-path and the reassign a POST: merging them into the `{id}` method
+        // router would make the impact a second GET of the provider and the reassign a second
+        // POST of a provider, which are different actions with different guards.
+        .route(
+            "/iam/providers/{id}/deletion-impact",
+            iam_provider_deletion_impact,
+        )
+        .route(
+            "/iam/providers/{id}/reassign",
+            iam_provider_reassign,
+        )
+        .route("/iam/providers/{id}/enable", iam_provider_enable)
+        .route("/iam/providers/{id}/disable", iam_provider_disable)
         .route("/iam/providers/{id}/events", iam_provider_events)
+        // The batch sits at `/iam/providers/bulk`, NOT `/iam/providers/{id}/bulk`: axum matches
+        // static segments before `{id}`, so the two can share a prefix — but only because the
+        // batch is registered on a literal path. Folding the ids into the path instead would
+        // give the router a second pattern that looks like a provider id and is not.
+        .route("/iam/providers/bulk", iam_providers_bulk)
+        .route("/iam/providers/{id}/sync-runs", iam_provider_sync_runs)
+        .route("/iam/providers/{id}/sync-runs/{run_id}", iam_provider_sync_run)
+        .route(
+            "/iam/providers/{id}/sync-runs/{run_id}/retry",
+            iam_provider_sync_retry,
+        )
+        .route("/iam/providers/{id}/sync-groups", iam_provider_sync_groups)
+        .route(
+            "/iam/providers/{id}/attribute-mappings",
+            iam_provider_attribute_mappings,
+        )
+        .route(
+            "/iam/providers/{id}/attribute-mappings/preview",
+            iam_provider_attribute_preview,
+        )
+        .route("/iam/providers/{id}/role-rules", iam_provider_role_rules)
+        .route(
+            "/iam/providers/{id}/role-rules/preview",
+            iam_provider_role_rule_preview,
+        )
         .route("/scim/v2/ServiceProviderConfig", scim_config)
         .route("/scim/v2/Schemas", scim_schemas)
         .route("/scim/v2/Users", scim_users)
@@ -1620,7 +1317,6 @@ pub fn router(state: AppState) -> Router {
         // collection route rather than replacing it, so a client written against `{site_id, media}`
         // keeps working while the browser moves to the file system.
         .route("/media/files", media_files_route)
-        .route("/media/uploaders", media_uploaders)
         .route("/media/files/{id}", media_file)
         .route("/media/files/{id}/restore", media_file_restore)
         .route("/media/files/{id}/purge", media_file_purge)
@@ -1631,7 +1327,7 @@ pub fn router(state: AppState) -> Router {
         .route("/media/trash/empty", media_trash_empty)
         .route("/media/bulk", media_bulk)
         .route("/media/{id}/versions", media_versions)
-        .merge(media_version_create)
+        .route("/media/{id}/versions", media_version_create)
         .route(
             "/media/{id}/versions/{version}/restore",
             media_version_restore,
@@ -1687,36 +1383,6 @@ pub fn router(state: AppState) -> Router {
         .route("/media/retention/repair", media_retention_repair)
         .route("/media/retention/{id}", media_retention_update)
         .route("/media/retention/{id}", media_retention_delete)
-        .route("/backups", backups_read)
-        .route("/backups", backups_create)
-        .route("/backups/status", backups_status)
-        // Registered BEFORE `/backups/{id}` and not after it. A `POST` against
-        // `/backups/sweep` would otherwise match `{id}` and fail to parse `sweep` as a UUID
-        // — a 500 that reads like a router bug on the one route whose whole point is to be
-        // callable by hand.
-        .route("/backups/sweep", backups_sweep)
-        .route("/backups/{id}", backups_detail)
-        .route("/backups/{id}", backups_delete)
-        .route("/backups/{id}/manifest", backups_manifest)
-        .route("/backups/{id}/restore-preview", backups_restore_preview)
-        .route("/backups/{id}/restore", backups_restore)
-        .route("/backups/{id}/restore-queue", backups_restore_queue)
-        .route("/backups/{id}/restore-jobs", backups_restore_jobs)
-        // A SEPARATE prefix, not `/backups/{id}/…`, because a cancel is addressed by the
-        // JOB's id and not the run's — two different resources, and a route that accepted
-        // either would let a cancel for one run's job stop another run's restore.
-        .route("/restore-jobs/{id}/cancel", restore_job_cancel)
-        .route("/backups/{id}/verify", backups_verify)
-        .route("/backup-schedules", backup_schedules_read)
-        .route("/backup-schedules", backup_schedules_write)
-        // Registered before any `/backup-schedules/{id}` route, and not after it, for the
-        // same reason `/backups/sweep` sits above `/backups/{id}`: a `POST` against a
-        // non-UUID segment would otherwise match `{id}` and fail to parse it.
-        .route("/backup-schedules/{id}", backup_schedule)
-        .route("/backup-schedules/{id}", backup_schedule_delete)
-        .route("/backup-schedules/{id}/run", backup_schedule_run)
-        .route("/backup-settings", backup_settings_read)
-        .route("/backup-settings", backup_settings_write)
         // The hold is on a *file*, so it lives under the file rather than under the policy.
         .route("/media/files/{id}/hold", media_file_hold)
         .route("/media/transformation-presets", media_preset_create)
@@ -1778,36 +1444,7 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/pages/{id}/revisions/{revision_id}/comments",
             page_revision_comments,
-        )
-        // The request log is the INNERMOST layer of the API (REQ-022, slice 2), installed here —
-        // at the **end** of the `v1` chain rather than the start, and that position is load
-        // -bearing rather than cosmetic.
-        //
-        // `Router::layer` applies to the routes registered *so far*. Called as the first
-        // statement, it wraps an empty router and every route added afterwards is simply not
-        // wrapped: the layer compiles, installs, and never runs. That is exactly what happened
-        // the first time this was written, and the walk `a_request_writes_its_own_log_row`
-        // caught it by finding **zero** rows for requests the platform had plainly served — a
-        // confidently blank log, the precise failure this table exists to catch.
-        //
-        // It goes here rather than on the whole tree for two reasons that are both about what
-        // the layer is allowed to see:
-        //
-        // * It must sit **inside** the permission guards, so a `403` is a row. A layer outside
-        //   them records that a guard ran; only this one records what it decided, and the
-        //   decision is the entire reason the row exists.
-        // * It must **not** see the panel's assets or the readiness probe. `/readyz` touches
-        //   the database on every probe, and a probe that both reads and writes is a probe that
-        //   reports the platform down when the log table is unavailable. `should_log_path` is
-        //   the second half of that and is a pure function of the path, so a new route is
-        //   covered without touching this file.
-        //
-        // Note the contrast with the four layers further down, which wrap the *outer* router and
-        // therefore **do** see `/healthz`: the limiter and the IP access list are there on
-        // purpose (a caller with no account must still be capped), and the header policy must
-        // reach the one endpoint a scanner probes. The request log has the opposite requirement,
-        // which is why it is the only layer of the five that lives here rather than there.
-        .layer(crate::request_log_middleware::RequestLog::new(&state));
+        );
 
     // The header policy is applied to the WHOLE tree, `/healthz` included: a security header
     // that is missing on the one endpoint a scanner probes is missing where it is read.
@@ -1818,44 +1455,10 @@ pub fn router(state: AppState) -> Router {
     // unreachable at boot still serves headers rather than serving none.
     let header_layer = crate::headers_middleware::install(omnion_security::HeaderPolicy::default());
 
-    // The rate limiter (REQ-012, slice 3) holds its document in the same process-wide cell the
-    // headers do, and for the same reason: read once, not per request, so a request's cost never
-    // depends on the database; `security_limiter::put_rate_limits` then replaces the numbers in
-    // place, so a save applies to the next request rather than after the next restart.
-    //
-    // `main.rs` reads the stored document before building the router and installs it; a router
-    // built without one (the in-process test harnesses) falls back to the shipped defaults rather
-    // than to no limiter at all, which is the failure mode this whole layer exists to remove.
-    let limiter_layer = crate::rate_limit_middleware::ensure_installed(&state);
-    // The IP access list is installed the same way and for the same reason (REQ-012 slice 4):
-    // read once, swapped in place by a save, so a rule added on the panel refuses the *next*
-    // request rather than the one after the next restart.
-    let ip_access_layer = crate::security_ip::ensure_installed(&state);
-
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(readyz::readyz))
         .nest("/api/v1", v1)
-        // The limiter is the OUTERMOST layer, ahead of CSRF and ahead of every permission guard,
-        // and the order is the design rather than an accident of where the line falls in the chain:
-        //
-        // * A limiter behind the guards would cap only callers who already hold a permission, which
-        //   leaves an anonymous spray against `POST /auth/login` uncapped — the one path worth
-        //   capping, and the only one an attacker can reach without an account.
-        // * Ahead of CSRF, because a cookie-less mutation is still a request somebody is sending and
-        //   it must spend budget whether or not it would have been refused anyway.
-        //
-        // `/healthz` and `/readyz` are inside it too, which is deliberate and cheap: they are two
-        // `GET`s a probe makes every few seconds, counted against a budget of 600 a minute, and a
-        // probe that trips the limiter is a probe that reports the platform down.
-        .layer(crate::rate_limit_middleware::rate_limit(
-            limiter_layer.clone(),
-        ))
-        // The IP access list runs ahead of the limiter and ahead of every guard, for the same
-        // reason the limiter does: an address rule exists to stop a caller who has no account,
-        // so anything behind `guards::require` would never see one. Ahead of the limiter because
-        // a denied address should cost nothing — not even a Redis round trip.
-        .layer(crate::security_ip::ip_access(ip_access_layer))
         // CSRF sits OUTSIDE the permission guards on purpose: a guard answers 401 for a request
         // with no session and 403 for one whose account lacks the key. The CSRF layer's answer is
         // about the *request*, and it has to be reached only by a request that actually

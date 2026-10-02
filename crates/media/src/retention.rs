@@ -922,18 +922,22 @@ pub async fn purge_eligible(
     })
 }
 
-/// Every storage key a set of files owns, current version, superseded history and preset cache
-/// alike.
-///
-/// A **delegate**, not a second query. This function and [`crate::browser::owned_object_keys`] are
-/// the same question asked twice, and they had drifted: this one unioned `media` with
-/// `media_versions` only, so the nightly purge sweep — the path that exists to reclaim storage that
-/// nothing else will — left every `media_derivatives` object in the bucket while deleting the rows
-/// that named it. Three implementations of one answer (this, `owned_object_keys`, and
-/// [`crate::preset_store::clear_derivatives`]) is how the interactive purge came to read only
-/// `media.storage_key` in the first place. One function, one answer.
+/// Every storage key a set of files owns, current version and superseded history alike.
 pub async fn all_keys_of(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<String>> {
-    crate::browser::owned_object_keys(pool, ids).await
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut keys = sqlx::query_scalar::<_, String>(
+        "select storage_key from media where id = any($1) \
+         union \
+         select storage_key from media_versions where media_id = any($1)",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
 }
 
 /// How many trashed files of a site are past their restore window, and their bytes.
@@ -944,27 +948,16 @@ pub async fn all_keys_of(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<String>> {
 pub async fn past_restore_window(pool: &PgPool, site_id: Uuid, window: Window) -> Result<(i64, i64)> {
     let cutoff =
         OffsetDateTime::now_utc() - time::Duration::days(i64::from(window.trash_days));
-    // The `::bigint` on the size column is not decoration, and it is load-bearing in a way that
-    // is easy to undo. `sum()` over a `bigint` returns `numeric`, and sqlx will not decode that
-    // into an `i64` — verified against the database, not assumed:
-    //
-    //   select pg_typeof(sum(size_bytes))            -- numeric
-    //   select pg_typeof(coalesce(sum(size_bytes),0)) -- numeric  ← the `0` adopts the other type
-    //
-    // The previous line had no cast at all, and the comment above it claimed one. Nothing
-    // exercised it: every site in the walks had no trashed file past its window, so `sum()` over
-    // an empty set returned `NULL`, which `Option<i64>` accepts — a query that fails only when
-    // there is something to count, and a comment that asserted the guard was already in place.
-    // The screen that shows this number is the retention tab, so the symptom a person meets is
-    // "the retention screen 500s once enough files are trashed".
     let row = sqlx::query_as::<_, (i64, Option<i64>)>(
-        "select count(*), sum(size_bytes)::bigint from media \
+        "select count(*), sum(size_bytes) from media \
          where site_id = $1 and deleted_at is not null and deleted_at < $2",
     )
     .bind(site_id)
     .bind(cutoff)
     .fetch_one(pool)
     .await?;
+    // `sum(bigint)` decodes as NUMERIC and cannot be read into an `i64`; coalescing in the
+    // query and mapping into an `Option<i64>` through a cast is the shape sqlx accepts.
     Ok((row.0, row.1.unwrap_or(0)))
 }
 

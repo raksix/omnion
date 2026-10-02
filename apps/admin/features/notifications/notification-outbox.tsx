@@ -52,25 +52,12 @@ const STATUS_LINE: Record<NotificationDeliveryStatus, string> = {
   skipped: "Skipped",
 };
 
-/**
- * The same four states, worded the same way on the reader's drawer and on the administrator's
- * outbox.
- *
- * Exported so the drawer prints "Delivered" where the outbox prints "Delivered". A reader who
- * reads "Sent" in their own notification detail and "Delivered" in the admin log has to guess
- * whether those are the same state, and the guess will be wrong at least once.
- */
-export const DELIVERY_STATUS_LINE = STATUS_LINE;
-
 const STATUS_CLASS: Record<NotificationDeliveryStatus, string> = {
   pending: "text-muted",
   sent: "text-emerald-700 dark:text-emerald-300",
   failed: "text-red-700 dark:text-red-300",
   skipped: "text-muted",
 };
-
-/** The colour for each state, shared with the detail drawer for the same reason. */
-export const DELIVERY_STATUS_CLASS = STATUS_CLASS;
 
 const PRIORITY_CLASS: Record<string, string> = {
   low: "text-muted",

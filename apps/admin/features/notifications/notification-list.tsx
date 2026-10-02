@@ -51,11 +51,6 @@ import {
   type NotificationFilters,
   type NotificationRow,
 } from "@/lib/types";
-import { CHANNEL_LINE as DELIVERY_CHANNEL_LINE } from "./notification-settings";
-import {
-  DELIVERY_STATUS_CLASS,
-  DELIVERY_STATUS_LINE,
-} from "./notification-outbox";
 
 const PAGE = 25;
 
@@ -741,79 +736,6 @@ export function NotificationList() {
                   {JSON.stringify(drawer.payload, null, 2)}
                 </pre>
               ) : null}
-
-              {/* The delivery rows. This is the section the whole drawer exists for: a
-                  notification that is in the panel and never arrived by e-mail is two pieces of
-                  state that only contradict each other if the platform refuses to show both. */}
-              <section data-notification-deliveries className="mt-5 border-t border-line pt-4">
-                <h3 className="mb-2 text-[12px] font-semibold uppercase tracking-wide text-muted">
-                  Delivery
-                </h3>
-
-                {drawer.deliveries.length === 0 ? (
-                  /* Empty is a state, not a failure to load: a notification recorded before the
-                     runner claimed it has no attempts yet, and "nothing has been sent yet" is an
-                     answer. Rendering a bare heading here would read as a broken panel. */
-                  <p data-notification-deliveries-empty className="text-[12.5px] text-muted">
-                    No delivery has been attempted for this notification yet.
-                  </p>
-                ) : (
-                  <ul className="space-y-2">
-                    {drawer.deliveries.map((delivery) => (
-                      <li
-                        key={delivery.channel}
-                        data-notification-delivery={delivery.channel}
-                        data-status={delivery.status}
-                        className="rounded-lg border border-line px-3 py-2"
-                      >
-                        <div className="flex items-center justify-between gap-3">
-                          <span className="text-[12.5px] font-medium">
-                            {DELIVERY_CHANNEL_LINE[delivery.channel] ?? delivery.channel}
-                          </span>
-                          <span
-                            className={`text-[12px] font-medium ${
-                              DELIVERY_STATUS_CLASS[delivery.status]
-                            }`}
-                          >
-                            {DELIVERY_STATUS_LINE[delivery.status] ?? delivery.status}
-                          </span>
-                        </div>
-
-                        {/* The attempt count is only worth showing once something has been
-                            tried, and a row at the cap says so differently from one that has
-                            not reached it — "gave up after 3" and "tried 1 of 3" are different
-                            news and the drawer must not print them the same way. */}
-                        {delivery.attempts > 0 ? (
-                          <p className="mt-1 text-[11.5px] text-muted tabular-nums">
-                            {delivery.status === "failed"
-                              ? `Gave up after ${delivery.attempts} of ${delivery.max_attempts} attempts`
-                              : `Attempt ${delivery.attempts} of ${delivery.max_attempts}`}
-                            {delivery.sent_at
-                              ? ` · delivered ${new Date(delivery.sent_at).toLocaleString()}`
-                              : ""}
-                            {!delivery.sent_at && delivery.next_attempt_at && delivery.status === "pending"
-                              ? ` · next attempt ${new Date(delivery.next_attempt_at).toLocaleString()}`
-                              : ""}
-                          </p>
-                        ) : null}
-
-                        {/* The reason, in the platform's words. A failed channel with no reason
-                            on screen is the state this whole table was added to make
-                            representable, so the line is not optional. */}
-                        {delivery.error ? (
-                          <p
-                            data-notification-delivery-error
-                            className="mt-1 text-[11.5px] text-red-700 dark:text-red-300"
-                          >
-                            {delivery.error}
-                            {delivery.response_status ? ` (status ${delivery.response_status})` : ""}
-                          </p>
-                        ) : null}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </section>
             </div>
 
             <footer className="flex items-center gap-2 border-t border-line px-4 py-3">

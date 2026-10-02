@@ -12,41 +12,9 @@ import type {
   SecurityFindingStatus,
   SecurityImportReport,
   SecurityOverview,
-  HealthOverview,
-  HealthServiceDetail,
-  HealthSamplePoint,
-  HealthSummary,
-  HealthPruneResult,
-  HealthMetricRow,
-  HealthMetricsReport,
-  HealthRangeKey,
-  HealthIncident,
-  HealthIncidentPage,
-  HealthIncidentAction,
-  HealthMaintenanceWindow,
-  HealthSettings,
-  HealthThreshold,
   HeaderPolicyDocument,
   HeaderPolicySave,
   HeaderPolicySaved,
-  CreateIpRuleInput,
-  CreateIpRuleResult,
-  IpRulesPage,
-  SecretInventory,
-  SecurityEventsFilter,
-  SecurityEventsPage,
-  IpTestResult,
-  LockedAccountsPage,
-  LockoutPolicy,
-  RateLimitScope,
-  RateLimitsDocument,
-  RateLimitsSave,
-  RateLimitsSaved,
-  RateLimitTestRequest,
-  RateLimitTestResponse,
-  SignInProtectionDocument,
-  SignInProtectionSave,
-  SignInProtectionSaved,
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
   WebhookEndpoint,
@@ -70,7 +38,6 @@ import type {
   MediaFilePage,
   MediaFilters,
   MediaFolder,
-  MediaUploader,
   MediaFolderTree,
   MediaMergeResult,
   MediaPreset,
@@ -94,19 +61,6 @@ import type {
   MediaRetentionPolicy,
   MediaRetentionPolicyInput,
   MediaRetentionRepair,
-  BackupCreateResult,
-  BackupDetail,
-  BackupList,
-  BackupSchedule,
-  BackupSettings,
-  BackupStatus,
-  BackupPurge,
-  BackupPurgeFailure,
-  BackupSweepReport,
-  RestoreJob,
-  RestoreOutcome,
-  RestorePreview,
-  BackupVerification,
   MediaRetentionRunList,
   MediaRetentionRunResult,
   MediaTrash,
@@ -123,7 +77,6 @@ import type {
   NotificationPage,
   NotificationPreferences,
   NotificationPreferencesSaved,
-  NotificationPushKey,
   NotificationPushOutcome,
   NotificationRouteReport,
   NotificationRouteRule,
@@ -133,20 +86,6 @@ import type {
   Site,
   User,
 } from "./types";
-// The portal's own shapes live in their own module rather than in `types.ts`, because they come
-// with a *rule* attached (only `IssuedDeveloperKey` may hold a token) that is worth reading
-// next to the type itself rather than one of two hundred lines of a shared list.
-import type {
-  CreateDeveloperKeyInput,
-  DeveloperKey,
-  DeveloperKeyDetail,
-  DeveloperLogDetail,
-  DeveloperLogFilters,
-  DeveloperLogPage,
-  DeveloperOverview,
-  DeveloperScopeCatalogue,
-  IssuedDeveloperKey,
-} from "./developer";
 
 /** An error answered by the API, or raised before the request could leave the browser. */
 export class ApiError extends Error {
@@ -161,59 +100,24 @@ export class ApiError extends Error {
    * `action`; without this the panel could only print the sentence.
    */
   readonly details: Record<string, unknown> | null;
-  /**
-   * Seconds the API asked the caller to wait, from `Retry-After`.
-   *
-   * `null` on everything that is not a refusal with a window behind it, and that distinction is
-   * the point: a screen that retried blindly would spin against the very limiter it exists to
-   * diagnose, and an operator watching a page refresh into `429` learns less from the error than
-   * from the number of seconds the platform is willing to wait.
-   */
-  readonly retryAfterSeconds: number | null;
 
   constructor(
     status: number,
     code: string,
     message: string,
     details: Record<string, unknown> | null = null,
-    retryAfterSeconds: number | null = null,
   ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.details = details;
-    this.retryAfterSeconds = retryAfterSeconds;
   }
 
   /** `true` when the session is missing or expired. */
   get isUnauthenticated(): boolean {
     return this.status === 401;
   }
-
-  /**
-   * `true` when the platform refused the request because a scope's budget is spent.
-   *
-   * A screen handles this differently from every other error: it says what was refused, by which
-   * scope and when to try again — instead of a "something went wrong" banner that implies the
-   * panel is broken when it is in fact doing exactly what it was configured to do.
-   */
-  get isRateLimited(): boolean {
-    return this.status === 429;
-  }
-}
-
-/**
- * Read the wait the API attached, or `null` when there is none.
- *
- * Parsed rather than trusted: a header the platform sent is still a string that came off a wire,
- * and `Number("soon")` is a number.
- */
-function retryAfterOf(response: Response): number | null {
-  const raw = response.headers.get("retry-after");
-  if (!raw) return null;
-  const seconds = Number(raw);
-  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
 }
 
 type ErrorBody = {
@@ -302,7 +206,6 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       body.error?.code ?? "unknown_error",
       body.error?.message ?? `The API answered with status ${response.status}.`,
       body.error?.details ?? null,
-      retryAfterOf(response),
     );
   }
 
@@ -549,82 +452,9 @@ function mediaQuery(siteId: string, filters: MediaFilters = {}): string {
     if (value === undefined || value === null || value === "" || value === false) {
       continue;
     }
-    if (key === "created_after" || key === "created_before") {
-      // The store's window is two instants, the toolbar's is two days, and the expansion happens
-      // here and NOT in the API for one reason: `new Date("2026-10-03")` on a server is midnight
-      // **UTC**, so a server-side expansion shifts the window by the server's offset from the
-      // operator's. A file uploaded at 23:00 on the 3rd in Istanbul is outside a UTC-midnight
-      // window, and the panel would report "nothing matches" about a file the operator can see.
-      // The browser knows the operator's own day, so the browser draws the line.
-      //
-      // `created_before` is the start of the day AFTER the one picked, because the store's
-      // clause is `created_at <` — sending the start of the picked day would exclude every file
-      // uploaded after midnight on the day the operator chose, and the window's last day would
-      // be silently empty.
-      const instant =
-        key === "created_after"
-          ? startOfLocalDay(value as string)
-          : startOfLocalDay(nextLocalDay(value as string));
-      if (instant) {
-        params.set(key, instant);
-      }
-      continue;
-    }
     params.set(key, value === true ? "true" : String(value));
   }
   return params.toString();
-}
-
-/**
- * Split a `YYYY-MM-DD` string into numbers, or `null` when it is not a plain calendar day.
- *
- * The check exists so a malformed value cannot reach the query string as `Invalid Date` and come
- * back from the store as a `400` nobody can act on. A date input hands over nothing else, so
- * this is a guard against a hand-edited URL, not against the control.
- */
-function calendarDay(day: string): [number, number, number] | null {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
-  if (!match) {
-    return null;
-  }
-  return [Number(match[1]), Number(match[2]), Number(match[3])];
-}
-
-/**
- * The first instant of a `YYYY-MM-DD` day **in this browser's timezone**, as RFC 3339.
- *
- * Built from the parts rather than from `new Date("2026-10-03")`, because that form is specified
- * as UTC: an operator picking "3 October" means their own 3 October, and a UTC reading of the
- * same string is a different day for most of the planet.
- *
- * `null` for a value that is not a plain calendar day.
- */
-function startOfLocalDay(day: string): string | null {
-  const parts = calendarDay(day);
-  if (!parts) {
-    return null;
-  }
-  const [year, month, date] = parts;
-  const moment = new Date(year, month - 1, date, 0, 0, 0, 0);
-  return Number.isNaN(moment.getTime()) ? null : moment.toISOString();
-}
-
-/**
- * The `YYYY-MM-DD` day after the one given, in this browser's timezone.
- *
- * Round-tripped through the offset rather than built by hand from the parts: adding a day to
- * `31 December` has to be `1 January`, and `new Date(year, month - 1, 32)` does that while
- * hand-rolled arithmetic on the month does not.
- */
-function nextLocalDay(day: string): string {
-  const parts = calendarDay(day);
-  if (!parts) {
-    return day;
-  }
-  const [year, month, date] = parts;
-  const moment = new Date(year, month - 1, date + 1, 0, 0, 0, 0);
-  const shifted = new Date(moment.getTime() - moment.getTimezoneOffset() * 60_000);
-  return shifted.toISOString().slice(0, 10);
 }
 
 /** The folder tree of a site, with the file count of every folder. */
@@ -670,20 +500,6 @@ export function fetchMediaFiles(
   return request<MediaFilePage>(`/api/v1/media/files?${mediaQuery(siteId, filters)}`);
 }
 
-/**
- * The accounts the uploader filter offers, most prolific first.
- *
- * Its own route rather than a field on the listing: a dropdown of candidates is a different
- * question from the rows that question selects, and a list response carrying both would make
- * every page of the library pay for a filter nobody touched. `media.read` is enough — it reads
- * the `created_by` of rows the caller may already list.
- */
-export function fetchMediaUploaders(siteId: string): Promise<MediaUploader[]> {
-  return request<{ site_id: string; uploaders: MediaUploader[] }>(
-    `/api/v1/media/uploaders?site_id=${encodeURIComponent(siteId)}`,
-  ).then((body) => body.uploaders);
-}
-
 /** Rename, move or edit the metadata of one file. */
 export function updateMediaFile(
   fileId: string,
@@ -693,15 +509,6 @@ export function updateMediaFile(
     caption?: string;
     description?: string;
     tags?: string[];
-    /**
-     * The whole custom pair set, sent as the editor holds it.
-     *
-     * `{}` clears the pairs; omitting the field leaves them alone. A *merge* would be the
-     * friendlier shape and the wrong one here — a caller that does not know the current set
-     * would drop every pair it did not send, which is how a licence number disappears during a
-     * caption edit.
-     */
-    metadata?: Record<string, string>;
     folder_id?: string | null;
   },
 ): Promise<MediaFile> {
@@ -3746,6 +3553,17 @@ export type IamProvisioningToken = {
   last_used_at: string | null;
   revoked_at: string | null;
   created_at: string;
+  /** When the token stops being accepted; null only for tokens minted before expiry existed. */
+  expires_at: string | null;
+  /** Set when a newer token replaced this one. */
+  rotated_at: string | null;
+  /**
+   * Computed by the API, not by the client. A panel that compares timestamps in the browser
+   * disagrees with the server by the viewer's timezone and its clock, and an expired token that
+   * still reads as live is the one thing this screen must never show.
+   */
+  expired: boolean;
+  rotated: boolean;
 };
 
 /** One line of the SCIM sync log. */
@@ -3759,6 +3577,13 @@ export type IamSyncLogEntry = {
   action: string;
   outcome: string;
   detail: string;
+  /**
+   * Live sessions this line ended (`0126`). Always a number: 0 means the line revoked nothing,
+   * which is the true answer for a create or a group write. The panel must not re-parse `detail`
+   * to get this — the sentence in `detail` is for a reader, and two consumers parsing it
+   * differently is how a security panel ends up quoting a wrong figure to somebody leaving.
+   */
+  revoked_sessions: number;
   created_at: string;
 };
 
@@ -3774,14 +3599,32 @@ export function fetchIamProvisioningTokens(
 export function createIamProvisioningToken(input: {
   name?: string;
   organizationId?: string | null;
+  /** Lifetime in days; omitted means the server's default rather than "never expires". */
+  expiresInDays?: number;
 }): Promise<{ token: IamProvisioningToken; secret: string }> {
   return request("/api/v1/iam/provisioning/tokens", {
     method: "POST",
     body: JSON.stringify({
       name: input.name ?? "",
       ...(input.organizationId ? { organization_id: input.organizationId } : {}),
+      ...(input.expiresInDays !== undefined ? { expires_in_days: input.expiresInDays } : {}),
     }),
   });
+}
+
+/**
+ * Rotate a token: the old secret stops working and a new one is returned, shown once.
+ *
+ * `replaced` is re-read from the database rather than echoing the pre-rotation row, so the panel
+ * can render "replaced by" without contradicting the list it refreshes into.
+ */
+export function rotateIamProvisioningToken(id: string): Promise<{
+  rotated: boolean;
+  replaced: IamProvisioningToken;
+  token: IamProvisioningToken;
+  secret: string;
+}> {
+  return request(`/api/v1/iam/provisioning/tokens/${id}`, { method: "POST" });
 }
 
 /** Revoke a token. */
@@ -3817,7 +3660,7 @@ export type IamAuthProvider = {
   id: string;
   organization_id: string;
   slug: string;
-  kind: "oidc" | "oauth2" | "saml";
+  kind: "oidc" | "oauth2" | "saml" | "ldap" | "active_directory";
   name: string;
   config: Record<string, unknown>;
   secret_ref: string | null;
@@ -3827,6 +3670,19 @@ export type IamAuthProvider = {
   default_role_id: string | null;
   jit_enabled: boolean;
   enabled: boolean;
+  /**
+   * `null` on `last_test_ok` is *never tested* — a third state, not a failure. The chip renders
+   * it differently because a brand-new provider and a broken one call for different actions.
+   */
+  last_test_at: string | null;
+  last_test_ok: boolean | null;
+  /** 0 means "not on a schedule", which is a real choice for an interactive-only directory. */
+  sync_interval_minutes: number;
+  last_sync_at: string | null;
+  last_sync_status: "ok" | "partial" | "failed" | null;
+  plugin_key: string | null;
+  /** Derived by the server, so the list and the drawer can never disagree about it. */
+  status: "enabled" | "disabled" | "degraded";
   created_at: string;
   updated_at: string;
   sign_in_count: number;
@@ -3844,15 +3700,45 @@ export type IamProviderEvent = {
   created_at: string;
 };
 
-/** The answer of the discovery test — a failed test is a `200` with `status: "failed"`. */
+/**
+ * One step of a directory connection test.
+ *
+ * The ladder is the answer, not a decoration on one: a directory fails at exactly one of these
+ * and "connection failed" leaves an operator with nothing to act on.
+ */
+export type IamTestStep = {
+  step: "dns" | "tcp" | "tls" | "bind" | "search" | "attributes";
+  status: "pending" | "ok" | "failed";
+  detail: string;
+};
+
+/** A configuration problem, attached to the field the wizard should underline. */
+export type IamTestProblem = {
+  field: string;
+  message: string;
+  kind: "missing" | "invalid" | "conflict";
+};
+
+/**
+ * The answer of a connection test. A failed test is a `200`, not a transport error.
+ *
+ * `status` is three-valued on purpose: `incomplete` means the form is sound and nothing has
+ * asked the directory anything yet, which is NOT a pass and does not unlock the enable button.
+ */
 export type IamProviderTest = {
   provider_id: string;
   slug: string;
-  kind: "oidc" | "oauth2" | "saml";
-  status: "ok" | "failed";
+  kind: "oidc" | "oauth2" | "saml" | "ldap" | "active_directory";
+  status: "ok" | "failed" | "incomplete";
   detail: string;
   endpoints?: Record<string, unknown> | null;
   secret_present: boolean;
+  /**
+   * The step ladder, for every kind. A directory walks six checks and a protocol provider walks
+   * four; the two sets differ, the shape does not, so the panel renders one list.
+   */
+  steps?: IamTestStep[] | null;
+  problems?: IamTestProblem[] | null;
 };
 
 /** The provider list, with the kinds the form offers. */
@@ -3861,7 +3747,13 @@ export function fetchIamProviders(
 ): Promise<{
   organization_id: string;
   providers: IamAuthProvider[];
-  kinds: { value: string; label: string; default_scopes: string[] }[];
+  kinds: {
+    value: string;
+    label: string;
+    default_scopes: string[];
+    /** A directory is configured and proved differently, so the form branches on this. */
+    family: "protocol" | "directory";
+  }[];
 }> {
   const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
   return request(`/api/v1/iam/providers${query}`);
@@ -3878,6 +3770,7 @@ export function createIamProvider(input: {
   groupClaim?: string | null;
   jitEnabled?: boolean;
   organizationId?: string | null;
+  syncIntervalMinutes?: number | null;
 }): Promise<IamAuthProvider> {
   return request("/api/v1/iam/providers", {
     method: "POST",
@@ -3891,6 +3784,9 @@ export function createIamProvider(input: {
       ...(input.groupClaim ? { group_claim: input.groupClaim } : {}),
       ...(typeof input.jitEnabled === "boolean" ? { jit_enabled: input.jitEnabled } : {}),
       ...(input.organizationId ? { organization_id: input.organizationId } : {}),
+      ...(typeof input.syncIntervalMinutes === "number"
+        ? { sync_interval_minutes: input.syncIntervalMinutes }
+        : {}),
     }),
   });
 }
@@ -3906,6 +3802,7 @@ export function updateIamProvider(
     groupClaim?: string | null;
     jitEnabled?: boolean;
     enabled?: boolean;
+    syncIntervalMinutes?: number;
   },
 ): Promise<IamAuthProvider> {
   return request(`/api/v1/iam/providers/${id}`, {
@@ -3927,9 +3824,113 @@ export function deleteIamProvider(id: string): Promise<null> {
   return request(`/api/v1/iam/providers/${id}`, { method: "DELETE" });
 }
 
+/** One account the deletion would take away, as the dialog shows it. */
+export type IamDeletionAccount = {
+  user_id: string;
+  email: string;
+  /** Which system owns the account: `local`, `sso`, `scim`, … */
+  source: string;
+  /** What the directory calls it, when it has said. */
+  external_id: string | null;
+};
+
+/** One row of the per-source breakdown. */
+export type IamDeletionSourceCount = {
+  source: string;
+  count: number;
+};
+
+/**
+ * What removing this provider would do, read *before* the button is pressed.
+ *
+ * `by_source` is carried alongside the total rather than instead of it, and the panel adds it up
+ * in front of the operator: "7 accounts" is a number to wave through, "7 accounts: 5 LDAP, 2
+ * SCIM" says a directory sweep created these people. `unknown_sources` is why a total that does
+ * not add up is still renderable — a source string a newer migration wrote must not leave the
+ * dialog showing a number it cannot account for.
+ */
+export type IamProviderDeletionImpact = {
+  provider_id: string;
+  slug: string;
+  affected_accounts: number;
+  by_source: IamDeletionSourceCount[];
+  /** A bounded sample, not the whole set: a directory of 4000 people must not render 4000 rows. */
+  accounts: IamDeletionAccount[];
+  unknown_sources: boolean;
+  /** `true` when the delete would be refused, so the panel never re-derives the rule itself. */
+  blocked: boolean;
+};
+
+/**
+ * Read the deletion impact.
+ *
+ * Separate from the delete on purpose. A dialog that discovers the block only after the click is
+ * a dialog that failed, and the refusal it would then show arrives as an error body rather than
+ * as the answer to a question somebody asked.
+ */
+export function fetchIamProviderDeletionImpact(id: string): Promise<IamProviderDeletionImpact> {
+  return request(`/api/v1/iam/providers/${id}/deletion-impact`);
+}
+
+/**
+ * The answer of a reassignment: four numbers, and the caller shows them rather than the count
+ * they asked for.
+ *
+ * `requested` is what the button sent, `reassigned` is what the update actually moved. A batch
+ * that named a local account and another tenant's account is a batch of two, and printing
+ * "4 reassigned" would be the lie. `not_moved` is always zero today and is carried anyway —
+ * an update reporting fewer rows than the scope query matched means something moved
+ * concurrently, and a caller that could not see the difference would report a success one
+ * account short.
+ */
+export type IamProviderReassignResult = {
+  requested: number;
+  reassigned: number;
+  not_moved: number;
+  skipped: number;
+};
+
+/**
+ * Fall accounts back to local sign-in — the action the refusal tells the operator to take.
+ *
+ * Every id is checked against the caller's organization *and* the provider's, so a batch cannot
+ * quietly take an account from a different tenant that happens to be in the list; an id from
+ * elsewhere comes back in `skipped` instead.
+ */
+export function reassignIamProviderAccounts(
+  id: string,
+  userIds: string[],
+): Promise<IamProviderReassignResult> {
+  return request(`/api/v1/iam/providers/${id}/reassign`, {
+    method: "POST",
+    body: JSON.stringify({ user_ids: userIds }),
+  });
+}
+
 /** Ask the provider what it actually is. A broken provider is a result, not a transport error. */
 export function testIamProvider(id: string): Promise<IamProviderTest> {
   return request(`/api/v1/iam/providers/${id}/test`, { method: "POST" });
+}
+
+/**
+ * Switch a provider on. Refused with `provider_not_ready` until a test has passed — which is why
+ * this is a verb of its own rather than a PATCH, and why the button stays disabled until then.
+ */
+export function enableIamProvider(id: string): Promise<{
+  id: string;
+  enabled: boolean;
+  gate_passed: boolean;
+}> {
+  return request(`/api/v1/iam/providers/${id}/enable`, { method: "POST" });
+}
+
+/** Switch a provider off. Never gated: stopping something broken must always be possible. */
+export function disableIamProvider(id: string): Promise<{
+  id: string;
+  enabled: boolean;
+  gate_passed: boolean;
+}> {
+  return request(`/api/v1/iam/providers/${id}/disable`, { method: "POST" });
 }
 
 /** A provider's sign-in log, newest first. */
@@ -3944,12 +3945,337 @@ export function fetchIamProviderEvents(
   return request(`/api/v1/iam/providers/${id}/events${query ? `?${query}` : ""}`);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The sync ledger (REQ-065, slice 4 part 2)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One sync run, as the ledger lists it.
+ *
+ * `healthy` is carried separately from `status` because the panel must not colour a `partial`
+ * run green: a sweep that created forty accounts and refused three people is the failure this
+ * screen exists to surface, and a boolean derived from the counters would hide exactly that.
+ * `duration_seconds` is `null` while a run is still going — never "time so far", which renders a
+ * slow run as permanently unfinished.
+ */
+export type IamSyncRun = {
+  id: string;
+  provider_id: string;
+  kind: "full" | "delta" | "scim" | "manual";
+  status: "running" | "ok" | "partial" | "failed";
+  healthy: boolean;
+  started_at: string;
+  finished_at: string | null;
+  duration_seconds: number | null;
+  counts: {
+    users_seen: number;
+    users_created: number;
+    users_updated: number;
+    users_deactivated: number;
+    groups_seen: number;
+  };
+  error_count: number;
+  message: string | null;
+  triggered_by: string | null;
+};
+
+/** One subject a run could not process, however many attempts it took. */
+export type IamFailedSubject = {
+  key: string;
+  attempts: number;
+  code: string;
+  message: string;
+  last_failed_at: string;
+};
+
+/** A provider's runs, newest first, with the counts the header shows. */
+export function fetchIamSyncRuns(
+  id: string,
+  input: { limit?: number; problemsOnly?: boolean } = {},
+): Promise<{
+  provider_id: string;
+  sync_interval_minutes: number;
+  summary: { runs: number; problems: number; running: number };
+  runs: IamSyncRun[];
+}> {
+  const params = new URLSearchParams();
+  if (input.limit) params.set("limit", String(input.limit));
+  if (input.problemsOnly) params.set("problems_only", "true");
+  const query = params.toString();
+  return request(`/api/v1/iam/providers/${id}/sync-runs${query ? `?${query}` : ""}`);
+}
+
+/**
+ * One run and the subjects it could not process.
+ *
+ * `attempts` and `subjects` are separate on purpose: three honest failures of one person are
+ * three rows underneath and one row to act on. Collapsing either direction produces a screen
+ * that looks right and is not.
+ */
+export function fetchIamSyncRun(
+  id: string,
+  runId: string,
+): Promise<{
+  run: IamSyncRun;
+  attempts: number;
+  failed_subjects: IamFailedSubject[];
+}> {
+  return request(`/api/v1/iam/providers/${id}/sync-runs/${runId}`);
+}
+
+/**
+ * Re-attempt named subjects. The names are required: an empty list would mean every subject that
+ * ever failed, which is not what the button says.
+ */
+export function retryIamSyncRun(
+  id: string,
+  runId: string,
+  subjects: string[],
+): Promise<{ retry_run_id: string; source_run_id: string; subjects: string[] }> {
+  return request(`/api/v1/iam/providers/${id}/sync-runs/${runId}/retry`, {
+    method: "POST",
+    body: JSON.stringify({ subjects }),
+  });
+}
+
+/** The groups a sync has seen, with the two values that go stale quietly. */
+export function fetchIamSyncGroups(
+  id: string,
+): Promise<{
+  provider_id: string;
+  summary: { groups: number; unsynced: number };
+  groups: {
+    id: string;
+    external_id: string;
+    external_label: string;
+    member_count: number;
+    last_seen_at: string;
+    synced: boolean;
+  }[];
+}> {
+  return request(`/api/v1/iam/providers/${id}/sync-groups`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The attribute map (REQ-065, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/** One row of a provider's attribute map. */
+export type IamAttributeMapping = {
+  source_attr: string;
+  target_field: string;
+  transform: string;
+  /** Whether the transform needs an argument — the server says so, the client does not guess. */
+  needs_argument: boolean;
+  transform_arg: string | null;
+  required: boolean;
+  position: number;
+};
+
+/** One transform, with the hint the picker shows. */
+export type IamTransform = { name: string; needs_argument: boolean; hint: string };
+
+/**
+ * The map, plus the catalogue the editor renders itself from.
+ *
+ * The pickers are built from `target_fields` and `transforms` rather than from constants here, so
+ * adding a field to the server does not leave this screen offering an option that is then
+ * refused — the failure an operator reads as "the panel is broken".
+ */
+export type IamAttributeMap = {
+  provider_id: string;
+  mappings: IamAttributeMapping[];
+  target_fields: string[];
+  transforms: IamTransform[];
+  problems: IamTestProblem[];
+};
+
+/**
+ * The result of running the map against a pasted sample.
+ *
+ * `ok: false` with a non-empty `missing` is the important case: it is what a real sign-in would
+ * do, which is why this endpoint runs the sign-in function rather than a display-only one.
+ */
+export type IamAttributePreview = {
+  provider_id: string;
+  ok: boolean;
+  values: { field: string; value: string }[];
+  missing: string[];
+  unused: string[];
+  rows: {
+    source_attr: string;
+    target_field: string;
+    transform: string;
+    transform_arg: string | null;
+    raw: string | null;
+    value: string | null;
+    required: boolean;
+  }[];
+  problems: IamTestProblem[];
+};
+
+/** The provider's map, with the field and transform catalogues. */
+export function fetchIamAttributeMap(id: string): Promise<IamAttributeMap> {
+  return request(`/api/v1/iam/providers/${id}/attribute-mappings`);
+}
+
+/**
+ * Replace the whole map. A PUT and not a row-at-a-time POST because a partially applied map is
+ * the failure that matters: an email row that never landed refuses real sign-ins for a reason
+ * nobody can see from the panel.
+ */
+export function saveIamAttributeMap(
+  id: string,
+  mappings: IamAttributeMapping[],
+): Promise<IamAttributeMap> {
+  return request(`/api/v1/iam/providers/${id}/attribute-mappings`, {
+    method: "PUT",
+    body: JSON.stringify({ mappings }),
+  });
+}
+
+/** Run the map against a pasted sample. Writes nothing and creates no account. */
+export function previewIamAttributeMap(
+  id: string,
+  sample: unknown,
+): Promise<IamAttributePreview> {
+  return request(`/api/v1/iam/providers/${id}/attribute-mappings/preview`, {
+    method: "POST",
+    body: JSON.stringify({ sample }),
+  });
+}
+
+/** One rule, as the editor reads it. */
+export type IamRoleRule = {
+  id: string | null;
+  position: number;
+  when_kind: string;
+  needs_key: boolean;
+  when_key: string;
+  when_operator: string;
+  when_value: string;
+  role_id: string;
+  scope_type: string;
+  site_id: string | null;
+  stop: boolean;
+  enabled: boolean;
+};
+
+/** A picker option the server sent, so the client never hard-codes a vocabulary. */
+export type IamRuleOption = { name: string; hint: string; needs_key?: boolean; needs_site?: boolean };
+
+/** The provider's role rules, with the kind/operator/scope catalogues. */
+export type IamRoleRules = {
+  provider_id: string;
+  rules: IamRoleRule[];
+  when_kinds: IamRuleOption[];
+  when_operators: IamRuleOption[];
+  scope_types: IamRuleOption[];
+  default_role_id: string | null;
+  problems: IamTestProblem[];
+};
+
+/**
+ * The result of walking the rules against a sample.
+ *
+ * `trace` is the reason this is worth showing rather than just the role: a rule that did not fire
+ * carries the values it read, so "matched nothing" and "read nothing" — different bugs with
+ * different fixes — are visibly different.
+ */
+export type IamRoleRuleDryRun = {
+  provider_id: string;
+  role_id: string | null;
+  reason: string;
+  matched_rule_index: number | null;
+  sample_email: string;
+  sample_groups: string[];
+  trace: {
+    index: number;
+    label: string;
+    when_kind: string;
+    when_key: string;
+    when_operator: string;
+    when_value: string;
+    role_id: string;
+    scope_type: string;
+    read: string[];
+    matched: boolean;
+    verdict: "matched" | "no_match" | "not_reached" | "disabled";
+  }[];
+  problems: IamTestProblem[];
+};
+
+export function fetchIamRoleRules(id: string): Promise<IamRoleRules> {
+  return request(`/api/v1/iam/providers/${id}/role-rules`);
+}
+
+/**
+ * Replace the whole rule set in one PUT. The order is the semantics, so a save that applies rows
+ * one at a time would let a sign-in land between the delete and the insert and see an empty set.
+ */
+export function saveIamRoleRules(
+  id: string,
+  rules: IamRoleRule[],
+): Promise<IamRoleRules> {
+  return request(`/api/v1/iam/providers/${id}/role-rules`, {
+    method: "PUT",
+    body: JSON.stringify({ rules }),
+  });
+}
+
+/** Dry-run a pasted identity against the *stored* rules. Writes nothing. */
+export function dryRunIamRoleRules(
+  id: string,
+  sample: unknown,
+): Promise<IamRoleRuleDryRun> {
+  return request(`/api/v1/iam/providers/${id}/role-rules/preview`, {
+    method: "POST",
+    body: JSON.stringify({ sample }),
+  });
+}
+
 /** The providers a person may sign in with — the public list the sign-in screen renders. */
 export function fetchSsoProviders(): Promise<{
   organization_id: string;
   providers: { slug: string; name: string; kind: string; start_url: string }[];
 }> {
   return request("/api/v1/auth/sso/providers");
+}
+
+/** What a bulk provider action did to one provider. */
+export type IamProviderBulkRow = {
+  id: string;
+  slug: string;
+  enabled: boolean | null;
+  error?: string;
+  message?: string;
+};
+
+/**
+ * The answer of a bulk enable/disable.
+ *
+ * `results` is one row per **requested** id — a refusal is a row with a code, never a hole, so
+ * the panel can render "3 switched on, 2 need a passing test" from the same list that carries
+ * the slugs. `missing` is separate because a provider in another tenant is not a gate refusal
+ * and must not be counted as one.
+ */
+export type IamProviderBulkResult = {
+  action: string;
+  results: IamProviderBulkRow[];
+  applied: number;
+  refused: number;
+  missing: string[];
+};
+
+/** Switch several providers on or off in one request. */
+export function bulkIamProviders(
+  action: "enable" | "disable",
+  ids: string[],
+): Promise<IamProviderBulkResult> {
+  return request("/api/v1/iam/providers/bulk", {
+    method: "POST",
+    body: JSON.stringify({ action, ids }),
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4407,44 +4733,6 @@ export function removeNotificationDevice(id: string): Promise<void> {
   return request<void>(`/api/v1/notifications/push-subscriptions/${id}`, { method: "DELETE" });
 }
 
-/**
- * The installation's VAPID public key, which is what `applicationServerKey` needs.
- *
- * `available: false` is an answer, not an error: the settings screen renders the push block
- * either way, and a rejected request would put a toast on a panel that is working correctly
- * and simply has nothing configured yet.
- */
-export function fetchNotificationPushKey(): Promise<NotificationPushKey> {
-  return request<NotificationPushKey>("/api/v1/notifications/push-key");
-}
-
-/**
- * Send one test notification through one channel, now, and report what happened.
- *
- * **The answer carries the transport's own outcome, not a boolean the client invented.**
- * `delivered` plus `detail` are separate because the settings screen renders them
- * differently — the boolean decides the colour of the line, `detail` is the sentence under
- * it. A failure is a `200`, not an error status: "your SMTP host refused the message" is a
- * result the reader asked for, and a `502` would tell them their settings screen is broken.
- */
-export function sendTestNotificationDelivery(input: {
-  channel: string;
-  title?: string;
-  body?: string;
-}): Promise<{
-  channel: string;
-  delivered: boolean;
-  detail: string;
-  response_status: number | null;
-  notification_id: string;
-  delivery_status: string;
-}> {
-  return request("/api/v1/notifications/preferences/test", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
 /** What each channel can do on this installation, and the sentence explaining it. */
 export function fetchNotificationChannels(): Promise<NotificationChannelReadiness[]> {
   return request<NotificationChannelReadiness[]>("/api/v1/notifications/channels");
@@ -4870,853 +5158,4 @@ export function saveHeaderPolicy(save: HeaderPolicySave): Promise<HeaderPolicySa
     method: "PUT",
     body: JSON.stringify(save),
   });
-}
-
-// ---------------------------------------------------------------------------------------------
-// Security centre (REQ-012, slice 3) — rate limiting and sign-in protection
-// ---------------------------------------------------------------------------------------------
-
-/**
- * The five scopes, merged with the baseline.
- *
- * `no-store` for the same reason the overview and the header policy carry it: a stale limiter
- * table is a screen that says "600 per minute" while the platform enforces something else, and
- * the whole value of the screen is that the two agree.
- */
-export function fetchRateLimits(): Promise<RateLimitsDocument> {
-  return request<RateLimitsDocument>("/api/v1/security/rate-limits", { cache: "no-store" });
-}
-
-/**
- * Save the limiter document.
- *
- * `expected_scopes` is the document the form was opened with and is the compare-and-swap key:
- * a form somebody else has since saved is **refused** rather than silently overwriting them. The
- * client validates nothing — the server owns every range, and a second rule that disagreed with
- * it would be a second place to be wrong about a limit that is refusing real traffic.
- */
-export function saveRateLimits(save: RateLimitsSave): Promise<RateLimitsSaved> {
-  return request<RateLimitsSaved>("/api/v1/security/rate-limits", {
-    method: "PUT",
-    body: JSON.stringify(save),
-  });
-}
-
-/**
- * Dry-run one request through the limiter.
- *
- * This is a **server** call rather than a local computation on purpose, and the reason is the
- * acceptance criterion it satisfies: the tester's verdict must match the real middleware
- * decision. Only the server holds the same `decide` the middleware runs, so a client that
- * reimplemented the arithmetic would agree with it on the day it was written and drift the
- * first time somebody tunes a limit — which is the day somebody is relying on it.
- */
-export function testRateLimit(body: RateLimitTestRequest): Promise<RateLimitTestResponse> {
-  return request<RateLimitTestResponse>("/api/v1/security/rate-limits/test", {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
-}
-
-/** The lockout document, its ranges, and how many accounts are locked right now. */
-export function fetchSignInProtection(): Promise<SignInProtectionDocument> {
-  return request<SignInProtectionDocument>("/api/v1/security/sign-in-protection", {
-    cache: "no-store",
-  });
-}
-
-/** Save the lockout document. `expected_policy` is the compare-and-swap key. */
-export function saveSignInProtection(save: SignInProtectionSave): Promise<SignInProtectionSaved> {
-  return request<SignInProtectionSaved>("/api/v1/security/sign-in-protection", {
-    method: "PUT",
-    body: JSON.stringify(save),
-  });
-}
-
-/** Who is locked out right now, soonest to expire first. */
-export function fetchLockedAccounts(): Promise<LockedAccountsPage> {
-  return request<LockedAccountsPage>("/api/v1/security/locked-accounts", { cache: "no-store" });
-}
-
-/**
- * Release one account early.
- *
- * The REQ calls out that lockout can be weaponised against a known account, so the unlock path
- * is deliberately not hidden behind a confirmation dialog with no escape: it is one click, and
- * it is audited server-side with the actor. The remaining `lockout_minutes` is the thing a
- * cautious operator narrows, not this button.
- */
-// -- REQ-012 slice 4: the IP access lists ----------------------------------------------------
-
-/**
- * Both access lists and their counts.
- *
- * One call rather than two: the screen renders the two tables side by side and a summary line,
- * and reading them separately would let the counts describe a different moment than the rows.
- */
-export function fetchIpRules(): Promise<IpRulesPage> {
-  return request<IpRulesPage>("/api/v1/security/ip-rules", { cache: "no-store" });
-}
-
-/**
- * Add one access rule.
- *
- * The response carries `blocks_you` — whether the new rule covers the address this request came
- * from — and the screen surfaces it as a warning rather than hiding it. The rule is saved either
- * way: refusing it would leave the platform unable to express a legitimate self-lockout, and the
- * operator would only learn which input avoids the check.
- */
-export function createIpRule(input: CreateIpRuleInput): Promise<CreateIpRuleResult> {
-  return request<CreateIpRuleResult>("/api/v1/security/ip-rules", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Remove one rule by id. */
-export function deleteIpRule(id: string): Promise<void> {
-  return request<void>(`/api/v1/security/ip-rules/${id}`, { method: "DELETE" });
-}
-
-/**
- * Ask what one address would do.
- *
- * The same evaluator the request path runs, so the verdict is the platform's verdict rather than
- * a second implementation's. Takes a single address, not a network — listing a network is what
- * the form above is for, and the error message says so.
- */
-export function testIpAddress(address: string): Promise<IpTestResult> {
-  return request<IpTestResult>("/api/v1/security/ip-rules/test", {
-    method: "POST",
-    body: JSON.stringify({ address }),
-  });
-}
-
-/**
- * The security-event timeline (REQ-012 slice 4).
- *
- * **Two sources, and that is the point.** The audit trail holds privileged actions somebody took;
- * it holds no sign-ins at all, because a failed sign-in happens before there is a session and so
- * before there is an actor to write an audit entry for. The server merges both tables and every row
- * names which one it came from, so this client does not choose — it cannot, and a screen that
- * could only read one of them would show an operator an empty sign-in list on a platform where
- * nothing is wrong.
- *
- * The filter is sent as a query string built here rather than assembled by the screen, so the
- * export and the table are guaranteed to be asking the server the same question.
- */
-export function fetchSecurityEvents(
-  filter: SecurityEventsFilter = {},
-): Promise<SecurityEventsPage> {
-  const params = new URLSearchParams();
-  if (filter.q) params.set("q", filter.q);
-  if (filter.category) params.set("category", filter.category);
-  if (filter.source) params.set("source", filter.source);
-  if (filter.since) params.set("since", filter.since);
-  if (filter.until) params.set("until", filter.until);
-  if (filter.limit) params.set("limit", String(filter.limit));
-  const query = params.toString();
-  return request<SecurityEventsPage>(
-    `/api/v1/security/events${query ? `?${query}` : ""}`,
-    { cache: "no-store" },
-  );
-}
-
-/**
- * The same filter as a CSV download.
- *
- * A browser navigation rather than a fetch, because the response is a file with
- * `Content-Disposition: attachment` and the panel's own `request()` wrapper is built for JSON —
- * reading it as text would hand the operator the CSV body instead of saving it.
- */
-/**
- * The secret inventory. Read-only, and the client has no mutation to offer.
- *
- * No filter parameter, deliberately: the inventory is small enough to render whole, and a filter
- * over a list whose point is "what does this platform hold" invites the reading that the screen
- * is hiding something rather than that it is complete.
- */
-export function fetchSecretInventory(): Promise<SecretInventory> {
-  return request<SecretInventory>("/api/v1/security/secrets");
-}
-
-export function securityEventsExportUrl(filter: SecurityEventsFilter = {}): string {
-  const params = new URLSearchParams();
-  if (filter.q) params.set("q", filter.q);
-  if (filter.category) params.set("category", filter.category);
-  if (filter.source) params.set("source", filter.source);
-  if (filter.since) params.set("since", filter.since);
-  if (filter.until) params.set("until", filter.until);
-  // Deliberately NOT sent: the server drops the page size for the export, because an operator
-  // who filters to "denials" and exports 50 of 300 has produced a document that reads as a
-  // complete list and is not one.
-  const query = params.toString();
-  return `/api/v1/security/events.csv${query ? `?${query}` : ""}`;
-}
-
-export function unlockAccount(userId: string): Promise<LockedAccountsPage> {
-  return request<LockedAccountsPage>(
-    `/api/v1/security/locked-accounts/${encodeURIComponent(userId)}/unlock`,
-    { method: "POST" },
-  );
-}
-
-
-/* ---------------------------------------------------------------------------------------------
- * Backups (REQ-013)
- *
- * Six functions for the overview, the detail, the create drawer, the verify action and the
- * settings screen. The schedules' writes arrive with slice 3, which is also where the worker
- * that produces them arrives; a "Run now" button with no worker behind it is a dead button,
- * and this file does not grow one.
- * ------------------------------------------------------------------------------------------- */
-
-/** The query the list screen sends. Every field is optional and every one is a filter. */
-export interface BackupListQuery {
-  /** Restrict to one terminal state. */
-  status?: string;
-  /** Restrict to one kind. */
-  kind?: string;
-  /** Restrict to runs that included this part. */
-  scope?: string;
-  /** Restrict to one destination. */
-  destination?: string;
-  /** Only runs created at or after this. */
-  created_after?: string;
-  /** Only runs created at or before this. */
-  created_before?: string;
-  /** Page size. */
-  limit?: number;
-  /** Page offset. */
-  offset?: number;
-}
-
-/** The list, filtered and paged. */
-export function fetchBackups(query: BackupListQuery = {}): Promise<BackupList> {
-  const search = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) {
-    if (value === undefined || value === null || value === "") continue;
-    search.set(key, String(value));
-  }
-  const suffix = search.toString();
-  return request<BackupList>(`/api/v1/backups${suffix ? `?${suffix}` : ""}`);
-}
-
-/** The four cards at the top of the overview. */
-export function fetchBackupStatus(): Promise<BackupStatus> {
-  return request<BackupStatus>("/api/v1/backups/status");
-}
-
-/** One run with its parts and its manifest. */
-export function fetchBackup(id: string): Promise<BackupDetail> {
-  return request<BackupDetail>(`/api/v1/backups/${id}`);
-}
-
-/** The manifest on its own, for the copy button. */
-export function fetchBackupManifest(id: string): Promise<unknown> {
-  return request<unknown>(`/api/v1/backups/${id}/manifest`);
-}
-
-/** Take a backup now. The response is the FINISHED run, not a queued one. */
-export function createBackup(input: {
-  label?: string;
-  scopes?: string[];
-  destination?: string;
-  protected?: boolean;
-  retain_days?: number | null;
-}): Promise<BackupCreateResult> {
-  return request<BackupCreateResult>("/api/v1/backups", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/**
- * Re-read a run's artifacts and compare them with its manifest.
- *
- * A `200` with `clean: false` is a successful verification that found a problem, so this
- * returns normally in that case — the caller renders the verdict, it does not catch it.
- */
-export function verifyBackup(id: string): Promise<BackupVerification> {
-  return request<BackupVerification>(`/api/v1/backups/${id}/verify`, { method: "POST" });
-}
-
-/**
- * What a restore of this run would do — without doing it.
- *
- * A `GET` on purpose: the preview re-reads every artifact off the destination and counts the
- * live side, and neither of those writes anything. Putting it behind the destructive
- * permission would mean the first time an operator meets this screen is a 403 that never
- * showed them what they were agreeing to.
- */
-export function previewRestore(id: string): Promise<RestorePreview> {
-  return request<RestorePreview>(`/api/v1/backups/${id}/restore-preview`, { method: "GET" });
-}
-
-/**
- * Perform a restore of the ticked parts.
- *
- * The API takes the parts the operator **left ticked**, not "everything available": an empty
- * array is a refusal naming the parts on offer, because a panel that posted nothing and got
- * the whole archive back would be a panel that restored more than it showed.
- */
-export function restoreBackup(
-  id: string,
-  parts: string[],
-  confirmation: string,
-): Promise<RestoreOutcome> {
-  return request<RestoreOutcome>(`/api/v1/backups/${id}/restore`, {
-    method: "POST",
-    body: JSON.stringify({ parts, confirmation }),
-  });
-}
-
-/**
- * Queue a restore instead of performing it — the one that can still be stopped (REQ-013
- * slice 2c).
- *
- * The distinction is the whole point and the panel is careful about it: `restoreBackup` runs
- * inside the request and has no cancel, because a `POST` in flight cannot be un-pressed. This
- * one answers `202` with the queued job, and the job can be stopped until its worker claims
- * it. Offering the cancellable one by default and the immediate one behind a named choice is
- * the honest arrangement; offering only the immediate one is a screen with no way back.
- */
-export function queueRestore(
-  id: string,
-  parts: string[],
-  confirmation: string,
-): Promise<RestoreJob> {
-  return request<RestoreJob>(`/api/v1/backups/${id}/restore-queue`, {
-    method: "POST",
-    body: JSON.stringify({ parts, confirmation }),
-  });
-}
-
-/**
- * This run's queued and finished restores, newest first.
- *
- * `backup.read`, not `backup.restore`: reading that a restore is queued changes nothing, and
- * hiding it behind the destructive key means the first time an operator looks for the thing
- * they are waiting for is a 403.
- */
-export function listRestoreJobs(id: string): Promise<RestoreJob[]> {
-  return request<RestoreJob[]>(`/api/v1/backups/${id}/restore-jobs`, { method: "GET" });
-}
-
-/**
- * Stop a queued restore.
- *
- * Addressed by the JOB's id and not the run's, because they are different resources: a route
- * that accepted either would let a cancel for one run's job stop another run's restore.
- *
- * The response is the job as it now reads, so a call that lost the race to the worker comes
- * back `running` rather than a `200` claiming a cancellation that did not happen.
- */
-export function cancelRestoreJob(jobId: string): Promise<RestoreJob> {
-  return request<RestoreJob>(`/api/v1/restore-jobs/${jobId}/cancel`, {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
-}
-
-/**
- * Remove a run **and the artifacts it left on the destination**.
- *
- * The returned report is the point of this call: "the row is gone" and "the bytes are gone"
- * are two facts, and a `204` collapsed them. A partial removal comes back with
- * `failed_entries > 0` and the paths that are still on disk, so the screen can say which
- * files an operator has to clear by hand instead of rendering "removed" over a directory
- * that is still full of the media library.
- */
-export function deleteBackup(id: string): Promise<BackupPurge> {
-  return request<BackupPurge>(`/api/v1/backups/${id}`, { method: "DELETE" });
-}
-
-/**
- * Run the retention sweep now, for this tenant.
- *
- * The background sweep runs every six hours, and a six hour wait is not an answer an
- * operator can act on when the disk is filling. The full report comes back rather than a
- * count, because "pruned 4" and "1 of those 4 left a stuck file" are two different facts and
- * the screen renders both.
- */
-export function sweepBackups(): Promise<BackupSweepReport> {
-  return request<BackupSweepReport>("/api/v1/backups/sweep", { method: "POST" });
-}
-
-/** The schedules table. */
-export function fetchBackupSchedules(): Promise<BackupSchedule[]> {
-  return request<BackupSchedule[]>("/api/v1/backup-schedules");
-}
-
-/**
- * What the schedule editor sends.
- *
- * The conditional fields are sent as `null` rather than omitted, so a schedule changed from
- * weekly to daily does not keep a `day_of_week` the server has to decide about. The server
- * refuses a daily schedule that still carries one.
- */
-export interface BackupScheduleInput {
-  name: string;
-  frequency: "hourly" | "daily" | "weekly" | "monthly";
-  at_time: string | null;
-  day_of_week: number | null;
-  day_of_month: number | null;
-  timezone: string;
-  scopes: string[];
-  retention_count: number;
-  enabled: boolean;
-}
-
-/**
- * Create a schedule.
- *
- * The response carries the **computed** `next_run_at`, not a value the form supplied — the
- * form never computes one. A schedule whose cadence cannot be computed (an unknown timezone,
- * a daily row with no time) is refused with a `400` naming the field rather than stored with
- * a null next run, which would leave a row that looks live and never fires.
- */
-export function createBackupSchedule(input: BackupScheduleInput): Promise<BackupSchedule> {
-  return request<BackupSchedule>("/api/v1/backup-schedules", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/**
- * Edit a schedule, and get the recomputed next run back.
- *
- * The next run is recomputed on every save rather than left alone. An operator who moves a
- * schedule from 02:00 to 04:00 and does not see the next run move has been told the change
- * did not take, when in fact it was stored and the stale column is what the worker reads.
- */
-export function updateBackupSchedule(
-  id: string,
-  input: BackupScheduleInput,
-): Promise<BackupSchedule> {
-  return request<BackupSchedule>(`/api/v1/backup-schedules/${id}`, {
-    method: "PUT",
-    body: JSON.stringify(input),
-  });
-}
-
-/**
- * Remove a schedule.
- *
- * Its runs keep their own `kind` and lose only the link: deleting a schedule stops future
- * backups and does not delete the restore points it produced. The schema is arranged so the
- * other outcome is not expressible here.
- */
-export function deleteBackupSchedule(id: string): Promise<void> {
-  return request<void>(`/api/v1/backup-schedules/${id}`, { method: "DELETE" });
-}
-
-/**
- * Take a backup on a schedule's terms, right now.
- *
- * `backup.create`, not `backup.manage`: this produces a backup and changes nothing else. It
- * does **not** advance the schedule — clicking this at 09:00 to test a 02:00 schedule must
- * not consume the 02:00 slot, which is the difference between a test and a silent skip.
- */
-export function runBackupScheduleNow(id: string): Promise<BackupCreateResult> {
-  return request<BackupCreateResult>(`/api/v1/backup-schedules/${id}/run`, { method: "POST" });
-}
-
-/** The settings record. */
-export function fetchBackupSettings(): Promise<BackupSettings> {
-  return request<BackupSettings>("/api/v1/backup-settings");
-}
-
-/**
- * Save the settings.
- *
- * The API probes the destination before it stores anything and refuses an unwritable one, so
- * a `200` here means the configuration was not only saved but proved writable.
- */
-export function saveBackupSettings(input: {
-  destination: string;
-  local_root: string;
-  s3_prefix?: string | null;
-  credential_ref?: string | null;
-  encryption: string;
-  default_retention: number;
-  verify_after_backup: boolean;
-}): Promise<BackupSettings> {
-  return request<BackupSettings>("/api/v1/backup-settings", {
-    method: "PUT",
-    body: JSON.stringify(input),
-  });
-}
-
-// ---------------------------------------------------------------------------------------------
-// System health (REQ-014).
-//
-// The overview is fetched with `cache: "no-store"` and the POST carries the CSRF header
-// `request()` already adds, because both of those are the difference between this screen
-// showing the platform and showing a screenshot of it. A cached overview is a status
-// screen that answers "how were things when this tab was last opened", which is the one
-// question a health screen must never answer.
-// ---------------------------------------------------------------------------------------------
-
-/** Every service's state, the host's metrics and the banner, read live. */
-export function fetchHealthOverview(): Promise<HealthOverview> {
-  return request<HealthOverview>("/api/v1/health/overview", { cache: "no-store" });
-}
-
-/**
- * Run every probe now and record the samples.
- *
- * The answer is a full overview rather than a run id, so the panel replaces what it has
- * with what the server now believes. A client that merged the new states into the old rows
- * would keep the last stored `healthy` for a service that has just gone down.
- */
-export function runHealthChecks(): Promise<HealthOverview> {
-  return request<HealthOverview>("/api/v1/health/checks/run", {
-    method: "POST",
-    cache: "no-store",
-  });
-}
-
-/** One service, with the checks it ran and the metrics it has published. */
-export function fetchHealthService(key: string): Promise<HealthServiceDetail> {
-  return request<HealthServiceDetail>(`/api/v1/health/services/${encodeURIComponent(key)}`, {
-    cache: "no-store",
-  });
-}
-
-/**
- * One metric's series, oldest first.
- *
- * The window is a **named range** (`1h` / `24h` / `7d`), the same vocabulary
- * `/health/metrics` uses, and the server refuses anything else with a message naming
- * what is offered. It used to take `hours` and clamp it, which is the silent-clamp
- * shape: a caller asking for a month got a week with a `200`, drew the wrong chart,
- * and had no way to tell from the response. The parameter's *name* is the reason this
- * was worth changing rather than leaving compatible — `hours=24` and `range=24h` are
- * the same window with two spellings, and the second one travels into the CSV
- * filename, so there must be exactly one.
- */
-export function fetchHealthSamples(
-  service: string,
-  metric: string,
-  range: HealthRangeKey = "24h",
-): Promise<HealthSamplePoint[]> {
-  const query = new URLSearchParams({ service, metric, range });
-  return request<HealthSamplePoint[]>(`/api/v1/health/samples?${query.toString()}`, {
-    cache: "no-store",
-  });
-}
-
-/** The one-line summary the security overview and the operator dashboard embed. */
-export function fetchHealthSummary(): Promise<HealthSummary> {
-  return request<HealthSummary>("/api/v1/health/summary", { cache: "no-store" });
-}
-
-/** The host's raw kernel readings, including the notes for anything unreadable. */
-export function fetchHealthHost(): Promise<Record<string, unknown>> {
-  return request<Record<string, unknown>>("/api/v1/health/host", { cache: "no-store" });
-}
-
-/** Drop raw samples past the retention window. Destructive, so it is a POST. */
-export function pruneHealthSamples(): Promise<HealthPruneResult> {
-  return request<HealthPruneResult>("/api/v1/health/maintenance/prune", { method: "POST" });
-}
-
-/**
- * `GET /api/v1/health/metrics` — the aggregated table for a named range.
- *
- * The range is a **name** (`1h`, `24h`, `7d`) rather than a number of hours, and the server
- * refuses anything else. The client cannot quietly ask for a window the panel has no label
- * for, which is what stops a table headed `7d` from holding a day.
- */
-export function fetchHealthMetrics(
-  range: HealthRangeKey = "24h",
-): Promise<HealthMetricsReport> {
-  return request<HealthMetricsReport>(
-    `/api/v1/health/metrics?range=${encodeURIComponent(range)}`,
-    { cache: "no-store" },
-  );
-}
-
-/**
- * `GET /api/v1/health/metrics.csv` — exactly the rows the table is showing.
- *
- * The **server** renders the file from the same query the table used, and repeats the window in
- * `X-Health-Range`. The client never builds CSV from the rows it holds: a client-built export is
- * a client-chosen file, and "the export matches the range shown" is precisely the property that
- * a client-built export cannot promise.
- */
-export async function downloadHealthMetricsCsv(
-  range: HealthRangeKey = "24h",
-): Promise<{ rows: number; blob: Blob; filename: string; range: string }> {
-  const url = `/api/v1/health/metrics.csv?range=${encodeURIComponent(range)}`;
-  let response: Response;
-  try {
-    response = await fetch(url, { credentials: "same-origin", headers: { accept: "text/csv" } });
-  } catch {
-    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
-  }
-
-  if (!response.ok) {
-    const text = await response.text();
-    let code = "export_failed";
-    let message = `The export answered with status ${response.status}.`;
-    try {
-      const body = JSON.parse(text) as ErrorBody;
-      code = body.error?.code ?? code;
-      message = body.error?.message ?? message;
-    } catch {
-      // A non-JSON error body is still an error; the status stays in the message.
-    }
-    throw new ApiError(response.status, code, message);
-  }
-
-  const disposition = response.headers.get("content-disposition") ?? "";
-  const match = /filename="?([^";]+)"?/.exec(disposition);
-  const served = response.headers.get("x-health-range") ?? range;
-  const blob = await response.blob();
-
-  // The row count is read from the file itself rather than trusted from a header, because the
-  // header the API sends is the same code path that made the mistake.
-  const text = await blob.text();
-  const rows = Math.max(0, text.split("\n").filter((line) => line.trim() !== "").length - 1);
-
-  return { rows, blob, filename: match?.[1] ?? `omnion-health-${served}.csv`, range: served };
-}
-
-// ---------------------------------------------------------------------------------------------
-// Incidents and threshold policy (REQ-014, slice 3)
-// ---------------------------------------------------------------------------------------------
-
-/**
- * `GET /api/v1/health/incidents` — a page of the timeline.
- *
- * The filters go out as query parameters and the server **refuses** a malformed instant rather
- * than ignoring it: a `from=` that silently widens to "no lower bound" is the kind of filter
- * that makes an incident screen agree with itself while showing the wrong week.
- */
-export function fetchHealthIncidents(
-  filter: {
-    service?: string | null;
-    state?: string | null;
-    from?: string | null;
-    to?: string | null;
-    limit?: number;
-    offset?: number;
-  } = {},
-): Promise<HealthIncidentPage> {
-  const query = new URLSearchParams();
-  if (filter.service) query.set("service", filter.service);
-  if (filter.state) query.set("state", filter.state);
-  if (filter.from) query.set("from", filter.from);
-  if (filter.to) query.set("to", filter.to);
-  if (filter.limit !== undefined) query.set("limit", String(filter.limit));
-  if (filter.offset !== undefined) query.set("offset", String(filter.offset));
-  const suffix = query.toString();
-  return request<HealthIncidentPage>(
-    `/api/v1/health/incidents${suffix ? `?${suffix}` : ""}`,
-    { cache: "no-store" },
-  );
-}
-
-/** `GET /api/v1/health/incidents/{id}` — one incident with its own detail. */
-export function fetchHealthIncident(id: string): Promise<HealthIncident> {
-  return request<HealthIncident>(`/api/v1/health/incidents/${encodeURIComponent(id)}`, {
-    cache: "no-store",
-  });
-}
-
-/**
- * `PATCH /api/v1/health/incidents/{id}` — acknowledge with a note, or resolve by hand.
- *
- * One endpoint for both, because they are one decision: an operator looking at an incident
- * either claims it or closes it.
- */
-export function patchHealthIncident(
-  id: string,
-  action: HealthIncidentAction,
-  note?: string,
-): Promise<HealthIncident> {
-  return request<HealthIncident>(`/api/v1/health/incidents/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    body: JSON.stringify({ action, note: note ?? "" }),
-  });
-}
-
-/** `GET /api/v1/health/settings` — the policy, its bounds and its suggestions. */
-export function fetchHealthSettings(): Promise<HealthSettings> {
-  return request<HealthSettings>("/api/v1/health/settings", { cache: "no-store" });
-}
-
-/**
- * `PUT /api/v1/health/settings` — save intervals, pairs and toggles.
- *
- * `thresholds` is omitted entirely when the caller did not change a pair, so a save of one
- * interval cannot silently reset every threshold to whatever the form's placeholders say. That
- * is why the argument is `null`-able rather than an empty array: an empty array is a request to
- * erase the policy.
- */
-export function saveHealthSettings(update: {
-  check_interval_seconds?: number;
-  worker_stale_seconds?: number;
-  thresholds?: HealthThreshold[] | null;
-  notifications?: Record<string, boolean>;
-}): Promise<HealthSettings> {
-  const body: Record<string, unknown> = {};
-  if (update.check_interval_seconds !== undefined) {
-    body.check_interval_seconds = update.check_interval_seconds;
-  }
-  if (update.worker_stale_seconds !== undefined) {
-    body.worker_stale_seconds = update.worker_stale_seconds;
-  }
-  if (update.thresholds !== undefined && update.thresholds !== null) {
-    body.thresholds = update.thresholds.map((row) => ({
-      metric: row.metric,
-      warn: row.warn,
-      crit: row.crit,
-      direction: row.direction,
-    }));
-  }
-  if (update.notifications !== undefined) body.notifications = update.notifications;
-  return request<HealthSettings>("/api/v1/health/settings", {
-    method: "PUT",
-    body: JSON.stringify(body),
-  });
-}
-
-/** `GET /api/v1/health/maintenance-windows` — the windows, newest first. */
-export function fetchHealthMaintenanceWindows(): Promise<HealthMaintenanceWindow[]> {
-  return request<HealthMaintenanceWindow[]>("/api/v1/health/maintenance-windows", {
-    cache: "no-store",
-  });
-}
-
-/**
- * `POST /api/v1/health/maintenance-windows` — create one.
- *
- * An empty `services` array is the deploy case and covers every service; that is a real choice
- * the form makes explicitly rather than a default the API invents.
- */
-export function createHealthMaintenanceWindow(input: {
-  starts_at: string;
-  ends_at: string;
-  services?: string[];
-  note?: string;
-}): Promise<HealthMaintenanceWindow> {
-  return request<HealthMaintenanceWindow>("/api/v1/health/maintenance-windows", {
-    method: "POST",
-    body: JSON.stringify({
-      starts_at: input.starts_at,
-      ends_at: input.ends_at,
-      services: input.services ?? [],
-      note: input.note ?? "",
-    }),
-  });
-}
-
-/** `DELETE /api/v1/health/maintenance-windows/{id}` — withdraw a window. */
-export function deleteHealthMaintenanceWindow(id: string): Promise<void> {
-  return request<void>(`/api/v1/health/maintenance-windows/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
-}
-
-// ---------------------------------------------------------------------------------------------
-// Developer portal (REQ-022, slice 2)
-// ---------------------------------------------------------------------------------------------
-//
-// These live here rather than in `lib/developer.ts` because this module owns the session cookie,
-// the CSRF header and the `ApiError` shape; a second file calling `fetch` itself would be a
-// second implementation of all three. The portal's *types* and its CSV builder live in
-// `lib/developer.ts` — a shape and a pure function need neither a cookie nor an error type.
-
-/** `GET /api/v1/developer/overview` — the card row and the recent failures. */
-export function fetchDeveloperOverview(): Promise<DeveloperOverview> {
-  return request<DeveloperOverview>("/api/v1/developer/overview", { cache: "no-store" });
-}
-
-/** `GET /api/v1/developer/api-keys` — the list, with its three optional filters. */
-export function fetchDeveloperKeys(
-  filters: {
-    environment?: string | null;
-    status?: string | null;
-    search?: string | null;
-  } = {},
-): Promise<DeveloperKey[]> {
-  const query = new URLSearchParams();
-  if (filters.environment) query.set("environment", filters.environment);
-  if (filters.status) query.set("status", filters.status);
-  if (filters.search) query.set("search", filters.search);
-  const suffix = query.toString();
-  return request<DeveloperKey[]>(
-    `/api/v1/developer/api-keys${suffix ? `?${suffix}` : ""}`,
-    { cache: "no-store" },
-  );
-}
-
-/**
- * `POST /api/v1/developer/api-keys` — the only call that returns a token.
- *
- * The caller must show it once and let it go; nothing here caches the answer, and the panel
- * keeps it in component state that is dropped when the reveal dialog closes.
- */
-export function createDeveloperKey(
-  input: CreateDeveloperKeyInput,
-): Promise<IssuedDeveloperKey> {
-  return request<IssuedDeveloperKey>("/api/v1/developer/api-keys", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** `GET /api/v1/developer/api-keys/{id}`. */
-export function fetchDeveloperKey(id: string): Promise<DeveloperKeyDetail> {
-  return request<DeveloperKeyDetail>(
-    `/api/v1/developer/api-keys/${encodeURIComponent(id)}`,
-    { cache: "no-store" },
-  );
-}
-
-/** `POST /api/v1/developer/api-keys/{id}/rotate` — a new secret, the old one dead at once. */
-export function rotateDeveloperKey(id: string): Promise<IssuedDeveloperKey> {
-  return request<IssuedDeveloperKey>(
-    `/api/v1/developer/api-keys/${encodeURIComponent(id)}/rotate`,
-    { method: "POST" },
-  );
-}
-
-/** `DELETE /api/v1/developer/api-keys/{id}` — a soft revoke; the row and its logs stay. */
-export function revokeDeveloperKey(id: string): Promise<{ revoked: boolean; id: string }> {
-  return request<{ revoked: boolean; id: string }>(
-    `/api/v1/developer/api-keys/${encodeURIComponent(id)}`,
-    { method: "DELETE" },
-  );
-}
-
-/** `GET /api/v1/developer/scopes` — grouped in the API, never re-derived in the panel. */
-export function fetchDeveloperScopes(): Promise<DeveloperScopeCatalogue> {
-  return request<DeveloperScopeCatalogue>("/api/v1/developer/scopes", { cache: "no-store" });
-}
-
-/** `GET /api/v1/developer/logs` — one page, filtered. */
-export function fetchDeveloperLogs(
-  filters: DeveloperLogFilters = {},
-  before?: number | null,
-): Promise<DeveloperLogPage> {
-  const query = new URLSearchParams();
-  if (filters.api_key_id) query.set("api_key_id", filters.api_key_id);
-  if (filters.method) query.set("method", filters.method);
-  if (filters.path_prefix) query.set("path_prefix", filters.path_prefix);
-  if (filters.status_class) query.set("status_class", filters.status_class);
-  if (filters.window_days) query.set("window_days", String(filters.window_days));
-  if (before) query.set("before", String(before));
-  const suffix = query.toString();
-  return request<DeveloperLogPage>(`/api/v1/developer/logs${suffix ? `?${suffix}` : ""}`, {
-    cache: "no-store",
-  });
-}
-
-/** `GET /api/v1/developer/logs/{id}` — the detail drawer. */
-export function fetchDeveloperLog(id: number): Promise<DeveloperLogDetail> {
-  return request<DeveloperLogDetail>(`/api/v1/developer/logs/${id}`, { cache: "no-store" });
 }

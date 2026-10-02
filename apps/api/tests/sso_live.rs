@@ -35,18 +35,72 @@ use uuid::Uuid;
 use support::stub_idp::{CLIENT_ID, CLIENT_SECRET, SAML_AUDIENCE, SAML_ISSUER, StubIdp};
 
 const PASSWORD: &str = "correct horse battery";
-const HOST: &str = "sso-live.omnion.test";
+
+/// Serializes this file's two tests against each other.
+///
+/// Each fixture clears every row carrying the `sso-live-%` prefix before it inserts its own, so
+/// a blanket cleanup in one test deletes the organization the other inserted microseconds
+/// earlier. The failure then surfaces as a foreign-key violation on an unrelated statement,
+/// which is exactly the sort of thing that sends the next reader looking in the wrong file.
+/// The two tests are not independent enough to run in parallel; this says so in one line rather
+/// than leaving `--test-threads=1` in a runbook.
+static FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A host that is unique per fixture.
+///
+/// The public sign-in surface resolves its organization from the `Host` header, so every fixture
+/// has to register a domain — and `site_domains.host` is globally unique. A shared constant made
+/// the two tests in this file race: the first to insert won, and the loser died on a unique
+/// violation in a line that has nothing to do with what it was testing. A per-fixture host makes
+/// the two independent, which is the only reason to run them in parallel at all.
+fn fixture_host() -> String {
+    format!("sso-live-{}.omnion.test", Uuid::new_v4().simple())
+}
 
 /// The name of the environment variable the provider's client secret lives under.
 const SECRET_REF: &str = "OMNION_SSO_LIVE_STUB_SECRET";
 
+/// The CSRF secret this file's walks run under.
+///
+/// Every write in this file that authenticates with a **session cookie** — connecting a
+/// provider, publishing one, saving role rules, minting a provisioning token — is refused
+/// `403 csrf_unavailable` unless the platform has a CSRF secret configured, and the layer
+/// *refuses* rather than skipping when it has none. That is the right production behaviour: a
+/// platform that silently drops CSRF protection when the key is missing is worse than one that
+/// refuses writes, because the refusal is visible and the skip is not.
+///
+/// The cost is that a walk which only sets up its OAuth client secret fails at the *first
+/// provider POST* with a message about CSRF, which names neither the walk nor the fix. The
+/// secret belongs in the test file, next to the code that depends on it — not in a CI profile,
+/// and certainly not defaulted in the platform.
+///
+/// The SCIM half of the new walk does **not** need this: a provisioning token is a bearer
+/// credential, not ambient authority, and the layer deliberately skips bearer requests. That
+/// asymmetry is the reason the two halves of this file look so different.
+const CSRF_SECRET: &str = "qa-walkthrough-csrf-secret-not-a-real-credential";
+
 struct TestResponse {
     status: StatusCode,
     set_cookie: Option<String>,
+    /// **Every** `Set-Cookie` header, in order.
+    ///
+    /// `set_cookie` keeps only the first, which is right for the session and wrong for anything
+    /// that comes after it: login sets `omnion_session` and `omnion_csrf` as two separate
+    /// headers, so a walk that reads only the first sees no CSRF token and concludes — from a
+    /// `403` on its first write — that the platform is misconfigured. Collected by name at the
+    /// point of use rather than index, so the two can swap places without breaking anything.
+    raw_set_cookies: Vec<String>,
     location: Option<String>,
     body: Value,
     /// The raw bytes, for the one route that answers HTML rather than JSON.
     raw: String,
+}
+
+/// A signed-in owner: the session cookie, and the CSRF token that authenticates writes made with
+/// it. The two travel together because that is what the platform issues them as.
+struct Session {
+    session: String,
+    csrf: String,
 }
 
 async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
@@ -56,7 +110,14 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .expect("router must answer");
 
     let status = response.status();
-    let set_cookie = header_text(&response, header::SET_COOKIE);
+    let raw_set_cookies: Vec<String> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect();
+    let set_cookie = raw_set_cookies.first().cloned();
     let location = header_text(&response, header::LOCATION);
     let bytes = response
         .into_body()
@@ -73,6 +134,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     TestResponse {
         status,
         set_cookie,
+        raw_set_cookies,
         location,
         body,
         raw,
@@ -115,6 +177,47 @@ fn public_request(method: Method, uri: &str, host: &str) -> Request<Body> {
         .header(header::HOST, host)
         .body(Body::empty())
         .expect("request must build")
+}
+
+/// A request carrying a **provisioning token** — the credential a directory connector uses, and
+/// the one thing a session cookie must never be able to stand in for.
+///
+/// It is a separate constructor rather than a flag on `session_request` on purpose: the SCIM
+/// extractor answers `401` for a cookie *and* for a session, and a walk that built its requests
+/// with the session helper would be testing the wrong credential for every SCIM assertion.
+fn bearer_request(method: Method, uri: &str, token: &str, body: Option<Value>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+    match body {
+        Some(value) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .expect("request must build"),
+        None => builder.body(Body::empty()).expect("request must build"),
+    }
+}
+
+/// A cookie-authenticated write, carrying the CSRF token the session was issued with.
+///
+/// The header form rather than the cookie form, because that is what a browser sends and the
+/// point of a walk is to be the browser. Sending the cookie instead would pass here and say
+/// nothing about whether the header path works, which is the one an `admin` client library
+/// actually uses.
+fn owner_write(session: &Session, method: Method, uri: &str, body: Option<Value>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::COOKIE, session.session.clone())
+        .header("x-omnion-csrf", session.csrf.clone());
+    match body {
+        Some(value) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .expect("request must build"),
+        None => builder.body(Body::empty()).expect("request must build"),
+    }
 }
 
 /// A form POST — the shape a SAML response arrives in.
@@ -204,6 +307,14 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
+        // Held for the whole test, not just the setup: the cleanup runs at both ends. A tokio
+        // mutex rather than `std::sync::Mutex`, because this guard lives across `.await` points
+        // and a blocking lock there would pin a runtime worker for the length of the test.
+        let _guard = FIXTURE_LOCK.lock().await;
+        // Set **before** `Config::from_env`, because the CSRF secret is read when the config is
+        // built. Set in the fixture rather than in each walk so a new walk cannot reintroduce
+        // the `403 csrf_unavailable` that has nothing to do with SSO; see `CSRF_SECRET`.
+        unsafe { std::env::set_var("OMNION_CSRF_SECRET", CSRF_SECRET) };
         let config = Config::from_env().expect("environment must be valid");
         let db = match Db::connect(&config.database).await {
             Ok(db) => db,
@@ -241,7 +352,11 @@ impl Fixture {
         // a test that only passes in a particular harness is a test that lies.
         // The walk marks everything it owns with a prefix and clears only what carries it, so a
         // sibling suite in the same database is never touched.
-        const OWNED: &str = "sso-live-";
+        let owned = "sso-live-%";
+        // The order is the foreign keys' order, not a preference: a user references its
+        // organization, a site references its organization, a domain references its site, and
+        // every provider row references the organization. Deleting the organization first fails
+        // on whichever of those three happens to have a row left.
         for statement in [
             "delete from sessions where user_id in \
              (select id from users where email like $1)",
@@ -253,40 +368,20 @@ impl Fixture {
              (select id from organizations where slug like $1)",
             "delete from auth_providers where organization_id in \
              (select id from organizations where slug like $1)",
+            "delete from site_domains where site_id in \
+             (select id from sites where organization_id in \
+              (select id from organizations where slug like $1))",
+            "delete from sites where organization_id in \
+             (select id from organizations where slug like $1)",
+            "delete from users where email like $1",
+            "delete from organizations where slug like $1",
         ] {
             sqlx::query(statement)
-                .bind(format!("{OWNED}%"))
+                .bind(&owned)
                 .execute(db.pool())
                 .await
                 .expect("a leftover row from a previous run must be clearable");
         }
-        sqlx::query("delete from users where email like $1")
-            .bind(format!("{OWNED}%"))
-            .execute(db.pool())
-            .await
-            .expect("a leftover account from a previous run must be clearable");
-        sqlx::query(
-            "delete from site_domains where site_id in \
-             (select id from sites where organization_id in \
-              (select id from organizations where slug like $1))",
-        )
-        .bind(format!("{OWNED}%"))
-        .execute(db.pool())
-        .await
-        .expect("a leftover domain from a previous run must be clearable");
-        sqlx::query(
-            "delete from sites where organization_id in \
-             (select id from organizations where slug like $1)",
-        )
-        .bind(format!("{OWNED}%"))
-        .execute(db.pool())
-        .await
-        .expect("a leftover site from a previous run must be clearable");
-        sqlx::query("delete from organizations where slug like $1")
-            .bind(format!("{OWNED}%"))
-            .execute(db.pool())
-            .await
-            .expect("a leftover organization from a previous run must be clearable");
 
         let organization_id: Uuid = sqlx::query_scalar(
             "insert into organizations (name, slug) values ($1, $2) returning id",
@@ -324,14 +419,11 @@ impl Fixture {
         .fetch_one(db.pool())
         .await
         .expect("the test site must be created");
-        sqlx::query("delete from site_domains where host = $1")
-            .bind(HOST)
-            .execute(db.pool())
-            .await
-            .expect("the stale domain must be cleared");
+        // Its own host, so a parallel run cannot collide on the globally unique `host` column.
+        let host = fixture_host();
         sqlx::query("insert into site_domains (site_id, host, is_primary) values ($1, $2, true)")
             .bind(site_id)
-            .bind(HOST)
+            .bind(&host)
             .execute(db.pool())
             .await
             .expect("the test domain must be created");
@@ -340,12 +432,21 @@ impl Fixture {
             state,
             db,
             organization_id,
-            host: HOST.to_owned(),
+            host,
         })
     }
 
-    /// Sign in as the Owner and answer the full `Cookie` header value.
-    async fn owner_session(&self) -> String {
+    /// Sign in as the Owner and answer the session cookie **and** the CSRF token with it.
+    ///
+    /// What makes this a pair rather than a bare cookie is the mechanism: a session cookie is *ambient* authority, so every
+    /// cookie-authenticated write must also carry a token derived from the **resolved session
+    /// id** — not from the cookie value, which is opaque, and derives a token that looks
+    /// plausible and fails `csrf_failed`. The platform hands that token out as an
+    /// `omnion_csrf` cookie on the same login response, deliberately not `HttpOnly` so a
+    /// browser can echo it in a header; this walk reads it off that response the way the browser
+    /// would, rather than reimplementing the derivation — a walk that reimplemented it would be
+    /// testing its own copy of the rule.
+    async fn owner_session_with_csrf(&self) -> Session {
         let email: String = sqlx::query_scalar(
             "select email from users where organization_id = $1 order by created_at limit 1",
         )
@@ -365,10 +466,33 @@ impl Fixture {
         )
         .await;
         assert_eq!(response.status, StatusCode::OK, "login: {}", response.body);
-        format!(
-            "omnion_session={}",
-            session_value(&response.set_cookie.expect("login sets the session cookie"))
-        )
+
+        let headers = response.set_cookie.expect("login sets the session cookie");
+        let session = format!("omnion_session={}", session_value(&headers));
+        // The `Set-Cookie` helper keeps only the first header, so the CSRF cookie — a second
+        // header on the same response — is recovered from the raw header list. Finding it by
+        // name rather than by position is what keeps this honest if the order ever changes.
+        let csrf = response
+            .raw_set_cookies
+            .iter()
+            .find(|value| value.starts_with("omnion_csrf="))
+            .map(|value| value.split(';').next().expect("cookie has a value"))
+            .map(|value| {
+                value
+                    .split_once('=')
+                    .expect("cookie is name=value")
+                    .1
+                    .to_owned()
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "login did not hand out a CSRF token, so no cookie-authenticated write in this \
+                     file can be made: {:?}",
+                    response.raw_set_cookies
+                )
+            });
+
+        Session { session, csrf }
     }
 
     /// The `state` the newest challenge of a provider issued, read the way the callback reads it.
@@ -490,15 +614,10 @@ async fn authorization_target(url: &str) -> String {
 }
 
 /// Connect a provider, publish it, and return its id.
-async fn connect(fixture: &Fixture, cookie: &str, body: Value) -> (Uuid, Uuid) {
+async fn connect(fixture: &Fixture, owner: &Session, body: Value) -> (Uuid, Uuid) {
     let created = call(
         &fixture.state,
-        session_request(
-            Method::POST,
-            "/api/v1/iam/providers",
-            Some(cookie),
-            Some(body),
-        ),
+        owner_write(&owner, Method::POST, "/api/v1/iam/providers", Some(body)),
     )
     .await;
     assert_eq!(
@@ -518,13 +637,18 @@ async fn connect(fixture: &Fixture, cookie: &str, body: Value) -> (Uuid, Uuid) {
 }
 
 /// Turn a provider on, as an administrator does once the wiring is right.
-async fn publish(fixture: &Fixture, cookie: &str, provider_id: Uuid) {
+///
+/// The order matters and used to be the other way round: the enablement gate refuses a provider
+/// whose connection test has never passed, so a walk that published first was testing a gate it
+/// had not yet satisfied — and the refusal it got back was the gate working, not a broken test.
+/// Publishing is now *after* the test below, which is also the order the wizard uses.
+async fn publish(fixture: &Fixture, owner: &Session, provider_id: Uuid) {
     let response = call(
         &fixture.state,
-        session_request(
+        owner_write(
+            &owner,
             Method::PATCH,
             &format!("/api/v1/iam/providers/{provider_id}"),
-            Some(cookie),
             Some(json!({ "enabled": true })),
         ),
     )
@@ -537,11 +661,73 @@ async fn publish(fixture: &Fixture, cookie: &str, provider_id: Uuid) {
     );
 }
 
+/// The gate, on its own: a provider that has never passed a test stays off.
+async fn assert_untested_providers_stay_off(
+    fixture: &Fixture,
+    owner: &Session,
+    provider_id: Uuid,
+) {
+    let response = call(
+        &fixture.state,
+        owner_write(
+            &owner,
+            Method::PATCH,
+            &format!("/api/v1/iam/providers/{provider_id}"),
+            Some(json!({ "enabled": true })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "a provider that has never passed a connection test cannot be switched on: {}",
+        response.body
+    );
+    assert_eq!(
+        response.body["error"]["code"],
+        json!("provider_not_ready"),
+        "and the refusal says which precondition is unmet, rather than failing generically"
+    );
+}
+
+/// The person the stub provider will assert on the next authorization request.
+///
+/// A named struct rather than four positional strings, because the second walk in this file
+/// asserts a *different* identity and a `&["editors"]` in the wrong position compiles perfectly
+/// while meaning something else entirely.
+struct Subject {
+    subject: &'static str,
+    email: &'static str,
+    display_name: &'static str,
+    groups: &'static [&'static str],
+}
+
+/// The identity the main walk signs in: in the `editors` group, which is what the legacy claim
+/// mapping keys on.
+const EDITOR: Subject = Subject {
+    subject: "stub-user-1",
+    email: "sso-live-subject@omnion.test",
+    display_name: "Live Directory Person",
+    groups: &["editors"],
+};
+
+/// The directory group the stored-membership walk keys its rule on.
+///
+/// A constant rather than a literal in the rule *and* in the group write, because the two have
+/// to be the same string and a pair of identical literals in different halves of a test is the
+/// classic way for a test to keep passing after one of them is edited.
+const STOREFRONT: &str = "Storefront";
+
 /// Walk a full OIDC sign-in: `start` → the provider's own authorization endpoint → `callback`.
 ///
 /// `challenge`, `code` and `state` are all read out of what each party actually sent, so the two
 /// servers are driven against each other rather than the walk inventing a code.
-async fn oidc_sign_in(fixture: &Fixture, idp: &StubIdp, slug: &str) -> TestResponse {
+async fn oidc_sign_in(
+    fixture: &Fixture,
+    idp: &StubIdp,
+    slug: &str,
+    who: &Subject,
+) -> TestResponse {
     let start = call(
         &fixture.state,
         public_request(
@@ -569,10 +755,10 @@ async fn oidc_sign_in(fixture: &Fixture, idp: &StubIdp, slug: &str) -> TestRespo
     let challenge =
         query_value(&authorization_url, "code_challenge").expect("PKCE must ride the URL");
     idp.expect_identity(
-        "stub-user-1",
-        "sso-live-subject@omnion.test",
-        "Live Directory Person",
-        &["editors"],
+        who.subject,
+        who.email,
+        who.display_name,
+        who.groups,
         &challenge,
     );
 
@@ -591,7 +777,8 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let cookie = fixture.owner_session().await;
+    let owner = fixture.owner_session_with_csrf().await;
+    let cookie = &owner.session;
 
     // The client secret lives in the environment, never in the row — the walk puts it there the
     // way an operator would, so `secret_present` becomes true and the exchange is confidential.
@@ -602,7 +789,7 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
     // ---- 1. The discovery test reaches the provider and reports what it actually found -------
     let (provider_id, _) = connect(
         &fixture,
-        &cookie,
+        &owner,
         json!({
             "slug": "stub-oidc",
             "kind": "oidc",
@@ -631,14 +818,14 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
          the value ever leaving the process"
     );
 
-    publish(&fixture, &cookie, provider_id).await;
+    assert_untested_providers_stay_off(&fixture, &owner, provider_id).await;
 
     let tested = call(
         &fixture.state,
-        session_request(
+        owner_write(
+            &owner,
             Method::POST,
             &format!("/api/v1/iam/providers/{provider_id}/test"),
-            Some(&cookie),
             None,
         ),
     )
@@ -655,6 +842,8 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
             .as_str()
             .is_some_and(|uri| uri.ends_with("/jwks"))
     );
+
+    publish(&fixture, &owner, provider_id).await;
 
     // ---- 2. The browser is sent to the provider, and comes back with a session ---------------
     let start = call(
@@ -677,7 +866,7 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
     // would follow is added to that same response as a `Location` (the session rides the response
     // that carries it), so both facts are asserted: who is signed in, and where the panel sends
     // them next.
-    let response = oidc_sign_in(&fixture, &idp, "stub-oidc").await;
+    let response = oidc_sign_in(&fixture, &idp, "stub-oidc", &EDITOR).await;
     assert!(
         response.status.is_success(),
         "a verified sign-in opens a session: {}",
@@ -812,7 +1001,7 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
     // The signature is perfectly valid — the provider really issued it. What does not match is
     // the code it was issued for, and a stateless signature check alone would never notice.
     idp.corrupt_code_hash();
-    let wrong_code = oidc_sign_in(&fixture, &idp, "stub-oidc").await;
+    let wrong_code = oidc_sign_in(&fixture, &idp, "stub-oidc", &EDITOR).await;
     assert_eq!(
         wrong_code.status,
         StatusCode::BAD_REQUEST,
@@ -823,7 +1012,7 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
 
     // ---- 9. A token signed by a key the provider does not publish is refused ----------------
     idp.sign_with_unpublished_key();
-    let unpublished = oidc_sign_in(&fixture, &idp, "stub-oidc").await;
+    let unpublished = oidc_sign_in(&fixture, &idp, "stub-oidc", &EDITOR).await;
     assert_eq!(
         unpublished.status,
         StatusCode::BAD_REQUEST,
@@ -878,12 +1067,13 @@ async fn a_live_saml_provider_signs_a_person_in_end_to_end() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let cookie = fixture.owner_session().await;
+    let owner = fixture.owner_session_with_csrf().await;
+    let cookie = &owner.session;
     let idp = StubIdp::start().await;
 
     let (provider_id, _) = connect(
         &fixture,
-        &cookie,
+        &owner,
         json!({
             "slug": "stub-saml",
             "kind": "saml",
@@ -907,17 +1097,17 @@ async fn a_live_saml_provider_signs_a_person_in_end_to_end() {
     // reader to parse a response — a certificate it cannot use fails here, not at a real sign-in.
     let tested = call(
         &fixture.state,
-        session_request(
+        owner_write(
+            &owner,
             Method::POST,
             &format!("/api/v1/iam/providers/{provider_id}/test"),
-            Some(&cookie),
             None,
         ),
     )
     .await;
     assert_eq!(tested.body["status"], json!("ok"), "test: {}", tested.body);
 
-    publish(&fixture, &cookie, provider_id).await;
+    publish(&fixture, &owner, provider_id).await;
 
     // `start` redirects to the relay page, which now carries the challenge in its URL. This is
     // the half that was broken: the page used to post the *return path* as `RelayState`, which
@@ -1125,5 +1315,593 @@ async fn a_live_saml_provider_signs_a_person_in_end_to_end() {
         replayed.body
     );
 
+    fixture.cleanup().await;
+}
+
+// ------------------------------------------------------------------------------------------
+// REQ-065 slice 3: the rule set decides on the sign-in path, and says so in the audit
+// ------------------------------------------------------------------------------------------
+
+/// The identity a rule set is written *against*: a group the rules do not name, so a rule that
+/// matches is a rule that read something real rather than a catch-all.
+const ANALYST: Subject = Subject {
+    subject: "stub-user-rules",
+    email: "sso-live-rules@omnion.test",
+    display_name: "Rule Mapped Person",
+    groups: &["analytics"],
+};
+
+/// A real OIDC sign-in resolves the provider's ordered rules, and the sign-in audit says which
+/// one decided.
+///
+/// This is the walk the dry run exists to be checked against. Everything upstream of it was
+/// proven by a real provider and real cryptography, and everything downstream is bookkeeping; the
+/// claim being made here is the narrow one that `RoleRules::resolve` is what a *callback* calls,
+/// not only what a preview calls, and that the sentence `role via rule #N` reaches the audit.
+///
+/// The test is arranged so it can only pass one way. The provider carries **both** a legacy
+/// `role_mappings` entry that would grant the platform `editor` and a rule set that says
+/// something different. If the rules were consulted in *addition* to the mapping, the person
+/// would hold two roles and the dry run — which shows the rules alone — would have been a lie
+/// about what the sign-in does. Asserting that `editor` is absent is therefore not a detail: it
+/// is the proof that "first match wins" means first, not last.
+#[tokio::test]
+async fn a_real_sign_in_resolves_the_rules_and_says_which_one_decided() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let owner = fixture.owner_session_with_csrf().await;
+    let cookie = &owner.session;
+    unsafe { std::env::set_var(SECRET_REF, CLIENT_SECRET) };
+    let idp = StubIdp::start().await;
+
+    let (provider_id, _) = connect(
+        &fixture,
+        &owner,
+        json!({
+            "slug": "stub-rules",
+            "kind": "oidc",
+            "name": "Live Rule Directory",
+            "config": {
+                "issuer": idp.issuer(),
+                "client_id": CLIENT_ID,
+                // The legacy claim mapping is left in place on purpose — see the doc comment.
+                "role_mappings": [{ "claim_value": "analytics", "role_slug": "editor" }],
+            },
+            "secret_ref": SECRET_REF,
+            "group_claim": "groups",
+            "jit_enabled": true,
+        }),
+    )
+    .await;
+
+    let tested = call(
+        &fixture.state,
+        owner_write(
+            &owner,
+            Method::POST,
+            &format!("/api/v1/iam/providers/{provider_id}/test"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(tested.body["status"], json!("ok"), "test: {}", tested.body);
+    publish(&fixture, &owner, provider_id).await;
+
+    // Two roles to rule between, and the rules are ordered so that the *first* one is the narrow
+    // one. A set evaluated last-to-first would grant the moderator and the test would say so.
+    let editor: Uuid = sqlx::query_scalar("select id from roles where key = 'editor'")
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the platform seeds a base editor role");
+    let moderator: Uuid = sqlx::query_scalar("select id from roles where key = 'moderator'")
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the platform seeds a base moderator role");
+
+    let saved = call(
+        &fixture.state,
+        owner_write(
+            &owner,
+            Method::PUT,
+            &format!("/api/v1/iam/providers/{provider_id}/role-rules"),
+            Some(json!({
+                "rules": [
+                    {
+                        "when_kind": "group",
+                        "when_key": "groups",
+                        "when_operator": "equals",
+                        "when_value": "analytics",
+                        "role_id": moderator,
+                        "scope_type": "organization",
+                    },
+                    {
+                        "when_kind": "group",
+                        "when_key": "groups",
+                        "when_operator": "equals",
+                        "when_value": "analytics",
+                        "role_id": editor,
+                        "scope_type": "organization",
+                    },
+                ]
+            }),
+        ),
+        ),
+    )
+    .await;
+    assert_eq!(
+        saved.status,
+        StatusCode::OK,
+        "two rules, both matching, in a saved order: {}",
+        saved.body
+    );
+
+    // ---- 1. The dry run and the callback are asked the same question, before the sign-in -----
+    let preview = call(
+        &fixture.state,
+        owner_write(
+            &owner,
+            Method::POST,
+            &format!("/api/v1/iam/providers/{provider_id}/role-rules/preview"),
+            Some(json!({ "sample": { "groups": ["analytics"], "sub": "stub-user-rules" } }),
+        ),
+        ),
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK, "preview: {}", preview.body);
+    assert_eq!(
+        preview.body["matched_rule_index"],
+        json!(0),
+        "the first rule wins, and the preview says which: {}",
+        preview.body
+    );
+    assert_eq!(
+        preview.body["role_id"],
+        json!(moderator),
+        "and the role it predicts is the first rule's"
+    );
+
+    // ---- 2. A real sign-in, through the provider, resolves the same rule ---------------------
+    let response = oidc_sign_in(&fixture, &idp, "stub-rules", &ANALYST).await;
+    assert!(
+        response.status.is_success(),
+        "a verified sign-in opens a session: {}",
+        response.body
+    );
+    let user_id: Uuid = Uuid::parse_str(response.body["user"]["id"].as_str().unwrap()).unwrap();
+
+    let roles: Vec<String> = sqlx::query_scalar(
+        "select r.key from role_bindings b join roles r on r.id = b.role_id \
+         where b.subject_id = $1 and b.revoked_at is null order by r.key",
+    )
+    .bind(user_id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the bindings must be readable");
+    assert!(
+        roles.iter().any(|key| key == "moderator"),
+        "the first rule's role is the one attached: {roles:?}"
+    );
+    assert!(
+        !roles.iter().any(|key| key == "editor"),
+        "the second matching rule is NOT also applied — first match wins, and the rule set \
+         replaces the claim mapping rather than adding to it: {roles:?}"
+    );
+    assert_eq!(
+        role_of(&fixture, user_id).await,
+        Some("moderator".to_owned()),
+        "and the role the sign-in produced is the role the dry run predicted"
+    );
+    assert_eq!(
+        preview.body["role_id"],
+        json!(moderator),
+        "the preview and the callback named the same role id, which is the only thing that makes \
+         the preview evidence rather than a picture of it"
+    );
+
+    // ---- 3. The audit carries the sentence, and not the rule's condition ---------------------
+    let (metadata,): (String,) = sqlx::query_as(
+        "select metadata::text from audit_log where action = 'iam.sso_sign_in' \
+         and actor_user_id = $1 order by created_at desc limit 1",
+    )
+    .bind(user_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the sign-in audit entry must exist");
+    assert!(
+        metadata.contains("role via rule #1"),
+        "the audit answers 'why does this person have that role': {metadata}"
+    );
+    assert!(
+        metadata.contains("moderator"),
+        "and names what it granted: {metadata}"
+    );
+    // The rule's `when_value` is `analytics` — the group the person belongs to. It must NOT be
+    // written down: a rule diff in a log nobody audits is a second copy of the directory.
+    assert!(
+        !metadata.contains("analytics"),
+        "the audit records the decision, not the directory behind it: {metadata}"
+    );
+
+    // ---- 4. The event fires, carrying ids and counts only ------------------------------------
+    let (payload,): (serde_json::Value,) = sqlx::query_as(
+        "select payload from events where name = 'iam.role_rule_matched' \
+         and organization_id = $1 order by created_at desc limit 1",
+    )
+    .bind(fixture.organization_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("a role granted by a rule is a fact somebody subscribed to");
+    assert_eq!(payload["subject_id"], json!(user_id));
+    assert_eq!(payload["rule_position"], json!(0));
+    assert_eq!(payload["role_id"], json!(moderator));
+    assert_eq!(payload["scope_type"], json!("organization"));
+    assert!(
+        !payload.to_string().contains("analytics"),
+        "a webhook payload carries ids and codes, never a group name: {payload}"
+    );
+
+    // ---- 5. An identity that matches nothing says so, rather than silently granting -----------
+    let visitor = Subject {
+        subject: "stub-user-nomatch",
+        email: "sso-live-nomatch@omnion.test",
+        display_name: "Nobody In Particular",
+        groups: &[],
+    };
+    let unmatched = oidc_sign_in(&fixture, &idp, "stub-rules", &visitor).await;
+    assert!(
+        unmatched.status.is_success(),
+        "a sign-in nobody wrote a rule for still succeeds: {}",
+        unmatched.body
+    );
+    let visitor_id: Uuid =
+        Uuid::parse_str(unmatched.body["user"]["id"].as_str().unwrap()).unwrap();
+    let (no_rule_metadata,): (String,) = sqlx::query_as(
+        "select metadata::text from audit_log where action = 'iam.sso_sign_in' \
+         and actor_user_id = $1 order by created_at desc limit 1",
+    )
+    .bind(visitor_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("that sign-in is audited too");
+    assert!(
+        no_rule_metadata.contains("no rule matched"),
+        "a rule set that granted nothing says so in those words — a silent no-op and a misconfigured \
+         provider look identical from the panel otherwise: {no_rule_metadata}"
+    );
+    // And the event did *not* fire for a sign-in no rule decided.
+    let fired: i64 = sqlx::query_scalar(
+        "select count(*) from events where name = 'iam.role_rule_matched' \
+         and payload ->> 'subject_id' = $1",
+    )
+    .bind(visitor_id.to_string())
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the count must run");
+    assert_eq!(
+        fired, 0,
+        "`iam.role_rule_matched` means a rule matched; firing it for a default role would make \
+         the event name false"
+    );
+
+    unsafe { std::env::remove_var(SECRET_REF) };
+    fixture.cleanup().await;
+}
+
+/// The single role key a subject holds, for the assertions above.
+///
+/// A `Vec` reduced to one is the shape that makes the claim legible: "the role this person ended
+/// up with" is one string, and a test that asserts on a list forces the reader to work out which
+/// element was meant.
+async fn role_of(fixture: &Fixture, user_id: Uuid) -> Option<String> {
+    let mut roles: Vec<String> = sqlx::query_scalar(
+        "select r.key from role_bindings b join roles r on r.id = b.role_id \
+         where b.subject_id = $1 and b.revoked_at is null order by r.key",
+    )
+    .bind(user_id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the bindings must be readable");
+    assert!(
+        roles.len() <= 1,
+        "this walk asserts a single role, and the person holds {roles:?}"
+    );
+    roles.pop()
+}
+
+
+/// The last unproven half of the group-membership criterion, and the one no unit test can reach.
+///
+/// Two walks in this file already exist and neither covers this. `sso_live`'s main walk signs a
+/// person in through a real authorization code against the stub provider, and it grants the role
+/// from the **claim** — the provider's own `groups` assertion. `iam_group_membership` proves the
+/// other source, the stored row a connector wrote, and it does it with a **pasted sample**, not a
+/// real sign-in. So each source is proven and the *binding* — the one thing the sign-in path has
+/// to do for a provisioned account — is proven by neither, and the two walks are green
+/// simultaneously with a callback that grants the default role to a SCIM-provisioned person.
+///
+/// That is the case this feature exists for, and it is why the criterion stayed unticked. This
+/// walk joins the two: a real OIDC round trip, by an account a **connector** created, whose
+/// token carries **no** group claim at all, where the only thing that can grant the role is a
+/// `group_members` row.
+///
+/// Four things are pinned, because the obvious implementation satisfies three of them and
+/// silently fails the fourth:
+///
+/// 1. **The provider asserts no group.** Not "an unrelated group" — the `groups` claim is empty,
+///    so the claim arm of the union has nothing to offer. A walk that asserted a *different*
+///    group would pass even if only the claim were ever consulted.
+/// 2. **The role is granted anyway**, read back from `role_bindings` rather than from the
+///    response body, so the assertion cannot be satisfied by a response echoing a request.
+/// 3. **No second account.** A provisioned account re-created on sign-in is a duplicate-directory
+///    bug, and the sign-in "succeeding" would hide it. The row count before and after is equal.
+/// 4. **The audit names the rule**, so an operator can tell a grant apart from a default.
+#[tokio::test]
+async fn a_scim_provisioned_account_is_granted_its_stored_group_on_a_live_sign_in() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    // The CSRF-aware session, not the bare cookie: connecting a provider, saving its rules and
+    // minting a token are all cookie-authenticated writes, and the platform refuses every one of
+    // them without the token it issued alongside the cookie. See `CSRF_SECRET` and `owner_write`.
+    let owner = fixture.owner_session_with_csrf().await;
+    let cookie = &owner.session;
+
+    unsafe { std::env::set_var(SECRET_REF, CLIENT_SECRET) };
+    let idp = StubIdp::start().await;
+
+    // ---- 1. The provider, with a rule keyed on a group the token will never carry -----------
+    let (provider_id, _) = connect(
+        &fixture,
+        &owner,
+        json!({
+            "slug": "stub-oidc",
+            "kind": "oidc",
+            "name": "Live Stub Directory",
+            "config": {
+                "issuer": idp.issuer(),
+                "client_id": CLIENT_ID,
+            },
+            "secret_ref": SECRET_REF,
+            "group_claim": "groups",
+            "jit_enabled": true,
+        }),
+    )
+    .await;
+    let tested = call(
+        &fixture.state,
+        owner_write(
+            &owner,
+            Method::POST,
+            &format!("/api/v1/iam/providers/{provider_id}/test"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(tested.body["status"], json!("ok"), "test: {}", tested.body);
+    publish(&fixture, &owner, provider_id).await;
+
+    let editor: Uuid = sqlx::query_scalar("select id from roles where key = 'editor'")
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the platform seeds a base editor role");
+
+    // A rule that can only be satisfied by a stored membership. The value is the group's **name**,
+    // not an id: a rule comparing ids would be a different feature, and a walk that used one
+    // would not exercise the name resolution the panel writes.
+    let saved = call(
+        &fixture.state,
+        owner_write(
+            &owner,
+            Method::PUT,
+            &format!("/api/v1/iam/providers/{provider_id}/role-rules"),
+            Some(json!({
+                "rules": [{
+                    "when_kind": "group",
+                    "when_key": "groups",
+                    "when_operator": "equals",
+                    "when_value": STOREFRONT,
+                    "role_id": editor,
+                    "scope_type": "organization",
+                }]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "role rules: {}", saved.body);
+
+    // ---- 2. A connector pushes the account, and puts it in a group ----------------------------
+    // A real provisioning token, minted through the real route, because the whole point is that
+    // this is how a directory creates people: no panel involved.
+    let minted = call(
+        &fixture.state,
+        owner_write(
+            &owner,
+            Method::POST,
+            "/api/v1/iam/provisioning/tokens",
+            Some(json!({ "name": "Storefront connector" })),
+        ),
+    )
+    .await;
+    assert_eq!(minted.status, StatusCode::CREATED, "mint: {}", minted.body);
+    let secret = minted.body["secret"].as_str().expect("a secret").to_owned();
+
+    let email = format!("scim-live-{}@omnion.test", Uuid::new_v4().simple());
+    let pushed = call(
+        &fixture.state,
+        bearer_request(
+            Method::POST,
+            "/api/v1/scim/v2/Users",
+            &secret,
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+                "userName": email,
+                "displayName": "Storefront Person",
+                "externalId": "connector-1",
+                "active": true,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(pushed.status, StatusCode::CREATED, "push: {}", pushed.body);
+    let user_id = Uuid::parse_str(pushed.body["id"].as_str().expect("id")).expect("a uuid");
+
+    // The account carries no role yet. Asserted **before** the sign-in, so "the sign-in granted
+    // the role" is a claim about a change this walk watched happen rather than about a state that
+    // was already true.
+    assert_eq!(
+        role_of(&fixture, user_id).await,
+        None,
+        "a freshly pushed account holds no role"
+    );
+
+    // The connector creates the group and adds the member — a SCIM-shaped write, so the
+    // membership is a row a real connector made rather than a fixture that inserted one.
+    let group = call(
+        &fixture.state,
+        bearer_request(
+            Method::POST,
+            "/api/v1/scim/v2/Groups",
+            &secret,
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+                "displayName": STOREFRONT,
+                "members": [{ "value": user_id.to_string() }],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(group.status, StatusCode::CREATED, "group: {}", group.body);
+
+    // The membership is **stored**, which is the whole claim: read the table the evaluator
+    // consults, rather than trusting that the group write implied it.
+    let stored_member: bool = sqlx::query_scalar(
+        "select exists(select 1 from group_members m \
+         join groups g on g.id = m.group_id \
+         where g.organization_id = $1 and m.user_id = $2)",
+    )
+    .bind(fixture.organization_id)
+    .bind(user_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the membership must be readable");
+    assert!(
+        stored_member,
+        "the connector's group write left a real membership row"
+    );
+
+    let accounts_before: i64 =
+        sqlx::query_scalar("select count(*) from users where organization_id = $1")
+            .bind(fixture.organization_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the count must run");
+
+    // ---- 3. The person signs in, and the token says nothing about their group -----------------
+    // `groups: &[]` is the load-bearing part of this walk. The provider asserts **no** group, so
+    // every role this sign-in can grant has to come from the database.
+    //
+    // `Subject` holds `&'static str`s, which is right for the file's constant identities and
+    // wrong for this one: the address is generated per run so the walk is re-runnable. The values
+    // are leaked deliberately rather than made `'static` by accident — one small allocation per
+    // run, freed with the process. Widening `Subject` to a lifetime would touch the other walks
+    // for no gain.
+    let subject: &'static str = Box::leak("stub-scim-user".into());
+    let leaked_email: &'static str = Box::leak(email.clone().into_boxed_str());
+    let who = Subject {
+        subject,
+        email: leaked_email,
+        display_name: "Storefront Person",
+        groups: &[],
+    };
+    let response = oidc_sign_in(&fixture, &idp, "stub-oidc", &who).await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "a provisioned account can sign in through the directory: {}",
+        response.body
+    );
+    assert_eq!(
+        response.body["user"]["email"],
+        json!(email),
+        "and the session belongs to the person the connector pushed"
+    );
+
+    // ---- 4. The role came from the stored row, not from a claim --------------------------------
+    assert_eq!(
+        role_of(&fixture, user_id).await.as_deref(),
+        Some("editor"),
+        "the sign-in granted the role its stored group maps to — the claim carried no group at all"
+    );
+
+    // The sign-in did not create a second account for the same address.
+    let accounts_after: i64 =
+        sqlx::query_scalar("select count(*) from users where organization_id = $1")
+            .bind(fixture.organization_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the count must run");
+    assert_eq!(
+        accounts_after, accounts_before,
+        "signing in a provisioned account must not create another one"
+    );
+
+    // ---- 5. The audit answers "why does this person hold that role" ----------------------------
+    // Two surfaces, because they carry different halves and conflating them is how a grant
+    // becomes unattributable. The **provider event** says what the sign-in did and which roles it
+    // applied; the **audit entry** says which rule decided, and an operator reads the audit.
+    //
+    // The rule sentence is in the audit's `metadata`, not in the event's `detail` — a walk that
+    // looked in the wrong column gets a passable-looking failure and the wrong fix.
+    let events = call(
+        &fixture.state,
+        session_request(
+            Method::GET,
+            &format!("/api/v1/iam/providers/{provider_id}/events?limit=20"),
+            Some(cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(events.status, StatusCode::OK, "events: {}", events.body);
+    let first = &events.body["events"][0];
+    assert_eq!(first["outcome"], json!("success"), "{}", first);
+    assert_eq!(
+        first["external_subject"],
+        json!("stub-scim-user"),
+        "the event is the provider's own record of the sign-in: {first}"
+    );
+    assert!(
+        first["roles_applied"]
+            .as_str()
+            .is_some_and(|roles| roles.contains("editor")),
+        "the event names the role the rule attached: {first}"
+    );
+
+    let (metadata,): (String,) = sqlx::query_as(
+        "select metadata::text from audit_log where action = 'iam.sso_sign_in' \
+         and actor_user_id = $1 order by created_at desc limit 1",
+    )
+    .bind(user_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the sign-in audit entry must exist");
+    assert!(
+        metadata.contains("role via rule #1"),
+        "the audit says a rule decided, not a default: {metadata}"
+    );
+    assert!(
+        metadata.contains("editor"),
+        "and names what it granted: {metadata}"
+    );
+    // The rule's *condition* is the operator's configuration, not the person's record, and the
+    // audit is delivered outside the tenant. The stored-membership case makes that concrete: the
+    // condition is a group name, and a group name is directory data.
+    assert!(
+        !metadata.contains(STOREFRONT),
+        "and does not leak the directory group the rule was written against: {metadata}"
+    );
+
+    unsafe { std::env::remove_var(SECRET_REF) };
     fixture.cleanup().await;
 }

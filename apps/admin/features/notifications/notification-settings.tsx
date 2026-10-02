@@ -20,35 +20,19 @@
  *    can't I find my notifications".
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  Bell,
-  BellOff,
-  CircleCheck,
-  Clock,
-  Lock,
-  Mail,
-  RefreshCw,
-  Save,
-  Send,
-  TriangleAlert,
-} from "lucide-react";
+import { Bell, BellOff, Clock, Lock, Mail, RefreshCw, Save, TriangleAlert } from "lucide-react";
 
 import {
-  fetchNotificationChannels,
   fetchNotificationPreferences,
   saveNotificationPreferences,
-  sendTestNotificationDelivery,
   type ApiError,
 } from "@/lib/api";
-import { NotificationDevices } from "./notification-devices";
-
 import {
   DIGEST_CADENCES,
   DIGEST_WEEKDAYS,
   NOTIFICATION_CATEGORIES,
   NOTIFICATION_CHANNELS,
   NOTIFICATION_TIMEZONES,
-  type NotificationChannelReadiness,
   type NotificationPreferenceCell,
   type NotificationSettingsRow,
 } from "@/lib/types";
@@ -67,16 +51,7 @@ const CATEGORY_LINE: Record<string, string> = {
   mention: "Mentions",
 };
 
-/**
- * How each channel is named in prose, wherever a channel is shown to a person.
- *
- * **One map for three screens** — the settings matrix, the preference form and the delivery
- * rows in the detail drawer. "In-app" spelled three ways is one of them wrong within a month,
- * and a reader who sees "In app" on one screen and "In-app" on the next reasonably concludes
- * they are different channels. Exported rather than redeclared per screen, which is the whole
- * point: this file is where the vocabulary lives.
- */
-export const CHANNEL_LINE: Record<string, string> = {
+const CHANNEL_LINE: Record<string, string> = {
   in_app: "In-app",
   email: "E-mail",
   web_push: "Web Push",
@@ -91,17 +66,6 @@ const CHANNEL_ICON: Record<string, typeof Bell> = {
   webhook: RefreshCw,
   chat: Bell,
 };
-
-/**
- * The channels a test can actually go over, in the order the screen lists them.
- *
- * **Derived from the channel vocabulary rather than retyped.** `in_app` is filtered out
- * because it cannot be tested (the row *is* the notification), and everything else in the
- * closed list is offered — including the ones this installation cannot send over, because a
- * button that returns the server's reason teaches more than a button that is simply missing.
- * A hard-coded list of two would go stale the day a connector ships.
- */
-const TESTABLE_CHANNELS = NOTIFICATION_CHANNELS.filter((channel) => channel !== "in_app");
 
 const CADENCE_LINE: Record<string, string> = {
   off: "Off — send each notification as it happens",
@@ -160,16 +124,6 @@ export function NotificationSettings() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [showQuietHours, setShowQuietHours] = useState(false);
-  // Channel readiness and the in-flight test, kept here rather than in a child because the
-  // test *is* about the matrix above it: the button that sends is per channel, and the reason
-  // a channel cannot be tested belongs next to the row that proves the other channels can.
-  const [readiness, setReadiness] = useState<NotificationChannelReadiness[]>([]);
-  const [testing, setTesting] = useState<string | null>(null);
-  const [testResult, setTestResult] = useState<{
-    channel: string;
-    delivered: boolean;
-    detail: string;
-  } | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -193,54 +147,6 @@ export function NotificationSettings() {
   useEffect(() => {
     void load();
   }, [load]);
-
-  /**
-   * Channel readiness, fetched on its own rather than folded into `load`.
-   *
-   * **A screen that cannot render must still be able to answer "is e-mail working?"** — so
-   * this read is deliberately not part of the critical path: it fails into an empty list
-   * rather than into the form's error state, which would replace a working preferences matrix
-   * with a red banner because a *different* endpoint said no. The buttons fall back to "test
-   * it and see" when readiness is unknown, which is the honest thing to offer.
-   */
-  useEffect(() => {
-    void (async () => {
-      try {
-        setReadiness(await fetchNotificationChannels());
-      } catch {
-        setReadiness([]);
-      }
-    })();
-  }, []);
-
-  /**
-   * Send one real notification through one channel and show what the transport said.
-   *
-   * The button is never disabled for an unavailable channel: pressing it produces the reason
-   * in the server's own words, which is more useful than a greyed button whose tooltip is the
-   * only place the answer exists. What *is* disabled is the channel already in flight, so a
-   * double click cannot queue two sends whose results race each other in the same line.
-   */
-  const runTest = async (channel: string) => {
-    setTesting(channel);
-    setTestResult(null);
-    try {
-      const answer = await sendTestNotificationDelivery({ channel });
-      setTestResult({
-        channel: answer.channel,
-        delivered: answer.delivered,
-        detail: answer.detail,
-      });
-    } catch (caught) {
-      setTestResult({
-        channel,
-        delivered: false,
-        detail: (caught as ApiError).message,
-      });
-    } finally {
-      setTesting(null);
-    }
-  };
 
   /**
    * What the reader changed, and nothing else.
@@ -564,131 +470,6 @@ export function NotificationSettings() {
               </select>
             </label>
           </div>
-        ) : null}
-      </section>
-
-      {/* --------------------------------------------------------- browser push */}
-      {/*
-        **Slice 6b.** The device block sits between the matrix and the test-delivery rows
-        because that is the order a reader needs them in: "Web Push is on in the matrix" is a
-        claim about the matrix, and "this browser is registered" is the fact that makes it
-        true. Putting the devices below the test rows would ask somebody to test a channel
-        whose destination they had not yet been told about.
-
-        Rendered for every reader with `notifications.manage` rather than gated on readiness,
-        for the same reason the test rows are: an installation that has lost its push key still
-        has registered devices, and those are exactly the rows somebody needs to delete.
-      */}
-      <NotificationDevices />
-
-      {/* ------------------------------------------------------------- test delivery */}
-      {/*
-        **The section the request named and the platform could not draw.** REQ-021's own API
-        table lists `POST /notifications/preferences/test` and its screen spec says "test
-        delivery", and until this tick neither existed — so the one control a reader reaches
-        for when asking "did my e-mail actually go out?" was missing, and no acceptance box
-        could be ticked about it.
-
-        **One row per channel, and the in-app row explains itself instead of offering a
-        button.** In-app cannot be tested because the test notification *is* an in-app
-        notification: a green "delivered" there would be the platform proving it can write to
-        a table it owns, which is true of every installation and tells nobody anything.
-      */}
-      <section aria-labelledby="test-heading" className="space-y-3" data-test-delivery>
-        <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <h2 id="test-heading" className="flex items-center gap-2 text-[15px] font-semibold">
-            <Send className="h-4 w-4" aria-hidden />
-            Test delivery
-          </h2>
-          <p className="text-[12px] text-muted">
-            Sends a real notification over one channel and reports what the transport answered.
-          </p>
-        </div>
-
-        <ul className="divide-y divide-line rounded-lg border border-line">
-          {TESTABLE_CHANNELS.map((channel) => {
-            const Icon = CHANNEL_ICON[channel] ?? Bell;
-            const state = readiness.find((entry) => entry.channel === channel);
-            const busy = testing === channel;
-            return (
-              <li
-                key={channel}
-                className="flex flex-wrap items-center gap-3 px-3 py-2.5"
-                data-test-channel={channel}
-              >
-                <Icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
-                <span className="min-w-32 text-[13px] font-medium">
-                  {CHANNEL_LINE[channel] ?? channel}
-                </span>
-                {state ? (
-                  state.available ? (
-                    <span
-                      className="inline-flex items-center gap-1 text-[12px] text-emerald-700 dark:text-emerald-400"
-                      data-test-ready={channel}
-                    >
-                      <CircleCheck className="h-3.5 w-3.5" aria-hidden />
-                      Ready
-                    </span>
-                  ) : (
-                    <span
-                      className="text-[12px] text-muted"
-                      title={state.detail}
-                      data-test-unavailable={channel}
-                    >
-                      {state.detail}
-                    </span>
-                  )
-                ) : (
-                  <span className="text-[12px] text-muted">Not checked</span>
-                )}
-                <button
-                  type="button"
-                  onClick={() => void runTest(channel)}
-                  disabled={busy}
-                  data-test-button={channel}
-                  className="ml-auto inline-flex min-h-9 items-center gap-2 rounded-md border border-line px-3 py-1.5 text-[13px] disabled:opacity-50"
-                >
-                  {busy ? (
-                    <RefreshCw className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                  ) : (
-                    <Send className="h-3.5 w-3.5" aria-hidden />
-                  )}
-                  {busy ? "Sending…" : "Send a test"}
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-
-        <p className="text-[12px] text-muted">
-          In-app is not listed: it is always on, and a test over it would only prove the
-          platform can write to its own database.
-        </p>
-
-        {testResult ? (
-          <p
-            role="status"
-            data-test-result={testResult.channel}
-            data-delivered={testResult.delivered ? "yes" : "no"}
-            className={
-              testResult.delivered
-                ? "flex items-start gap-2 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-[13px] text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200"
-                : "flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-[13px] text-red-900 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200"
-            }
-          >
-            {testResult.delivered ? (
-              <CircleCheck className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-            ) : (
-              <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-            )}
-            <span>
-              <strong className="font-medium">
-                {CHANNEL_LINE[testResult.channel] ?? testResult.channel}:{" "}
-                {testResult.delivered ? "delivered" : "not delivered"}
-              </strong>{" "}
-              — {testResult.detail}
-            </span>
-          </p>
         ) : null}
       </section>
 

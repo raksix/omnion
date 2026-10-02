@@ -6,30 +6,19 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, Code2, FileText, Fingerprint, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
 import { SiteSwitcher } from "@/components/site-switcher";
 import { GlobalSearch } from "@/components/global-search";
 import { NotificationBell } from "@/components/notification-bell";
-import { useDeveloperAccess } from "@/lib/developer-access";
 import { useSession } from "@/lib/session";
 
 const NAV = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/pages", label: "Pages", icon: FileText },
   { href: "/media", label: "Media", icon: Images },
-  // Backups sit beside Media rather than under Settings: an operator asking "where are my
-  // files and can I get them back" is one question, and burying half of it under a
-  // settings sub-path is what makes somebody believe the platform has no restore point.
-  { href: "/backups", label: "Backups", icon: HardDriveDownload },
-  // System health (REQ-014, slice 1). It sits with Backups rather than under Settings for
-  // the same reason: "can I get my data back" and "is anything answering" are both questions
-  // an operator asks at the same moment, usually while something is already wrong — and
-  // burying the liveness screen under a settings sub-path is how a platform looks healthy
-  // to the person who opened the admin panel to find out that it is not.
-  { href: "/health", label: "System Health", icon: HeartPulse },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/notifications", label: "Notifications", icon: Bell },
   // The event console (REQ-016, slice 1). It sits beside Notifications rather than under
@@ -57,39 +46,7 @@ const NAV = [
   { href: "/settings/iam/sessions", label: "Sessions", icon: Timer },
   { href: "/settings/iam/devices", label: "Devices", icon: Fingerprint },
   { href: "/settings/search", label: "Search settings", icon: SlidersHorizontal },
-  // The developer portal (REQ-022, slice 2). Three entries rather than eight: the brief lists
-  // eight, but OAuth apps, plugins, themes, docs and the sandbox are slices 3 and 4, and a nav
-  // link to a screen that does not exist is the dead control the definition of done forbids.
-  // These three are the whole of what slice 2 ships.
-  { href: "/developer", label: "Developer", icon: Code2, needsDeveloper: true },
-  { href: "/developer/api-keys", label: "API keys", icon: KeyRound, needsDeveloper: true },
-  { href: "/developer/logs", label: "Request log", icon: ScrollText, needsDeveloper: true },
 ] as const;
-
-/**
- * A navigation entry that only exists for accounts allowed into the developer portal.
- *
- * The property is on the entry rather than in a filter above, so "which entries are conditional"
- * is one list a reader can scan instead of a second list somewhere else that has to be kept in
- * step with it.
- */
-type NavItem = (typeof NAV)[number];
-
-/**
- * Whether an entry is shown to this account.
- *
- * `needsDeveloper` is resolved against a route the API guards for `developer.read`, and the
- * answer is `null` while it is in flight — which means the group is hidden for that first paint
- * and appears a moment later. That is the right trade: a group that appears, then vanishes, then
- * reappears as the answer lands is a flicker, and a group that briefly shows an account who will
- * be refused is a lie. See `lib/developer-access.tsx` for why the sidebar asks at all.
- */
-function visible(item: NavItem, canOpen: boolean | null): boolean {
-  if (!("needsDeveloper" in item) || item.needsDeveloper !== true) {
-    return true;
-  }
-  return canOpen === true;
-}
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against
 /// `/settings/iam/users`): the parent highlights only when it is exactly the open screen.
@@ -134,7 +91,6 @@ export function AppShell({ title, description, children }: AppShellProps) {
   const pathname = usePathname();
   const router = useRouter();
   const { user, signOut } = useSession();
-  const { canOpen: canOpenDeveloper } = useDeveloperAccess();
   const [navOpen, setNavOpen] = useState(false);
 
   const handleSignOut = async () => {
@@ -158,7 +114,7 @@ export function AppShell({ title, description, children }: AppShellProps) {
       </Link>
 
       <nav aria-label="Sections" className="flex flex-col gap-1">
-        {NAV.filter((item) => visible(item, canOpenDeveloper)).map((item) => {
+        {NAV.map((item) => {
           const active = isActive(item.href, pathname);
           const Icon = item.icon;
           return (

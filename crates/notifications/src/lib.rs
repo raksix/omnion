@@ -17,7 +17,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod delivery;
 pub mod error;
 pub mod model;
 pub mod preference_store;
@@ -27,19 +26,13 @@ pub mod router;
 pub mod store;
 pub mod vocabulary;
 
-pub use delivery::{
-    DeliveryConfig, DeliveryJob, EnqueueReport, InAppTransport, NO_TRANSPORT_YET,
-    READER_SWITCHED_IT_OFF, RunReport as DeliveryRunReport, Transport, TransportOutcome, claim_due,
-    enqueue, mark_failed, mark_retry, mark_sent, remote_channels, retry_delay, run_due,
-    settle_not_ready,
-};
 pub use error::{NotificationError, Result};
 pub use model::{
-    CategoryCount, DeliveryRow, ListQuery, NewNotification, Notification, NotificationPage, Summary,
+    CategoryCount, ListQuery, NewNotification, Notification, NotificationPage, Summary,
 };
 pub use preference_store::{
-    allowed_channels, disabled_channels, read_preferences, read_settings, reset_preferences,
-    write_preferences, write_settings,
+    allowed_channels, read_preferences, read_settings, reset_preferences, write_preferences,
+    write_settings,
 };
 pub use preferences::{
     DIGEST_CADENCES, IN_APP, PreferenceCell, Preferences, Settings, StatedPreference,
@@ -56,9 +49,8 @@ pub use router::{
     list_rules, render, resolve_recipients, route, rules_for_event,
 };
 pub use store::{
-    BulkRecord, archive, delete, find, list, mark_all_read, record, record_many,
-    record_many_with_deliveries, record_with_deliveries, set_read, set_read_many, summary,
-    validate_categories, validate_channel, within_emit_budget,
+    archive, delete, find, list, mark_all_read, record, record_many, set_read, set_read_many,
+    summary, validate_categories, validate_channel, within_emit_budget,
 };
 pub use vocabulary::{
     CATEGORIES, CHANNELS, EMIT_BUDGET_PER_MINUTE, MAX_BULK_IDS, MAX_PAGE, PRIORITIES, is_category,

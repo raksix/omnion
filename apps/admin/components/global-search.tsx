@@ -74,16 +74,7 @@ export function GlobalSearch({ title, className }: GlobalSearchProps) {
         return;
       }
 
-      // `/` focuses the page's own search box when nothing on it offers a nearer `/`. The
-      // check is `defaultPrevented`, not "the page has no `/` of its own": by the time this
-      // window listener runs the component's own handler has already run (document listeners
-      // run in registration order, and `preventDefault()` is set by both), so a page that
-      // *does* wire `/` has already claimed the key and calling `focus()` here as well would
-      // pull focus straight back out of the box the page just focused. That is the defect the
-      // notification centre's keyboard criterion caught — `/` is in its documented shortcut
-      // list, its handler focuses `notification-search`, and the walk measured a different
-      // element focused afterwards because this listener answered it a second time.
-      if (event.key === "/" && !typing && !event.defaultPrevented) {
+      if (event.key === "/" && !typing) {
         event.preventDefault();
         boxRef.current?.focus();
         boxRef.current?.select();

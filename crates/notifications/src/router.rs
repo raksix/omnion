@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::model::NewNotification;
-use crate::store::record_with_deliveries;
+use crate::store::record;
 use crate::vocabulary::{is_category, is_priority};
 
 /// Who a rule addresses its notifications to.
@@ -198,13 +198,6 @@ pub struct RouteRule {
     /// Who wrote it.
     pub created_by: Option<Uuid>,
     /// When.
-    ///
-    /// **Annotated because the router's own list route publishes this type verbatim** —
-    /// `apps/api/src/routes/notifications_admin.rs` answers `Json<Vec<RouteRule>>` with no
-    /// conversion layer, so this is a wire field. Without the attribute it crosses as `time`'s
-    /// three-element array (the workspace enables `serde-well-known` but not
-    /// `serde-human-readable`), which the panel reads as `Invalid Date`.
-    #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
 }
 
@@ -462,17 +455,7 @@ pub async fn route(pool: &PgPool, event: &RoutedEvent) -> Result<RouteReport> {
                     "event_name": event.name,
                 }));
             }
-            // **The deliveries variant, and slice 6c exists because this call did not.**
-            // `record` wrote the notification and stopped there: no `notification_deliveries`
-            // row, so the runner had nothing to claim and the drawer had no channel to show.
-            // A routed bus event — a ticket assigned, a page submitted for review — is exactly
-            // the notification that is supposed to *leave* the panel, and it was the one path
-            // that could not. The dedupe branch is unchanged: a collapsed event is the same
-            // fact, and its deliveries already exist.
-            if record_with_deliveries(pool, event.organization_id, event.actor_user_id, &draft)
-                .await?
-                .is_some()
-            {
+            if record(pool, event.organization_id, event.actor_user_id, &draft).await? {
                 report.created += 1;
             } else {
                 report.deduped += 1;

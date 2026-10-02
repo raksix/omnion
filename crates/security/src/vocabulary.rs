@@ -65,21 +65,6 @@ pub const MAX_HEADER_VALUE_LENGTH: usize = 2048;
 /// nobody can hold in their head, so it is refused rather than silently truncated.
 pub const MAX_CSP_SOURCES: usize = 64;
 
-/// The rate-limit scopes, in the order the panel lists them (REQ-012, slice 3).
-///
-/// A closed list, and the closure is the feature: a limiter whose scope table can grow from a
-/// document is a table an operator can grow *accidentally*, with a row nothing enforces. The
-/// panel's scope dropdown, the middleware's scope resolution and the migration's check
-/// constraint are all built from this one list — `crates/security/src/limiter.rs` refuses a
-/// scope that is not in it, with the valid ones in the message.
-pub const RATE_SCOPES: &[&str] = &[
-    "global",
-    "sign_in",
-    "public_api",
-    "authenticated_api",
-    "webhook_intake",
-];
-
 /// `true` when `value` is a state the platform knows.
 #[must_use]
 pub fn is_state(value: &str) -> bool {
