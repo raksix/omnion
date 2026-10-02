@@ -148,6 +148,19 @@ fn the_backup_bodies_answer_timestamps_as_strings() {
             reason: String::new(),
             message: String::new(),
             encryption: "none".to_owned(),
+            // `aebe9a34` split room out of writability and this fixture never grew the field, so
+            // the gate below stopped compiling and — because a test target that does not build
+            // never runs — **the whole wire-date gate has been absent since**. That is the failure
+            // mode this gate exists to prevent, witnessed by the gate itself: nothing reported it,
+            // because "the test did not run" is indistinguishable from "the test was green" in any
+            // summary that only prints counts. Constructed literally rather than through
+            // `HeadroomBody::new`, which is private to the route module.
+            headroom: routes::backups::HeadroomBody {
+                level: "unknown".to_owned(),
+                free_bytes: None,
+                largest_backup_bytes: None,
+                message: String::new(),
+            },
         },
     })
     .expect("the status body serialises");
@@ -395,10 +408,65 @@ fn no_serialised_struct_carries_a_bare_instant() {
          harmless, but leaving the assertion would be a lie."
     );
 
+    /*
+     * The scan also reads the **crate types the routes publish**, because a route does not have to
+     * define the struct it returns: `list_keys` answers `Json<Vec<KeyView>>` and `get_log` answers
+     * a body holding `LogRow`, and both types live in `crates/developer`. Neither carries a
+     * `*Body`/`*Query`/`*Response` suffix, so the name filter below never looked at them — which is
+     * how `KeyView::expires_at` reached a shipped screen as a nine-element array and the key list
+     * rendered no expiry at all.
+     *
+     * **Which crate types qualify is the whole difficulty, and the first attempt got it wrong.**
+     * "Derives `Serialize` somewhere in the crate" reports about thirty types, and almost all of
+     * them are wrong: `IpRule`, `PushSubscription`, `ServiceReport` and `ApiKey` are all serialised
+     * *storage* types that a route converts into its own `*Body` on the way out (`RuleBody`,
+     * `DeviceBody`, `ServiceBody`, `KeyView`), precisely so the wire shape is decided in one place.
+     * A gate that demands a wire annotation on those is a gate nobody keeps green, and the way it
+     * dies is the dangerous way: someone adds `#[serde(skip)]` or deletes the field to quiet it.
+     *
+     * So the test is **reachability from a wire boundary**, not serialisability: the type name must
+     * appear on a line that either wraps it in `Json<…>` or declares it as a field of a route body.
+     * That admits `KeyView` (`Json<Vec<KeyView>>`, `pub key: KeyView`) and `LogRow`
+     * (`pub row: omnion_developer::LogRow`) and rejects every converter's input — `impl From<…>`
+     * and `fn f(x: &T)` are neither, which is exactly right, because those lines are the moment the
+     * shape is still being chosen.
+     */
+    let crates_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates");
+    let route_source = entries
+        .iter()
+        .map(|path| std::fs::read_to_string(path).expect("a route module reads"))
+        .collect::<Vec<_>>();
+
+    let mut scanned = entries.clone();
+    let mut crates_seen = 0_usize;
+    for entry in std::fs::read_dir(&crates_root)
+        .expect("the crates directory is readable")
+        .flatten()
+    {
+        let crate_src = entry.path().join("src");
+        if !crate_src.is_dir() {
+            continue;
+        }
+        crates_seen += 1;
+        if let Ok(found) = std::fs::read_dir(&crate_src) {
+            scanned.extend(
+                found
+                    .flatten()
+                    .map(|module| module.path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "rs")),
+            );
+        }
+    }
+    assert!(
+        crates_seen >= 8,
+        "the scan looked at {crates_seen} crate(s); a scan that reaches no crate is not covering \
+         the routes' other half"
+    );
+
     let mut unannotated: Vec<String> = Vec::new();
     let mut bodies_seen = 0_usize;
-    for path in &entries {
-        let source = std::fs::read_to_string(path).expect("a route module reads");
+    for path in &scanned {
+        let source = std::fs::read_to_string(path).expect("a scanned module reads");
         let relative = path
             .strip_prefix(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
             .unwrap_or(path)
@@ -413,7 +481,30 @@ fn no_serialised_struct_carries_a_bare_instant() {
             }) else {
                 continue;
             };
-            if !name.ends_with("Body") && !name.ends_with("Query") && !name.ends_with("Response") {
+            // The suffix filter stays for **route** structs, where the convention is real, and
+            // is dropped for **crate** structs, where a published type is named for what it is
+            // rather than for its transport (`KeyView`, `LogRow`, `Overview`).
+            let in_routes = path.starts_with(&routes_dir);
+            if in_routes
+                && !name.ends_with("Body")
+                && !name.ends_with("Query")
+                && !name.ends_with("Response")
+            {
+                continue;
+            }
+            // **Serialisation is the whole defect**, so a struct that only derives `Deserialize` is
+            // out of scope on either half. `CreateKeyBody` is the case that forced this: it is an
+            // inbound body, and `time`'s *deserialiser* under `serde-well-known` reads a string
+            // whatever the feature set, so its `expires_at` is fine. Flagging it was reporting a
+            // field the platform never emits, and a gate that reports those gets muted.
+            if !derives_serialize(&lines[..index]) {
+                continue;
+            }
+            // A crate struct counts only when a route publishes it: `IpRule` reaches a route as
+            // `From<IpRule>` and as `&IpRule` in a signature, neither of which is a wire boundary,
+            // and every one of those types is converted into a `*Body` precisely so the wire shape
+            // is decided in one place.
+            if !in_routes && !published_on_the_wire(&route_source, name) {
                 continue;
             }
             // Walk to the closing brace of the struct body.
@@ -470,4 +561,42 @@ fn no_serialised_struct_carries_a_bare_instant() {
         unannotated.len(),
         unannotated.join("\n  ")
     );
+}
+
+/// Is `name` published on the wire by some route?
+///
+/// A **wire boundary**, not a mention. Two shapes count: a line that wraps the type in `Json<…>`,
+/// and a `pub` field declaration inside a route body. `impl From<IpRule> for RuleBody` and
+/// `fn rule_body(rule: &IpRule)` are deliberately not boundaries — those are the lines where the
+/// wire shape is still being *decided*, and a converter's input never has to match one.
+///
+/// Both halves matter. Without the `Json<…>` arm the gate misses a route that answers a bare
+/// vector, which is exactly `list_keys` — the defect this whole check was widened for.
+fn published_on_the_wire(route_source: &[String], name: &str) -> bool {
+    route_source.iter().any(|source| {
+        source.lines().any(|line| {
+            let trimmed = line.trim();
+            let on_a_body_field = trimmed.starts_with("pub ") && trimmed.contains(':');
+            (trimmed.contains("Json<") || on_a_body_field)
+                && trimmed
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .any(|word| word == name)
+        })
+    })
+}
+
+/// Does the attribute block above a struct derive `Serialize`?
+///
+/// Walks back to the nearest real (non-doc, non-blank) line, which is the last line of the
+/// `#[derive(…)]`. A one-line lookback is the version that misses a multi-line
+/// `#[derive(Debug,\n/// Serialize)]` and then reports a type the platform never publishes.
+fn derives_serialize(above: &[&str]) -> bool {
+    above
+        .iter()
+        .rev()
+        .find(|candidate| {
+            let text = candidate.trim();
+            !text.is_empty() && !text.starts_with("///") && !text.starts_with("//")
+        })
+        .is_some_and(|attribute| attribute.contains("Serialize"))
 }
