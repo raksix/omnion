@@ -389,12 +389,40 @@ pub async fn usage(
     Ok(rows)
 }
 
+/// Strip the query string (and any fragment) from a request path.
+///
+/// This is the property the request log table depends on, and it lives beside the writer rather
+/// than in `model` because that is the only place that can guarantee it: a helper the callers
+/// *may* use is a rule the next writer has to remember, and the thing it protects is a secret in
+/// a CSV export.
+///
+/// `?a=1#frag` loses the fragment too. A fragment never reaches the server in the first place, so
+/// a path that carries one is being constructed somewhere else — and stripping it is the same
+/// answer there as leaving it.
+pub fn path_without_query(path: &str) -> String {
+    let before_fragment = path.split('#').next().unwrap_or(path);
+    before_fragment
+        .split('?')
+        .next()
+        .unwrap_or(before_fragment)
+        .to_owned()
+}
+
 /// Write one request log row.
 ///
 /// No body, no headers, no query string — the columns are the whole of what the platform knows
 /// about a request once it is over, and a caller cannot get more detail out of this than they
 /// put in the path.
+///
+/// The query string is stripped **here**, at the last point where the raw path still exists, and
+/// not in the caller. A query string is caller-controlled and routinely carries a token or an
+/// e-mail address in a filter, and this is the table an operator exports to CSV. Stripping it in
+/// `developer_auth::record_key_use` worked and was still the wrong place: it left a writer that
+/// binds `entry.path` verbatim, so the next caller — the CSV exporter, a replay, a future
+/// middleware — writes the secret unless it remembers a rule that is not on its signature. The
+/// strip is a property of the table, so it belongs in the only function that inserts into it.
 pub async fn log_request(pool: &PgPool, entry: &RequestLog) -> Result<i64> {
+    let path = path_without_query(&entry.path);
     let row = sqlx::query(
         "insert into api_request_logs (organization_id, api_key_id, actor_user_id, method, path, \
          status, duration_ms, request_id, bytes_in, bytes_out, error_code) \
@@ -404,7 +432,7 @@ pub async fn log_request(pool: &PgPool, entry: &RequestLog) -> Result<i64> {
     .bind(entry.api_key_id)
     .bind(entry.actor_user_id)
     .bind(&entry.method)
-    .bind(&entry.path)
+    .bind(&path)
     .bind(entry.status)
     .bind(entry.duration_ms)
     .bind(&entry.request_id)
@@ -573,5 +601,41 @@ mod tests {
             stored,
             Some(vec!["10.0.0.0/8".to_owned(), "192.168.0.0/16".to_owned()])
         );
+    }
+
+    #[test]
+    fn a_logged_path_never_carries_a_query_string() {
+        // The reason `log_request` strips rather than trusting its caller: `?access_token=` is a
+        // bearer in a URL, this table is exported to CSV, and an export is the leak.
+        assert_eq!(
+            path_without_query("/api/v1/media?access_token=super-secret-value"),
+            "/api/v1/media"
+        );
+        assert_eq!(
+            path_without_query("/api/v1/developer/oauth/token?client_secret=abc&grant_type=x"),
+            "/api/v1/developer/oauth/token"
+        );
+        // An operator filtering by e-mail would otherwise write every address into the export.
+        assert_eq!(
+            path_without_query("/api/v1/users?email=furkan@example.com"),
+            "/api/v1/users"
+        );
+    }
+
+    #[test]
+    fn a_path_with_nothing_to_strip_is_returned_unchanged() {
+        // A strip that also mangles ordinary paths would make the column useless, and a useless
+        // column gets worked around by storing the raw path somewhere else.
+        assert_eq!(path_without_query("/api/v1/me"), "/api/v1/me");
+        assert_eq!(path_without_query("/"), "/");
+        assert_eq!(path_without_query(""), "");
+        // Only the FIRST `?` ends the path; a later one is part of the query, not the path.
+        assert_eq!(path_without_query("/a?b?c=1"), "/a");
+        // A fragment never reaches the server, so a path carrying one is constructed elsewhere —
+        // but it must not be a way to smuggle the query back in.
+        assert_eq!(path_without_query("/api/v1/me?x=1#frag"), "/api/v1/me");
+        assert_eq!(path_without_query("#frag"), "");
+        // A bare `?` is a query with nothing in it: the path is what precedes it.
+        assert_eq!(path_without_query("/api/v1/me?"), "/api/v1/me");
     }
 }

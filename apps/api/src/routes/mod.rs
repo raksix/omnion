@@ -85,6 +85,7 @@ pub mod deployment_ops;
 pub mod deployment_run;
 pub mod developer;
 pub mod developer_oauth;
+pub mod developer_portal_extras;
 pub mod developer_scaffolds;
 pub mod developer_sdks;
 pub mod environments;
@@ -1663,6 +1664,78 @@ pub fn router(state: AppState) -> Router {
     // gets its own `let ... = Router::new()` and its own `merge`, or it inherits a key that has
     // nothing to do with it. Nesting routers is how the security centre ended up behind a key
     // named for a different feature.
+    // The developer portal (REQ-022, slice 1) is its own router for the same reason the
+    // security centre is (see the comment above): every one of its routes declares the key it
+    // actually needs, so nesting it under a broader builder would add a permission the route
+    // never asked for. The guards are split by blast radius — reading a key list is not
+    // issuing a credential, and neither is reading the traffic record.
+    //
+    // **The add/add resolution.** `crates/developer` and this module were created independently
+    // on `main` (REQ-022 slice 1) and here (REQ-033), so the merge had to pick a side. It kept
+    // this branch's, which answers every endpoint main's slice registered except two; those two
+    // are grafted in `routes/developer_portal_extras.rs`. Main's *paths* are kept byte-for-byte
+    // here as aliases onto this branch's handlers rather than as a second reader over the same
+    // table: two handlers answering the same question drift the day a column is added, and main's
+    // `list_logs` would be a second answer to `/request-logs` with a narrower payload.
+    //
+    // The alias costs nothing at runtime beyond a route entry, and it is why a merge did not have
+    // to touch main's admin screens. The one deliberate difference: main's `developer.logs.read`
+    // is not re-registered, because this branch reads the traffic record under `keys.read` — it
+    // is the same question as the key list, answered one row at a time, and the split is already
+    // argued at the `/request-logs` route below.
+    let developer_routes = Router::new()
+        // The scope catalogue is what the create-key picker is built from, so it is the one
+        // read a key author needs before they have a key.
+        .route(
+            "/developer/scopes",
+            get(developer_portal_extras::list_scopes)
+                .layer(guards::require(&state, "developer.read")),
+        )
+        .route(
+            "/developer/api-keys",
+            get(developer::list_keys).layer(guards::require(&state, "developer.keys.read")),
+        )
+        .route(
+            "/developer/api-keys",
+            post(developer::create_key).layer(guards::require(&state, "developer.keys.manage")),
+        )
+        .route(
+            "/developer/api-keys/{id}",
+            get(developer::get_key).layer(guards::require(&state, "developer.keys.read")),
+        )
+        .route(
+            "/developer/api-keys/{id}",
+            delete(developer::revoke_key).layer(guards::require(&state, "developer.keys.manage")),
+        )
+        .route(
+            "/developer/api-keys/{id}/rotate",
+            post(developer::rotate_key).layer(guards::require(&state, "developer.keys.manage")),
+        )
+        // Main's `/developer/logs` paths, answered by this branch's reader. Same rows, same
+        // filters, one implementation — see the comment above on why this is an alias and not
+        // a second `list_logs`.
+        .route(
+            "/developer/logs",
+            get(developer::list_request_logs).layer(guards::require(&state, "developer.keys.read")),
+        )
+        .route(
+            "/developer/logs/{id}",
+            get(developer::get_request_log).layer(guards::require(&state, "developer.keys.read")),
+        );
+    // One guarded route deliberately accepts a developer key, because the REQ's own acceptance
+    // criterion is "a key authenticates on a guarded endpoint and is rejected after
+    // revocation" — and a criterion with no route behind it is a criterion about nothing. The
+    // permission chosen is `content.pages.read` because it is a real, catalogued read that a
+    // publisher's integration genuinely needs, so the walk exercises the production shape
+    // rather than a purpose-made one.
+    let developer_guarded = Router::new().route(
+        "/developer/sandbox/probe",
+        get(developer_portal_extras::sandbox_probe).layer(guards::require_or_developer_key(
+            &state,
+            "content.pages.read",
+        )),
+    );
+
     let security_reports = Router::new()
         // Security centre (docs/requests/REQ-012, slice 1). The split is by *power*, not by
         // verb: `security.read` sees the posture and the findings, `security.scan` re-runs the
@@ -2045,6 +2118,8 @@ pub fn router(state: AppState) -> Router {
             analytics_settings_read.merge(analytics_settings_write),
         )
         .route("/analytics/snippet", analytics_snippet)
+        .merge(developer_routes)
+        .merge(developer_guarded)
         .merge(security_reports)
         .merge(analytics_reports)
         .route("/analytics/export", analytics_export)

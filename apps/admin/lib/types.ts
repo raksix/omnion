@@ -2553,6 +2553,29 @@ export interface BackupDestination {
   message: string;
   /** none or passphrase. */
   encryption: string;
+  /** Room left on the destination — a different fact from `writable`. */
+  headroom: BackupHeadroom;
+}
+
+/**
+ * Whether the next backup fits on the destination.
+ *
+ * `healthy` | `tight` | `full` | `unknown`. `unknown` is a real state, not an absence: a
+ * destination nobody has measured yet has a free-space number but no yardstick to judge it
+ * against, and printing `0 B` there would be a number the operator enlarges a disk over.
+ */
+export type BackupHeadroomLevel = "healthy" | "tight" | "full" | "unknown";
+
+/** A destination's room, and the two numbers its verdict was judged from. */
+export interface BackupHeadroom {
+  /** The verdict. */
+  level: BackupHeadroomLevel;
+  /** Free bytes on the destination's filesystem, or null when the kernel would not say. */
+  free_bytes: number | null;
+  /** The largest backup this tenant holds there — the yardstick. */
+  largest_backup_bytes: number | null;
+  /** The sentence the card shows under the numbers. */
+  message: string;
 }
 
 /** The four cards at the top of the overview. */

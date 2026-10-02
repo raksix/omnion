@@ -55,6 +55,17 @@ pub enum GuardKind {
     Session,
     /// A session or a service-account key presented as `Authorization: Bearer`.
     SessionOrMachine,
+    /// A session, a service-account key, or a **developer API key** — a delegation with a
+    /// scope list rather than a role.
+    ///
+    /// This is a third case and not a flavour of the second, because the two authenticate
+    /// against different tables and are resolved by *different* rules: a service-account key
+    /// is a subject roles bind to, so it is authorised through the binding table; a developer
+    /// key has no role at all, so its scopes are the authorization. Folding the second into the
+    /// first would mean either a developer key is looked up in a service-account table it was
+    /// never written to, or a service-account key is authorized by a scope column that does not
+    /// exist. Both are the "two mechanisms that look alike and behave nothing alike" trap.
+    SessionOrDeveloperKey,
 }
 
 /// Layer rejecting requests whose caller does not carry `permission`.
@@ -97,6 +108,20 @@ pub fn require(state: &AppState, permission: &'static str) -> RequirePermission 
 #[must_use]
 pub fn require_or_machine(state: &AppState, permission: &'static str) -> RequirePermission {
     RequirePermission::new_with_machine(state.clone(), permission)
+}
+
+/// Guard a route with `permission`, accepting a developer API key as a `Bearer` token too.
+///
+/// The key's scopes are the authorization, checked in [`check_kind`] before the permission
+/// decision is made — so a key carrying only `content.pages.read` is refused `403` on a route
+/// guarded for `content.pages.manage`, with the missing scope named.
+#[must_use]
+pub fn require_or_developer_key(state: &AppState, permission: &'static str) -> RequirePermission {
+    RequirePermission {
+        state: state.clone(),
+        permission,
+        kind: GuardKind::SessionOrDeveloperKey,
+    }
 }
 
 impl<S> Layer<S> for RequirePermission {
@@ -227,8 +252,73 @@ pub async fn check_kind(
         };
     }
 
+    // No cookie. A developer key first, because it is the narrower mechanism: a token that
+    // authenticates against `api_keys` must never fall through to the service-account branch
+    // and be reported as an unknown machine key, which names the wrong table in the error an
+    // integrator reads at 2am.
+    //
+    // **This calls `developer_auth::authenticate_key` rather than re-reading the key.** Main's
+    // slice of the developer portal called `omnion_developer::keys_store::authenticate` here
+    // directly; this branch's crate spells the same check `store::find_by_prefix` +
+    // `authn::decide`, because its token has two halves and its keys carry an IP allowlist, so
+    // "look the row up and compare the secret" is not the whole decision. Two readers for one
+    // credential is the defect worth naming: the one without the allowlist would accept a key
+    // the other refuses, and which of them ran depends on which route the caller hit.
+    // `authenticate_key` is also the only one of the two that records the use, so routing here
+    // is what makes the request log cover this path.
+    if kind == GuardKind::SessionOrDeveloperKey {
+        if let Some(_bearer) = bearer_token(headers) {
+            let address = None;
+            match crate::developer_auth::authenticate_key(
+                state,
+                headers,
+                address,
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            {
+                Ok(principal) => {
+                    // **The scope check is the authorization.** A key holds no role, so a
+                    // permission the route asks for that the key does not carry is a plain
+                    // refusal — and the refusal names the missing scope, so the integrator is
+                    // told which scope to add rather than which route they hit.
+                    if !principal.allows(permission) {
+                        tracing::debug!(
+                            permission,
+                            api_key = %principal.key_id,
+                            scopes = ?principal.scopes,
+                            "developer key does not carry the scope this route requires"
+                        );
+                        return Err(ApiError::forbidden(
+                            "scope_missing",
+                            format!(
+                                "this key does not carry the \"{permission}\" scope — rotate it with \
+                                 that scope added"
+                            ),
+                        ));
+                    }
+
+                    return Ok(Caller::Machine(MachinePrincipal {
+                        // A key has no subject of its own: it is a delegation *by* somebody, so
+                        // the issuing organization is the closest honest subject. It is never
+                        // resolved against (a developer key is authorized by its scopes above,
+                        // and a revoked issuer must not revoke the integration they delegated —
+                        // that is what the portal's own revoke button is for).
+                        account: omnion_permissions::model::Subject::User(Uuid::nil()),
+                        organization_id: principal.organization_id,
+                        key_id: principal.key_id,
+                    }));
+                }
+                // A bad key here is not "no key" — the caller presented one and it was refused.
+                // Answering 401 rather than falling through to the service-account branch is the
+                // whole reason this check comes first.
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     // No cookie: a machine key may authenticate, when the route accepts one.
-    if kind == GuardKind::SessionOrMachine {
+    if matches!(kind, GuardKind::SessionOrMachine) {
         if let Some(bearer) = bearer_token(headers) {
             let Some(machine) =
                 omnion_permissions::service_accounts::authenticate(state.db().pool(), &bearer)

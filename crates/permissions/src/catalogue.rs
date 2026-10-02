@@ -590,6 +590,54 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "security",
         description: "Change the IP allow and deny lists",
     },
+    // Developer portal (docs/requests/REQ-022, slice 1). Six powers, and the split is drawn
+    // where the *blast radius* changes rather than where the screens do.
+    //
+    // * `developer.read` is the overview and the scope catalogue — what the portal exists to
+    //   show somebody who is about to integrate. It is not in the base role: an account that
+    //   can read it by default learns the shape of the public API surface of the deployment,
+    //   which is reconnaissance, not a convenience.
+    // * `developer.keys.read` / `developer.keys.manage` are the credential pair. Issuing a
+    //   credential is the only action in the platform that creates a *usable* secret, so it is
+    //   never inferred from reading the list — an account that can see the key prefixes must
+    //   not be able to mint one that does anything.
+    // * `developer.oauth.read` / `developer.oauth.manage` are the same pair for OAuth apps,
+    //   kept separate because an app's redirect URIs are a token-theft surface and an account
+    //   auditing which apps exist should not be able to change where they point.
+    // * `developer.logs.read` is the request log. Separate from `developer.read` because the
+    //   log answers "who called what, and what did it cost" — the closest thing this platform
+    //   has to a traffic record, and not something an integration author needs in order to
+    //   build an integration.
+    PermissionDef {
+        key: "developer.read",
+        category: "developer",
+        description: "Read the developer portal overview and the scope catalogue",
+    },
+    PermissionDef {
+        key: "developer.keys.read",
+        category: "developer",
+        description: "Read API keys, their scopes and their usage",
+    },
+    PermissionDef {
+        key: "developer.keys.manage",
+        category: "developer",
+        description: "Create, rotate and revoke API keys",
+    },
+    PermissionDef {
+        key: "developer.oauth.read",
+        category: "developer",
+        description: "Read OAuth apps and their authorizations",
+    },
+    PermissionDef {
+        key: "developer.oauth.manage",
+        category: "developer",
+        description: "Register OAuth apps, rotate their secrets and archive them",
+    },
+    PermissionDef {
+        key: "developer.logs.read",
+        category: "developer",
+        description: "Read the API request log",
+    },
     // Backup centre (docs/requests/REQ-013). Four powers, and the split is the one the
     // request draws: **taking** a backup and **overwriting the live platform** are different
     // powers, and the gap between them is the whole risk of the screen.
@@ -901,30 +949,6 @@ mod tests {
     }
 
     #[test]
-    fn the_developer_family_is_catalogued() {
-        // REQ-033 slice 1. The two keys are guarded separately and a route guarded by a name
-        // the catalogue does not know answers 403 for *everybody* — including the owner — so a
-        // typo here would read as "permissions are broken" rather than as "a key is missing".
-        // The assertion is on the category as well as the key because the panel's role editor
-        // groups by it and a key in the wrong category is invisible where the editor looks.
-        for key in [
-            "developer.keys.read",
-            "developer.keys.manage",
-            "developer.read",
-            "developer.explorer.run",
-            "developer.oauth.read",
-            "developer.oauth.manage",
-            "developer.sdks.scaffold",
-        ] {
-            assert_eq!(
-                get(key).map(|entry| entry.category),
-                Some("developer"),
-                "{key} belongs to the developer category"
-            );
-        }
-    }
-
-    #[test]
     fn the_workflow_family_is_catalogued() {
         // P09: the automation surface is guarded by three keys — read, manage and run — so a
         // role can be trusted to trigger a workflow without letting it rewrite definitions.
@@ -949,6 +973,46 @@ mod tests {
                 "{key} belongs to the ai category"
             );
         }
+    }
+
+    #[test]
+    fn the_developer_family_is_catalogued() {
+        // REQ-033 slice 1, and REQ-022's slice on top. The keys are guarded separately and a
+        // route guarded by a name the catalogue does not know answers 403 for *everybody* —
+        // including the owner — so a typo here would read as "permissions are broken" rather
+        // than as "a key is missing".
+        //
+        // The assertion is on the category as well as the key because the panel's role editor
+        // groups by it and a key in the wrong category is invisible where the editor looks.
+        //
+        // `developer.logs.read` is main's key for the traffic record, kept in the catalogue
+        // because the role editor offers it and an operator who granted it must not find the
+        // grant silently unrecognised. It is *not* what guards `/developer/logs` on this
+        // branch — that read rides `developer.keys.read`, argued at the route.
+        for key in [
+            "developer.keys.read",
+            "developer.keys.manage",
+            "developer.read",
+            "developer.logs.read",
+            "developer.explorer.run",
+            "developer.oauth.read",
+            "developer.oauth.manage",
+            "developer.sdks.scaffold",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("developer"),
+                "{key} belongs to the developer category"
+            );
+        }
+        // REQ-022's stronger form, kept because it is the one that fails loudly: a catalogue
+        // that collapsed `developer.keys.manage` into `developer.keys.read` would still pass a
+        // presence check and would ship the escalation.
+        assert_ne!(
+            get("developer.keys.read").map(|entry| entry.description),
+            get("developer.keys.manage").map(|entry| entry.description),
+            "a read and a manage of the same object must be two keys with two descriptions"
+        );
     }
 
     #[test]

@@ -1000,12 +1000,8 @@ async fn gather(
     env.database_encryption = Some(Probe::unreadable(
         "storage encryption is a deployment fact; the application cannot verify it",
     ));
-    env.rate_limiting = Some(Probe::unreadable(
-        "rate limit policy is configured in slice 3; nothing to verify yet",
-    ));
-    env.csp = Some(Probe::unreadable(
-        "header policy is configured in slice 2; nothing to verify yet",
-    ));
+    env.rate_limiting = Some(rate_limit_probe(state).await);
+    env.csp = Some(csp_probe(state).await);
     env.ip_rules = match sqlx::query_scalar::<_, i64>(
         "select count(*) from information_schema.tables \
          where table_schema = current_schema() and table_name = 'security_ip_rules'",
@@ -1047,6 +1043,80 @@ async fn factor_probe(state: &AppState) -> Probe {
             Err(error) => Probe::unreadable(format!("the factor table could not be read: {error}")),
         },
         Err(error) => Probe::unreadable(format!("the factor table could not be probed: {error}")),
+    }
+}
+
+/// Whether a content security policy is configured, and in which mode.
+///
+/// **This probe used to be a `Probe::unreadable` naming slice 2, and slice 2 shipped a year
+/// earlier than this line was written.** `security_settings.headers` exists, is seeded by
+/// migration `0135`, and is what the `/security/headers` screen has been editing all along —
+/// while `csp_configured` sat at `unknown` with the reason *"header policy is configured in
+/// slice 2; nothing to verify yet"*. The screen therefore told an operator who had just
+/// enforced a policy that the platform could not find out, and its "Header policy" action
+/// link led to a page that plainly showed one. No test could catch it: the check's contract
+/// is "never claim `pass` without a fact", and this answer is honest *about its own probe*
+/// while saying nothing about the platform.
+///
+/// The read goes through [`omnion_security::load_headers`] rather than a second query, for the
+/// same reason the retention sweep delegates in REQ-010: two readers of one document is how
+/// they drift, and the drift here would be a security row.
+///
+/// A **missing row** is `absent`, not `unknown`: the migration inserts the singleton, so a row
+/// that is not there is a fact about this database, and the honest state for "there is no
+/// policy document" is the one `from_probe` maps to a failing row.
+async fn csp_probe(state: &AppState) -> Probe {
+    match omnion_security::load_headers(state.db().pool()).await {
+        Ok(stored) => {
+            if stored.document.is_null() {
+                return Probe::missing("the settings row holds no header policy document");
+            }
+            // The stored document is parsed by the *same* constructor the header middleware
+            // uses, so the fact the check reports is the policy that will actually be sent —
+            // not a second, looser reading of the same JSON that could disagree with it.
+            let policy = omnion_security::HeaderPolicy::from_json(Some(&stored.document));
+            Probe::value(json!({
+                "mode": policy.csp_mode.as_str(),
+                "directives": policy.csp.len(),
+                "saved_at": stored.updated_at.to_string(),
+            }))
+        }
+        Err(error) => Probe::unreadable(format!("the header policy could not be read: {error}")),
+    }
+}
+
+/// Whether the rate limiter is configured with at least one enabled scope.
+///
+/// The same defect as [`csp_probe`], one slice later: a frozen `unknown` whose reason named
+/// slice 3, on a table (`security_settings.rate_limits`) that slice 3 created and that the
+/// limiter middleware has been enforcing from ever since. `merge_with_defaults` is used rather
+/// than a raw array length because the middleware resolves the *merged* policy — a document
+/// that omits a scope still gets that scope's default, so counting stored rows would report a
+/// narrower platform than the one actually enforcing requests.
+///
+/// **All scopes disabled is `fail`, not `pass`.** A limiter with nothing enabled is a limiter
+/// that is not limiting, and it is the one state in this check where a green row would be the
+/// over-claim the whole crate exists to prevent.
+async fn rate_limit_probe(state: &AppState) -> Probe {
+    match omnion_security::load_rate_limits(state.db().pool()).await {
+        Ok(document) => {
+            let policies = omnion_security::merge_with_defaults(&document);
+            let enabled: Vec<&str> = policies
+                .iter()
+                .filter(|policy| policy.enabled)
+                .map(|policy| policy.scope.as_str())
+                .collect();
+            if enabled.is_empty() {
+                return Probe::missing(
+                    "every rate-limit scope is disabled, so no request is being limited",
+                );
+            }
+            Probe::value(json!({
+                "enabled_scopes": enabled,
+                "scopes": policies.len(),
+            }))
+        }
+        Err(error) => Probe::unreadable(format!("the rate limit policy could not be read: {error}")),
     }
 }
 
