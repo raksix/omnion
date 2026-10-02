@@ -133,6 +133,20 @@ import type {
   Site,
   User,
 } from "./types";
+// The portal's own shapes live in their own module rather than in `types.ts`, because they come
+// with a *rule* attached (only `IssuedDeveloperKey` may hold a token) that is worth reading
+// next to the type itself rather than one of two hundred lines of a shared list.
+import type {
+  CreateDeveloperKeyInput,
+  DeveloperKey,
+  DeveloperKeyDetail,
+  DeveloperLogDetail,
+  DeveloperLogFilters,
+  DeveloperLogPage,
+  DeveloperOverview,
+  DeveloperScopeCatalogue,
+  IssuedDeveloperKey,
+} from "./developer";
 
 /** An error answered by the API, or raised before the request could leave the browser. */
 export class ApiError extends Error {
@@ -8052,4 +8066,104 @@ export function deleteHealthMaintenanceWindow(id: string): Promise<void> {
   return request<void>(`/api/v1/health/maintenance-windows/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Developer portal (REQ-022, slice 2)
+// ---------------------------------------------------------------------------------------------
+//
+// These live here rather than in `lib/developer.ts` because this module owns the session cookie,
+// the CSRF header and the `ApiError` shape; a second file calling `fetch` itself would be a
+// second implementation of all three. The portal's *types* and its CSV builder live in
+// `lib/developer.ts` — a shape and a pure function need neither a cookie nor an error type.
+
+/** `GET /api/v1/developer/overview` — the card row and the recent failures. */
+export function fetchDeveloperOverview(): Promise<DeveloperOverview> {
+  return request<DeveloperOverview>("/api/v1/developer/overview", { cache: "no-store" });
+}
+
+/** `GET /api/v1/developer/api-keys` — the list, with its three optional filters. */
+export function fetchDeveloperKeys(
+  filters: {
+    environment?: string | null;
+    status?: string | null;
+    search?: string | null;
+  } = {},
+): Promise<DeveloperKey[]> {
+  const query = new URLSearchParams();
+  if (filters.environment) query.set("environment", filters.environment);
+  if (filters.status) query.set("status", filters.status);
+  if (filters.search) query.set("search", filters.search);
+  const suffix = query.toString();
+  return request<DeveloperKey[]>(
+    `/api/v1/developer/api-keys${suffix ? `?${suffix}` : ""}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * `POST /api/v1/developer/api-keys` — the only call that returns a token.
+ *
+ * The caller must show it once and let it go; nothing here caches the answer, and the panel
+ * keeps it in component state that is dropped when the reveal dialog closes.
+ */
+export function createDeveloperKey(
+  input: CreateDeveloperKeyInput,
+): Promise<IssuedDeveloperKey> {
+  return request<IssuedDeveloperKey>("/api/v1/developer/api-keys", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** `GET /api/v1/developer/api-keys/{id}`. */
+export function fetchDeveloperKey(id: string): Promise<DeveloperKeyDetail> {
+  return request<DeveloperKeyDetail>(
+    `/api/v1/developer/api-keys/${encodeURIComponent(id)}`,
+    { cache: "no-store" },
+  );
+}
+
+/** `POST /api/v1/developer/api-keys/{id}/rotate` — a new secret, the old one dead at once. */
+export function rotateDeveloperKey(id: string): Promise<IssuedDeveloperKey> {
+  return request<IssuedDeveloperKey>(
+    `/api/v1/developer/api-keys/${encodeURIComponent(id)}/rotate`,
+    { method: "POST" },
+  );
+}
+
+/** `DELETE /api/v1/developer/api-keys/{id}` — a soft revoke; the row and its logs stay. */
+export function revokeDeveloperKey(id: string): Promise<{ revoked: boolean; id: string }> {
+  return request<{ revoked: boolean; id: string }>(
+    `/api/v1/developer/api-keys/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** `GET /api/v1/developer/scopes` — grouped in the API, never re-derived in the panel. */
+export function fetchDeveloperScopes(): Promise<DeveloperScopeCatalogue> {
+  return request<DeveloperScopeCatalogue>("/api/v1/developer/scopes", { cache: "no-store" });
+}
+
+/** `GET /api/v1/developer/logs` — one page, filtered. */
+export function fetchDeveloperLogs(
+  filters: DeveloperLogFilters = {},
+  before?: number | null,
+): Promise<DeveloperLogPage> {
+  const query = new URLSearchParams();
+  if (filters.api_key_id) query.set("api_key_id", filters.api_key_id);
+  if (filters.method) query.set("method", filters.method);
+  if (filters.path_prefix) query.set("path_prefix", filters.path_prefix);
+  if (filters.status_class) query.set("status_class", filters.status_class);
+  if (filters.window_days) query.set("window_days", String(filters.window_days));
+  if (before) query.set("before", String(before));
+  const suffix = query.toString();
+  return request<DeveloperLogPage>(`/api/v1/developer/logs${suffix ? `?${suffix}` : ""}`, {
+    cache: "no-store",
+  });
+}
+
+/** `GET /api/v1/developer/logs/{id}` — the detail drawer. */
+export function fetchDeveloperLog(id: number): Promise<DeveloperLogDetail> {
+  return request<DeveloperLogDetail>(`/api/v1/developer/logs/${id}`, { cache: "no-store" });
 }

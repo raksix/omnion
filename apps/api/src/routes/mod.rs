@@ -1537,6 +1537,13 @@ pub fn router(state: AppState) -> Router {
     // never asked for. The guards are split by blast radius — reading a key list is not
     // issuing a credential, and neither is reading the traffic record.
     let developer_routes = Router::new()
+        // The overview's card row (REQ-022, slice 2). `developer.read` rather than a narrower
+        // key: the screen exists to be the first thing a key author sees, and a permission
+        // named after nothing the screen does would be a second thing to look up.
+        .route(
+            "/developer/overview",
+            get(developer::overview).layer(guards::require(&state, "developer.read")),
+        )
         // The scope catalogue is what the create-key picker is built from, so it is the one
         // read a key author needs before they have a key.
         .route(
@@ -2444,7 +2451,36 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/pages/{id}/revisions/{revision_id}/comments",
             page_revision_comments,
-        );
+        )
+        // The request log is the INNERMOST layer of the API (REQ-022, slice 2), installed here —
+        // at the **end** of the `v1` chain rather than the start, and that position is load
+        // -bearing rather than cosmetic.
+        //
+        // `Router::layer` applies to the routes registered *so far*. Called as the first
+        // statement, it wraps an empty router and every route added afterwards is simply not
+        // wrapped: the layer compiles, installs, and never runs. That is exactly what happened
+        // the first time this was written, and the walk `a_request_writes_its_own_log_row`
+        // caught it by finding **zero** rows for requests the platform had plainly served — a
+        // confidently blank log, the precise failure this table exists to catch.
+        //
+        // It goes here rather than on the whole tree for two reasons that are both about what
+        // the layer is allowed to see:
+        //
+        // * It must sit **inside** the permission guards, so a `403` is a row. A layer outside
+        //   them records that a guard ran; only this one records what it decided, and the
+        //   decision is the entire reason the row exists.
+        // * It must **not** see the panel's assets or the readiness probe. `/readyz` touches
+        //   the database on every probe, and a probe that both reads and writes is a probe that
+        //   reports the platform down when the log table is unavailable. `should_log_path` is
+        //   the second half of that and is a pure function of the path, so a new route is
+        //   covered without touching this file.
+        //
+        // Note the contrast with the four layers further down, which wrap the *outer* router and
+        // therefore **do** see `/healthz`: the limiter and the IP access list are there on
+        // purpose (a caller with no account must still be capped), and the header policy must
+        // reach the one endpoint a scanner probes. The request log has the opposite requirement,
+        // which is why it is the only layer of the five that lives here rather than there.
+        .layer(crate::request_log_middleware::RequestLog::new(&state));
 
     // The header policy is applied to the WHOLE tree, `/healthz` included: a security header
     // that is missing on the one endpoint a scanner probes is missing where it is read.

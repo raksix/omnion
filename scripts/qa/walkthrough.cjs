@@ -3468,7 +3468,22 @@ async function runDepthPass(name, pass) {
     const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
     log(`depth pass ${name} failed: ${reason}`);
     record({ page: "qa", action: "depth-pass-failed", pass: name, reason });
-    return { ok: false, steps: 0, reason };
+    // **Whatever the pass already recorded is kept.** This wrapper's return value is assigned over
+    // `report.<something>` by its caller, so returning a fresh `{ ok: false, steps: 0 }` throws away
+    // every step the pass managed to record before it died — and the report then shows a failed pass
+    // with no evidence of *where* it failed. That is the same "a pass that cannot fail is a pass
+    // that proved nothing" defect one level down: the steps are the only thing that turns "the
+    // portal is broken" into "the portal works until the revoke, and here is the row that did not
+    // change".
+    //
+    // The steps are read from the **click stream**, not from a `report` argument, because
+    // `runDepthPass` is called from sixteen places with two arguments and adding a third would be
+    // a silent `undefined` at every one of them that nobody notices until a pass fails. The stream
+    // is the pass's own record of what it saw, keyed by `action`, so the recovery is exact.
+    const partial = clickLines
+      .filter((e) => e.action === "depth-pass" && e.pass === name)
+      .reduce((acc, entry) => ({ ...acc, ...entry.value }), {});
+    return { steps: partial, ok: false, reason };
   }
 }
 
@@ -12614,6 +12629,14 @@ async function main() {
     //   `suggestion`, which is the difference between a limit and a placeholder.
     { path: "/health/incidents", name: "health-incidents" },
     { path: "/health/settings", name: "health-settings" },
+    // The developer portal (REQ-022, slice 2). All four are in the route list because all four are
+    // reachable and none had ever been rendered by anything — a screen no pass opens is the one
+    // screen whose job is to be believed. `/developer/api-keys/{id}` is deliberately NOT a route
+    // entry: its id comes from the key this pass creates, so `runDeveloperDepth` clicks through to
+    // it from the list instead, which is also the only way to prove the link works.
+    { path: "/developer", name: "developer-overview" },
+    { path: "/developer/api-keys", name: "developer-api-keys" },
+    { path: "/developer/logs", name: "developer-logs" },
   ];
   // `--only` narrows the route list; the default walks every entry above, unchanged.
   const walkedRoutes = ONLY_ALL ? routes : routes.filter((route) => wants(route.name));
@@ -12936,6 +12959,20 @@ async function main() {
   // because both screens run live probes, and running them in the other order
   // would have the health screen's own PostgreSQL probe read the connection pool
   // the security scan is still holding.
+  // The developer portal (REQ-022, slice 2). It runs LAST in `main`: the pass creates a key,
+  // authenticates a real request with it and reads that request out of the log, so it changes the
+  // key inventory and the request log that any earlier pass might have counted. It also leaves a
+  // revoked key behind, which is the state the acceptance criteria describe.
+  if (wants("developer-api-keys")) {
+    matchedOnly.add("developer-api-keys");
+    // **Not** `report.developer = await runDepthPass(...)`: this pass writes `report.developer`
+    // itself on every exit path, and assigning the wrapper's return over it would drop the
+    // `failures` array the roll-up reads — so a failing pass would be reported as a crashed pass
+    // with no list of which claims went unproved. The wrapper still records the crash.
+    await runDepthPass("developer", () => runDeveloperDepth(page, report));
+  }
+  log(`developer: ${JSON.stringify(report.developer)}`);
+
   if (wants("health-overview")) {
     matchedOnly.add("health-overview");
     report.health = await runDepthPass("health", () => runHealthDepth(page, report));
@@ -13044,7 +13081,13 @@ async function main() {
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
   // as a known name instead of reporting it as unmatched.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/security/events", name: "security-events" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/security/events", name: "security-events" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" },
+  // The portal's two tables at 390 px. Seven columns do not fit a phone, and the check that
+  // matters is the one the cards exist for: the *key status* stays readable without a sideways
+  // scroll, because "is this credential still alive" is the question a phone is asked.
+  { path: "/developer", name: "developer-overview" },
+  { path: "/developer/api-keys", name: "developer-api-keys" },
+  { path: "/developer/logs", name: "developer-logs" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been
@@ -13286,6 +13329,28 @@ async function main() {
       "high",
       "click-error",
       `[${c.page}] "${c.label}" (${c.tag}) → ${c.outcome}: ${c.reason || ""} ${(c.errors || []).join(" | ")}`.slice(0, 240),
+    );
+  }
+  /*
+   * A depth pass that threw is a **high** finding, and this loop is the only place that can say so.
+   *
+   * `runDepthPass` records the failure and returns `{ ok: false }`, but nothing downstream read it:
+   * the roll-up above counts clicks, console lines and network failures, and a crashed depth pass
+   * produces none of those three. So a pass that died on its first locator wrote exactly the same
+   * report as a pass that proved everything, minus some screenshots — and the difference between
+   * "the developer portal does not work" and "the developer portal was never exercised" is exactly
+   * the difference this report exists to record. The new pass is the first one to make it visible,
+   * so it is counted here rather than in its own module.
+   */
+  const deadPasses = clickLines.filter((e) => e.action === "depth-pass-failed");
+  for (const d of deadPasses) {
+    pushFindings("high", "depth-pass-failed", `the ${d.pass} depth pass did not finish: ${d.reason || "no reason recorded"}`);
+  }
+  if (report.developer && report.developer.failures && report.developer.failures.length) {
+    pushFindings(
+      "high",
+      "unproved-claim",
+      `the developer portal left ${report.developer.failures.length} claim(s) unproved: ${report.developer.failures.join(", ")}`,
     );
   }
   if (report.web && report.web.error && report.web.error !== "Error: skipped") pushFindings("high", "web-unreachable", report.web.error);
