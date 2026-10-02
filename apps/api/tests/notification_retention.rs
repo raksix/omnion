@@ -225,10 +225,29 @@ async fn delivery_row(pool: &PgPool, notification_id: Uuid, channel: &str) -> Uu
 /// Backdate a row's own clock. `settled_at = null` leaves the enqueue clock in play, which is
 /// what makes a row "abandoned" rather than "finished".
 ///
+/// **`settled` is DAYS IN THE PAST, and a negative value is refused.** The parameter is added to
+/// `now()` inside a `make_interval(days => …)`, so `-45` dates the row 45 days into the FUTURE.
+/// A future `settled_at` is on the far side of every window predicate, so the row is correctly
+/// kept and the count correctly answers `0` — and the failure reads as a product defect, because
+/// the walk's own comment says "45 days old" while the fixture wrote the opposite. Three walks
+/// were green-adjacent here for exactly that reason: nothing was measuring the clock, because the
+/// clock was never in the past.
+///
+/// The assertion is here rather than at the call site on purpose. A backdate that moves time
+/// *forward* is not a weaker fixture, it is a fixture that makes the sweep's guard untestable, and
+/// the error it produces points at the product instead of at the line that wrote it.
+///
 /// **`status` is deliberately left alone.** The sweep's guard is the *claim*, not the status, so
 /// the abandoned row this builds stays `pending` — which is exactly the state an abandoned row
 /// is in on a real installation, and the state the first version of the predicate excluded.
 async fn backdate(pool: &PgPool, id: Uuid, settled: Option<i32>) {
+    assert!(
+        settled.is_none_or(|days| days >= 0),
+        "backdate() takes days IN THE PAST: {settled:?} would date the row in the future, \
+         which no retention window can sweep, and the resulting count of 0 would read as a \
+         product defect rather than as this mistake"
+    );
+
     let result: PgQueryResult = sqlx::query(
         "update notification_deliveries \
          set created_at = now() - make_interval(days => $2::int), \
@@ -888,4 +907,219 @@ async fn the_fallback_window_is_the_number_the_screen_publishes() {
         "'how long is a dead device kept' must have one answer between the screen and the \\
          sweeper"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice 8: the window a person can read and change
+//
+// The sweep existed with no reader and no setter: `organizations.notification_retention_days`
+// was a column only a worker consulted, so the sentence on the outbox screen ("the log goes
+// back 60 days") was published from a constant while a tenant's own window went unmentioned and
+// unsettable. These walks measure the read and the write, and the walk that ties them together
+// is the one below — `due` counted on a window the sweep does not use would make the panel's
+// "the next sweep removes N" a second lie.
+// ---------------------------------------------------------------------------------------------
+
+/// **The read answers the column, not the constant.**
+///
+/// The defect this closes is a *sentence* disagreeing with the sweeper: the outbox route
+/// returned `OUTBOX_RETENTION_DAYS` for every tenant forever, so a tenant on a 7-day window was
+/// told it kept 60 days of history while its rows went after seven. A walk that only asserted
+/// "the read is 60" would pass against the broken version, so the assertion is on the tenant
+/// that set a window of its own.
+#[tokio::test]
+async fn a_tenant_reads_back_the_window_it_set() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    let tenant = organization(harness.pool(), "reader", 7).await;
+    let other = organization(harness.pool(), "bystander", 90).await;
+
+    // **Both tenants are read, in one pool, in one process.** A read that leaked a window
+    // between organizations would still answer 7 for the first caller, so the assertion is
+    // two-sided.
+    assert_eq!(
+        retention::retention_window(harness.pool(), Some(tenant)).await.expect("the read must answer"),
+        7,
+        "a tenant must read its own window back"
+    );
+    assert_eq!(
+        retention::retention_window(harness.pool(), Some(other)).await.expect("the read must answer"),
+        90,
+        "a second tenant must read its own window, not the first one's"
+    );
+
+    harness.dispose().await;
+}
+
+/// **The setter writes the column and the read-back is what the column holds.**
+///
+/// The read-back is not a formality: `set_retention_window` returns `… returning
+/// notification_retention_days` rather than the number it was handed, so a column check
+/// constraint that clamped the value would surface as the clamped value rather than as a
+/// silent success. Writing the value back through the same function the screen uses is what
+/// makes "the answer is what the database holds" a property rather than a comment.
+#[tokio::test]
+async fn setting_the_window_writes_the_column_the_sweep_reads() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    let tenant = organization(harness.pool(), "setter", 60).await;
+    let stored = retention::set_retention_window(harness.pool(), tenant, 14)
+        .await
+        .expect("the setter must answer");
+
+    assert_eq!(stored, 14, "the setter returns what the column now holds");
+
+    // **Read the column directly as well as through the function.** The sweep reads the column;
+    // a function that answered 14 while the column said 60 would leave the sweeper on the old
+    // clock, which is precisely the disagreement this slice exists to remove.
+    let column: i32 = sqlx::query_scalar(
+        "select notification_retention_days from organizations where id = $1",
+    )
+    .bind(tenant)
+    .fetch_one(harness.pool())
+    .await
+    .expect("the column must be readable");
+    assert_eq!(column, 14, "the column the sweep reads must hold the new window");
+
+    harness.dispose().await;
+}
+
+/// **An organization that does not exist is an error, not a silent zero-row update.**
+///
+/// `fetch_optional` returning `None` and the caller falling back to the default would answer
+/// `200` and change nothing — the exact "a platform account has no window to set" trap the
+/// handler refuses by name. A setter that reported success here would let an operator believe
+/// they had changed a retention policy on a tenant that was never there.
+#[tokio::test]
+async fn setting_the_window_on_a_missing_organization_is_refused() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    let absent = Uuid::new_v4();
+    let refused = retention::set_retention_window(harness.pool(), absent, 30)
+        .await
+        .expect_err("a missing organization must be refused, not silently ignored");
+
+    assert!(
+        refused.to_string().contains(&absent.to_string()),
+        "the refusal names the organization it could not find: {refused}"
+    );
+
+    harness.dispose().await;
+}
+
+/// **`due` is the sweep's predicate, not a count written for the panel.**
+///
+/// This is the walk that ties the screen to the worker. `retention_counts` reads its window out
+/// of the *same subquery* `work_list` binds, and filters on the *same* claim guard `sweep_
+/// deliveries` deletes with. If either drifted, the panel would promise removals the sweeper
+/// does not make — the mirror image of the sentence it published before this slice.
+///
+/// **A row the sweeper would delete is counted; a row it would keep is not.** The two sides are
+/// one fixture with two clocks, so a count that was simply wrong (say, `rows`) fails this too.
+#[tokio::test]
+async fn the_due_count_is_the_clock_the_sweeper_deletes_on() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    let tenant = organization(harness.pool(), "counts", 30).await;
+    let notification = notification_for(harness.pool(), Some(tenant)).await;
+
+    // Two rows on one notification, on two channels — the pair `notification_deliveries_unique`
+    // admits. Built through the fixture that exists for it, not by hand.
+    let due = delivery_row(harness.pool(), notification, "in_app").await;
+    let kept = delivery_row(harness.pool(), notification, "email").await;
+
+    // **Both are settled long ago**, so the only thing that can separate them is the window:
+    // 45 days back crosses a 30-day window and not a 400-day one.
+    backdate(harness.pool(), due, Some(45)).await;
+    backdate(harness.pool(), kept, Some(45)).await;
+
+    let (rows, due_count) = retention::retention_counts(harness.pool(), Some(tenant), LEASE)
+        .await
+        .expect("the counts must answer");
+    assert_eq!(rows, 2, "both rows belong to this tenant");
+    assert_eq!(
+        due_count, 2,
+        "both rows are 45 days old against a 30-day window, so both are due"
+    );
+
+    // Now prove it is *the sweep's* clock by moving the window under the same rows: at 400 days
+    // nothing is due, at 30 days both are. A count that had bound the window as a parameter
+    // from somewhere else would answer the same for both.
+    retention::set_retention_window(harness.pool(), tenant, 400).await.expect("widen");
+    let (_, none_due) = retention::retention_counts(harness.pool(), Some(tenant), LEASE)
+        .await
+        .expect("the counts must answer");
+    assert_eq!(none_due, 0, "a 400-day window keeps a 45-day-old row");
+
+    // **And the sweeper agrees, on the same rows, at the same window.** This is the load-bearing
+    // half: the count and the delete are two queries, and only running the second one proves
+    // they were written to mean the same thing.
+    retention::set_retention_window(harness.pool(), tenant, 30).await.expect("narrow");
+    let policy = policy_for(harness.pool(), Some(tenant)).await;
+    let report = retention::sweep_deliveries(harness.pool(), policy, 1_000, LEASE)
+        .await
+        .expect("the sweep must answer");
+
+    assert_eq!(report.deliveries_deleted, 2, "the sweeper removes exactly what was counted");
+    assert!(!exists(harness.pool(), due).await, "the counted row is gone");
+    assert!(!exists(harness.pool(), kept).await, "the kept row is gone at the narrower window");
+    let (rows_after, due_after) = retention::retention_counts(harness.pool(), Some(tenant), LEASE)
+        .await
+        .expect("the counts must answer");
+    assert_eq!(rows_after, 0, "the count empties when the sweeper does");
+    assert_eq!(due_after, 0, "and nothing stays due");
+
+    harness.dispose().await;
+}
+
+/// **The last run is readable, and "never" is a real answer rather than a missing row.**
+///
+/// `retention_status` is the read side of a table whose only reader was the worker that wrote
+/// it. Without this walk the run log has no reader at all, and the panel would have a permanent
+/// "no sweep has run" line on an installation that sweeps hourly — the silent-zero shape.
+#[tokio::test]
+async fn the_last_sweep_is_readable_and_its_absence_is_an_answer() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    let tenant = organization(harness.pool(), "runs", 45).await;
+    let notification = notification_for(harness.pool(), Some(tenant)).await;
+    let row = delivery_row(harness.pool(), notification, "in_app").await;
+    backdate(harness.pool(), row, Some(90)).await;
+
+    // **Before any pass:** the status answers, and the absence is a `None` rather than an error
+    // or a fabricated row. An empty pass writes a run row, so "no sweep here" and "the sweep
+    // found nothing" are two different answers and the panel renders both.
+    let before = retention::retention_status(harness.pool(), Some(tenant), LEASE)
+        .await
+        .expect("the status must answer before any pass");
+    assert_eq!(before.window_days, 45, "the status carries the window");
+    assert_eq!(before.due, 1, "the one 90-day-old row is due at 45 days");
+    assert!(before.last_run.is_none(), "no pass has run, so there is no last run");
+
+    let pass = retention::run_pass(harness.pool(), 500, 1_000, LEASE)
+        .await
+        .expect("a pass must answer");
+    assert!(pass.walked >= 1, "the tenant must be on the work list");
+
+    let after = retention::retention_status(harness.pool(), Some(tenant), LEASE)
+        .await
+        .expect("the status must answer after a pass");
+    let run = after.last_run.expect("a finished pass must be readable as the last run");
+    assert_eq!(run.window_days, 45, "the run row carries the window it swept on");
+    assert_eq!(run.deliveries_deleted, 1, "and what it removed");
+    assert_eq!(run.organization_id, Some(tenant), "and which tenant it swept");
+    assert_eq!(after.rows, 0, "the log is empty after the sweep");
+    assert_eq!(after.due, 0, "and nothing remains due");
+
+    harness.dispose().await;
 }
