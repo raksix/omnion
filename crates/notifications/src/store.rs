@@ -140,13 +140,11 @@ pub async fn record_with_deliveries(
     };
 
     let allowed =
-        crate::preference_store::allowed_channels(pool, validated.user_id, &validated.category).await?;
-    let disabled = crate::preference_store::disabled_channels(
-        pool,
-        validated.user_id,
-        &validated.category,
-    )
-    .await?;
+        crate::preference_store::allowed_channels(pool, validated.user_id, &validated.category)
+            .await?;
+    let disabled =
+        crate::preference_store::disabled_channels(pool, validated.user_id, &validated.category)
+            .await?;
 
     let report = crate::delivery::enqueue(pool, id, &allowed, &disabled).await?;
     Ok(Some((id, report)))
@@ -344,9 +342,8 @@ pub async fn find_by_dedupe_key(
     user_id: Uuid,
     dedupe_key: &str,
 ) -> Result<Option<Notification>> {
-    let query = format!(
-        "select {COLUMNS} from notifications where user_id = $1 and dedupe_key = $2"
-    );
+    let query =
+        format!("select {COLUMNS} from notifications where user_id = $1 and dedupe_key = $2");
     Ok(sqlx::query_as::<_, Notification>(&query)
         .bind(user_id)
         .bind(dedupe_key)
@@ -550,13 +547,75 @@ pub async fn existing_users(pool: &PgPool, user_ids: &[Uuid]) -> Result<Vec<Uuid
     if user_ids.is_empty() {
         return Ok(Vec::new());
     }
+    let known: Vec<Uuid> = sqlx::query_scalar("select id from users where id = any($1::uuid[])")
+        .bind(user_ids)
+        .fetch_all(pool)
+        .await?;
+    Ok(known)
+}
+
+/// The subset of `user_ids` that names an account **of that organization**.
+///
+/// [`existing_users`] answers "is this a real account". This answers the other half of the
+/// question — "is this somebody we may tell" — and the two are not the same sentence:
+/// `users.organization_id` is **nullable**, so an account on another tenant, or on the platform
+/// itself, is a perfectly real row. A caller that uses the existence check as a tenancy check
+/// sends a tenant's notification into another tenant's inbox, and the notification table will
+/// carry the *sending* organization next to a recipient who belongs to a different one, which
+/// is the shape that makes the leak look correct in a query.
+///
+/// **The predicate is equality, not `is distinct from`.** An orgless (platform) account is
+/// excluded here on purpose: a platform operator is not a recipient for tenant A's business, and
+/// the platform account is the one population `organization_id is null` was *for*.
+///
+/// **No `status` filter, and that is load-bearing.** `users.status` is the access system, not the
+/// tenancy system: a colleague disabled after a policy was saved is still somebody who has to be
+/// told, and filtering them here would silently drop every escalation for a team on leave. The
+/// two questions are independent and this function answers exactly one of them.
+pub async fn existing_users_in_organization(
+    pool: &PgPool,
+    organization_id: Uuid,
+    user_ids: &[Uuid],
+) -> Result<Vec<Uuid>> {
+    if user_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let known: Vec<Uuid> = sqlx::query_scalar(
-        "select id from users where id = any($1::uuid[])",
+        "select id from users where id = any($1::uuid[]) and organization_id = $2",
     )
     .bind(user_ids)
+    .bind(organization_id)
     .fetch_all(pool)
     .await?;
     Ok(known)
+}
+
+/// The organization each of `user_ids` belongs to, as `id -> organization_id`.
+///
+/// **This is the database half of [`crate::audience::may_address`]**, which is a pure function
+/// on the two organizations and therefore cannot know which tenant an id is in. `users.organization_id`
+/// is **nullable**, so the answer is `Option<Option<Uuid>>` for a reason that a plain `HashMap`
+/// would hide: `Some(None)` is the platform's own account (a row, on no tenant) and `None` is
+/// an id that is not an account at all. The caller needs all three facts, and collapsing the
+/// first two would make "a platform account" indistinguishable from "a stranger's id" — which is
+/// the exact pair [`crate::audience::refused_recipients`] is required to refuse identically.
+///
+/// **Unknown ids are simply absent from the map**, not mapped to a value: that is what makes
+/// the endpoint's existence oracle hold. The emit route asks this map, and an id with no entry
+/// is refused without a second query to discover whether it is missing or merely elsewhere.
+pub async fn recipient_organizations(
+    pool: &PgPool,
+    user_ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, Option<Uuid>>> {
+    if user_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<(Uuid, Option<Uuid>)> =
+        sqlx::query_as("select id, organization_id from users where id = any($1::uuid[])")
+            .bind(user_ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
 }
 
 /// Check a payload's category and channel names before the store ever sees them.

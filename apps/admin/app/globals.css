@@ -31,13 +31,6 @@
   --color-positive-soft: #e7f2ec;
   --color-caution: #8a5d16;
   --color-caution-soft: #f8efdd;
-  /* `danger` was used by eleven feature files and declared nowhere: the class compiled to
-     nothing, so every "this failed" message inherited the surrounding muted grey and read as
-     ordinary body copy. It is a *lighter*, higher-chroma red than `caution`, so the AA pair is
-     stated rather than assumed — a destructive affordance must not also be the quietest one. */
-  --color-danger: #9b2c2c;
-  --color-danger-strong: #7f2222;
-  --color-danger-soft: #f8e7e7;
   --color-quiet-soft: #eeeae2;
 }
 

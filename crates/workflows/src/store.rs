@@ -22,16 +22,38 @@ fn workflow_columns() -> &'static str {
 }
 
 /// Insert a workflow definition.
+///
+/// **The write guard lives here, not in the two handlers.** `POST /workflows` and
+/// `POST /automations` are separate functions in separate files that both reach this one insert,
+/// and a check pasted into each is a check that will be on one of them — the same shape as the
+/// run guard this store already moved away from the handlers. Two questions are asked, in the
+/// order that makes each refusal name a remedy that works:
+///
+/// 1. **Is this project still writable?** An archived project refuses edits as well as runs
+///    (`ensure_project_accepts_writes`), and an editor or owner pressing save on a project that
+///    was archived an hour ago gets told to restore it rather than silently succeeding.
+/// 2. **Is there room for one more?** `max_workflows` is a cap this REQ promises and the limits
+///    screen draws a bar for; the notice sweep only *notices* a crossing, so without this a
+///    project could exceed its cap for ever while the bar read "at the limit".
+///
+/// Both run inside the transaction that writes, so a project archived between the handler's
+/// capability check and this insert cannot slip a save through: the insert sees `archived` and
+/// refuses. That is the check-then-write race this module has now removed from the run path and
+/// the move path, applied to the last write path that did not have it.
 pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow> {
+    let mut tx = pool.begin().await?;
+    crate::projects::ensure_project_accepts_writes(&mut tx, new.project_id).await?;
     let sql = format!(
-        "insert into workflows (organization_id, site_id, name, description, enabled, \
-         trigger_kind, schedule, trigger_event, conditions, next_run_at, steps, created_by) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) returning {}",
+        "insert into workflows (organization_id, project_id, site_id, name, description, \
+         enabled, trigger_kind, schedule, trigger_event, conditions, next_run_at, steps, \
+         created_by) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) returning {}",
         workflow_columns()
     );
 
     let workflow: Workflow = sqlx::query_as(&sql)
         .bind(new.organization_id)
+        .bind(new.project_id)
         .bind(new.site_id)
         .bind(new.name)
         .bind(new.description)
@@ -43,22 +65,36 @@ pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow
         .bind(new.next_run_at)
         .bind(new.steps)
         .bind(new.created_by)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
+
+    tx.commit().await?;
 
     Ok(workflow)
 }
 
 /// List workflows, newest first; `organization_id` and `site_id` filter when given.
+///
+/// `project_id` filters too (REQ-133), and the parameter is `Option<Uuid>` on purpose even
+/// though the column is `not null`: the column being non-nullable is a statement about *rows in
+/// the table*, and this function is a statement about *which rows a caller may see*. A caller who
+/// passes `None` is not writing a workflow without a project — they are asking for everything
+/// they can see, which is the question the project list and the instance-wide views ask.
+///
+/// The filter is a `where` clause rather than a caller-side partition because a caller-side one is
+/// a leak: the rows still cross the wire, and slice 2's rule is that a workflow the caller may not
+/// see is never *fetched*, not merely never displayed.
 pub async fn list_workflows(
     pool: &PgPool,
     organization_id: Option<Uuid>,
     site_id: Option<Uuid>,
+    project_id: Option<Uuid>,
 ) -> Result<Vec<Workflow>> {
     let sql = format!(
         "select {} from workflows \
          where ($1::uuid is null or organization_id = $1) \
            and ($2::uuid is null or site_id = $2) \
+           and ($3::uuid is null or project_id = $3) \
          order by created_at desc, id",
         workflow_columns()
     );
@@ -66,6 +102,7 @@ pub async fn list_workflows(
     let workflows: Vec<Workflow> = sqlx::query_as(&sql)
         .bind(organization_id)
         .bind(site_id)
+        .bind(project_id)
         .fetch_all(pool)
         .await?;
 
@@ -105,11 +142,36 @@ pub struct WorkflowUpdate {
 }
 
 /// Rewrite a workflow definition; `None` when the row is gone.
+///
+/// **The archive half of the read-only rule is here too**, for the reason
+/// [`insert_workflow`] gives in full: an archived project is *"read-only — no new runs, **no
+/// edits**"*, and the edit door was the one with no guard. The project's own row is read in the
+/// same transaction as the write (the workflow's `project_id` is a `not null` column, so it
+/// cannot be absent and cannot be resolved any other way), which is the check-then-write shape
+/// removed from the run path two slices ago.
 pub async fn update_workflow(
     pool: &PgPool,
     id: Uuid,
     update: WorkflowUpdate,
 ) -> Result<Option<Workflow>> {
+    let mut tx = pool.begin().await?;
+    // Read the project this workflow is in and ask the same question the create path asks. A
+    // workflow that does not exist resolves to `None` below exactly as it did before; asking
+    // about a project only after the row is known to exist would be two statements where one
+    // `select … left join` is both, and it cannot answer for a workflow that is not there.
+    let project_id: Option<Uuid> =
+        sqlx::query_scalar("select project_id from workflows where id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(project_id) = project_id {
+        // The **archive** guard only. `ensure_project_accepts_writes` would also refuse this
+        // rewrite because the project is over its workflow cap, and a cap is a statement about how
+        // many definitions may EXIST — refusing a rename because the number is already right would
+        // make an over-cap project uneditable as well as uncapped, which is not what `max_workflows`
+        // says anywhere. The create path is where the cap belongs.
+        crate::projects::ensure_project_is_writable(&mut tx, project_id).await?;
+    }
     let sql = format!(
         "update workflows set name = $2, description = $3, site_id = $4, enabled = $5, \
          trigger_kind = $6, schedule = $7, next_run_at = $8, steps = $9, trigger_event = $10, \
@@ -130,19 +192,41 @@ pub async fn update_workflow(
         .bind(update.steps)
         .bind(update.trigger_event)
         .bind(update.conditions)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
+
+    tx.commit().await?;
 
     Ok(workflow)
 }
 
 /// Remove a workflow and (through the schema) its executions.
+///
+/// **A delete is a write, and an archived project is read-only.** Removing the last workflow of
+/// an archived project is also the only way an operator could empty it without restoring it, which
+/// is why the guard is asked here and not only on the create and update doors: "keep their
+/// history" (the REQ's own words for archiving) is a promise about rows, and a delete is the
+/// action that breaks it.
 pub async fn delete_workflow(pool: &PgPool, id: Uuid) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let project_id: Option<Uuid> =
+        sqlx::query_scalar("select project_id from workflows where id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(project_id) = project_id {
+        // Archive only, and deliberately: deleting is the operator's way back UNDER a cap, so the
+        // cap here would make an over-quota project unrecoverable without a route nobody wrote.
+        // `a_delete_is_never_refused_by_the_workflow_cap` is the assertion that keeps this honest.
+        crate::projects::ensure_project_is_writable(&mut tx, project_id).await?;
+    }
     let removed = sqlx::query("delete from workflows where id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+
+    tx.commit().await?;
 
     Ok(removed > 0)
 }
@@ -227,6 +311,37 @@ pub async fn create_execution(
 /// The automation layer needs it: a match starts a run and advances the event cursor in ONE
 /// transaction, so a crash can never leave a cursor that skipped an event whose run never
 /// existed (and a replay can never start the same run twice).
+///
+/// **This is also the archive guard's only call site, and that placement is the point.** Every
+/// way a run starts — the manual route, the scheduler, the event matcher, a retry — passes
+/// through this one function, so "an archived project refuses new runs at the API boundary"
+/// (REQ-133) is a fact about the write rather than a promise each caller has to remember to
+/// keep. The check reads the project row in this transaction, so a run cannot slip between a
+/// read that said `active` and the insert: see [`crate::projects::ensure_run_allowed`].
+///
+/// **The limits guard is the second thing called here, and it belongs here for the same reason.**
+/// `ensure_run_within_limits` reads the day's counters and the in-flight executions; asking them
+/// through a pool would be a second connection reading what this transaction is about to change.
+/// A limit that is checked anywhere but inside the write it guards is a limit that counts a run
+/// before it exists — which, on a project one run below its cap, refuses the run that would have
+/// been the last one.
+///
+/// **The counter is written here for the same reason the guard is read here.** `record_usage_in`
+/// is the only writer of `automation_project_usage`, and for its whole life on this branch it had
+/// **no caller outside its own tests** — the thirteenth instance of the defect this module keeps
+/// meeting. Every guard read it, the screen rendered it, the notice sweep claimed on it, and the
+/// daily cap was therefore decided against a table nothing ever wrote: a project could run a
+/// hundred workflows a day under a cap of ten and never be refused, its limits bar sat at zero,
+/// its series was empty, and the CSV exported nothing. Not one of those checks could have told,
+/// because each of them asked the counter a question and the counter answered.
+///
+/// Placement is the whole of the fix. Counting here rather than at `settle_execution` is not a
+/// stylistic choice: the guard above reads the counter, so a counter written anywhere after the
+/// run completes counts *n+1* runs while the cap says *n* — a project would be allowed exactly
+/// its cap of runs and refused on the run after it, and "the cap is the cap" would be off by one
+/// in the direction that looks like an intermittent refusal. Counting where the guard reads it
+/// makes the two statements one transaction, so a run that was refused is never counted and a run
+/// that was counted is always counted once.
 pub async fn create_execution_in(
     connection: &mut sqlx::PgConnection,
     workflow: &Workflow,
@@ -234,6 +349,14 @@ pub async fn create_execution_in(
     triggered_by: Option<Uuid>,
     steps: &[StepDefinition],
 ) -> Result<(WorkflowExecution, Vec<WorkflowStep>)> {
+    crate::projects::ensure_run_allowed(connection, workflow.project_id).await?;
+    crate::limits::ensure_run_within_limits(connection, workflow.project_id).await?;
+    // **After the guard, before the insert.** The counter is the guard's own input, so it has to be
+    // written by the same transaction that read it: a run refused above must leave the day's count
+    // untouched, and a run allowed above must be counted before this transaction ends or the next
+    // caller re-reads a cap that has already spent one of its runs.
+    crate::limits::record_usage_in(connection, workflow.project_id, false, 0).await?;
+
     let execution_sql = format!(
         "insert into workflow_executions (workflow_id, organization_id, status, trigger_kind, \
          triggered_by) values ($1, $2, 'running', $3, $4) returning {}",
@@ -306,17 +429,34 @@ pub async fn list_event_rules<'e>(
     Ok(workflows)
 }
 
-/// The event-triggered workflows of a scope, for the automations surface.
-pub async fn list_event_workflows(
+/// The definitions a caller may see: organization, site, and an explicit set of projects.
+///
+/// This is the query a scoped list actually runs, and it is separate from [`list_workflows`]
+/// rather than a flag on it because the id set is a **closure that is already computed**: the
+/// caller asked `visible_project_ids` once and narrowed it. The alternative — a nullable
+/// `project_id = any($3)` where `null` means "no filter" — is a filter that silently stops
+/// applying the moment a variable is wrong, and the one place that must never silently stop is
+/// the scoping filter.
+///
+/// `project_ids` is `&[Uuid]`, so an empty slice is a real, answerable question ("which workflows
+/// are in none of the projects you can see?" → none) rather than an accident.
+pub async fn list_workflows_in_projects(
     pool: &PgPool,
     organization_id: Option<Uuid>,
     site_id: Option<Uuid>,
+    project_ids: &[Uuid],
 ) -> Result<Vec<Workflow>> {
+    if project_ids.is_empty() {
+        // Answered without a round trip, and the shortcut is safe precisely because the caller's
+        // set is already empty: there is no project in it, so no workflow in it either.
+        return Ok(Vec::new());
+    }
+
     let sql = format!(
         "select {} from workflows \
-         where trigger_kind = 'event' \
-           and ($1::uuid is null or organization_id = $1) \
+         where ($1::uuid is null or organization_id = $1) \
            and ($2::uuid is null or site_id = $2) \
+           and project_id = any($3) \
          order by created_at desc, id",
         workflow_columns()
     );
@@ -324,6 +464,38 @@ pub async fn list_event_workflows(
     let workflows: Vec<Workflow> = sqlx::query_as(&sql)
         .bind(organization_id)
         .bind(site_id)
+        .bind(project_ids)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(workflows)
+}
+
+/// The event-triggered workflows of a scope, for the automations surface.
+///
+/// Carries the project filter for the same reason as [`list_workflows`]: the automations list is
+/// a screen the project switcher scopes, and a rule in another project is not a rule this caller
+/// may run.
+pub async fn list_event_workflows(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+) -> Result<Vec<Workflow>> {
+    let sql = format!(
+        "select {} from workflows \
+         where trigger_kind = 'event' \
+           and ($1::uuid is null or organization_id = $1) \
+           and ($2::uuid is null or site_id = $2) \
+           and ($3::uuid is null or project_id = $3) \
+         order by created_at desc, id",
+        workflow_columns()
+    );
+
+    let workflows: Vec<Workflow> = sqlx::query_as(&sql)
+        .bind(organization_id)
+        .bind(site_id)
+        .bind(project_id)
         .fetch_all(pool)
         .await?;
 
@@ -534,6 +706,15 @@ pub async fn cancel_step(pool: &PgPool, step_id: Uuid) -> Result<()> {
 ///
 /// Answers `Some(status)` only for the call that actually settled the run, so the caller can
 /// audit a state change exactly once.
+///
+/// **The project's failure counter is written here, in the same statement's transaction, and
+/// that is the placement argument rather than a convenience.** `runs` is counted when the run
+/// starts (see `create_execution_in`) because the daily cap reads it there; `failures` can only
+/// be counted where the outcome is known, which is here. Splitting the two columns across the two
+/// places that can actually see their own number is the whole point — a single write at start time
+/// cannot know whether the run will fail, and a single write at settlement would count a run the
+/// cap never saw. The `where status = 'running'` in the update below is the once: a second caller
+/// that races this one matches no row, `settled` is 0, and the failure is not counted twice.
 pub async fn settle_execution(
     pool: &PgPool,
     execution_id: Uuid,
@@ -592,7 +773,36 @@ pub async fn settle_execution(
     .await?
     .rows_affected();
 
+    // The failure counter, taken only by the caller that actually settled the row. `settled > 0`
+    // is the once, not a defensive re-read: the update above matches a running row, so a second
+    // caller racing it sees zero rows and must not count. Only `Failed` counts — a cancelled run
+    // was a person's decision and a completed run has nothing to report.
+    if settled > 0 && status == ExecutionStatus::Failed {
+        if let Some(project_id) = execution_project_id(pool, execution_id).await? {
+            let mut connection = pool.acquire().await?;
+            crate::limits::count_failed_run_in(&mut connection, project_id).await?;
+        }
+    }
+
     Ok(if settled > 0 { Some(status) } else { None })
+}
+
+/// The project a run belongs to, read through its workflow.
+///
+/// `workflow_executions` carries `organization_id` but not `project_id`, and the two are not
+/// interchangeable: an organization holds many projects and the usage counters are per project, so
+/// the join is the only path to the right number. Returns `None` when the workflow is gone — a run
+/// whose workflow was deleted while it was still settling has no project to attribute, and
+/// inventing one would charge an unrelated project's counter.
+async fn execution_project_id(pool: &PgPool, execution_id: Uuid) -> Result<Option<Uuid>> {
+    sqlx::query_scalar(
+        "select w.project_id from workflow_executions e \
+         join workflows w on w.id = e.workflow_id where e.id = $1",
+    )
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(WorkflowError::from)
 }
 
 /// Cancel a running execution: the flag is the row's status, and every open step is closed.

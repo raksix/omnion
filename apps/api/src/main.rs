@@ -7,13 +7,15 @@
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
-use omnion_api::audit_retention;
+use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
     analytics_runner, automation_runner, backup_schedule_runner, backup_sweep_runner,
-    cdn_purge_runner, environment_clone_runner, event_retention_runner, event_runner,
-    notification_runner, restore_job_runner, retention_runner, search_runner, workflow_runner,
+    crm_autoresponder_runner, crm_sla_runner, event_retention_runner, event_runner,
+    notification_retention_runner, notification_runner, project_limit_runner,
+    restore_job_runner, search_runner,
+    workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -118,13 +120,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The event-retention sweeper ticks in this process too (REQ-016, slice 3), under its own
     // flag: it deletes history rather than sending it, so an installation that drains the
     // queue from a dedicated worker and not at all from the web nodes still wants retention
-    // where it is — and vice versa. The window is each organization's own, read inside the
+    // where it is — and vice versa.
+    // And so does the delivery-log sweeper (REQ-021, slice 7), for the same reason and with the
+    // same flag-of-its-own: `push::prune_deliveries` and `prune_stale` had zero call sites for
+    // their whole life, so the outbox screen has been publishing a 60-day window that nothing
+    // enforced since the day it shipped. The window is each organization's own
+    // (`organizations.notification_retention_days`), so one tenant's compliance policy never
+    // shortens another's log. The window is each organization's own, read inside the
     // delete, so one tenant's compliance policy never shortens another's history.
     if state.config().events.retention_enabled {
         let _sweeper = event_retention_runner::spawn(state.clone());
     } else {
         tracing::info!(
             "the event retention sweeper is disabled (OMNION_EVENT_RETENTION_RUNNER=false)"
+        );
+    }
+    if state.config().notification_retention.runner_enabled {
+        let _delivery_sweeper = notification_retention_runner::spawn(state.clone());
+    } else {
+        tracing::info!(
+            "the notification retention sweeper is disabled \
+             (OMNION_NOTIFICATION_RETENTION_RUNNER=false)"
         );
     }
 
@@ -198,29 +214,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("the analytics rollup worker is disabled (OMNION_ANALYTICS_RUNNER=false)");
     }
 
-    // The CDN purge worker drains the queue slice 2 added (REQ-011). It runs on the
-    // retention poll interval rather than a configuration of its own: a purge is an
-    // invalidation of something a visitor is about to see, so the queue must not sit
-    // still for minutes — and a second interval knob would be one more thing an operator
-    // sets to zero by accident.
-    let _purge_worker = cdn_purge_runner::spawn(state.clone());
-
-    // The staging clone worker (REQ-017): it is what makes "clone" mean something after the
-    // request returns. Unconditional, like the purge worker, because an environment that sits in
-    // `cloning` with nobody filling it is a state the list screen has to render and the operator
-    // has no way out of except a retry that also needs a worker.
-    let _clone_worker = environment_clone_runner::spawn(state.clone());
-
-    // The audit retention sweep applies each tenant's own stored window, unattended
-    // (REQ-005, slice 4): the number an operator typed into the Settings tab is enforced by
-    // the platform, so the trail holds what that tenant said it should hold — and no more.
-    if state.config().audit_retention.sweep_enabled {
-        let _sweeper = audit_retention::spawn(state.clone());
+    // The autoresponder worker (REQ-117, slice 3) sends the acknowledgements whose configured
+    // send delay has elapsed. A source that sets a delay relies on this worker: the slot was
+    // reserved at capture, and without the sweep the reservation is a promise with no clock
+    // behind it — the reply simply never goes out, on exactly the sources that asked for it
+    // to wait.
+    if state.config().crm_autoresponder.runner_enabled {
+        let _autoresponder = crm_autoresponder_runner::spawn(state.clone());
     } else {
         tracing::info!(
-            "the audit retention sweep is disabled (OMNION_AUDIT_RETENTION_SWEEP=false)"
+            "the crm autoresponder worker is disabled (OMNION_CRM_AUTORESPONDER_RUNNER=false)"
         );
     }
+
+    // The SLA worker (REQ-117, slice 3) escalates the leads whose first-response deadline has
+    // passed and reminds the owners of the ones about to. Until this existed, the store read
+    // `due_breaches` and nothing called it: the panel computed a `breached` state that no
+    // timer ever acted on, so a policy with a 60-minute target was a number in a column rather
+    // than an escalation. The reminder is the half that had *no* reader at all — the column
+    // existed and the editor rendered it, which is exactly what makes a missing worker hard to
+    // notice: every screen said the reminder was configured and nothing said it was not running.
+    if state.config().crm_sla.runner_enabled {
+        let _sla = crm_sla_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the crm sla worker is disabled (OMNION_CRM_SLA_RUNNER=false)");
+    }
+
+    // The project limit notice worker (REQ-133, slice 4) emits
+    // `automation.project.limit.warning` and `.limit_exceeded` exactly once per limit per period.
+    // Everything about the limits already worked -- the screen drew the amber bar and the engine
+    // refused the over-quota run by name -- but the REQ's two events were emitted by nothing, and
+    // the warning a client saw was computed per read, so reloading re-warned for ever. The
+    // once-ness is a claim row rather than a property of this process, so a second API node
+    // sweeping the same database cannot double-notify.
+    if state.config().project_limit.runner_enabled {
+        let _project_limit = project_limit_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the project limit worker is disabled (OMNION_PROJECT_LIMIT_RUNNER=false)");
+    }
+
     // The rate-limit document is read here, once, and handed to the layer the router is about to
     // install (REQ-012, slice 3). Reading it per request would make every request's cost depend on
     // the database, which is how a settings screen turns into an outage; reading it here and
@@ -233,15 +265,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // reach `state` after `router(state)` has taken the original by value.
     let state_for_runners = state.clone();
     let app = routes::router(state);
-
-    // The API Explorer dispatches *through this router* rather than building one of its own
-    // (REQ-033, slice 2). Two routers would mean two header layers, two limiters and two IP
-    // access lists fighting over the same process-wide `OnceLock`s, and the second install
-    // would be silently ignored — so the Explorer would either run under the wrong policy or
-    // under none. The one built above is the whole application, layers included, which is
-    // exactly what "run the call as the signed-in caller" requires.
-    omnion_api::routes::explorer::install_router(app.clone());
-
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

@@ -52,7 +52,7 @@ in_use() {
   return 1
 }
 
-# Is a QA pass running against the worktree that owns this target directory?
+# Is a QA pass running against the worktree that owns this tmpfs target?
 #
 # `in_use` alone was not enough, and this function exists because of the day it was not. A
 # stack's build runs in its own wrapper process (`qa-pass.sh` → `cargo build`), which **exits**
@@ -62,32 +62,11 @@ in_use() {
 # that was a minute from using it. The honest test is not "is somebody building right now" but
 # "is anybody at all still working in that worktree", and a live process with its cwd in the
 # worktree is the cheapest honest answer.
-#
-# The worktree is found two ways, and the second one was missing for a long time:
-#
-#   - by **name**, for the tmpfs convention: `/dev/shm/omnion-w2-target` → `omnion-w2`;
-#   - by **parent**, for a worktree's own `target/`, whose basename is the useless literal
-#     `target` and which therefore derived the name `omnion-target` — a directory that does not
-#     exist. So for every default-target build on this box, `worktree_busy` scanned two
-#     non-existent paths, found nothing, and reported "idle" while rustc was mid-compile. That
-#     is what let the ceiling above delete a live build: the guard's own liveness test was
-#     structurally incapable of seeing the most common build shape there is.
-#
-# The parent rule is asked first and is the authoritative one, because the directory holding the
-# target is the worktree by construction — no name convention, no guessing. A `.git` marker is
-# what separates a worktree from an arbitrary directory that happens to contain `target/`.
 worktree_busy() {
-  local dir="$1" token wt parent p
-  parent="$(dirname "$dir")"
-  if [ -e "$parent/.git" ]; then
-    for p in /proc/[0-9]*; do
-      [ "$(readlink "$p/cwd" 2>/dev/null)" = "$parent" ] && return 0
-    done
-  fi
+  local dir="$1" token wt p
   token="$(basename "$dir")"; token="${token%-target}"; token="${token#omnion-}"
-  for wt in "$ROOT/omnion-$token" "$ROOT/omnion"; do
+  for wt in "$ROOT"/omnion-$token "$ROOT"/omnion; do
     [ -d "$wt" ] || continue
-    [ "$wt" = "$parent" ] && continue   # already answered above
     for p in /proc/[0-9]*; do
       [ "$(readlink "$p/cwd" 2>/dev/null)" = "$wt" ] && return 0
     done
@@ -104,22 +83,9 @@ reclaimable() {
 }
 
 # 1. incremental compilation cache is pure speed — always safe, do it first
-#
-# "Always safe" was true of a *finished* build. A rustc that is mid-compile keeps its own
-# incremental state under this directory, and step 4 below has just proved the harder version of
-# the point: a directory removed underneath a running build fails with `os error 2` on whatever
-# crate it happened to be writing. Reclaiming speed from a build that is still running buys
-# nothing — the space comes back the moment the build ends. The same `reclaimable` test applies,
-# for the same reason: a build using the default `target/` sets no `CARGO_TARGET_DIR` and is
-# visible only through `worktree_busy`.
 freed=0
 for inc in "$ROOT"/omnion*/target/debug/incremental; do
   [ -d "$inc" ] || continue
-  # The guard takes a target/ directory, not the incremental subdirectory.
-  t="$(dirname "$(dirname "$inc")")"
-  if ! reclaimable "$t"; then
-    continue
-  fi
   m=$(dir_mb "$inc")
   if [ "$m" -gt 300 ]; then
     say "drop incremental ${m}M: $(dirname "$(dirname "$inc")")"
@@ -151,35 +117,11 @@ for art in "$ROOT"/omnion*/qa-artifacts; do
 done
 
 # 4. per-worktree ceiling: never let one target/ grow past the cap
-#
-# The ceiling test is `reclaimable`, not the size alone, and this line is where a build died.
-#
-# What happened: a worktree built with the **default** target directory — no `CARGO_TARGET_DIR`
-# in its environment, which is what every plain `cargo test` does — sat over the cap while
-# rustc was mid-compile, and this loop removed the directory. rustc then failed writing three
-# object files with `No such file or directory (os error 2)`, on a crate three levels from
-# anything anybody was editing, which reads like a broken dependency rather than a deleted
-# directory. Step 5 already had this exact `in_use` guard and this step did not, so the two
-# cliffs disagreed about whether a build in progress is a victim.
-#
-# `in_use` alone would not have saved it either: it matches `CARGO_TARGET_DIR` out of a
-# process's environment, and a build that never set that variable is invisible to it by
-# construction. `worktree_busy` is the half that sees those builds — a live process whose cwd is
-# the worktree owns the build, whether or not it named a target directory. So both halves are
-# required, which is exactly what `reclaimable` is; using the size alone is what deleted a
-# compile that was four minutes from finishing.
 for t in "$ROOT"/omnion*/target; do
   [ -d "$t" ] || continue
   m=$(dir_mb "$t")
   if [ "$m" -gt "$MAX_MB" ]; then
     w="$(dirname "$t")"
-    # Over the ceiling but somebody is building in it: say so and leave it alone. A silent skip
-    # is how the ceiling stops being enforced without anybody noticing; the next run, after the
-    # build ends, drops it as intended.
-    if ! reclaimable "$t"; then
-      say "target ${m}M over the ${MAX_MB}M ceiling — kept, $(basename "$w") is building in it"
-      continue
-    fi
     say "target ${m}M over the ${MAX_MB}M ceiling — dropping: $(basename "$w")"
     freed=$((freed + m)); rm -rf "$t"
   fi

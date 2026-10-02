@@ -363,9 +363,7 @@ fn channels_without_transport() -> Vec<&'static str> {
     CHANNELS
         .iter()
         .copied()
-        .filter(|channel| {
-            *channel != crate::preferences::IN_APP && !QUEUEABLE.contains(channel)
-        })
+        .filter(|channel| *channel != crate::preferences::IN_APP && !QUEUEABLE.contains(channel))
         .collect()
 }
 
@@ -465,8 +463,15 @@ pub async fn settle_not_ready(pool: &PgPool, lease_seconds: f64) -> Result<u64> 
     // asks "does *anybody* have e-mail switched on" and settles org B's row as "not
     // configured" whenever org A has a mail transport. One customer configuring a channel would
     // then silently stop delivery for every other customer who had it.
+    // **`settled_at` here too, and it is the one this statement could most easily have missed:**
+    // the row leaves `pending` without ever reaching `mark_sent` or `mark_failed`, so a settle
+    // instant stamped only in those two functions would leave this population — every channel a
+    // tenant never switched on — on the enqueue clock for ever. Retention falls back to
+    // `created_at` for such a row, which happens to be right for a born-skipped row, so the
+    // omission was harmless *today* and would have become a bug the moment the fallback changed.
     let result: PgQueryResult = sqlx::query(
-        "update notification_deliveries d set status = 'skipped', claimed_at = null, \
+        "update notification_deliveries d set status = 'skipped', settled_at = now(), \
+             claimed_at = null, \
              error = 'no organization on this platform has this channel switched on' \
          from notifications n \
          where n.id = d.notification_id \
@@ -524,10 +529,7 @@ pub async fn claim_due(pool: &PgPool, batch: i64, lease_seconds: f64) -> Result<
                left join webhook_endpoints w on w.id = c.endpoint_id and w.enabled \
                where d.id = any ($1) \
                order by d.next_attempt_at asc, d.created_at asc";
-    let rows: Vec<ClaimedRow> = sqlx::query_as(sql)
-        .bind(claimed)
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<ClaimedRow> = sqlx::query_as(sql).bind(claimed).fetch_all(pool).await?;
     let mut jobs: Vec<DeliveryJob> = rows.into_iter().map(DeliveryJob::from_row).collect();
 
     attach_push_targets(pool, &mut jobs).await?;
@@ -610,8 +612,16 @@ struct ReaderTarget {
 
 /// Record that a transport accepted the delivery.
 pub async fn mark_sent(pool: &PgPool, id: Uuid, response_status: Option<i32>) -> Result<u64> {
+    // **The settle instant is stamped here and not by the sweep.** `settled_at` exists because
+    // retention used to judge a row by `created_at`, which is written once by `enqueue` and
+    // never updated: a delivery queued on day 1 and settled on day 59 was swept on day 60 "for
+    // being sixty days old", so the history of a row that spent a month retrying disappeared
+    // the day after it finally arrived. `sent_at` already held this instant and is kept for the
+    // outbox's own read; `settled_at` is the column the *retention predicate* uses, and a
+    // second timestamp is cheaper than a predicate that has to know which of the two writers
+    // last touched a row.
     let result: PgQueryResult = sqlx::query(
-        "update notification_deliveries set status = 'sent', sent_at = now(), \
+        "update notification_deliveries set status = 'sent', sent_at = now(), settled_at = now(), \
              response_status = $2, error = null, claimed_at = null \
          where id = $1 and status = 'pending'",
     )
@@ -656,9 +666,15 @@ pub async fn mark_failed(
     response_status: Option<i32>,
     error: &str,
 ) -> Result<u64> {
+    // **`settled_at` on the failure is the half the old predicate could not reach.** It read
+    // `status in ('sent', 'skipped')`, so a `failed` row — the one an administrator opens the
+    // outbox to find, and the one a support conversation is about — was never swept at all: the
+    // failure log grew without bound precisely because it was the log people cared about. The
+    // sweep no longer keeps a status list, so this column is what puts a failed row on the same
+    // clock as a delivered one.
     let result: PgQueryResult = sqlx::query(
-        "update notification_deliveries set status = 'failed', response_status = $2, \
-             error = $3, claimed_at = null \
+        "update notification_deliveries set status = 'failed', settled_at = now(), \
+             response_status = $2, error = $3, claimed_at = null \
          where id = $1 and status = 'pending'",
     )
     .bind(id)
@@ -731,10 +747,7 @@ impl TransportOutcome {
     #[must_use]
     pub fn with_pruned(self, pruned: Vec<PrunedSubscription>) -> Self {
         match self {
-            Self::Accepted { status, .. } => Self::Accepted {
-                status,
-                pruned,
-            },
+            Self::Accepted { status, .. } => Self::Accepted { status, pruned },
             Self::Failed { status, reason, .. } => Self::Failed {
                 status,
                 reason,
@@ -1191,8 +1204,8 @@ mod tests {
         assert!(built.is_accepted());
 
         // The failed arm keeps its sentence, which is the column the outbox renders.
-        let built = TransportOutcome::failed(Some(500), "the service answered 500")
-            .with_pruned(Vec::new());
+        let built =
+            TransportOutcome::failed(Some(500), "the service answered 500").with_pruned(Vec::new());
         match built {
             TransportOutcome::Failed { reason, .. } => {
                 assert_eq!(reason, "the service answered 500");

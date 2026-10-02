@@ -1,6 +1,6 @@
 # REQ-035 — Edge / Multi-region
 
-> **Status:** in-progress (slice 1) — the region registry, the health checker with history and the two read screens are shipped and verified; the remaining three slices (residency, routing+failover, migration) are untouched. Two defects were found by RUNNING the pass rather than by reading the code: a fixture whose sibling CTEs shared one snapshot wrote zero permissions and zero bindings while exiting 0, and `traffic_share` was read as `Option<String>` from a `numeric(5,2)` column so every list call answered 503 while all twelve unit tests stayed green. **Captured:** 2026-09-25 · **Layer:** platform / infra · **Captured:** 2026-09-25 · **Layer:** platform / infra
+> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** platform / infra
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -143,11 +143,11 @@ Audit: region status changes, routing policy replacements (with before/after dif
 
 ### Acceptance criteria
 
-- [x] The registry lists seeded regions with status, endpoints and storage labels, and every read works on a single-region deployment with multi-region actions disabled and explained. **Proved:** `GET /api/v1/regions` returns 200 with the three seeded regions (`tr-ankara` default/100.00, `eu-frankfurt`, `us-virginia`), each carrying status, endpoints, storage bucket and cache namespace; the live screen renders all three from it.
-- [x] Exactly one region is the default, enforced at both database and API level. **Proved:** `exactly_one_region_is_default_and_the_database_refuses_a_second` — a unique index rejects a second default at the database and the API refuses it too.
-- [x] Health checks cover all seven services per region, and a stopped service flips the region to `degraded` within the configured threshold. **Proved:** `a_stopping_service_moves_the_region_within_the_threshold`; the screen renders a badge per service from the same seven-name list.
-- [x] The health matrix renders history, and a region with no recent checks shows `Unknown` rather than green. **Proved:** `a_region_with_no_health_data_is_unknown_and_never_green`; the panel's `Unknown` tone and the QA claim `everyServiceBadgeRendersAWord`.
-- [x] The latency matrix shows p95 values with a timestamp, and data older than the refresh window is visibly marked as stale. **Proved:** the grid renders numeric p95 with a `measured at` stamp (`regions-latency-measured`) and a stale marker (`regions-stale-warning`) rather than colour alone; the QA claim `aMatrixThatRendersAlsoSaysWhenItMeasured` refuses a matrix with no timestamp.
+- [ ] The registry lists seeded regions with status, endpoints and storage labels, and every read works on a single-region deployment with multi-region actions disabled and explained.
+- [ ] Exactly one region is the default, enforced at both database and API level.
+- [ ] Health checks cover all seven services per region, and a stopped service flips the region to `degraded` within the configured threshold.
+- [ ] The health matrix renders history, and a region with no recent checks shows `Unknown` rather than green.
+- [ ] The latency matrix shows p95 values with a timestamp, and data older than the refresh window is visibly marked as stale.
 - [ ] Routing rules reject duplicate priorities, missing matches, unknown target regions and disabled targets with field-level messages.
 - [ ] `Simulate` returns a region and the matched rule for country, host-suffix and path-prefix inputs, and falls back to the default region when nothing matches.
 - [ ] Policy writes are atomic: a rejected replacement leaves the previous policy intact when fetched afterwards.

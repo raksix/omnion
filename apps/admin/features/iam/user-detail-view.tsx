@@ -25,7 +25,6 @@ import {
   fetchIamBindings,
   fetchIamFactors,
   fetchIamUser,
-  fetchOrganizations,
   fetchPasskeys,
   fetchRoles,
   fetchSites,
@@ -43,13 +42,7 @@ import {
 } from "@/lib/api";
 import { ceremonyMessage, createPasskey, passkeysSupported } from "@/lib/webauthn";
 import { StepUpPrompt } from "@/features/iam/step-up-prompt";
-import {
-  TenantPicker,
-  isTenantRequired,
-  tenantMissingReason,
-  tenantRequiredMessage,
-} from "@/components/tenant-picker";
-import type { Organization, Site } from "@/lib/types";
+import type { Site } from "@/lib/types";
 
 type Tab = "profile" | "bindings" | "effective" | "factors";
 
@@ -99,17 +92,6 @@ export function UserDetailView({ userId }: { userId: string }) {
   const [scopeModule, setScopeModule] = useState("");
   const [scopeResource, setScopeResource] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
-  /**
-   * The tenant a binding is made in, for an account that has none of its own.
-   *
-   * The subject's own organization is the right answer for everybody else and is used
-   * automatically; this is the only way a platform account can say *where* a grant applies.
-   * Without it, binding a role to a platform account at organization scope posts
-   * `organization_id: null` and the API answers `400 organization_required` — a sentence about
-   * a field the form does not have.
-   */
-  const [bindingOrganizationId, setBindingOrganizationId] = useState<string>("");
-  const [organizations, setOrganizations] = useState<Organization[]>([]);
   // Second factors (REQ-006, slice 3).
   const [factors, setFactors] = useState<IamFactorList | null>(null);
   const [factorLabel, setFactorLabel] = useState("Authenticator app");
@@ -158,16 +140,6 @@ export function UserDetailView({ userId }: { userId: string }) {
   useEffect(() => {
     void load();
   }, [load]);
-
-  // The tenants a grant can be made in. Loaded for every account, because a subject that has
-  // one of its own uses it implicitly while an operator still has to be able to read what the
-  // picker would have offered — and a control that appears only in one case is a control whose
-  // absence silently means "this is normal" in the other.
-  useEffect(() => {
-    void fetchOrganizations()
-      .then(setOrganizations)
-      .catch(() => setOrganizations([]));
-  }, []);
 
   useEffect(() => {
     if (!detail) return;
@@ -362,19 +334,6 @@ export function UserDetailView({ userId }: { userId: string }) {
 
   const addBinding = async () => {
     if (!newRoleId || !detail) return;
-    // The tenant the grant is made in: the subject's own when it has one, otherwise the one
-    // this form picked. `global` scope carries no tenant at all — it is the scope where
-    // "no organization" is the *point*, so it must not be refused for lacking one.
-    const needsTenant = scopeType !== "global";
-    const organizationId = detail.user.organization_id ?? (bindingOrganizationId || null);
-    if (needsTenant && !organizationId) {
-      setError({
-        code: "organization_required",
-        message:
-          "This account works platform-wide, so it has no tenant of its own. Choose the organization the grant applies to.",
-      });
-      return;
-    }
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -384,7 +343,7 @@ export function UserDetailView({ userId }: { userId: string }) {
         subjectId: userId,
         roleId: newRoleId,
         scopeType,
-        organizationId: scopeType === "global" ? null : organizationId,
+        organizationId: scopeType === "global" ? null : detail.user.organization_id,
         siteId: scopeType === "site" ? scopeSite : null,
         department: scopeType === "department" ? scopeDepartment : undefined,
         module: scopeType === "module" ? scopeModule : undefined,
@@ -397,12 +356,6 @@ export function UserDetailView({ userId }: { userId: string }) {
       setExpiresAt("");
       await load();
     } catch (cause) {
-      // The API's own refusal, rendered as guidance rather than as a sentence about a field
-      // this form used not to have.
-      if (isTenantRequired(cause)) {
-        setError({ code: "organization_required", message: tenantRequiredMessage(cause)! });
-        return;
-      }
       setError(
         cause instanceof ApiError
           ? { code: cause.code, message: cause.message }
@@ -628,26 +581,6 @@ export function UserDetailView({ userId }: { userId: string }) {
                   className="h-9 rounded-lg border border-line bg-surface px-2 text-[13px] text-ink outline-none focus:border-accent focus:ring-2 focus:ring-accent/15"
                 />
               </label>
-              {/*
-               * The tenant a non-global grant is made in. Rendered for a subject that has no
-               * organization of its own — a platform account — because for everybody else the
-               * subject's own tenant is the only correct answer and asking would be noise. In
-               * `global` scope there is deliberately nothing: "no tenant" is what that scope
-               * *means*, and a picker there would invite a reader to narrow a grant that is
-               *meant* to be platform-wide.
-               */}
-              {detail && detail.user.organization_id === null && scopeType !== "global" ? (
-                <div className="sm:col-span-2">
-                  <TenantPicker
-                    platformAccount
-                    organizations={organizations}
-                    value={bindingOrganizationId || null}
-                    onChange={setBindingOrganizationId}
-                    testId="user-binding-organization"
-                    label="Grant applies to"
-                  />
-                </div>
-              ) : null}
               {scopeType === "site" ? (
                 <label className="flex flex-col gap-1.5">
                   <span className="text-[12.5px] font-medium text-ink">Site</span>

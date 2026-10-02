@@ -184,6 +184,14 @@ pub struct Workflow {
     pub id: Uuid,
     /// Organization that owns the workflow.
     pub organization_id: Uuid,
+    /// Project the workflow lives in (REQ-133).
+    ///
+    /// Not optional anywhere in the code, because 0164 made the column `not null`: a caller that
+    /// asks for a workflow without saying which project is answered with the organization's
+    /// default by [`crate::projects::resolve_target`], so "unassigned" is not a state this type
+    /// can represent — and a type that cannot represent it is a type the write path cannot
+    /// accidentally produce.
+    pub project_id: Uuid,
     /// Site the workflow belongs to, when it is site-scoped.
     pub site_id: Option<Uuid>,
     /// Display name.
@@ -235,15 +243,23 @@ impl Workflow {
 }
 
 /// Columns of `workflows`, in the order [`Workflow`] expects.
-pub const WORKFLOW_COLUMNS: &str = "id, organization_id, site_id, name, description, enabled, \
-     trigger_kind, schedule, trigger_event, conditions, next_run_at, steps, last_triggered_at, \
-     trigger_count, created_by, created_at, updated_at";
+pub const WORKFLOW_COLUMNS: &str = "id, organization_id, project_id, site_id, name, description, \
+     enabled, trigger_kind, schedule, trigger_event, conditions, next_run_at, steps, \
+     last_triggered_at, trigger_count, created_by, created_at, updated_at";
 
 /// A definition row to be written.
 #[derive(Debug, Clone)]
 pub struct NewWorkflow {
     /// Organization that owns the workflow.
     pub organization_id: Uuid,
+    /// Project the workflow lands in.
+    ///
+    /// A resolved [`crate::projects::Project`], never an `Option<Uuid>`: the alternative is a
+    /// nullable write, and a nullable write against a `not null` column is a runtime 23502 on the
+    /// feature's most basic path. [`crate::projects::resolve_target`] is the one function that
+    /// turns "the caller did not say" into "the organization's default", so this field is the
+    /// place that decision has already been made by.
+    pub project_id: Uuid,
     /// Optional site scope.
     pub site_id: Option<Uuid>,
     /// Display name.

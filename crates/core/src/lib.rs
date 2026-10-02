@@ -21,7 +21,7 @@ pub mod telemetry;
 pub mod vapid;
 
 pub use config::{Config, WorkflowConfig};
-pub use db::{Db, MigrationStatus};
+pub use db::{migration_flags, Db, MigrationStatus};
 pub use error::{ConfigError, CoreError, Result};
 pub use redis_client::RedisClient;
 pub use telemetry::Telemetry;

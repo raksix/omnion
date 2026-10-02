@@ -5,30 +5,6 @@
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
 import type {
-  ApiKey,
-  ApiKeyDetail,
-  ApiKeysResponse,
-  ApiRequestLog,
-  ApiRequestLogPage,
-  MintedApiKey,
-  MintedOAuthApp,
-  OAuthAppDetailResponse,
-  OAuthAppsResponse,
-  OAuthGrant,
-  CdnAdapterInfo,
-  CdnCacheRule,
-  CdnCacheRuleInput,
-  CdnRulesResponse,
-  CdnAdapter,
-  CdnProviderProbe,
-  CdnPurge,
-  CdnPurgeDetail,
-  CdnPurgeFilters,
-  CdnPurgeInput,
-  CdnPurgePage,
-  CdnSettings,
-  CdnSettingsInput,
-  CdnStatus,
   SecurityBulkResult,
   SecurityFinding,
   SecurityFindingFilter,
@@ -71,39 +47,15 @@ import type {
   SignInProtectionDocument,
   SignInProtectionSave,
   SignInProtectionSaved,
-  DeploymentAvailability,
-  DeploymentCheckRow,
-  DeploymentCheckRunResponse,
-  DeploymentChecksResponse,
-  DeploymentEnvironmentCard,
-  DeploymentEnvironmentDetail,
-  DeploymentEnvironmentsResponse,
-  DeploymentHistoryFilters,
-  DeploymentCancelResponse,
-  DeploymentHistoryResponse,
-  DeploymentJobResponse,
-  DeploymentLogChunk,
-  DeploymentMaintenanceResponse,
-  DeploymentMaintenanceWindow,
-  DeploymentPreflight,
-  DeploymentRollbackResponse,
-  DeploymentHistoryRow,
-  DeploymentRelease,
-  DeploymentReleaseDetail,
-  DeploymentReleasesResponse,
-  DeploymentRollbackOffer,
-  DeploymentStep,
-  DeploymentVersion,
-  ClusterMetric,
-  ClusterRestartResponse,
-  ClusterSampleRunResponse,
-  ClusterSamplesResponse,
-  ClusterSparkline,
-  ClusterWorkload,
-  DeploymentClusterResponse,
-  DeploymentProcessCard,
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
+  Project,
+  ProjectAudit,
+  ProjectLimits,
+  ProjectLimitsSave,
+  ProjectMember,
+  ProjectRole,
+  ProjectSwitcher,
   WebhookEndpoint,
   WebhookList,
   WebhookRedeliverBatch,
@@ -112,21 +64,6 @@ import type {
   WebhookTestReport,
   CreatedMediaShare,
   EventCatalogue,
-  DeviceLookup,
-  RegionDetail,
-  RegionHealthMatrix,
-  RegionLatencyMatrix,
-  RegionOverview,
-  RegionPatchInput,
-  RegionPatchResponse,
-  DeviceStart,
-  ManifestReport,
-  ScaffoldList,
-  ScaffoldRecord,
-  ScaffoldTree,
-  SdkKind,
-  SdkTarget,
-  SdkTemplate,
   EventFilters,
   EventPage,
   RetentionStatus,
@@ -195,6 +132,7 @@ import type {
   NotificationPreferencesSaved,
   NotificationPushKey,
   NotificationPushOutcome,
+  NotificationRetention,
   NotificationRouteReport,
   NotificationRouteRule,
   NotificationRow,
@@ -202,21 +140,8 @@ import type {
   NotificationSummary,
   Site,
   User,
-  // Staging environments (REQ-017).
-  Environment,
-  EnvironmentCloneJob,
-  EnvironmentDetailResponse,
-  EnvironmentFilters,
-  EnvironmentListResponse,
-  // Promotions (REQ-017, slice 3).
-  ChangeSetResponse,
-  Promotion,
-  PromotionDetail,
-  PromotionRequested,
-  ExplorerOperations,
-  ExplorerRun,
-  ExplorerRunInput,
 } from "./types";
+import type { MoveReport, Workflow } from "./types";
 // The portal's own shapes live in their own module rather than in `types.ts`, because they come
 // with a *rule* attached (only `IssuedDeveloperKey` may hold a token) that is worth reading
 // next to the type itself rather than one of two hundred lines of a shared list.
@@ -358,7 +283,15 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+/**
+ * The one request every client function goes through.
+ *
+ * Exported for the module clients that live in their own files (`crm-intake-api.ts`): a second
+ * copy of this would produce a second `ApiError` class, and a screen that catches `ApiError`
+ * from here would not catch that one — an error state that silently never renders is worse
+ * than a duplicated function.
+ */
+export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
@@ -391,105 +324,6 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
 
   return payload as T;
-}
-
-/**
- * Download a CSV endpoint as a file.
- *
- * A separate function rather than a `format=csv` flag on the JSON caller, because the two cannot
- * share a body parser: the JSON path runs every response through `readJson`, which turns a CSV
- * into `null` and a `Blob` into a promise that never resolves. The error path *is* shared — a
- * refusal is JSON whatever the request asked for, so the caller still gets the API's own code and
- * message rather than a failed download.
- */
-export async function downloadCsv(
-  path: string,
-  filename: string,
-): Promise<{ filename: string; rows: number }> {
-  let response: Response;
-  try {
-    response = await fetch(path, { credentials: "same-origin", headers: { accept: "text/csv" } });
-  } catch {
-    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
-  }
-
-  if (!response.ok) {
-    const body = (await readJson(response)) as ErrorBody;
-    throw new ApiError(
-      response.status,
-      body.error?.code ?? "unknown_error",
-      body.error?.message ?? `The API answered with status ${response.status}.`,
-      body.error?.details ?? null,
-    );
-  }
-
-  const text = await response.text();
-  const url = URL.createObjectURL(new Blob([text], { type: "text/csv;charset=utf-8" }));
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.click();
-  // Revoked on the next tick rather than immediately: Firefox cancels an in-flight download whose
-  // URL disappears in the same task, and the file then lands empty.
-  setTimeout(() => URL.revokeObjectURL(url), 0);
-
-  return {
-    filename,
-    rows: text.split("\n").filter((line) => line.trim() !== "").length - 1,
-  };
-}
-
-/** One row of the Audit tab. */
-export type OrganizationAuditEntry = {
-  id: number;
-  action: string;
-  actor_type: string;
-  actor_user_id: string | null;
-  /** Display name of the actor, resolved server-side so the feed needs no second request. */
-  actor_name: string | null;
-  target_type: string | null;
-  target_id: string | null;
-  metadata: unknown;
-  ip_address: string | null;
-  created_at: string;
-};
-
-/** The Audit tab's payload: the rows, the filter's choices and the filtered count. */
-export type OrganizationAuditPayload = {
-  organization_id: string;
-  entries: OrganizationAuditEntry[];
-  actions: string[];
-  total: number;
-};
-
-/** The audit filters the tab offers. Empty strings mean "no filter", not "matches nothing". */
-export type OrganizationAuditFilters = {
-  action?: string;
-  actor?: string;
-  since?: string;
-};
-
-/**
- * Read one organization's audit trail.
- *
- * The action list comes back with the rows on purpose: the filter then offers what this tenant
- * has actually done, and cannot drift from the platform as actions are added.
- */
-export async function fetchOrganizationAudit(
-  organizationId: string,
-  filters: OrganizationAuditFilters = {},
-): Promise<OrganizationAuditPayload> {
-  const params = new URLSearchParams();
-  if (filters.action) params.set("action", filters.action);
-  if (filters.actor) params.set("actor", filters.actor);
-  // The date input speaks `YYYY-MM-DD`; the API speaks RFC 3339. Converting here keeps the
-  // server's parser strict — a half-understood date is a filter that quietly matches nothing.
-  if (filters.since) params.set("since", `${filters.since}T00:00:00Z`);
-  const query = params.toString();
-
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/audit${query ? `?${query}` : ""}`,
-  );
 }
 
 /** What a password check answered: a session, or the second factor it still needs. */
@@ -626,35 +460,333 @@ export async function fetchOrganizations(): Promise<Organization[]> {
   return body.organizations;
 }
 
-/** One tenant in full. */
-export function fetchOrganization(organizationId: string): Promise<Organization> {
-  return request<Organization>(`/api/v1/organizations/${encodeURIComponent(organizationId)}`);
+// -- Automation projects (REQ-133, slice 1) ------------------------------------------------
+//
+// Every function here narrows nothing on the caller's behalf: the API is the only place that
+// knows which projects an account may see, and a client-side filter over a list that is
+// already scoped is how the two drift. `mine: true` is the switcher's own question, and it is
+// asked of the server rather than answered here.
+
+/**
+ * The switcher's list (REQ-133, acceptance 3).
+ *
+ * Its own endpoint rather than a filter over `fetchProjects`, and the reason is in the server's
+ * comment: the recents ranking, the caller's per-row role and the stored selection are three
+ * answers `/api/v1/projects` does not carry, so a client-side filter would have had to reconstruct
+ * all three — and would have drifted the first time an instance administrator opened it.
+ */
+export async function fetchProjectSwitcher(
+  organizationId?: string,
+  linkedProjectId?: string | null,
+): Promise<ProjectSwitcher> {
+  const query = new URLSearchParams({ mine: "1" });
+  if (organizationId) query.set("organization_id", organizationId);
+  // The shared link's project travels with the request so the SERVER can say whether this person
+  // may see it. Deciding visibility in the browser would mean comparing an id against a list the
+  // browser already has, which is a second answer to a question the store answers once.
+  if (linkedProjectId) query.set("project", linkedProjectId);
+  return request<ProjectSwitcher>(`/api/v1/projects/switcher?${query.toString()}`);
 }
 
-/** Open a new tenant — `POST /api/v1/organizations` (platform accounts only). */
-export function createOrganization(input: { name: string; slug: string }): Promise<Organization> {
-  return request<Organization>("/api/v1/organizations", {
+/**
+ * Switch into a project, or — with `null` — into "All projects".
+ *
+ * One POST for both directions, so the panel cannot get the two out of step by forgetting the
+ * clear. A project the caller may not see answers `404` like every other project read, and
+ * `request` raises it as a normal error rather than as something the panel has to special-case.
+ */
+export function selectProject(
+  projectId: string | null,
+  organizationId?: string,
+  linkedProjectId?: string | null,
+): Promise<ProjectSwitcher> {
+  const query = new URLSearchParams();
+  if (organizationId) query.set("organization_id", organizationId);
+  // Sent on the write as well as the read, so both handlers resolve the link through ONE function.
+  // Two handlers each deciding for themselves is how the button and the address bar disagree.
+  if (linkedProjectId) query.set("project", linkedProjectId);
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return request<ProjectSwitcher>(`/api/v1/projects/switcher${suffix}`, {
+    method: "POST",
+    body: JSON.stringify({ project_id: projectId }),
+  });
+}
+
+/** The projects the caller may see, in the API's own order. */
+export async function fetchProjects(organizationId?: string): Promise<Project[]> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  const body = await request<{ projects: Project[] }>(`/api/v1/projects${query}`);
+  return body.projects;
+}
+
+/**
+ * One project with its members, the owner first.
+ *
+ * A `404` here is the documented answer for a project the caller may not see, and `request`
+ * raises it as a normal error: the panel renders the not-found state, never a permission
+ * message, because "you are not allowed" would confirm the row exists.
+ */
+export async function fetchProject(id: string): Promise<{ project: Project; members: ProjectMember[] }> {
+  const body = await request<Project & { members: ProjectMember[] }>(`/api/v1/projects/${id}`);
+  return { project: body, members: body.members };
+}
+
+/** Create a project and its first owner membership. */
+export function createProject(input: {
+  key: string;
+  name: string;
+  description?: string;
+  color?: string;
+  icon?: string;
+  owner_user_id?: string;
+  organization_id?: string;
+}): Promise<Project> {
+  return request<Project>("/api/v1/projects", {
     method: "POST",
     body: JSON.stringify(input),
   });
 }
 
-/** Change a tenant (name, status) — `PATCH /api/v1/organizations/{id}`. */
-export function updateOrganization(
-  organizationId: string,
-  changes: { name?: string; status?: string },
-): Promise<Organization> {
-  return request<Organization>(`/api/v1/organizations/${encodeURIComponent(organizationId)}`, {
-    method: "PATCH",
-    body: JSON.stringify(changes),
+/** Update a project's own fields. Omitted fields are left alone. */
+export function updateProject(
+  id: string,
+  input: { key?: string; name?: string; description?: string; color?: string; icon?: string },
+): Promise<Project> {
+  return request<Project>(`/api/v1/projects/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
   });
 }
 
-/** Delete a tenant that owns no sites — `DELETE /api/v1/organizations/{id}`. */
-export async function deleteOrganization(organizationId: string): Promise<void> {
-  await request(`/api/v1/organizations/${encodeURIComponent(organizationId)}`, {
-    method: "DELETE",
+/**
+ * Archive or restore a project.
+ *
+ * Archiving is not deletion: the history stays and the restore puts it back. The typed
+ * confirmation is the caller's, not the form's -- the API takes `confirm` so a script cannot
+ * skip it by omitting a field the UI happens to send.
+ */
+export function setProjectArchived(id: string, archived: boolean, confirm?: string): Promise<Project> {
+  const verb = archived ? "archive" : "restore";
+  return request<Project>(`/api/v1/projects/${id}/${verb}`, {
+    method: "POST",
+    body: JSON.stringify(archived ? { confirm: confirm ?? id } : {}),
   });
+}
+
+/** Add a member, or change an existing member's role -- the API treats them as one upsert. */
+export function setProjectMember(
+  id: string,
+  userId: string,
+  role: ProjectRole,
+): Promise<{ user_id: string; display_name: string; email: string; role: ProjectRole; created_at: string }> {
+  return request(`/api/v1/projects/${id}/members`, {
+    method: "POST",
+    body: JSON.stringify({ user_id: userId, role }),
+  });
+}
+
+/** Remove a membership. The API refuses the one that would leave nobody owning the project. */
+export function removeProjectMember(id: string, userId: string): Promise<void> {
+  return request<void>(`/api/v1/projects/${id}/members/${userId}`, { method: "DELETE" });
+}
+
+/**
+ * The workflows in one project, for the move dialog's host screen (REQ-133 slice 3).
+ *
+ * The API already accepts a `project_id` filter and already scopes the result to the projects the
+ * caller may see, so this passes the project rather than filtering client-side: a client-side
+ * filter over an unscoped list would show a workflow the API deliberately hid.
+ */
+export function fetchWorkflowsInProject(
+  projectId: string,
+  organizationId?: string,
+): Promise<{ workflows: Workflow[] }> {
+  const query = new URLSearchParams({ project_id: projectId });
+  if (organizationId) query.set("organization_id", organizationId);
+  return request<{ workflows: Workflow[] }>(`/api/v1/workflows?${query.toString()}`);
+}
+
+/**
+ * Report on a move, or make it. One call for both (REQ-133 slice 3).
+ *
+ * `dryRun` is a flag rather than a second endpoint because the report the dialog renders and the
+ * decision the move is made on come from the same detection -- two endpoints would be two
+ * implementations that could disagree, and the disagreement would only show up as a move that
+ * behaves unlike its own preview.
+ */
+export function moveWorkflow(
+  workflowId: string,
+  toProjectId: string,
+  dryRun: boolean,
+  organizationId?: string,
+): Promise<MoveReport> {
+  return request<MoveReport>(`/api/v1/workflows/${workflowId}/move`, {
+    method: "POST",
+    body: JSON.stringify({
+      organization_id: organizationId,
+      to_project_id: toProjectId,
+      dry_run: dryRun,
+    }),
+  });
+}
+
+/**
+ * The limits screen's payload: caps, today's counters, the series and the warnings (REQ-133
+ * slice 4).
+ *
+ * One read rather than four. The screen renders bars, a series and warnings that must agree with
+ * each other, and four reads would let a run land between them — a bar at 3 of 5 beside a series
+ * that says 2, with nothing on the page to explain the difference.
+ */
+export function fetchProjectLimits(
+  projectId: string,
+  organizationId?: string,
+  days = 30,
+): Promise<ProjectLimits> {
+  const query = new URLSearchParams({ days: String(days) });
+  if (organizationId) query.set("organization_id", organizationId);
+  return request<ProjectLimits>(`/api/v1/projects/${projectId}/limits?${query.toString()}`);
+}
+
+/**
+ * Replace a project's limit overrides.
+ *
+ * `0` means unlimited, and the API says so in its own refusal when a negative value arrives, so
+ * this client does not re-validate: a second copy of the rule is a second copy that can disagree.
+ */
+export function saveProjectLimits(
+  projectId: string,
+  body: ProjectLimitsSave,
+  organizationId?: string,
+): Promise<ProjectLimits> {
+  return request<ProjectLimits>(`/api/v1/projects/${projectId}/limits`, {
+    method: "PUT",
+    body: JSON.stringify({ ...body, organization_id: organizationId }),
+  });
+}
+
+/**
+ * The project-scoped audit trail (REQ-133 slice 4).
+ *
+ * `action` is passed to the API rather than filtered here: the server owns the filter, and a
+ * client-side filter over a truncated page would quietly report "nothing happened" for the rows
+ * the page never fetched.
+ */
+export function fetchProjectAudit(
+  projectId: string,
+  action: string,
+  organizationId?: string,
+  limit = 200,
+): Promise<ProjectAudit> {
+  const query = new URLSearchParams({ action, limit: String(limit) });
+  if (organizationId) query.set("organization_id", organizationId);
+  return request<ProjectAudit>(`/api/v1/projects/${projectId}/audit?${query.toString()}`);
+}
+
+/**
+ * Hand the project to a new owner, with both confirmations.
+ *
+ * The two booleans are the REQ's two sentences, and the API refuses a request that carries only
+ * one. **The caller passes them; this function must not supply them.** Hardcoding `true` here --
+ * which is what the first version did -- makes `ownership_transfer_unconfirmed` unreachable from
+ * every client path: the dialog's two checkboxes gated its own button and then sent the same
+ * body as a caller who ticked nothing, so the acknowledgements were collected, discarded, and
+ * replaced by a constant. A server rule that only one client can violate, by construction, is a
+ * rule no gate can prove and a panel that cannot honour it.
+ */
+export function transferProjectOwnership(
+  projectId: string,
+  toUserId: string,
+  confirmations: { owner: boolean; audit: boolean },
+  organizationId?: string,
+): Promise<{ previous_owner_user_id: string | null; owner_user_id: string | null; key: string }> {
+  return request(`/api/v1/projects/${projectId}/transfer-ownership`, {
+    method: "POST",
+    body: JSON.stringify({
+      organization_id: organizationId,
+      to_user_id: toUserId,
+      confirm_owner: confirmations.owner,
+      confirm_audit: confirmations.audit,
+    }),
+  });
+}
+
+/**
+ * Delete a project for good (REQ-133) — the destructive half of the settings screen.
+ *
+ * **The confirmation travels in the query string, and that is the server's decision, not this
+ * client's.** `DELETE` with a request body is a shape that proxies, gateways and HTTP client
+ * libraries all handle differently, and a typed confirmation that arrives through a mechanism half
+ * the ecosystem may drop is a confirmation that vanishes on the request that matters. So the key
+ * is a query parameter, and the server answers an absent one with a named refusal
+ * (`project_delete_confirmation_mismatch`) rather than a shape error.
+ *
+ * The caller passes the project's **key**, not its id: the key is the short form an operator
+ * writes in a ticket, and typing `PAY` when the project is `PAYROLL` has to fail — that is the
+ * whole point of asking somebody to type it.
+ */
+export function deleteProject(
+  id: string,
+  confirmKey: string,
+  organizationId?: string,
+): Promise<{ project_id: string; project_key: string; removed_members: number; retained_audit_rows: number }> {
+  const query = new URLSearchParams({ confirm: confirmKey });
+  if (organizationId) query.set("organization_id", organizationId);
+  return request<{ project_id: string; project_key: string; removed_members: number; retained_audit_rows: number }>(
+    `/api/v1/projects/${id}?${query.toString()}`,
+    { method: "DELETE" },
+  );
+}
+
+/**
+ * `GET /api/v1/projects/{id}/export` — a portable snapshot of the project, as a file.
+ *
+ * **Modelled on `downloadAnalyticsExport` rather than invented, and the reuse is the point:** that
+ * function already solved the two things this one has to get right — reading the filename out of
+ * `content-disposition` (so the file the user gets is the one the server named, not a client-side
+ * guess) and turning an error body into an `ApiError` with the server's own code and message.
+ * A second download helper that read the header itself would be a second answer to "what is this
+ * file called" waiting to disagree with the first.
+ *
+ * The route is guarded by `projects.read`, not `projects.manage`, so this is a read — nothing is
+ * locked and nothing is written, which is why a viewer may call it.
+ */
+export async function downloadProjectExport(
+  id: string,
+  organizationId?: string,
+): Promise<{ blob: Blob; filename: string }> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  let response: Response;
+  try {
+    response = await fetch(`/api/v1/projects/${id}/export${query}`, {
+      credentials: "same-origin",
+      headers: { accept: "application/json" },
+    });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    let code = "project_export_failed";
+    let message = `The export answered with status ${response.status}.`;
+    try {
+      const body = JSON.parse(text) as ErrorBody;
+      code = body.error?.code ?? code;
+      message = body.error?.message ?? message;
+    } catch {
+      // A non-JSON error body is still an error; the status stays in the message.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+
+  // The server's filename is the authority. The fallback is the shape it would have produced
+  // anyway (lower key + stamp) minus the stamp, so a proxy that drops the header still yields a
+  // file that opens — named rather than called "download".
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+
+  return { blob: await response.blob(), filename: match?.[1] ?? "project-export.json" };
 }
 
 /** The sites the account may see, optionally narrowed to one tenant. */
@@ -4017,718 +4149,6 @@ export function fetchIamProvisioningLog(input: {
   return request(`/api/v1/iam/provisioning/log${query ? `?${query}` : ""}`);
 }
 
-// ---------------------------------------------------------------------------------------------
-// Organization memberships, invitations and the switcher (REQ-005, slice 1)
-// ---------------------------------------------------------------------------------------------
-
-/** A role chip: which role, and what it is called. */
-export type MemberRole = {
-  id: string;
-  key: string;
-  name: string;
-};
-
-/** One row of the Members tab. */
-export type OrganizationMember = {
-  id: string;
-  user_id: string;
-  display_name: string;
-  email: string;
-  user_status: string;
-  status: string;
-  is_primary: boolean;
-  joined_at: string | null;
-  last_active_at: string | null;
-  roles: MemberRole[];
-};
-
-/** One invitation row. */
-export type OrganizationInvitation = {
-  id: string;
-  email: string;
-  role_id: string | null;
-  role_name: string | null;
-  invited_by: string | null;
-  invited_by_name: string | null;
-  status: string;
-  message: string;
-  expires_at: string;
-  accepted_by: string | null;
-  accepted_at: string | null;
-  created_at: string;
-};
-
-/** An invitation with the token that was created with it — returned exactly once. */
-export type CreatedOrganizationInvitation = {
-  invitation: OrganizationInvitation;
-  token: string;
-  accept_url: string;
-};
-
-/** One membership of the signed-in account. */
-export type AccountOrganization = {
-  organization_id: string;
-  name: string;
-  slug: string;
-  organization_status: string;
-  membership_status: string;
-  is_primary: boolean;
-  roles: MemberRole[];
-};
-
-/** The members of one organization. */
-export async function fetchOrganizationMembers(
-  organizationId: string,
-): Promise<{ organization_id: string; members: OrganizationMember[] }> {
-  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/members`);
-}
-
-/** Add an account to an organization. */
-export async function addOrganizationMember(
-  organizationId: string,
-  input: { user_id: string; status?: string; is_primary?: boolean },
-): Promise<OrganizationMember> {
-  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/members`, {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Change a membership's status, or promote/demote it as the account's home. */
-export async function updateOrganizationMember(
-  organizationId: string,
-  userId: string,
-  input: { status?: string; is_primary?: boolean },
-): Promise<OrganizationMember> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}`,
-    { method: "PATCH", body: JSON.stringify(input) },
-  );
-}
-
-/** Remove an account from an organization. */
-export async function removeOrganizationMember(
-  organizationId: string,
-  userId: string,
-): Promise<void> {
-  await request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}`,
-    { method: "DELETE" },
-  );
-}
-
-// ---------------------------------------------------------------------------------------------
-// The member drawer (REQ-005, slice 4)
-// ---------------------------------------------------------------------------------------------
-
-/** One role binding as the drawer shows it, with the role's key and name resolved. */
-export type MemberBinding = {
-  id: string;
-  role_id: string;
-  role_key: string;
-  role_name: string;
-  subject_type: string;
-  subject_id: string;
-  scope_type: string;
-  organization_id: string | null;
-  site_id: string | null;
-  department: string | null;
-  module: string | null;
-  resource_id: string | null;
-  expires_at: string | null;
-  revoked_at: string | null;
-  /** Whether it still applies right now. */
-  active: boolean;
-  /** Whether a temporary window has run out. */
-  expired: boolean;
-  created_at: string;
-};
-
-/** One row of the drawer's trail. */
-export type MemberAuditRow = {
-  action: string;
-  actor_user_id: string | null;
-  /** The account's name, or `system` for a row nobody performed. */
-  actor_name: string;
-  target_type: string | null;
-  target_id: string | null;
-  created_at: string;
-};
-
-/**
- * Everything the member drawer renders, in one response.
- *
- * One request rather than four: a person looking at a colleague must never see a half-filled
- * panel, and an empty binding list that arrived while the identity succeeded is
- * indistinguishable from "this person holds nothing".
- */
-export type OrganizationMemberDetail = {
-  organization_id: string;
-  membership_id: string;
-  user_id: string;
-  display_name: string;
-  email: string;
-  user_status: string;
-  status: string;
-  is_primary: boolean;
-  joined_at: string | null;
-  last_active_at: string | null;
-  bindings: MemberBinding[];
-  departments: MemberDepartment[];
-  recent_audit: MemberAuditRow[];
-};
-
-/** `GET /api/v1/organizations/{id}/members/{user_id}` — the member drawer. */
-export async function fetchOrganizationMember(
-  organizationId: string,
-  userId: string,
-): Promise<OrganizationMemberDetail> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}`,
-  );
-}
-
-/**
- * Grant a role to a member of this organization.
- *
- * The scope defaults to `organization` and the server refuses `global`: inside a tenant,
- * "this person may do this here" is the shape that cannot escape, and a tenant administrator
- * asking for a platform grant is asking for something the platform owns.
- */
-export async function grantMemberRole(
-  organizationId: string,
-  userId: string,
-  input: {
-    role_id: string;
-    scope_type?: "organization" | "site" | "department";
-    site_id?: string;
-    department?: string;
-    expires_at?: string;
-  },
-): Promise<MemberBinding> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}/role-bindings`,
-    { method: "POST", body: JSON.stringify(input) },
-  );
-}
-
-/**
- * Move a temporary grant's expiry.
- *
- * The server patches the same row and refuses a date in the past, so "extend" cannot leave two
- * live bindings for one role — which the effective-permissions screen would render as the same
- * role twice with two different windows, neither of them the truth.
- */
-export async function extendMemberRole(
-  organizationId: string,
-  userId: string,
-  bindingId: string,
-  expiresAt: string,
-): Promise<MemberBinding> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}/role-bindings/${encodeURIComponent(bindingId)}`,
-    { method: "PATCH", body: JSON.stringify({ expires_at: expiresAt }) },
-  );
-}
-
-/** Revoke a grant. The row stays in the trail; `revoked_at` is what changes. */
-export async function revokeMemberRole(
-  organizationId: string,
-  userId: string,
-  bindingId: string,
-): Promise<MemberBinding> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}/role-bindings/${encodeURIComponent(bindingId)}`,
-    { method: "DELETE" },
-  );
-}
-
-/** The invitations of one organization. */
-export async function fetchOrganizationInvitations(
-  organizationId: string,
-): Promise<{ organization_id: string; invitations: OrganizationInvitation[] }> {
-  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations`);
-}
-
-/** Invite an address into an organization. */
-export async function createOrganizationInvitation(
-  organizationId: string,
-  input: { email: string; role_id?: string | null; message?: string },
-): Promise<CreatedOrganizationInvitation> {
-  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations`, {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/**
- * The invitations waiting for an owner, oldest first.
- *
- * The `owner_approval` queue is a work list, so the panel asks for it directly instead of
- * filtering the whole invitation history on the client — a tenant that has invited two hundred
- * people would otherwise download two hundred rows to render the three that need a decision.
- */
-export async function fetchQueuedOrganizationInvitations(
-  organizationId: string,
-): Promise<{ organization_id: string; invitations: OrganizationInvitation[] }> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations/queue`,
-  );
-}
-
-/**
- * Release a queued invitation and receive its single-use link — once.
- *
- * The link is minted by the release, not recovered from the create: a queued invitation never
- * had a working link, so this is the only moment one exists and it is never readable again.
- */
-export async function releaseQueuedOrganizationInvitation(
-  organizationId: string,
-  invitationId: string,
-): Promise<CreatedOrganizationInvitation> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations/${encodeURIComponent(
-      invitationId,
-    )}/release`,
-    { method: "POST" },
-  );
-}
-
-/** Revoke a pending invitation. */
-export async function revokeOrganizationInvitation(
-  organizationId: string,
-  invitationId: string,
-): Promise<void> {
-  await request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations/${encodeURIComponent(invitationId)}`,
-    { method: "DELETE" },
-  );
-}
-
-// ---------------------------------------------------------------------------------------------
-// Departments (REQ-005, slice 2)
-// ---------------------------------------------------------------------------------------------
-
-/** One row of the Departments tab. */
-export type OrganizationDepartment = {
-  id: string;
-  /** Stable address inside the organization — what a role binding stores. */
-  key: string;
-  name: string;
-  description: string;
-  status: string;
-  parent_id: string | null;
-  parent_key: string | null;
-  member_count: number;
-  role_count: number;
-  /** Depth in the tree, 0 for a root. */
-  depth: number;
-  created_at: string;
-  updated_at: string;
-};
-
-/** A role bound to a department as a whole. */
-export type DepartmentRole = {
-  binding_id: string;
-  role_id: string;
-  role_key: string;
-  role_name: string;
-  granted_by: string | null;
-  expires_at: string | null;
-};
-
-/** One account inside a department. */
-export type DepartmentMember = {
-  user_id: string;
-  display_name: string;
-  email: string;
-  user_status: string;
-  membership_status: string;
-  last_active_at: string | null;
-};
-
-/** One department in full. */
-export type DepartmentDetail = {
-  department: OrganizationDepartment;
-  members: DepartmentMember[];
-  roles: DepartmentRole[];
-};
-
-/** One department of one member — what the member drawer reads. */
-export type MemberDepartment = {
-  id: string;
-  key: string;
-  name: string;
-  status: string;
-};
-
-/** Filters of the Departments tab. */
-export type DepartmentFilters = {
-  status?: string;
-  q?: string;
-};
-
-// ---------------------------------------------------------------------------------------------
-// Organization settings, modules, limits and usage (REQ-005, slice 3)
-// ---------------------------------------------------------------------------------------------
-
-/** One row of the Settings tab. */
-export type OrganizationSettings = {
-  locale: string;
-  timezone: string;
-  invite_policy: string;
-  default_invite_role_id: string | null;
-  logo_media_id: string | null;
-  accent_color: string | null;
-  audit_retention_days: number;
-  updated_at: string;
-};
-
-/** The Settings payload, with the choices the form offers. */
-export type OrganizationSettingsPayload = {
-  organization_id: string;
-  settings: OrganizationSettings;
-  available_locales: string[];
-  invite_policies: { key: string; description: string }[];
-};
-
-/** One row of the Modules tab. */
-export type OrganizationModule = {
-  key: string;
-  name: string;
-  description: string;
-  enabled: boolean;
-  /** Whether the organization made an explicit decision about this module. */
-  explicit: boolean;
-};
-
-/** The Modules payload. */
-export type OrganizationModulesPayload = {
-  organization_id: string;
-  modules: OrganizationModule[];
-};
-
-/** The plan and its ceilings; a `null` limit is unlimited. */
-export type OrganizationLimits = {
-  plan: string;
-  seat_limit: number | null;
-  site_limit: number | null;
-  storage_bytes_limit: number | null;
-  ai_monthly_limit_micros: number | null;
-  updated_at: string;
-};
-
-/** The Limits payload, with the plans the selector offers. */
-export type OrganizationLimitsPayload = {
-  organization_id: string;
-  limits: OrganizationLimits;
-  available_plans: { key: string; description: string }[];
-};
-
-/** What the organization holds, next to the ceilings it is measured against. */
-export type OrganizationUsage = {
-  organization_id: string;
-  seats_used: number;
-  sites_used: number;
-  storage_used_bytes: number;
-  ai_micros_this_month: number;
-  limits: OrganizationLimits;
-  /** Per-metric label naming which limit the bar reads. */
-  sources: {
-    seats: string;
-    sites: string;
-    storage_bytes: string;
-    ai_monthly_micros: string;
-  };
-};
-
-/** The organization settings and the choices the form may offer. */
-export function fetchOrganizationSettings(
-  organizationId: string,
-): Promise<OrganizationSettingsPayload> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/settings`,
-  );
-}
-
-/** Save the whole settings row. */
-export function updateOrganizationSettings(
-  organizationId: string,
-  input: {
-    locale: string;
-    timezone: string;
-    invite_policy: string;
-    default_invite_role_id?: string | null;
-    logo_media_id?: string | null;
-    accent_color?: string | null;
-    audit_retention_days: number;
-  },
-): Promise<OrganizationSettingsPayload> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/settings`,
-    { method: "PUT", body: JSON.stringify(input) },
-  );
-}
-
-/** The installed modules with this organization's decision about each. */
-export function fetchOrganizationModules(
-  organizationId: string,
-): Promise<OrganizationModulesPayload> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/modules`,
-  );
-}
-
-/**
- * Switch a set of modules.
- *
- * The whole batch is sent at once on purpose: the API validates every key before writing any
- * of them, so a batch naming one module this installation does not ship leaves the others
- * untouched — which a row of independent `PUT`s could not promise.
- */
-export function updateOrganizationModules(
-  organizationId: string,
-  modules: { module_key: string; enabled: boolean }[],
-): Promise<OrganizationModulesPayload> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/modules`,
-    { method: "PUT", body: JSON.stringify({ modules }) },
-  );
-}
-
-/** The plan and its ceilings. */
-export function fetchOrganizationLimits(
-  organizationId: string,
-): Promise<OrganizationLimitsPayload> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/limits`,
-  );
-}
-
-/** Save the plan and every ceiling. */
-export function updateOrganizationLimits(
-  organizationId: string,
-  input: {
-    plan: string;
-    seat_limit: number | null;
-    site_limit: number | null;
-    storage_bytes_limit: number | null;
-    ai_monthly_limit_micros: number | null;
-  },
-): Promise<OrganizationLimitsPayload> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/limits`,
-    { method: "PUT", body: JSON.stringify(input) },
-  );
-}
-
-/** What the organization holds, next to its ceilings. */
-export function fetchOrganizationUsage(organizationId: string): Promise<OrganizationUsage> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/usage`,
-  );
-}
-
-/**
- * The same numbers as a spreadsheet, from the same call the screen renders.
- *
- * The file is fetched rather than built here: a CSV assembled in the browser from an older
- * payload would be a second reading of the data, and the Billing tab's whole claim is that the
- * two agree.
- */
-export async function downloadOrganizationUsage(organizationId: string): Promise<Blob> {
-  const response = await fetch(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/usage?format=csv`,
-    { credentials: "include" },
-  );
-  if (!response.ok) {
-    throw new ApiError(response.status, "usage_export_failed", "The usage file could not be downloaded.");
-  }
-  return response.blob();
-}
-
-/** The department tree, parents before children. */
-export async function fetchOrganizationDepartments(
-  organizationId: string,
-  filters: DepartmentFilters = {},
-): Promise<{ organization_id: string; departments: OrganizationDepartment[] }> {
-  const params = new URLSearchParams();
-  if (filters.status) params.set("status", filters.status);
-  if (filters.q) params.set("q", filters.q);
-  const query = params.toString();
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments${query ? `?${query}` : ""}`,
-  );
-}
-
-/** One department with its members and the roles bound to it. */
-export async function fetchDepartment(
-  organizationId: string,
-  departmentId: string,
-): Promise<DepartmentDetail> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}`,
-  );
-}
-
-/** Create a department. The key is normalized and never changes afterwards. */
-export async function createOrganizationDepartment(
-  organizationId: string,
-  input: { key: string; name: string; description?: string; parent_id?: string | null },
-): Promise<OrganizationDepartment> {
-  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/departments`, {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Rename, re-describe, re-parent or archive a department. */
-export async function updateOrganizationDepartment(
-  organizationId: string,
-  departmentId: string,
-  change: {
-    name?: string;
-    description?: string;
-    parent_id?: string | null;
-    status?: string;
-  },
-): Promise<OrganizationDepartment> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}`,
-    { method: "PATCH", body: JSON.stringify(change) },
-  );
-}
-
-/** Archive a department: it keeps its structure but stops granting. */
-export async function archiveOrganizationDepartment(
-  organizationId: string,
-  departmentId: string,
-): Promise<OrganizationDepartment> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}`,
-    { method: "POST" },
-  );
-}
-
-/** Delete a department; refused while it still holds people, roles or children. */
-export async function deleteOrganizationDepartment(
-  organizationId: string,
-  departmentId: string,
-): Promise<void> {
-  await request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}`,
-    { method: "DELETE" },
-  );
-}
-
-/** Put an account into a department. */
-export async function addDepartmentMember(
-  organizationId: string,
-  departmentId: string,
-  userId: string,
-): Promise<void> {
-  await request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}/members`,
-    { method: "POST", body: JSON.stringify({ user_id: userId }) },
-  );
-}
-
-/** Take an account out of a department. */
-export async function removeDepartmentMember(
-  organizationId: string,
-  departmentId: string,
-  userId: string,
-): Promise<void> {
-  await request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}/members/${encodeURIComponent(userId)}`,
-    { method: "DELETE" },
-  );
-}
-
-/** The departments one account sits in. */
-export async function fetchMemberDepartments(
-  organizationId: string,
-  userId: string,
-): Promise<MemberDepartment[]> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}/departments`,
-  );
-}
-
-/** Bind a role to a department as a whole, optionally until a date. */
-export async function bindDepartmentRole(
-  organizationId: string,
-  departmentId: string,
-  input: { role_id: string; expires_at?: string | null },
-): Promise<DepartmentRole> {
-  return request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}/roles`,
-    { method: "POST", body: JSON.stringify(input) },
-  );
-}
-
-/** Revoke a role bound to a department. */
-export async function unbindDepartmentRole(
-  organizationId: string,
-  departmentId: string,
-  bindingId: string,
-): Promise<void> {
-  await request(
-    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}/roles/${encodeURIComponent(bindingId)}`,
-    { method: "DELETE" },
-  );
-}
-
-/** The public preview of an invitation link. */
-export async function fetchInvitationPreview(token: string): Promise<{
-  organization_name: string | null;
-  organization_slug: string | null;
-  invited_by_name: string | null;
-  role_name: string | null;
-  email_masked: string | null;
-  expires_at: string | null;
-  usable: boolean;
-  /**
-   * Why the token cannot be used — one coarse value on purpose. `unusable` covers queued,
-   * revoked, expired and never-issued alike, so a public link cannot be walked to find out which
-   * organizations exist. The panel says "ask for a new one" rather than guessing.
-   */
-  reason: string | null;
-}> {
-  return request(`/api/v1/invitations/${encodeURIComponent(token)}`);
-}
-
-/** Accept an invitation — signed in, or with a new account in the same request. */
-export async function acceptInvitation(
-  token: string,
-  input: { display_name?: string; password?: string },
-): Promise<{ organization_id: string; organization_name: string; user_id: string }> {
-  return request(`/api/v1/invitations/${encodeURIComponent(token)}/accept`, {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** The caller's own organizations — the switcher's list. */
-export async function fetchMyOrganizations(): Promise<{
-  current_organization_id: string | null;
-  organizations: AccountOrganization[];
-  /** Module keys the current tenant has switched off (REQ-005, slice 4). */
-  disabled_modules: string[];
-}> {
-  return request("/api/v1/me/organizations");
-}
-
-/** Switch the session's organization. */
-export async function switchOrganization(
-  organizationId: string,
-): Promise<{ organization_id: string; name: string }> {
-  return request("/api/v1/me/organization", {
-    method: "POST",
-    body: JSON.stringify({ organization_id: organizationId }),
-  });
-}
-
 /* ---------------------------------------------------------------------------------------------
  * Enterprise sign-in providers (REQ-006, slice 4b-2; docs/07-IAM.md §11)
  *
@@ -4876,7 +4296,6 @@ export function fetchSsoProviders(): Promise<{
   providers: { slug: string; name: string; kind: string; start_url: string }[];
 }> {
   return request("/api/v1/auth/sso/providers");
-
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5312,6 +4731,31 @@ export function retryNotificationDelivery(id: string): Promise<{ outcome: string
   });
 }
 
+/**
+ * The delivery log's retention window, the counts it would act on, and the last sweep.
+ *
+ * Read separately from the page rather than folded into it: the page is what an administrator
+ * filters, this is what they *configure*, and a slow count query failing should not empty the
+ * table above it.
+ */
+export function fetchNotificationRetention(): Promise<NotificationRetention> {
+  return request<NotificationRetention>("/api/v1/notifications/outbox/retention");
+}
+
+/**
+ * Set the window.
+ *
+ * **The server's refusal is rendered verbatim, not summarised** — `notification_retention_days
+ * must be between 1 and 3650, and 0 is not` names the field and the two bounds, and an operator
+ * who has just deleted their own evidence needs to know which end of the range they crossed.
+ */
+export function setNotificationRetention(windowDays: number): Promise<NotificationRetention> {
+  return request<NotificationRetention>("/api/v1/notifications/outbox/retention", {
+    method: "PATCH",
+    body: JSON.stringify({ window_days: windowDays }),
+  });
+}
+
 /** This person's registered browsers. The endpoint itself is never in the answer. */
 export function fetchNotificationDevices(): Promise<NotificationDevice[]> {
   return request<NotificationDevice[]>("/api/v1/notifications/push-subscriptions");
@@ -5432,36 +4876,6 @@ export function runNotificationRoute(input: {
 }
 
 // ---------------------------------------------------------------------------------------------
-// CDN / edge (REQ-011)
-// ---------------------------------------------------------------------------------------------
-
-/**
- * A site's cache rules, in precedence order.
- *
- * `unreadable` is part of the response rather than an error: one rule whose pattern no
- * longer compiles must not take the whole list away, and it must not be dropped either —
- * a rule that silently stopped matching is what an operator discovers days later.
- */
-export async function fetchCdnRules(siteId: string): Promise<CdnRulesResponse> {
-  return request(`/api/v1/cdn/rules?site_id=${encodeURIComponent(siteId)}`);
-}
-
-/** Create a cache rule. */
-export async function createCdnRule(input: CdnCacheRuleInput): Promise<CdnCacheRule> {
-  return request("/api/v1/cdn/rules", { method: "POST", body: JSON.stringify(input) });
-}
-
-/** Change one rule. The site is named in the body, not in the path. */
-export async function updateCdnRule(
-  ruleId: string,
-  input: CdnCacheRuleInput,
-): Promise<CdnCacheRule> {
-  return request(`/api/v1/cdn/rules/${encodeURIComponent(ruleId)}`, {
-    method: "PUT",
-    body: JSON.stringify(input),
-  });
-}
-
 // The event feed and the catalogue (REQ-016, slice 1)
 // ---------------------------------------------------------------------------------------------
 
@@ -5547,124 +4961,6 @@ export function createWebhookEndpoint(input: {
   });
 }
 
-/** Delete a rule. */
-export async function deleteCdnRule(ruleId: string, siteId: string): Promise<void> {
-  await request(
-    `/api/v1/cdn/rules/${encodeURIComponent(ruleId)}?site_id=${encodeURIComponent(siteId)}`,
-    { method: "DELETE" },
-  );
-}
-
-/** Turn a rule on or off without touching the rest of it. */
-export async function setCdnRuleEnabled(
-  ruleId: string,
-  siteId: string,
-  enabled: boolean,
-): Promise<CdnCacheRule> {
-  return request(`/api/v1/cdn/rules/${encodeURIComponent(ruleId)}/toggle`, {
-    method: "POST",
-    body: JSON.stringify({ site_id: siteId, enabled }),
-  });
-}
-
-/**
- * Persist a new precedence order.
- *
- * The order is sent as the complete list rather than as a delta: a reorder that renumbers
- * one row is the operation that can leave two rules claiming the same priority, and the
- * matcher would then pick between them by row order — which is not what the drag showed.
- */
-export async function reorderCdnRules(siteId: string, order: string[]): Promise<CdnRulesResponse> {
-  return request("/api/v1/cdn/rules/reorder", {
-    method: "POST",
-    body: JSON.stringify({ site_id: siteId, order }),
-  });
-}
-
-/** The settings row for a site, or the installation default when `siteId` is null. */
-export async function fetchCdnSettings(siteId: string | null): Promise<CdnSettings> {
-  const query = siteId === null ? "" : `?site_id=${encodeURIComponent(siteId)}`;
-  return request(`/api/v1/cdn/settings${query}`);
-}
-
-/**
- * Save the settings row.
- *
- * `credential` is only sent when the operator typed one: sending the empty string would
- * clear a stored credential, because "the field is empty" and "the operator cleared it" are
- * the same request. The panel therefore omits the field entirely when it is untouched.
- */
-export async function saveCdnSettings(input: CdnSettingsInput): Promise<CdnSettings> {
-  return request("/api/v1/cdn/settings", { method: "PUT", body: JSON.stringify(input) });
-}
-
-/**
- * The shipped provider adapters, with the fields each one needs.
- *
- * Typed as `CdnAdapter` rather than the bare `CdnAdapterInfo` because the capability flags
- * are what the console needs: offering "purge by tag" to an adapter that cannot do it
- * queues work that fails an hour later at drain time, which is the worst moment to find out.
- */
-export async function fetchCdnAdapters(): Promise<CdnAdapter[]> {
-  const body = await request<{ adapters: CdnAdapter[] }>("/api/v1/cdn/adapters");
-  return body.adapters;
-}
-
-/**
- * The overview's cards.
- *
- * One call rather than four: the provider state, the queue depth, the 24-hour counters and
- * the recent list are four numbers an operator reads together, and four round trips would
- * let them disagree with each other on screen — a purge that appears in the recent table
- * but not the counters, because the counters were fetched a second earlier.
- */
-export async function fetchCdnStatus(siteId: string): Promise<CdnStatus> {
-  return request(`/api/v1/cdn/status?site_id=${encodeURIComponent(siteId)}`);
-}
-
-/** One page of purge history. */
-export async function fetchCdnPurges(
-  siteId: string,
-  filters: CdnPurgeFilters = {},
-): Promise<CdnPurgePage> {
-  const query = new URLSearchParams({ site_id: siteId });
-  if (filters.status) query.set("status", filters.status);
-  if (filters.kind) query.set("kind", filters.kind);
-  if (filters.since) query.set("since", filters.since);
-  if (filters.until) query.set("until", filters.until);
-  if (typeof filters.limit === "number") query.set("limit", String(filters.limit));
-  if (typeof filters.offset === "number") query.set("offset", String(filters.offset));
-  return request(`/api/v1/cdn/purges?${query.toString()}`);
-}
-
-/** The detail drawer: the purge plus one row per target. */
-export async function fetchCdnPurge(purgeId: string): Promise<CdnPurgeDetail> {
-  return request(`/api/v1/cdn/purges/${encodeURIComponent(purgeId)}`);
-}
-
-/**
- * Ask for a purge.
- *
- * The 500-target cap is the server's, not the form's: the form counts so the operator gets
- * an answer while typing, and the server refuses so a client that skips the count still
- * cannot write a purge the worker will split into something the operator never saw.
- */
-export async function createCdnPurge(input: CdnPurgeInput): Promise<CdnPurge> {
-  return request("/api/v1/cdn/purges", { method: "POST", body: JSON.stringify(input) });
-}
-
-/**
- * Requeue the failed items of a purge.
- *
- * A `409` here is the server saying this purge has nothing to retry, which is a real
- * answer rather than a failure: the caller asked for the right thing and the state said no.
- */
-export async function retryCdnPurge(purgeId: string): Promise<CdnPurgeDetail> {
-  return request(`/api/v1/cdn/purges/${encodeURIComponent(purgeId)}/retry`, {
-    method: "POST",
-  });
-}
-
 /** Change an endpoint's name, URL, subscriptions or enabled flag. */
 export function updateWebhookEndpoint(
   id: string,
@@ -5720,12 +5016,6 @@ export function redeliverWebhookDelivery(id: string, deliveryId: string): Promis
   });
 }
 
-/** Run the configured provider's reachability check. */
-export async function testCdnProvider(siteId: string | null): Promise<CdnProviderProbe> {
-  const query = siteId === null ? "" : `?site_id=${encodeURIComponent(siteId)}`;
-  return request(`/api/v1/cdn/settings/test${query}`, { method: "POST" });
-}
-
 /**
  * Force many deliveries again, per id.
  *
@@ -5759,109 +5049,6 @@ export function fetchWebhookStats(id: string, windowHours?: number): Promise<Web
  */
 export function fetchEventCatalogue(): Promise<EventCatalogue> {
   return request<EventCatalogue>("/api/v1/events/catalogue");
-}
-
-// ---------------------------------------------------------------------------------------------
-// SDK scaffolds and the CLI device code (REQ-033, slice 4)
-// ---------------------------------------------------------------------------------------------
-
-/** The three template cards, with what each contains. */
-export function fetchSdkTemplates(): Promise<SdkTemplate[]> {
-  return request<SdkTemplate[]>("/api/v1/dev/sdks/templates");
-}
-
-/**
- * Preview a generated starter's file tree.
- *
- * Writes nothing: this is the call the name field makes while somebody is still typing, and a
- * button that records a row per keystroke would fill `sdk_scaffolds` with previews. The durable
- * half is {@link recordScaffold}, and the screen makes the difference visible by labelling them
- * "Preview" and "Generate".
- */
-export function previewScaffold(
-  kind: SdkKind,
-  name: string,
-  target: SdkTarget,
-): Promise<ScaffoldTree> {
-  return request<ScaffoldTree>("/api/v1/dev/sdks/scaffold", {
-    method: "POST",
-    body: JSON.stringify({ kind, name, target }),
-  });
-}
-
-/** Generate and record a starter, returning the row that was written. */
-export function recordScaffold(
-  kind: SdkKind,
-  name: string,
-  target: SdkTarget,
-): Promise<ScaffoldRecord> {
-  return request<ScaffoldRecord>("/api/v1/dev/sdks/scaffolds", {
-    method: "POST",
-    body: JSON.stringify({ kind, name, target }),
-  });
-}
-
-/** This tenant's recorded generations, newest first. */
-export function fetchScaffolds(): Promise<ScaffoldList> {
-  return request<ScaffoldList>("/api/v1/dev/sdks/scaffolds");
-}
-
-/**
- * The archive's URL, for a download link.
- *
- * A plain `<a href>` rather than a fetch: the browser's own download handling is what puts the
- * file in the downloads folder with the right name, and a `fetch` + blob would have to
- * reconstruct `Content-Disposition` on the client to arrive at the same place. The route reads
- * the session cookie as a first-party same-origin request, so the link needs no token of any kind
- * in its query — which is also why no key material can leak into a URL, a history entry or a
- * `Referer`.
- */
-export function scaffoldDownloadUrl(id: string): string {
-  return `/api/v1/dev/sdks/scaffolds/${id}/download`;
-}
-
-/**
- * Validate a manifest, with the runtime loader's own rules.
- *
- * The report carries a line per issue, and the screen renders them in order: a validator that
- * only said "invalid" would leave the author guessing which of forty lines to look at.
- */
-export function validateManifest(
-  kind: SdkKind,
-  manifest: string,
-): Promise<ManifestReport> {
-  return request<ManifestReport>("/api/v1/dev/manifests/validate", {
-    method: "POST",
-    body: JSON.stringify({ kind, manifest }),
-  });
-}
-
-/** Start a CLI device-code login from the signed-in browser session. */
-export function startDeviceCode(clientName: string): Promise<DeviceStart> {
-  return request<DeviceStart>("/api/v1/dev/cli/device-code", {
-    method: "POST",
-    body: JSON.stringify({ client_name: clientName }),
-  });
-}
-
-/**
- * What a pending code wants, before anybody approves it.
- *
- * The screen calls this so a person sees the requesting client's name and the plain-language
- * scopes rather than a bare code with a confirm button next to it.
- */
-export function fetchDeviceCode(userCode: string): Promise<DeviceLookup> {
-  return request<DeviceLookup>(
-    `/api/v1/dev/cli/device-code/${encodeURIComponent(userCode)}`,
-  );
-}
-
-/** Approve a pending code. The scopes come from the stored row, never from this call. */
-export function approveDeviceCode(userCode: string): Promise<{ user_code: string }> {
-  return request<{ user_code: string }>("/api/v1/dev/cli/device-code/approve", {
-    method: "POST",
-    body: JSON.stringify({ user_code: userCode }),
-  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6026,6 +5213,7 @@ export function importSecurityReport(
   });
 }
 
+// ---------------------------------------------------------------------------------------------
 // Security centre (REQ-012, slice 2) — the header policy
 // ---------------------------------------------------------------------------------------------
 
@@ -6056,149 +5244,28 @@ export function saveHeaderPolicy(save: HeaderPolicySave): Promise<HeaderPolicySa
 }
 
 // ---------------------------------------------------------------------------------------------
-// Staging environments (REQ-017)
+// Security centre (REQ-012, slice 3) — rate limiting and sign-in protection
 // ---------------------------------------------------------------------------------------------
 
 /**
- * The list, with its filters.
+ * The five scopes, merged with the baseline.
  *
- * A filter value the API does not recognise is answered as *no filter* rather than as a `400` —
- * that rule lives in the route, and the panel passes the chip through unchanged so the two can
- * never disagree about what a value means.
+ * `no-store` for the same reason the overview and the header policy carry it: a stale limiter
+ * table is a screen that says "600 per minute" while the platform enforces something else, and
+ * the whole value of the screen is that the two agree.
  */
-export async function fetchEnvironments(
-  filters: EnvironmentFilters = {},
-): Promise<EnvironmentListResponse> {
-  const query = new URLSearchParams();
-  if (filters.type) query.set("type", filters.type);
-  if (filters.status) query.set("status", filters.status);
-  if (filters.search && filters.search.trim() !== "") query.set("search", filters.search.trim());
-  const suffix = query.toString();
-  return request<EnvironmentListResponse>(
-    `/api/v1/environments${suffix ? `?${suffix}` : ""}`,
-  );
-}
-
-/** One environment, with its job history and the estimate for the next clone. */
-export async function fetchEnvironment(id: string): Promise<EnvironmentDetailResponse> {
-  return request<EnvironmentDetailResponse>(`/api/v1/environments/${encodeURIComponent(id)}`);
-}
-
-/**
- * Create a staging environment and start its first clone.
- *
- * The response is the environment with status `cloning`: the copy itself runs in the API's own
- * worker, so the wizard returns the moment the row exists and the list screen polls from there.
- */
-export async function createEnvironment(input: {
-  name: string;
-  key?: string;
-  staging_host?: string;
-  areas: string[];
-  exclude_archived: boolean;
-}): Promise<Environment> {
-  return request<Environment>("/api/v1/environments", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** The live progress of an environment's clone, polled while one is open. */
-export async function fetchCloneJobs(id: string): Promise<EnvironmentCloneJob[]> {
-  return request<EnvironmentCloneJob[]>(
-    `/api/v1/environments/${encodeURIComponent(id)}/clone-jobs`,
-  );
-}
-
-/**
- * Re-clone from production.
- *
- * `discard_confirmed` is not advisory: the API refuses with `clone_discard_unconfirmed` and
- * names how many staging rows would be lost, and that refusal is what the confirmation dialog is
- * built from. The dialog therefore sends the second request *after* the operator has seen the
- * count, not before.
- */
-export async function startEnvironmentClone(
-  id: string,
-  input: { areas: string[]; exclude_archived: boolean; discard_confirmed: boolean },
-): Promise<EnvironmentCloneJob> {
-  return request<EnvironmentCloneJob>(`/api/v1/environments/${encodeURIComponent(id)}/clone`, {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Stop a running clone. */
-export async function cancelEnvironmentClone(
-  id: string,
-  jobId: string,
-): Promise<{ job: EnvironmentCloneJob; environment_status: string }> {
-  return request(`/api/v1/environments/${encodeURIComponent(id)}/clone-jobs/${encodeURIComponent(jobId)}/cancel`, {
-    method: "POST",
-  });
-}
-
-/** Archive a staging environment: its content is kept, its host is released. */
-export async function archiveEnvironment(id: string): Promise<Environment> {
-  return request<Environment>(`/api/v1/environments/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
-}
-
-/** What staging holds that production does not — the Changes tab, and what a promotion freezes. */
-export async function fetchEnvironmentChanges(id: string): Promise<ChangeSetResponse> {
-  return request<ChangeSetResponse>(
-    `/api/v1/environments/${encodeURIComponent(id)}/changes`,
-  );
-}
-
-/** An environment's promotion history, newest first. */
-export async function fetchEnvironmentPromotions(id: string): Promise<Promotion[]> {
-  return request<Promotion[]>(
-    `/api/v1/environments/${encodeURIComponent(id)}/promotions`,
-  );
-}
-
-/** One promotion with the change set it froze. */
-export async function fetchPromotion(id: string): Promise<PromotionDetail> {
-  return request<PromotionDetail>(`/api/v1/promotions/${encodeURIComponent(id)}`);
-}
-
-/**
- * Request a promotion.
- *
- * `items` names the change-set rows to freeze; an **empty list means every change**, which is what
- * the dialog's primary button sends. The answer carries both the record and the frozen items,
- * because the dialog opens on it and a second request would describe a second instant.
- */
-export async function requestPromotion(
-  environmentId: string,
-  items: string[] = [],
-): Promise<PromotionRequested> {
-  return request<PromotionRequested>(
-    `/api/v1/environments/${encodeURIComponent(environmentId)}/promotions`,
-    { method: "POST", body: JSON.stringify({ items }) },
-  );
-}
-
-/** Approve and apply the frozen change set to production (`deployment.deploy`). */
-export async function approvePromotion(id: string): Promise<Promotion> {
-  return request<Promotion>(`/api/v1/promotions/${encodeURIComponent(id)}/approve`, {
-    method: "POST",
-  });
-}
-
-/** Withdraw a promotion that has not started. Only its requester may. */
-export async function cancelPromotion(id: string): Promise<Promotion> {
-  return request<Promotion>(`/api/v1/promotions/${encodeURIComponent(id)}/cancel`, {
-    method: "POST",
-  });
-}
-
 export function fetchRateLimits(): Promise<RateLimitsDocument> {
   return request<RateLimitsDocument>("/api/v1/security/rate-limits", { cache: "no-store" });
 }
 
+/**
+ * Save the limiter document.
+ *
+ * `expected_scopes` is the document the form was opened with and is the compare-and-swap key:
+ * a form somebody else has since saved is **refused** rather than silently overwriting them. The
+ * client validates nothing — the server owns every range, and a second rule that disagreed with
+ * it would be a second place to be wrong about a limit that is refusing real traffic.
+ */
 export function saveRateLimits(save: RateLimitsSave): Promise<RateLimitsSaved> {
   return request<RateLimitsSaved>("/api/v1/security/rate-limits", {
     method: "PUT",
@@ -6206,6 +5273,15 @@ export function saveRateLimits(save: RateLimitsSave): Promise<RateLimitsSaved> {
   });
 }
 
+/**
+ * Dry-run one request through the limiter.
+ *
+ * This is a **server** call rather than a local computation on purpose, and the reason is the
+ * acceptance criterion it satisfies: the tester's verdict must match the real middleware
+ * decision. Only the server holds the same `decide` the middleware runs, so a client that
+ * reimplemented the arithmetic would agree with it on the day it was written and drift the
+ * first time somebody tunes a limit — which is the day somebody is relying on it.
+ */
 export function testRateLimit(body: RateLimitTestRequest): Promise<RateLimitTestResponse> {
   return request<RateLimitTestResponse>("/api/v1/security/rate-limits/test", {
     method: "POST",
@@ -6213,12 +5289,14 @@ export function testRateLimit(body: RateLimitTestRequest): Promise<RateLimitTest
   });
 }
 
+/** The lockout document, its ranges, and how many accounts are locked right now. */
 export function fetchSignInProtection(): Promise<SignInProtectionDocument> {
   return request<SignInProtectionDocument>("/api/v1/security/sign-in-protection", {
     cache: "no-store",
   });
 }
 
+/** Save the lockout document. `expected_policy` is the compare-and-swap key. */
 export function saveSignInProtection(save: SignInProtectionSave): Promise<SignInProtectionSaved> {
   return request<SignInProtectionSaved>("/api/v1/security/sign-in-protection", {
     method: "PUT",
@@ -6226,6 +5304,7 @@ export function saveSignInProtection(save: SignInProtectionSave): Promise<SignIn
   });
 }
 
+/** Who is locked out right now, soonest to expire first. */
 export function fetchLockedAccounts(): Promise<LockedAccountsPage> {
   return request<LockedAccountsPage>("/api/v1/security/locked-accounts", { cache: "no-store" });
 }
@@ -6914,426 +5993,6 @@ export function deleteHealthMaintenanceWindow(id: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The deployment centre (REQ-024, slice 1)
-// ---------------------------------------------------------------------------------------------
-
-/**
- * The build metadata, also read by the shell footer.
- *
- * Answers even when the release feed is down and the cache is empty, because a footer that
- * fails when a publisher's CDN wobbles is worse than a footer that shows a version and says
- * nothing about updates.
- */
-export async function fetchDeploymentVersion(): Promise<{ version: DeploymentVersion }> {
-  return request<{ version: DeploymentVersion }>("/api/v1/deployment/version");
-}
-
-/** The environment cards, with the version block they were computed from. */
-export async function fetchDeploymentEnvironments(): Promise<DeploymentEnvironmentsResponse> {
-  return request<DeploymentEnvironmentsResponse>("/api/v1/deployment/environments");
-}
-
-/** One card with its recent history. */
-export async function fetchDeploymentEnvironment(
-  environment: string,
-): Promise<DeploymentEnvironmentDetail> {
-  return request<DeploymentEnvironmentDetail>(
-    `/api/v1/deployment/environments/${encodeURIComponent(environment)}`,
-  );
-}
-
-/** The release browser for a channel. */
-export async function fetchDeploymentReleases(filters: {
-  channel?: string;
-  limit?: number;
-} = {}): Promise<DeploymentReleasesResponse> {
-  const query = new URLSearchParams();
-  if (filters.channel) query.set("channel", filters.channel);
-  if (filters.limit) query.set("limit", String(filters.limit));
-  const suffix = query.toString();
-  return request<DeploymentReleasesResponse>(
-    `/api/v1/deployment/releases${suffix ? `?${suffix}` : ""}`,
-  );
-}
-
-/** `View Changes`: one release with the version block beside it. */
-export async function fetchDeploymentRelease(
-  version: string,
-  channel?: string,
-): Promise<DeploymentReleaseDetail> {
-  const query = channel ? `?channel=${encodeURIComponent(channel)}` : "";
-  return request<DeploymentReleaseDetail>(
-    `/api/v1/deployment/releases/${encodeURIComponent(version)}${query}`,
-  );
-}
-
-/** The deploy / rollback / restart history, with the applied filter echoed back. */
-export async function fetchDeploymentHistory(
-  filters: DeploymentHistoryFilters = {},
-): Promise<DeploymentHistoryResponse> {
-  const query = new URLSearchParams();
-  if (filters.environment) query.set("environment", filters.environment);
-  if (filters.kind) query.set("kind", filters.kind);
-  if (filters.status) query.set("status", filters.status);
-  if (filters.window) query.set("window", filters.window);
-  if (filters.limit) query.set("limit", String(filters.limit));
-  if (filters.offset) query.set("offset", String(filters.offset));
-  const suffix = query.toString();
-  return request<DeploymentHistoryResponse>(
-    `/api/v1/deployment/history${suffix ? `?${suffix}` : ""}`,
-  );
-}
-
-/** The update check's own state: last run, next run, what it announced. */
-export async function fetchDeploymentChecks(): Promise<DeploymentChecksResponse> {
-  return request<DeploymentChecksResponse>("/api/v1/deployment/checks");
-}
-
-/**
- * Run an update check now, and wait for it.
- *
- * Synchronous on the wire on purpose: an operator presses this immediately before a deploy and
- * needs the answer before the wizard's pre-flight, not a spinner and a re-poll. The response
- * carries *this* run's result, never the previous run's.
- */
-/* ── REQ-024 slice 2: the deploy wizard ───────────────────────────────────────────────────── */
-
-/** Run the pre-flight for a target version. Recomputed server-side on every call. */
-export async function runDeploymentPreflight(
-  environment: string,
-  toVersion: string,
-): Promise<DeploymentPreflight> {
-  return request<DeploymentPreflight>(
-    `/api/v1/deployment/environments/${encodeURIComponent(environment)}/preflight`,
-    { method: "POST", body: JSON.stringify({ to_version: toVersion }) },
-  );
-}
-
-/** Start a deploy. Production additionally requires the typed version. */
-export async function startDeployment(input: {
-  environment: string;
-  toVersion: string;
-  confirmVersion?: string;
-  backupFirst?: boolean;
-  preflightToken?: string;
-  acknowledged?: boolean;
-}): Promise<DeploymentJobResponse> {
-  return request<DeploymentJobResponse>(
-    `/api/v1/deployment/environments/${encodeURIComponent(input.environment)}/deploy`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        to_version: input.toVersion,
-        confirm_version: input.confirmVersion ?? null,
-        // The server defaults this to true; sending it explicitly means the panel's checkbox and
-        // the request cannot drift apart.
-        backup_first: input.backupFirst ?? true,
-        preflight_token: input.preflightToken ?? null,
-        acknowledged: input.acknowledged ?? false,
-      }),
-    },
-  );
-}
-
-/** One poll of a running job. */
-export async function fetchDeploymentJob(id: string): Promise<DeploymentJobResponse> {
-  return request<DeploymentJobResponse>(`/api/v1/deployment/jobs/${encodeURIComponent(id)}`);
-}
-
-/** The log since a cursor. The polling fallback for a browser that cannot hold an SSE open. */
-export async function fetchDeploymentLog(
-  id: string,
-  cursor: number,
-): Promise<DeploymentLogChunk> {
-  return request<DeploymentLogChunk>(
-    `/api/v1/deployment/jobs/${encodeURIComponent(id)}/log?cursor=${cursor}`,
-  );
-}
-
-/** Stop a job before its migrate step. */
-export async function cancelDeployment(id: string): Promise<DeploymentCancelResponse> {
-  return request<DeploymentCancelResponse>(
-    `/api/v1/deployment/jobs/${encodeURIComponent(id)}/cancel`,
-    { method: "POST" },
-  );
-}
-
-export async function runDeploymentCheck(): Promise<DeploymentCheckRunResponse> {
-  return request<DeploymentCheckRunResponse>("/api/v1/deployment/checks/run", { method: "POST" });
-}
-
-/**
- * Start a rollback to a previous version (REQ-024, slice 3).
- *
- * `reason` is not optional in the type, and that is the point: the server refuses an empty one
- * and the `0211` constraint refuses the row, so a form that lets an operator submit a blank
- * reason has a button that always fails.
- */
-export async function startDeploymentRollback(input: {
-  environment: string;
-  toVersion: string;
-  reason: string;
-  backupFirst?: boolean;
-}): Promise<DeploymentRollbackResponse> {
-  return request<DeploymentRollbackResponse>(
-    `/api/v1/deployment/environments/${encodeURIComponent(input.environment)}/rollback`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        to_version: input.toVersion,
-        reason: input.reason,
-        // Sent explicitly so the panel's checkbox and the request cannot drift; the server's own
-        // default is also `true`, because the dangerous default is the one with no way back.
-        backup_first: input.backupFirst ?? true,
-      }),
-    },
-  );
-}
-
-/** Every environment's maintenance window. Polled by the screen and by the shell banner. */
-export async function fetchDeploymentMaintenance(): Promise<DeploymentMaintenanceResponse> {
-  return request<DeploymentMaintenanceResponse>("/api/v1/deployment/maintenance");
-}
-
-/**
- * Save one environment's window.
- *
- * `scope` and the timestamps are sent as `null` when unset rather than omitted: the server
- * treats a missing scope as "keep the stored one", and a form that omitted it would silently
- * keep an old value the operator thought they had changed.
- */
-export async function saveDeploymentMaintenance(input: {
-  environment: string;
-  enabled: boolean;
-  message: string;
-  startsAt?: string | null;
-  endsAt?: string | null;
-  scope?: string | null;
-}): Promise<DeploymentMaintenanceWindow> {
-  return request<DeploymentMaintenanceWindow>(
-    `/api/v1/deployment/maintenance/${encodeURIComponent(input.environment)}`,
-    {
-      method: "PUT",
-      body: JSON.stringify({
-        enabled: input.enabled,
-        message: input.message,
-        starts_at: input.startsAt ?? null,
-        ends_at: input.endsAt ?? null,
-        scope: input.scope ?? null,
-      }),
-    },
-  );
-}
-
-/** ---------------------------------------------------------------------------------------------
- * The cluster panel (REQ-024, slice 4).
- *
- * The read refuses with a `404` carrying a payload on a single instance rather than answering an
- * empty cluster, so the caller has to handle the refusal: `fetchDeploymentCluster` returns the
- * discriminated union instead of throwing, because a 404 here is the normal answer for a single
- * VPS and a screen that renders an error state for it is wrong on most installations.
- * ------------------------------------------------------------------------------------------- */
-
-/** The cluster read, or the single-instance card. Never throws for "not a cluster". */
-export async function fetchDeploymentCluster(
-  environment: string,
-): Promise<DeploymentClusterResponse | DeploymentProcessCard> {
-  try {
-    return await request<DeploymentClusterResponse>("/api/v1/deployment/cluster");
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 404) {
-      // The server names which of the three cases it is; showing the operator a generic
-      // "not found" for a cluster whose token is missing sends them looking for the wrong thing.
-      return {
-        runtime: "single",
-        process: null,
-        reason: error.message,
-      };
-    }
-    throw error;
-  }
-}
-
-/** One workload's sample series, for the sparkline. */
-export async function fetchClusterSamples(
-  environment: string,
-  workload: string,
-): Promise<ClusterSamplesResponse> {
-  return request<ClusterSamplesResponse>(
-    `/api/v1/deployment/cluster/${encodeURIComponent(environment)}/samples/${encodeURIComponent(workload)}`,
-  );
-}
-
-/** Restart a workload. `confirm` is required in production and is the workload's name. */
-export async function restartClusterWorkload(input: {
-  environment: string;
-  workload: string;
-  confirm?: string;
-  reason?: string;
-}): Promise<ClusterRestartResponse> {
-  return request<ClusterRestartResponse>(
-    `/api/v1/deployment/cluster/${encodeURIComponent(input.environment)}/restart`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        workload: input.workload,
-        confirm: input.confirm ?? "",
-        reason: input.reason ?? null,
-      }),
-    },
-  );
-}
-
-/** Sample now and prune, so the "sample" button is not a dead control. */
-export async function runClusterSample(environment: string): Promise<ClusterSampleRunResponse> {
-  return request<ClusterSampleRunResponse>(
-    `/api/v1/deployment/cluster/${encodeURIComponent(environment)}/sample`,
-    { method: "POST" },
-  );
-}
-
-// The developer platform (REQ-033, slice 1)
-// ---------------------------------------------------------------------------------------------
-
-/**
- * List the organization's API keys.
- *
- * The return type is `ApiKeysResponse` rather than `ApiKey[]` because the API answers an object:
- * a bare array is the shape you cannot add a summary to later without changing every client's
- * type on the day you do.
- */
-export async function fetchApiKeys(): Promise<ApiKeysResponse> {
-  return request("/api/v1/api-keys");
-}
-
-/**
- * One key and its daily usage, in one round trip.
- *
- * `days` is bounded by the API (1–365) so a client cannot ask for a decade of bars and get a
- * thousand-point chart nobody reads.
- */
-export async function fetchApiKey(keyId: string, days = 30): Promise<ApiKeyDetail> {
-  return request(`/api/v1/api-keys/${encodeURIComponent(keyId)}?days=${days}`);
-}
-
-/** What `POST /api/v1/api-keys` accepts. */
-export type CreateApiKeyInput = {
-  name: string;
-  scopes: string[];
-  environment: "live" | "sandbox";
-  rate_tier?: "standard" | "high";
-  /** CIDR blocks. Omit the field entirely for "any source" — an empty array means the same. */
-  ip_allowlist?: string[];
-  /** 30, 90, 365, or omit for "never". */
-  expires_in_days?: number;
-};
-
-/**
- * Mint a key. The response carries `secret` and this is the only time it will.
- *
- * The caller is responsible for showing it once and then discarding it — there is no endpoint
- * to fetch it again, which is the point.
- */
-export async function createApiKey(input: CreateApiKeyInput): Promise<MintedApiKey> {
-  return request("/api/v1/api-keys", { method: "POST", body: JSON.stringify(input) });
-}
-
-/**
- * Rotate a key: a new secret, the old one dead immediately.
- *
- * No overlap window, and the panel says so — see the REQ-033 slice-1 note on why rotation and
- * the OAuth client-secret rotation (slice 3, which *does* overlap) are different operations.
- */
-export async function rotateApiKey(keyId: string): Promise<MintedApiKey> {
-  return request(`/api/v1/api-keys/${encodeURIComponent(keyId)}/rotate`, { method: "POST" });
-}
-
-/** Revoke a key. The row and its history stay; the credential stops working. */
-export async function revokeApiKey(keyId: string): Promise<void> {
-  await request(`/api/v1/api-keys/${encodeURIComponent(keyId)}`, { method: "DELETE" });
-}
-
-/** The filters `GET /api/v1/request-logs` accepts. Every one is optional. */
-export type RequestLogFilters = {
-  api_key_id?: string;
-  /** By public prefix — what a key row's "View logs" link uses. */
-  key_prefix?: string;
-  status?: number;
-  status_class?: "2xx" | "3xx" | "4xx" | "5xx";
-  path_prefix?: string;
-  method?: string;
-  /** How far back. The API defaults to 24 hours when this is omitted. */
-  since_hours?: number;
-  min_duration_ms?: number;
-  limit?: number;
-  offset?: number;
-};
-
-/**
- * Build the log query string.
- *
- * Empty values are *omitted* rather than sent blank: `?status_class=` would arrive as an empty
- * string, fail the API's closed-list validation with a 400, and read as "the filter is broken"
- * rather than "the filter is not set".
- */
-export function requestLogQuery(filters: RequestLogFilters): string {
-  const params = new URLSearchParams();
-  for (const [name, value] of Object.entries(filters)) {
-    if (value === undefined || value === null || value === "") {
-      continue;
-    }
-    params.set(name, String(value));
-  }
-  const query = params.toString();
-  return query.length > 0 ? `?${query}` : "";
-}
-
-/**
- * A filtered page of the request log.
- *
- * Metadata only. There is no body to return, so the absence of payload data is the schema
- * rather than a redaction somebody has to remember to apply.
- */
-export async function fetchRequestLogs(
-  filters: RequestLogFilters = {},
-): Promise<ApiRequestLogPage> {
-  return request(`/api/v1/request-logs${requestLogQuery(filters)}`);
-}
-
-/** One request's metadata — what the log row's drawer opens. */
-export async function fetchRequestLog(id: number): Promise<ApiRequestLog> {
-  return request(`/api/v1/request-logs/${encodeURIComponent(String(id))}`);
-}
-
-
-// The API Explorer (REQ-033, slice 2)
-// ---------------------------------------------------------------------------------------------
-
-/**
- * The operations this caller may see, for the browser's left column.
- *
- * A separate call from the OpenAPI document rather than a query flag on it: the document is a
- * standard that a code generator consumes, and an extension to its top level would break one.
- * The filtered list is the platform's own shape for its own UI.
- */
-export async function fetchExplorerOperations(): Promise<ExplorerOperations> {
-  return request("/api/v1/dev/operations");
-}
-
-/**
- * Send one call as the signed-in caller.
- *
- * The API refuses this route when the caller's own permissions would refuse the call it is
- * asked to make, so a `403` here is the same `403` the same person would get from their
- * terminal — which is the whole reason the Explorer is useful rather than dangerous.
- */
-export async function runExplorerRequest(input: ExplorerRunInput): Promise<ExplorerRun> {
-  return request("/api/v1/dev/explorer/requests", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
 // Developer portal (REQ-022, slice 2)
 // ---------------------------------------------------------------------------------------------
 //
@@ -7378,176 +6037,6 @@ export function createDeveloperKey(
   return request<IssuedDeveloperKey>("/api/v1/developer/api-keys", {
     method: "POST",
     body: JSON.stringify(input),
-  });
-}
-
-/**
- * The served OpenAPI document, for a developer who wants to point a generator at it.
- *
- * Nothing in the panel calls this — the panel's browser uses {@link fetchExplorerOperations},
- * which is permission-filtered. It is here because "download the OpenAPI document" is a thing
- * somebody will want to do, and a reference that can only be seen through a UI is a reference
- * that cannot be scripted against.
- */
-export async function fetchOpenApiDocument(): Promise<Record<string, unknown>> {
-  return request("/api/v1/dev/openapi.json");
-}
-
-/**
- * OAuth applications (REQ-033, slice 3). The panel's side of the OAuth story.
- *
- * These six functions wrap the six panel routes in `apps/api/src/routes/developer_oauth.rs`.
- * The four *sessionless* endpoints — authorize, consent POST, token and introspect — are
- * deliberately absent here: they take no session and are reached by a third-party client, so
- * putting them in the panel's `request()` helper would put them behind the caller's cookie and
- * make them look like panel routes.
- */
-
-/** `GET /api/v1/oauth-apps`. */
-export async function fetchOAuthApps(): Promise<OAuthAppsResponse> {
-  return request("/api/v1/oauth-apps");
-}
-
-/**
- * `GET /api/v1/oauth-apps/{id}` — one app and its live authorization-code count.
- *
- * The id is encoded: it is a UUID the panel read from the list, but the helper does not assume
- * a caller passed something it produced.
- */
-export async function fetchOAuthApp(appId: string): Promise<OAuthAppDetailResponse> {
-  return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}`);
-}
-
-/** Body of `POST /api/v1/oauth-apps`. `grant_types` omitted means the browser flow alone. */
-export type CreateOAuthAppInput = {
-  name: string;
-  description?: string;
-  logo_object_key?: string;
-  redirect_uris: string[];
-  scopes: string[];
-  grant_types?: OAuthGrant[];
-};
-
-/** Register an app. The secret is in this response and nowhere else, ever. */
-export async function createOAuthApp(input: CreateOAuthAppInput): Promise<MintedOAuthApp> {
-  return request("/api/v1/oauth-apps", { method: "POST", body: JSON.stringify(input) });
-}
-
-/**
- * `PATCH /api/v1/oauth-apps/{id}` — a partial edit.
- *
- * A `PATCH` rather than a `PUT` because the panel's form submits the record it read, and a `PUT`
- * means "this is now the whole resource" — so editing one description would blank the redirect
- * URIs. `description` and `logo_object_key` take `null` to *clear*, which is why they are
- * `string | null` rather than absent.
- */
-export async function editOAuthApp(
-  appId: string,
-  input: {
-    name?: string;
-    description?: string | null;
-    logo_object_key?: string | null;
-    redirect_uris?: string[];
-    scopes?: string[];
-    grant_types?: OAuthGrant[];
-  },
-): Promise<OAuthAppDetailResponse> {
-  return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}`, {
-    method: "PATCH",
-    body: JSON.stringify(input),
-  });
-}
-
-/**
- * `POST /api/v1/oauth-apps/{id}/rotate` — a new client secret, and a 7-day overlap for the old
- * one.
- *
- * The overlap is the difference from an API key rotation, which has none: a client secret is
- * usually deployed to more machines than anybody is tracking, so the panel says how long the old
- * one keeps working rather than pretending the switch is instantaneous.
- */
-export async function rotateOAuthAppSecret(appId: string): Promise<MintedOAuthApp> {
-  return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}/rotate`, { method: "POST" });
-}
-
-/**
- * `DELETE /api/v1/oauth-apps/{id}` — withdraw.
- *
- * Idempotent, and it does not delete the row: its codes and its audit trail reference it, and
- * "show me what this integration did last March" has to keep working.
- */
-export async function withdrawOAuthApp(appId: string): Promise<void> {
-  await request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}`, { method: "DELETE" });
-}
-
-/**
- * `POST /api/v1/oauth-apps/{id}/suspend` — switch an app off and back on without withdrawing it.
- *
- * Two verbs rather than a `PATCH` with a status, because the two are not symmetric: suspending is
- * reversible and safe, withdrawing is neither.
- */
-export async function setOAuthAppSuspended(
-  appId: string,
-  suspended: boolean,
-): Promise<OAuthAppDetailResponse> {
-  return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}/suspend`, {
-    method: "POST",
-    body: JSON.stringify({ suspended }),
-  });
-}
-
-// The edge region registry (REQ-035, slice 1)
-// ---------------------------------------------------------------------------------------------
-
-/**
- * The registry, the health matrix and the latency matrix, in one read.
- *
- * One request rather than three, and the reason is specific rather than tidy: the list screen
- * renders all three, so three fetches mean three independent paint states AND three moments
- * in time. On a deployment that is actively changing, the region table and the health badges
- * disagree for as long as the slowest request takes -- and the disagreement looks like a bug in
- * the panel rather than a race between two reads of the same instant.
- */
-export async function fetchRegions(): Promise<RegionOverview> {
-  return request<RegionOverview>("/api/v1/regions");
-}
-
-/**
- * One region, for the detail screen.
- *
- * A separate call rather than a filter of the overview, because the detail screen shows the
- * region's own row and column of the latency matrix — which the overview carries anyway, but a
- * deep link from a search result should not have to load every region to render one.
- */
-export async function fetchRegion(code: string): Promise<RegionDetail> {
-  return request<RegionDetail>(`/api/v1/regions/${encodeURIComponent(code)}`);
-}
-
-/** The health matrix on its own, for the health checker's own polling. */
-export async function fetchRegionHealth(): Promise<RegionHealthMatrix> {
-  return request<RegionHealthMatrix>("/api/v1/regions/health");
-}
-
-/** The region-to-region latency matrix on its own. */
-export async function fetchRegionLatency(): Promise<RegionLatencyMatrix> {
-  return request<RegionLatencyMatrix>("/api/v1/regions/latency-matrix");
-}
-
-/**
- * Rename a region, set its status, activate it, or move the routing default.
- *
- * `PATCH` rather than `PUT` and never a form-encoded body: the two endpoints are nullable, and
- * a `PUT` that means "replace the whole document" cannot express "clear the admin host, leave
- * the web host alone" without also resending every other field — which is how a concurrent
- * editor loses a change.
- */
-export async function patchRegion(
-  code: string,
-  patch: RegionPatchInput,
-): Promise<RegionPatchResponse> {
-  return request<RegionPatchResponse>(`/api/v1/regions/${encodeURIComponent(code)}`, {
-    method: "PATCH",
-    body: JSON.stringify(patch),
   });
 }
 

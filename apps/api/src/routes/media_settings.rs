@@ -83,17 +83,11 @@ impl SettingsBody {
     fn build(settings: &omnion_media::SiteStorage, created_at: time::OffsetDateTime) -> Self {
         // `configured` compares against the row's own creation instant rather than a stored
         // boolean: a row that was inserted by the trigger and never edited has the two
-        // timestamps equal, and a row somebody saved has them apart.
-        //
-        // The question has to be "were these two instants ever different", **not** "are they
-        // at least a second apart". Rounding the gap down to whole seconds first made this a
-        // race against the clock: a save followed by the read that observes it inside the same
-        // second leaves a difference of a few hundred microseconds, `whole_seconds()`
-        // truncated it to `0`, and a site that had just been configured reported itself as
-        // never touched. The panel then shows "you have not set this up yet" over a working
-        // configuration — the one screen where a wrong `false` destroys the operator's trust in
-        // every other value on the page.
-        let configured = settings.updated_at != created_at;
+        // timestamps equal to the microsecond, and a row somebody saved has them apart. The
+        // one-second window is deliberate — two writes inside the same clock tick are
+        // indistinguishable from one, and pretending otherwise would report an untouched site
+        // as configured after its first save.
+        let configured = (settings.updated_at - created_at).whole_seconds().abs() >= 1;
         let public_base_summary = describe_public_base(&settings.public_base_url);
         let visibility_note = if settings.uploads_are_public() {
             "New uploads on this site default to public. Anyone holding the file's URL can \

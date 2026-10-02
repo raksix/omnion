@@ -443,108 +443,6 @@ catalogue! {
     "A domain was detached from its site.",
     [("domain_id", Uuid, req), ("site_id", Uuid, opt), ("hostname", String, opt)];
 
-    // The CDN purge lifecycle (REQ-011). `cdn.purge.requested` is what an operator caused and
-    // `cdn.purge.failed` is what the runner could not finish; both are Low volume on the happy
-    // path and the failure one is the row an operations endpoint alerts on. The names that only
-    // exist as audit actions — `cdn.rule.changed`, `cdn.settings.updated` — are deliberately
-    // NOT listed: they are written to `audit_log`, not to the bus, and a catalogue row would
-    // put a name in the endpoint picker that no delivery can ever carry.
-    //
-    // `failed_items` is `Any` rather than an integer: it is a per-item error list, and pinning
-    // its shape here would make a future richer failure a breaking change to a subscribed name.
-    "cdn.purge.requested", "cdn", Live,
-    "An operator asked the edge to drop cached copies of something on a site.",
-    [("purge_id", Uuid, req), ("site_id", Uuid, req), ("kind", String, req),
-     ("target_count", Integer, req), ("provider", String, opt)];
-    "cdn.purge.failed", "cdn", Live,
-    "An edge purge finished with items the provider would not drop.",
-    [("purge_id", Uuid, req), ("provider", String, opt), ("kind", String, opt),
-     ("failed_items", Any, opt)];
-
-    // The tenant lifecycle (REQ-005). Every one of these carries `organization_id` in the
-    // payload as well as on the event, because the envelope's own field is what the fan-out
-    // scopes by and a consumer reading only the payload would otherwise not know the tenant
-    // without already holding the event.
-    //
-    // `organization.member.role_changed` is ONE name with two shapes, and the catalogue records
-    // that honestly rather than pretending it is uniform: a *membership* binding emits
-    // `user_id`/`role_id`/`scope`/`change`, while a *department* binding emits
-    // `department_id`/`department_key`/`role_id`/`action`. Both are marked optional, because
-    // neither is always present — a department grant has no `user_id`, and a member grant has no
-    // `department_key`. Declaring either as required would make the catalogue promise something
-    // an emitter does not deliver; declaring both optional is the honest statement, and the
-    // receiver that cares about one shape tests for the keys it needs.
-    "organization.member.joined", "tenancy", Live,
-    "A person became a member of an organization, directly or by accepting an invitation.",
-    [("organization_id", Uuid, req), ("user_id", Uuid, req), ("status", String, opt),
-     ("via", String, opt), ("invitation_id", Uuid, opt)];
-    "organization.member.status_changed", "tenancy", Live,
-    "A member's status within the organization changed.",
-    [("organization_id", Uuid, req), ("user_id", Uuid, req), ("status", String, req),
-     ("is_primary", Boolean, opt)];
-    "organization.member.removed", "tenancy", Live,
-    "A person was removed from an organization.",
-    [("organization_id", Uuid, req), ("user_id", Uuid, req)];
-    "organization.member.invitation_released", "tenancy", Live,
-    "A pending invitation was withdrawn or expired, freeing its seat.",
-    [("organization_id", Uuid, req), ("invitation_id", Uuid, req),
-     ("email_masked", String, opt), ("role_id", Uuid, opt)];
-    "organization.member.role_changed", "tenancy", Live,
-    "A role binding was granted or revoked, on a member or on a department.",
-    [("organization_id", Uuid, opt), ("user_id", Uuid, opt), ("role_id", Uuid, req),
-     ("scope", String, opt), ("change", String, opt),
-     ("department_id", Uuid, opt), ("department_key", String, opt), ("action", String, opt)];
-    "organization.department.created", "tenancy", Live,
-    "A department was added to an organization's structure.",
-    [("organization_id", Uuid, req), ("department_id", Uuid, req),
-     ("department_key", String, req), ("parent_id", Uuid, opt)];
-    "organization.department.updated", "tenancy", Live,
-    "A department was renamed, moved, or changed status.",
-    [("organization_id", Uuid, req), ("department_id", Uuid, req),
-     ("department_key", String, req), ("status", String, opt), ("parent_id", Uuid, opt)];
-    "organization.department.archived", "tenancy", Live,
-    "A department was archived and is no longer a part of the structure.",
-    [("organization_id", Uuid, req), ("department_id", Uuid, req),
-     ("department_key", String, req)];
-    "organization.limit.reached", "tenancy", Live,
-    "An organization hit a configured ceiling and the action that was refused.",
-    [("resource", String, req), ("used", Integer, opt), ("limit", Integer, opt),
-     ("action", String, req)];
-    // The sweep runs on a timer with no request behind it, so it has no actor — the field is
-    // left off entirely rather than filled with a synthetic id, because "who" is the wrong
-    // question for a row the scheduler produced.
-    "organization.retention.swept", "tenancy", Live,
-    "An organization's retention sweep removed audit rows older than its window.",
-    [("retention_days", Integer, req), ("rows_removed", Integer, opt),
-     ("cutoff", Timestamp, opt)];
-
-    // The staging lifecycle (REQ-017). `promotion.requested` and `promotion.completed` are the
-    // CI/CD signal this request names: an endpoint subscribed to `promotion.*` triggers a build,
-    // a cache purge or a smoke test on the other side of a deploy. That is why
-    // `promotion.completed` carries the affected item ids' *count* rather than re-emitting
-    // `page.published` for every copied row — the one event with the answer, not a flood.
-    //
-    // The remaining three (`promotion.approved`, `promotion.failed`, `promotion.conflict`) are
-    // not here: no emitter records them yet, and a row in this table is a promise that the name
-    // fires. They join the catalogue in the commit that gives the apply path its emitter.
-    "environment.created", "environments", Live,
-    "A staging environment was created and its first clone started.",
-    [("environment_id", Uuid, req), ("key", String, req), ("type", String, req)];
-    "environment.clone.started", "environments", Live,
-    "A clone job began copying production content into an environment.",
-    [("environment_id", Uuid, req), ("job_id", Uuid, req), ("areas", Json, opt)];
-    "environment.archived", "environments", Live,
-    "A staging environment was archived: its content is kept and its host released.",
-    [("environment_id", Uuid, req), ("key", String, req)];
-    "promotion.requested", "environments", Live,
-    "A frozen change set was submitted for promotion to production.",
-    [("promotion_id", Uuid, req), ("environment_id", Uuid, req),
-     ("items", Integer, req), ("conflicts", Integer, opt)];
-    "promotion.completed", "environments", Live,
-    "An approved change set was applied to production.",
-    [("promotion_id", Uuid, req), ("environment_id", Uuid, req),
-     ("written", Integer, opt), ("removed", Integer, opt), ("items", Integer, opt)];
-
     // ---- Plugins, themes, workflows --------------------------------------------------------------
     "plugin.installed", "plugins", Reserved,
     "A plugin was installed.",
@@ -570,6 +468,19 @@ catalogue! {
     "workflow.run.failed", "workflows", Reserved,
     "A workflow run stopped on a step that failed.",
     [("workflow_id", Uuid, req), ("run_id", Uuid, req), ("error", String, opt)];
+    // ---- Automation projects (REQ-133) ------------------------------------------------------------
+    // The limit notices are the interesting pair: an operations team subscribes to them precisely
+    // because they are *once*. `period` and `current` travel with every one of them, so a consumer
+    // can tell "crossed again after midnight" from "the same crossing observed twice" without
+    // keeping state of its own.
+    "automation.project.limit.warning", "automation", Live,
+    "An automation project crossed a limit's warning threshold, once per period.",
+    [("project_id", Uuid, req), ("limit", String, req), ("current", Integer, req),
+     ("max", Integer, req), ("period", String, req), ("project_key", String, opt)];
+    "automation.project.limit.exceeded", "automation", Live,
+    "An automation project reached a hard limit; further runs are refused until the limit rises.",
+    [("project_id", Uuid, req), ("limit", String, req), ("current", Integer, req),
+     ("max", Integer, req), ("period", String, req), ("project_key", String, opt)];
 
     // ---- Webhooks ------------------------------------------------------------------------------
     "webhook.endpoint.created", "webhooks", Live,
@@ -633,6 +544,69 @@ catalogue! {
     "notification.preferences.changed", "notifications", Live,
     "Somebody changed how or whether they are notified.",
     [("user_id", Uuid, req), ("field", String, opt)];
+
+    // ---- CRM intake (REQ-117) -------------------------------------------------------------------
+    // These five are recorded by `apps/api/src/routes/crm_intake.rs` today. They were absent
+    // from this table for six slices, which is the exact drift the walker test exists to catch:
+    // the bus wrote the fact, the delivery was queued, and the endpoint form's picker never
+    // offered the name — so "new quote request → notify Slack" was undeliverable by
+    // construction while looking like a configuration problem. A module that emits is a module
+    // whose names belong here the day it emits, not the day its own REQ is closed.
+    "crm.lead.received", "crm", Live,
+    "A submission was stored as a lead, or stored as a rejection so the inbox can show it.",
+    [("lead_id", Uuid, req), ("source_id", Uuid, opt), ("form_key", String, opt),
+     ("status", String, req), ("decision", String, opt), ("product_interest", String, opt)];
+    "crm.lead.assigned", "crm", Live,
+    "A lead got an owner, or changed hands.",
+    [("lead_id", Uuid, req), ("owner_user_id", Uuid, opt),
+     ("previous_owner_user_id", Uuid, opt), ("rule_id", Uuid, opt), ("reason", String, opt)];
+    "crm.lead.responded", "crm", Live,
+    "The first response against a lead was recorded and its SLA clock stopped.",
+    [("lead_id", Uuid, req), ("minutes_to_response", Integer, opt), ("sla_state", String, opt)];
+    "crm.lead.converted", "crm", Live,
+    "A lead became a contact and an opportunity, with a quotation draft when sales is installed.",
+    [("lead_id", Uuid, req), ("contact_id", Uuid, opt), ("deal_id", Uuid, opt),
+     ("quote_id", Uuid, opt)];
+    "crm.intake.source.updated", "crm", Live,
+    "An intake source, its mapping or its endpoint key changed. A rotation is a change.",
+    [("source_id", Uuid, req), ("changed_keys", String, opt)];
+    // Emitted by `apps/api/src/crm_sla_runner.rs`, which ships in the same slice as these two
+    // rows — so `Live`, not `Reserved`. The lifecycle flag is the table's promise about who
+    // records a name, and a name whose recorder is in the same commit as the row is live the
+    // moment that commit lands. Marking it reserved would have been the optimistic version of
+    // the drift the five rows above describe: the picker says "planned", an operator wires an
+    // automation to it, and nothing is ever recorded.
+    "crm.lead.sla_breached", "crm", Live,
+    "A lead's first-response deadline passed unanswered and the escalation target was told.",
+    [("lead_id", Uuid, req), ("due_at", Timestamp, opt), ("owner_user_id", Uuid, opt),
+     ("escalated_to", Uuid, opt)];
+    "crm.lead.sla_reminder", "crm", Live,
+    "A lead's first-response deadline is close enough that its owner was reminded.",
+    [("lead_id", Uuid, req), ("due_at", Timestamp, req), ("owner_user_id", Uuid, opt)];
+    // The eighth CRM name, and the reason this row reads the way it does. `crm.intake.rule.updated`
+    // is emitted on every assignment-rule create and update by a **local** helper —
+    // `emit(pool, organization_id, name, target_id, payload)` in `crm_assignment.rs`, which takes
+    // the name as a parameter and hands it to `bus::emit` — so it never reaches the drift gate in
+    // `apps/api/tests/events.rs` that walks the workspace for `NewEvent::new("…")`. The gate's
+    // own header calls this shape out: *"listing the wrapper here is the difference between a gate
+    // that measures the workspace and one that measures a subset of it"*, and it did it for
+    // `Announcement::new(`. This name is the second instance, and unlike the first it was
+    // **undeliverable by construction**: the picker never offered it, so a receiver could not
+    // subscribe, while the bus recorded the fact on every rule write.
+    //
+    // The name is deliberately `crm.intake.rule.updated` and not a `crm.assignment.*` name.
+    // `crm.intake.source.updated` already exists and means "a source, its mapping or its key
+    // changed" — a rule is what *decides* an intake lead's owner, and the wrapper deliberately
+    // reports both `created` and `updated` through one `changed_keys` payload, so renaming it
+    // would be a wire change for an event some receiver may already subscribe to. The
+    // `crm.assignment.*` names beside it are **audit actions**, not bus events: they are written
+    // to `audit_log` by `audit(…)` and never reach the bus at all, so listing them here would
+    // put a subscription in the picker that could never receive anything. That distinction is
+    // the whole reason this row was not written a week ago when the same gap was found — the
+    // file contains sixteen `crm.*` literals and exactly one of them is an unemitted bus event.
+    "crm.intake.rule.updated", "crm", Live,
+    "An assignment rule was created or changed, so a lead's owner may now be decided differently.",
+    [("rule_id", Uuid, req), ("changed_keys", String, opt)];
 
     // ---- System health --------------------------------------------------------------------------
     // The five names REQ-014's Events section names, and the reason this area exists at all is
@@ -912,95 +886,6 @@ mod tests {
         for name in ["webhook.test", "page.published", "media.created"] {
             assert!(is_known(name), "{name} is emitted but not listed");
         }
-    }
-
-    /// A group subscription has to reach the names it is supposed to cover.
-    ///
-    /// This is the test that would have caught the seventeen missing rows at the moment they
-    /// were written, rather than whenever somebody next ran the integration suite. It is a unit
-    /// test on purpose: the integration gate in `apps/api/tests/events.rs` needs a database and
-    /// a compiled API binary, so on a branch where the per-tick command is
-    /// `cargo test -p <the crate you touched> --quiet` it is exactly the gate that never runs,
-    /// and a missing catalogue row is invisible until a webhook endpoint quietly receives
-    /// nothing.
-    ///
-    /// The names are read out of this branch's own emitters rather than written out here — a
-    /// second hand-typed list would drift from the table it is supposed to check, which is the
-    /// bug this test exists to catch. `env!("CARGO_MANIFEST_DIR")` is `crates/events`, so the
-    /// routes live two levels up under `apps/api/src/routes`.
-    #[test]
-    fn the_group_wildcards_reach_the_names_this_branch_emits() {
-        // One representative per group, chosen because the emitter is on THIS branch: an
-        // event name from a module that is not shipped here would prove nothing.
-        const GROUPS: &[(&str, &str, &str)] = &[
-            (
-                "organization",
-                "tenancy",
-                "apps/api/src/routes/tenancy_members.rs",
-            ),
-            (
-                "promotion",
-                "environments",
-                "apps/api/src/routes/promotions.rs",
-            ),
-            (
-                "environment",
-                "environments",
-                "apps/api/src/routes/environments.rs",
-            ),
-        ];
-
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|path| path.parent())
-            .expect("the workspace root is two levels above crates/events");
-
-        let mut read = 0_usize;
-        for (group, area, relative) in GROUPS {
-            let path = workspace.join(relative);
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|err| panic!("{} must be readable: {err}", path.display()));
-
-            let emitted: Vec<&str> = text
-                .lines()
-                .filter_map(|line| {
-                    let rest = line.split("NewEvent::new(\"").nth(1)?;
-                    let name = rest.split('"').next()?;
-                    // A fixture asserting the validator refuses a name is not an emitter.
-                    (name.starts_with(*group)
-                        && name
-                            .chars()
-                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.'))
-                    .then_some(name)
-                })
-                .collect();
-
-            read += emitted.len();
-            assert!(
-                !emitted.is_empty(),
-                "{} emits no {group}.* name, so this test proves nothing about {group}.*",
-                path.display()
-            );
-            for name in emitted {
-                assert!(
-                    is_known(name),
-                    "{name} is emitted by {} but the catalogue does not list it, so a \
-                     {group}.* subscription cannot reach it",
-                    path.display()
-                );
-                assert_eq!(
-                    lookup(name).map(|entry| entry.area),
-                    Some(*area),
-                    "{name} is listed under the wrong area; {group}.* would expand against the \
-                     area grouping the panel shows"
-                );
-            }
-        }
-
-        assert!(
-            read >= 6,
-            "the walk read {read} emissions; a walk that sees almost nothing proves nothing"
-        );
     }
 
     #[test]

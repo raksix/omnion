@@ -24,7 +24,6 @@ pub mod catalogue;
 pub mod engine;
 pub mod error;
 pub mod model;
-pub mod schema;
 pub mod sender;
 pub mod signature;
 pub mod store;

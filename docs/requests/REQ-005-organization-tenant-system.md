@@ -1,16 +1,7 @@
 # REQ-005 — Organization / Tenant System
 
-> **Status:** in-progress (`ed845eb2`; tick 80 — the fix `42dfa290` proved on `tenancy.rs` is now carried into the three remaining suites: `tenancy_members`, `tenancy_departments` and `tenancy_limits` are 6,472 lines with ~180 request sites and 0 CSRF headers, all reading only the first `Set-Cookie` and keeping the session. They model the browser instead: `login()` returns `Credentials { session, csrf }` with `Deref<Target = str>`, so ~180 `Some(&admin)` call sites compile unchanged while the second cookie travels with the first — one function per file instead of one edit per site, and a session without its token is now unrepresentable. `Debug` is hand-written to print `<redacted>`, because deriving it would write a live session token into every CI log. PROOF: three targets compile (`COMPILE2_EXIT=0`); `tenancy_departments` 7/7 in 198.64 s and `tenancy_limits` 25/29 in 337.78 s with `grep -c csrf_failed` = **0** over the whole run — the failure class is gone, not four symptoms of it; the 4 remaining are `PoolTimedOut` at fixture setup on a PostgreSQL shared by seven writers at `max_connections=100`, and the first passes alone. `pnpm typecheck` 2/2. STILL OPEN: the box below needs the QA slot, which six orphaned waiters of mine were holding — a SIGKILLed pass never runs its EXIT trap and the waiter survives reparented to PID 1, so they are TERMed by matching `/proc/<pid>/cwd` and never another writer's) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
+> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
->
-> Slices 1 and 2 shipped (`0c63b73` for slice 2). Slice 3's API, migration and the Settings,
-> Modules and Billing tabs shipped (`9b5f268`); the invite-policy behaviours and the Audit tab
-> shipped with them (`337c5bc`), and the suspend/archive flows closed the slice (`a25267a`).
-> **Slice 3 is complete** — a frozen tenant keeps every read, refuses every write by name, and
-> the status change itself is the one write that gets through, so a tenant can always be brought
-> back. Slice 4's events, retention sweep and webhook-isolation walk shipped earlier; the
-> member drawer shipped with them — the one screen the spec and the QA plan both name and
-> neither had. What remains in slice 4 is the mobile pass and the green QA walkthrough.
 
 ## Request
 
@@ -157,129 +148,24 @@ automation engine uses; the token never appears in an event payload.
 
 ### Acceptance criteria
 
-- [x] The organizations list, organization detail with every tab, the switcher, the invite dialog and the invitation page exist at the routes above and appear in the QA walkthrough inventory.
-- [x] A user belonging to two organizations can switch between them with the header switcher, and the site list, pages and media follow the switch.
-- [x] Backfill is proven: every pre-existing user has exactly one primary membership, every organization has a settings and a limits row, and no orphan row exists.
-  _Membership half proven by `the_backfill_gives_every_home_organization_one_primary_membership`. The settings and limits half by `the_backfill_gives_every_organization_a_settings_and_a_limits_row` in `apps/api/tests/tenancy_limits.rs`: no orphan row in either table, exactly one row per organization however often it is read, and a hand-edited ceiling survives a later read (the read path upserts the defaults, so it must not reset what it did not write). An organization created *after* the migration legitimately has no row until the tab is first opened, which is why the read path upserts — the acceptance line is about the tenants that existed when it ran._
-- [x] Inviting an existing member is refused naming them; inviting the same address twice returns the pending invitation instead of creating a duplicate.
-- [x] The invitation link opens the preview, acceptance works for an existing account and for a new sign-up, and both land on the organization overview.
-- [x] Expired, revoked and already-accepted tokens each render their own explanation, and a rate-limited preview does not reveal whether the organization exists.
-- [x] Accepting an invitation at the seat limit is refused with `organization.limit.reached` naming the ceiling; raising the limit makes the same invitation acceptable.
-  _`a_ceiling_really_bounds_accepting_an_invitation`: inviting a third address is *not* refused — the REQ puts enforcement at acceptance, not at inviting — while accepting is, with `resource: seats` and the ceiling in `details`. The refused sign-up leaves no account behind (asserted with a count), and raising `seat_limit` lets the same token through._
-- [x] Creating a site beyond `site_limit` is refused the same way and the panel disables the control with that reason.
-  _`a_ceiling_really_bounds_creating_a_site`: one site fits, the second is `403 organization.limit.reached` naming the ceiling, and raising `site_limit` lets the *same* create succeed — which is what proves the refusal came from the stored plan. The panel half (a disabled control carrying the reason) is the Billing tab's bars plus the `organization.limit.reached` error surface._
-- [x] Removing the last owner is refused by the API and disabled in the UI with the reason shown.
-- [x] A member with `content.pages.read` in organization A gets 404 for a page id of organization B, and cannot see B's audit feed.
-- [x] A platform account can list every organization and must send `organization_id` on a write; omitting it is a 400 naming the field.
-  _`e00c53c`. "Naming the field" was the clause that was actually missing: the sentence already contained the string `organization_id`, so a check on the message passed against an error no client could act on. `organization_required()` in `apps/api/src/scope.rs` is now the single refusal every scope-resolving route shares, answering the same code, the same sentence and the same `details: { field: "organization_id", reason: "no_primary_organization" }`. The two refusals a client renders differently are kept apart on purpose and unit-proved (`a_missing_tenant_names_the_field_a_client_has_to_send`): a missing tenant names a field because it is the caller's problem to fix, and `cross_organization` names none because a picker there would only ever reproduce the same refusal. The walk `a_platform_account_names_the_tenant_every_write_needs` proves all three clauses in order — the list first, so the later assertions are known to be about a platform account rather than a session that failed to sign in — and asserts the 400 is `organization_required` and not `permission_denied`, since the account holds its permissions and a status-only check would have recorded the platform's rule as proven while proving the permission. Panel half: `TenantPicker` renders a labelled organization select for a subject with no organization of its own and is absent for everybody else (and in `global` scope, where "no tenant" is the point), and the grant form refuses in the browser with the server's own sentence so the answer lands at the field instead of in a banner above a form that has no such control._
-- [x] Department CRUD works, a department cannot become its own ancestor, and a role bound at department scope appears in `/iam/effective-permissions` for its members.
-  _Proven by the 7 HTTP walks in `apps/api/tests/tenancy_departments.rs`: the cycle refused as `department_cycle`, the role resolving for a member and not for an outsider, the grant gone once the member leaves, a parent's binding reaching its child until it is archived, and another tenant's department a 404._
-- [x] Switching a module off for an organization hides its navigation entry and makes its API answer 403 naming the module; switching it back on restores both.
-  _Slice 3 proved the half that stores the decision (`a_module_with_no_decision_is_on_and_the_toggle_persists`, `a_module_the_installation_does_not_ship_leaves_the_others_alone`). Slice 4 proved the half that applies it, in `switching_a_module_off_hides_its_api_and_switching_it_back_restores_it`: media answers 200, the switch is flipped, and both the collection route *and* a sub-route (`/media/files`) answer `403 organization.module.disabled` with the module key and its product name; analytics, tenancy and pages keep answering 200; the other tenant's own media read is untouched while A's site is `cross_organization` to them; `/me/organizations` reports exactly `["media"]` for A and `[]` for B; and switching it back restores 200. The round trip is the proof — a guard that only ever refuses would satisfy every refusal assertion alone. Panel half: the sidebar is filtered on `disabled_modules` and the Modules tab's consequence sentence now names the screen that disappears._
-- [x] Invite policy `closed` refuses new invitations; `self_serve` lets any member with `organizations.manage` invite; `owner_approval` queues the invitation until the owner releases it.
-  _All three behaviours are enforced in the create-invitation path, and the queue is a real state rather than a stored intention. `a_closed_organization_refuses_an_invitation_and_names_its_policy` proves `closed` refuses *by name* with the policy in `details` **and** leaves no row behind — a policy could otherwise "refuse" by writing a dead invitation — then the same address succeeds once the tenant is opened. `self_serve_hands_over_a_working_link_to_anyone_who_may_manage` proves the link it returns actually opens (`usable: true`). `owner_approval_queues_the_link_until_an_owner_releases_it` is the whole policy: the create answers **202 with no token at all** (a manager who cannot release has nothing to forward), the queue lists the row, the manager who raised it is refused `not_an_organization_owner` — the only thing that can refuse them is the owner check, since they already hold `organizations.manage` — the owner's release mints the link once, and a *second* release is refused `invitation_not_queued` rather than minting a second link and orphaning the first. `a_queued_link_never_works_and_says_so` holds a leaked token directly from the store and proves it is inert *and* that it is indistinguishable from a token nobody issued. `an_owner_inviting_into_their_own_tenant_is_not_stuck_behind_the_queue` proves the policy cannot deadlock on the owner. `one_tenants_queue_is_another_tenants_invisible_row` proves the isolation rule._
-- [x] The Billing tab shows seats, sites, storage and AI spend against their limits, and the CSV matches the on-screen numbers.
-  _`the_usage_csv_repeats_the_numbers_the_tab_renders` parses the CSV and compares each `used` figure against the value the JSON endpoint returned, and asserts every row repeats the plan; each bar also names its limit source and, for AI, the window it measures. A `null` ceiling reads as "unlimited" rather than as a zero (`an_unlimited_ceiling_reads_as_unlimited_everywhere`); the API refuses a literal `0`, which would render identically to "unlimited" while meaning the opposite._
-- [x] Suspending an organization shows the banner, blocks writes with the reason and keeps reads available; reactivating restores writes.
-  _`a_suspended_organization_keeps_reads_and_refuses_writes_by_name`: ten reads of a suspended
-  tenant (the organization, its members, departments, settings, modules, limits, usage, one site,
-  one site's domains, and the switcher's own list) all answer 200, while eight writes spread
-  across every family — settings, modules, limits, departments, invitations, sites, a site rename
-  and a domain — all answer `409 organization_not_writable` naming the tenant and its status and
-  carrying `reads: true` so a panel can say "still readable" rather than "gone". The three
-  refused writes are then read back out of the database, because a refusal that left the row
-  behind would be a refusal that failed. `reactivating_restores_writes_and_archives_freeze_them_too`
-  covers the round trip: suspend → 409, reactivate (which is the one write the freeze must not
-  block) → writes work again, archive → 409 again, reads still 200, and a *rename* of a frozen
-  tenant is still refused because the escape hatch is for a status change, not for any payload
-  that happens to carry one. `a_status_move_is_audited_and_announced_as_its_own_event` proves the
-  lifecycle action and the bus event. The panel half is `runOrganizationSuspend` in the
-  walkthrough: the banner is absent while active, present on a *frozen tenant* screen with the
-  right status, a settings save is refused with the reason on screen, and the reactivation takes
-  the banner away._
-- [x] The Audit tab lists the tenant's own trail, filters it by action, actor and date, and exports a CSV of exactly what it renders.
-  _`the_audit_tab_reads_this_tenant_only_and_exports_what_it_shows`: the route is guarded by `audit.read` and **not** by `organizations.read`, and the walk asserts the refusal first — a trail names every privileged act, so "can see the member list" must not imply it. An auditor then sees the writes the walk just made, every human row names its human and a system row says `system` rather than rendering blank, the action filter is exact and narrows both the rows and the count, a typo'd actor is refused `invalid_actor_filter` rather than answered as an empty history, the CSV carries the same page (`rows == entries.len`), and another tenant's trail is a `404`._
-- [x] A tenant's stored `audit_retention_days` is enforced: rows older than the window are removed on a scheduled sweep, the sweep is scoped to that tenant, and it files a system `organization.retention.swept` row and event carrying the count and the cutoff.
-  _`the_retention_sweep_applies_each_tenants_own_window` and `a_tenant_keeps_rows_inside_its_window_and_one_without_settings_is_still_swept`, in `apps/api/tests/tenancy_limits.rs`. Two tenants hold two different windows (30 and 365 days) and the walk plants rows at 2, 60, 100 and 400 days old: the 30-day tenant loses both of its expired rows and keeps the 2-day one, the 365-day tenant loses the 400-day one and **keeps** the 100-day one, the sweep reports 3 in total, and its receipt repeats `rows_removed: 2` / `retention_days: 30` as a `system` actor with the matching bus event. A second sweep over the same data removes 0 and files 0 — a trail full of its own nightly housekeeping is a trail nobody reads. The second walk covers the two edges a platform-wide default would hide: a row inside the window is untouched, and a tenant with no `organization_settings` row (created after the backfill) is held to the 365-day default instead of being skipped, which would keep its history forever._
-- [x] An org-scoped webhook endpoint subscribed to `organization.member.joined` delivers only that
-  organization's events.
-  _`a_members_join_reaches_only_the_tenant_it_belongs_to`, in `apps/api/tests/events.rs`. Two
-  routes emit that name — the administrative `POST /organizations/{id}/members` and the
-  invitation acceptance — so both are exercised. Each tenant connects its own endpoint to a real
-  loopback receiver, plus a **third endpoint inside tenant A subscribed to a different name**,
-  because subscription filtering and organization filtering are two different rules and only
-  running both proves either. Each tenant's join reaches its own receiver naming its own
-  `organization_id` and its own `user_id`; the per-endpoint delivery history and the
-  `/events?name=` feed agree, and an acceptance into tenant A does not move tenant B's receiver.
-  The walk also covers the direction a name-only fan-out gets wrong: a fact that belongs to **no**
-  tenant is a platform fact, queues 0 deliveries, and the following tick claims 0 — the endpoints
-  subscribed to that very name must not receive it._
-- [~] Partly: `pnpm typecheck` passes (2/2) and the three tenancy suites compile and run with zero CSRF refusals (`tenancy_departments` 7/7; `tenancy_limits` 25/29, the 4 being shared-Postgres `PoolTimedOut`, not assertions). Still owed on this box: `pnpm build`, and the QA walkthrough with zero high findings once the QA slot is free — `--workspace` still cannot link at load ~80.
-  _**Still open, and this tick found out why it has been open.** The box names `cargo test
-  --workspace`; what actually stands between the suite and a green run is not the box but the
-  suite. `apps/api/tests/tenancy.rs` read one `Set-Cookie` header (`Headers::get`) and kept
-  `.split(';').next()` of it — the session — while sign-in sends the session **and** a CSRF
-  token. The harness therefore never held a token, and every mutation it sent was refused
-  `csrf_failed` at the security layer before reaching the handler the walk was written to
-  exercise. `auth.rs` carries a comment naming this exact trap; the two suites disagreed about
-  how to read a response and only one was right. `42dfa290` fixes it: `call()` joins every
-  `Set-Cookie`, `login()` names both cookies and reports which is missing when one is, and the
-  three fixture helpers return the pair, which `request_with_csrf` attaches to writes.
-  **Proven, not assumed** — `domains_are_platform_wide_unique_and_keep_one_primary` and
-  `only_the_platform_opens_tenants_and_reads_across_them` both pass on their own database
-  (the second in 133.79 s, against a `0.01 s` "pass" that was really `live_state()` returning
-  `None` for a database I had not created). The remaining `tenancy_members` /
-  `tenancy_departments` / `tenancy_limits` carry the identical defect — 6,472 lines, `0` sites
-  carrying `x-omnion-csrf` — and are the next slice; the scoped rewrite of `tenancy.rs` compiled
-  clean at `COMPILE_EXIT=0`, so the shape is proven, but a scripted rewrite of the other three
-  was reverted rather than committed half-done. The `--workspace` run itself remains unproven
-  for the reason tick 78 recorded: the box cannot link ~45 integration binaries at load 100
-  without one of the two filesystems reaching 100%._
-  _Closer, and the first part of the gate now has a name. Tick 77 ran the tenant-scoped pass that
-  this box had been waiting on: `focused pass: 1/54 routes`, **7 route/pass names walked, 0
-  unmatched**, 32 clicks, 59 screenshots — and the scoping itself is now trustworthy, because
-  `668b4b9b` fixed a flag that had been making every scoped pass walk all 54 routes while
-  reporting the narrow label. What the pass proved, from the run's own steps rather than from the
-  summary: the organizations list renders and the detail tab opens; an unusable address is
-  refused **in the field** with the format it wants; an invite is created and its row is shown;
-  the same address a second time is refused naming the pending invitation; the departments pass
-  runs empty-state → invalid key refused in the field → create → bind a role → unbind → archive
-  → delete, with the archived row still listed and marked; the tenant tabs toggle a module and
-  prove it **persists and restores**, save locale/accent/timezone and prove each persisted, and
-  render four labelled usage bars reading `0 of unlimited` / `1 of unlimited` — the `null` ceiling
-  rendering as "unlimited" rather than as a zero, which is the case a bare number would get
-  backwards._
-  _**Not ticked, and the reason is not the product.** The pass reported 44 high findings, and read
-  as a cause rather than a count they are three: ~20 × 401 and 1 × 409 are the harness's *own*
-  refusals (`expectRefusal` provokes the refusal it then asserts), and 7 are
-  `net::ERR_INSUFFICIENT_RESOURCES` on `/_next/static/chunks/*` with `free -g` showing 32 G RAM
-  at 0 free and 25 G of swap in use — six writers compiling at once. The 500 on
-  `/organizations/{id}/members` is the same starvation in the admin *dev server*: the API never
-  logged that request and every `/organizations/…` page answered 200. The remaining gates
-  (`cargo test --workspace`, `pnpm build`) also have not run this tick — a full workspace build
-  on a box at load 97 and 0 free RAM measures the box, not the code._
-  _Two product observations this pass did surface, neither tickable here: `runOrganizationSuspend`
-  skipped itself with *"the list carries no Suspend control for this row"*, and the member drawer
-  found no rows to open on a tenant whose owner is a member. Both are the pass meeting a screen it
-  cannot drive yet; they are the next slice, not this box._
-
-- [x] Below 1024px the member table becomes cards, the department tree an indented list, tabs a
-  horizontal scroller, the switcher a sheet, and the usage bars stay labelled.
-  _`296bb84`. The tabs were already a scroller and the billing bars were already labelled (the
-  bars are a two-column grid that collapses to one, each `role="progressbar"` keeping its
-  `aria-valuetext`); the rest of the sentence was unbuilt and turned out to be **six** surfaces
-  rather than the three it names. Every table in the tenant surface now has a card rendering
-  below `md` — the organization list, members, invitations, the department tree and the audit
-  trail — and each card carries the same `data-*` hook as the row it replaces, so the existing
-  desktop depth passes keep driving the same elements and the mobile measurements are of a
-  layout some interaction can actually reach. The switcher is a bottom sheet under `sm`: a
-  dropdown anchored to the right edge of a 390px screen puts the longest organization name in
-  the one place a thumb cannot reach, and the sheet is anchored to the bottom edge with a
-  backdrop and a close control. The member drawer takes the whole screen below `sm`, because
-  `max-w-lg` beside a 390px viewport leaves every far-side control out of reach. The QA pass
-  walks all four tenant screens at 390×844 and reads the sheet's geometry — row height against
-  the 44px touch floor, bottom anchoring, backdrop presence and page overflow — each recorded as
-  a finding rather than a screenshot._
+- [ ] The organizations list, organization detail with every tab, the switcher, the invite dialog and the invitation page exist at the routes above and appear in the QA walkthrough inventory.
+- [ ] A user belonging to two organizations can switch between them with the header switcher, and the site list, pages and media follow the switch.
+- [ ] Backfill is proven: every pre-existing user has exactly one primary membership, every organization has a settings and a limits row, and no orphan row exists.
+- [ ] Inviting an existing member is refused naming them; inviting the same address twice returns the pending invitation instead of creating a duplicate.
+- [ ] The invitation link opens the preview, acceptance works for an existing account and for a new sign-up, and both land on the organization overview.
+- [ ] Expired, revoked and already-accepted tokens each render their own explanation, and a rate-limited preview does not reveal whether the organization exists.
+- [ ] Accepting an invitation at the seat limit is refused with `organization.limit.reached` naming the ceiling; raising the limit makes the same invitation acceptable.
+- [ ] Creating a site beyond `site_limit` is refused the same way and the panel disables the control with that reason.
+- [ ] Removing the last owner is refused by the API and disabled in the UI with the reason shown.
+- [ ] A member with `content.pages.read` in organization A gets 404 for a page id of organization B, and cannot see B's audit feed.
+- [ ] A platform account can list every organization and must send `organization_id` on a write; omitting it is a 400 naming the field.
+- [ ] Department CRUD works, a department cannot become its own ancestor, and a role bound at department scope appears in `/iam/effective-permissions` for its members.
+- [ ] Switching a module off for an organization hides its navigation entry and makes its API answer 403 naming the module; switching it back on restores both.
+- [ ] Invite policy `closed` refuses new invitations; `self_serve` lets any member with `organizations.manage` invite; `owner_approval` queues the invitation until the owner releases it.
+- [ ] The Billing tab shows seats, sites, storage and AI spend against their limits, and the CSV matches the on-screen numbers.
+- [ ] Suspending an organization shows the banner, blocks writes with the reason and keeps reads available; reactivating restores writes.
+- [ ] Empty, loading and error states exist on every screen and tab; no dead control and no placeholder copy.
+- [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough pass with zero high findings.
 
 ### QA plan
 
@@ -306,26 +192,8 @@ clipped copy on any tab.
    *Done when:* a role bound to a department shows up in `/iam/effective-permissions` for its members and disappears when a member leaves the department.
 3. **Settings, modules, limits, billing** — `organization_settings`, `organization_modules`, `organization_limits`, plan and usage endpoints, limit enforcement on invite/site/AI, the Settings, Modules and Billing tabs, suspend/archive flows, the Audit tab with CSV.
    *Done when:* each ceiling has a test that passes only when the enforcement exists, and suspend/reactivate behaves exactly as specified.
-   *Status:* **slice 3 is complete.** The ceilings are enforced and proven (`a_ceiling_really_bounds_creating_a_site`, `a_ceiling_really_bounds_accepting_an_invitation`, `the_usage_csv_repeats_the_numbers_the_tab_renders`), the invite policy is enforced in all three modes with a real queue (`1f09d86`…`ba4f6b9`), the Audit tab lists, filters and exports (`3fae4f3`, `0199709`), and the suspend/archive **behaviour** ships with a real write-path guard (`a25267a`): a frozen tenant keeps every read and refuses every write by name, the status change is the one write that gets through so a tenant can always be brought back, and the panel says so in a banner on every screen rather than letting a person discover it one refused Save at a time.
 4. **Events and hardening** — tenant lifecycle events, `organization.limit.reached`, module toggle events, per-organization retention sweep, mobile pass and empty states.
    *Done when:* an org-scoped webhook endpoint subscribed to `organization.member.joined` delivers only that organization's events, and the QA walkthrough is green.
-   *Status:* **slice 4, first unit shipped** (`0d95b2d`). The module switch is no longer a stored intention: `module_routes()` in the identity crate is the single table of which module owns which path, one layer on the whole `/api/v1` router reads it, the refusal is `403 organization.module.disabled` naming the module and its product name, `/me/organizations` reports the tenant's disabled keys so the sidebar can drop the entry, and the round trip is proven in `switching_a_module_off_hides_its_api_and_switching_it_back_restores_it`. The lifecycle events named in the spec's table were already emitted by slices 1–3 (`organization.created/.updated/.suspended/.archived`, `.member.invited/.joined/.removed/.status_changed/.role_changed`, `.department.created/.updated/.archived`, `.limit.reached`, `.module.enabled/.disabled`), so what is left in this slice is the mobile pass and the `organization.member.joined` webhook-isolation walk. The retention sweep shipped after it (`b8f4c21`): `organization_settings.audit_retention_days` is no longer a stored intention. `omnion_audit::purge_before` is the only place a row leaves the trail, scoped by `organization_id` in the statement itself, and `apps/api/src/retention_runner.rs` walks the tenants whose own window has closed, removes what fell out of it, then files a system `organization.retention.swept` row and announces the same event with the count and the cutoff. Proven by `the_retention_sweep_applies_each_tenants_own_window` (two tenants, two windows, and the only assertion that catches a platform-wide default is the one on the tenant that *kept* its 100-day-old row) and `a_tenant_keeps_rows_inside_its_window_and_one_without_settings_is_still_swept` (a tenant with no settings row is held to the 365-day default rather than skipped, because a settings row missing after the backfill would otherwise keep a history forever).
-   *Status:* **slice 4's done-when is now proven** (`d9e2ab3`). `a_members_join_reaches_only_the_tenant_it_belongs_to` in `apps/api/tests/events.rs` gives each of two tenants an endpoint subscribed to `organization.member.joined` and a real loopback receiver, adds a third endpoint *inside tenant A subscribed to a different name* — subscription filtering and organization filtering are separate rules, and a walk that only tests the first can pass an implementation that ignores the second — and then drives **both** routes that emit the name: the administrative add-member and the invitation acceptance. Each tenant's join reaches its own receiver naming its own organization and member; the delivery history and the event feed agree; tenant B's receiver does not move when tenant A accepts somebody. The walk's last third is the direction a name-only fan-out gets wrong: a fact belonging to **no** tenant is a platform fact, and it must queue 0 deliveries and leave the next tick idle, rather than reaching every endpoint subscribed to that very name.
-   *Status:* **the member drawer shipped** — the screen the spec's Members bullet and the QA plan both name ("open a member drawer and extend a binding") and which did not exist until this slice. Reading it first turned up a gap that is worth recording on its own: the spec lists three operations — **add / extend / revoke** — and the platform had verbs for two of them. `POST /api/v1/iam/bindings` granted and `DELETE /iam/bindings/{id}` revoked, but nothing could *lengthen* a temporary grant, so giving somebody another month meant revoking and re-granting. `bindings::extend_expiry` is the new store operation and it deliberately updates **the same row**: the alternative leaves two live bindings for one role and scope, which the effective-permissions screen then renders as the same role twice with two different windows, neither of them the truth. `a_temporary_grant_is_extended_in_place_and_never_into_a_second_row` is the walk that catches that, and the assertion that catches it is a *count* — a revoke-and-re-grant passes every other line. The drawer's own surface is `GET /api/v1/organizations/{id}/members/{user_id}` (one request, so a half-filled panel is not a rendering choice but a failure), plus the three binding operations beside it; a member of another tenant is a `404`, and a grant is refused when the subject is not a member or the role belongs elsewhere, so a tenant cannot end up with a binding applying to nobody.
-   *Status:* **the mobile pass shipped** (`296bb84`) — the spec's own `Mobile (<1024px)` line was
-   the last unbuilt acceptance item in the whole request, and it turned out to be *six* surfaces
-   with no phone layout at all rather than one. Every table in the tenant surface (the
-   organization list, members, invitations, the department tree and the audit trail) now renders
-   as cards below `md`; the switcher becomes a bottom sheet under `sm`; the member drawer takes
-   the whole screen below `sm`. Each card carries the **same `data-*` hooks as the row it
-   replaces**, which is the part that matters and is easy to get wrong: a `data-organization-suspend`
-   or a `data-audit-row` that exists in only one of the two renderings silently halves what the
-   desktop depth passes can drive, and the mobile pass then measures a layout no interaction has
-   ever reached. The pass walks all four tenant screens at 390px and reads the switcher sheet's
-   *geometry* — row height against the 44px floor, whether the sheet reaches the bottom edge,
-   whether a backdrop exists, and whether the page scrolls sideways underneath it — because
-   "it opens" is not a claim; "it opens and every row is thumb-sized and the screen behind it is
-   inert" is.
 
 ### Risks / notes
 

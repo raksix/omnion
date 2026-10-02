@@ -29,9 +29,11 @@ import {
   createNotificationRoute,
   deleteNotificationRoute,
   fetchNotificationOutbox,
+  fetchNotificationRetention,
   fetchNotificationRoutes,
   retryNotificationDelivery,
   runNotificationRoute,
+  setNotificationRetention,
   type ApiError,
 } from "@/lib/api";
 import {
@@ -42,6 +44,7 @@ import {
   type NotificationDeliveryStatus,
   type NotificationOutbox,
   type NotificationOutboxRow,
+  type NotificationRetention,
   type NotificationRouteRule,
 } from "@/lib/types";
 
@@ -93,6 +96,7 @@ function when(iso: string): string {
 export function NotificationOutbox() {
   const [outbox, setOutbox] = useState<NotificationOutbox | null>(null);
   const [rules, setRules] = useState<NotificationRouteRule[] | null>(null);
+  const [retention, setRetention] = useState<NotificationRetention | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   /** Which states the reader asked for. Empty means all four, which is the server's default. */
@@ -101,6 +105,12 @@ export function NotificationOutbox() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  /** The window being typed, as a string. */
+  const [windowDraft, setWindowDraft] = useState("");
+  /** The refusal from the last save, verbatim — the server names the field and both bounds. */
+  const [windowError, setWindowError] = useState<string | null>(null);
+  const [windowNotice, setWindowNotice] = useState<string | null>(null);
+  const [savingWindow, setSavingWindow] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -121,6 +131,49 @@ export function NotificationOutbox() {
       setLoading(false);
     }
   }, [statuses]);
+
+  // **The retention read is a third effect rather than a third promise above, and the reason is
+  // who it is for.** The page and the rules are what an administrator came to look at; the
+  // window is what they change. Folding it into the same `Promise.all` would mean a slow count
+  // query — the sweep's own predicate, over the whole table — emptied the delivery log above it
+  // on every filter change, which is a worse failure than a panel that says "could not load".
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const answer = await fetchNotificationRetention();
+        if (!live) return;
+        setRetention(answer);
+        setWindowDraft(String(answer.window_days));
+      } catch (caught) {
+        if (!live) return;
+        setWindowError((caught as ApiError).message);
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  /** Save the window, and adopt the server's answer rather than the number that was typed. */
+  const saveWindow = useCallback(async () => {
+    setSavingWindow(true);
+    setWindowError(null);
+    setWindowNotice(null);
+    try {
+      const answer = await setNotificationRetention(Number(windowDraft));
+      setRetention(answer);
+      setWindowDraft(String(answer.window_days));
+      setWindowNotice(`The log now goes back ${answer.window_days} days.`);
+    } catch (caught) {
+      // **Verbatim, and the draft is kept.** An operator whose save was refused needs the
+      // reason and their own input both still on screen; clearing the field would make the
+      // refusal about a number they can no longer see.
+      setWindowError((caught as ApiError).message);
+    } finally {
+      setSavingWindow(false);
+    }
+  }, [windowDraft]);
 
   useEffect(() => {
     void load();
@@ -205,7 +258,17 @@ export function NotificationOutbox() {
           </h2>
           <p className="text-[12px] text-muted">
             Every delivery across the organization, failures first.{" "}
-            {counts ? `The log goes back ${outbox?.retention_days} days.` : null}
+            {/* **The window is the organization's own, read from the column the sweep reads.**
+                This sentence published a constant for the whole life of the screen, and the
+                constant is the *fallback* — so on any tenant that had set its own window the
+                screen announced a floor the sweeper was not keeping. */}
+            {counts
+              ? `The log goes back ${outbox?.retention_days} days${
+                  retention && retention.window_days !== outbox?.retention_days
+                    ? " (a sweep is still catching up)"
+                    : ""
+                }.`
+              : null}
           </p>
         </div>
 
@@ -336,6 +399,17 @@ export function NotificationOutbox() {
           </div>
         )}
       </section>
+
+      {/* --------------------------------------------------- how long the log is kept */}
+      <RetentionPanel
+        retention={retention}
+        draft={windowDraft}
+        onDraft={setWindowDraft}
+        onSave={() => void saveWindow()}
+        saving={savingWindow}
+        error={windowError}
+        notice={windowNotice}
+      />
 
       {/* ----------------------------------------------------------- the routing rules */}
       <section aria-labelledby="rules-heading" className="space-y-3">
@@ -480,6 +554,8 @@ function RouteProbe({ onResult }: { onResult: (message: string | null) => void }
 
   const created = typeof report?.created === "number" ? report.created : null;
   const unmatched = typeof report?.unmatched_rules === "number" ? report.unmatched_rules : null;
+  const dropped =
+    typeof report?.dropped_recipients === "number" ? report.dropped_recipients : null;
   const unknownEvent = report?.unknown_event === true;
 
   return (
@@ -532,6 +608,22 @@ function RouteProbe({ onResult }: { onResult: (message: string | null) => void }
           <li className="text-muted">
             {unmatched ?? 0} rule{unmatched === 1 ? "" : "s"} matched nobody
           </li>
+          {/** The one line that says a rule is mis-wired rather than waiting. Rendered above
+              the "unknown event" note because a dropped recipient is a fact about the rule and a
+              missing producer is a fact about the event, and the two need different fixes. */}
+          {dropped ? (
+            <li
+              className="flex items-start gap-1.5 text-amber-700 dark:text-amber-300"
+              data-probe-dropped={String(dropped)}
+            >
+              <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+              <span>
+                {dropped} recipient{dropped === 1 ? "" : "s"} resolved and then refused — outside
+                this event&rsquo;s organization, or not an account. Nothing was written for them,
+                so check the rule&rsquo;s recipient field.
+              </span>
+            </li>
+          ) : null}
           {unknownEvent ? (
             <li className="flex items-center gap-1.5 text-amber-700 dark:text-amber-300">
               <TriangleAlert className="h-3.5 w-3.5" aria-hidden />
@@ -722,6 +814,158 @@ function RouteForm({
         </button>
       </div>
     </form>
+  );
+}
+
+/**
+ * How long the delivery log is kept, and what the last sweep removed.
+ *
+ * **The window is editable here and nowhere else, so it is the one control on this screen that
+ * can destroy evidence.** Three consequences are visible on the face of the panel rather than
+ * buried in a confirmation dialog: the `due` count is the sweep's own predicate, so an operator
+ * sees exactly what pressing Save costs before pressing it; the bounds come from the server, so
+ * the input cannot accept a day the API will refuse; and the last run is printed with its own
+ * window, because the sentence "removed 412 rows" means nothing without knowing which clock
+ * removed them.
+ *
+ * **A platform account gets no input, and says so.** `organization_id` is `null` for it, the
+ * setter refuses it by name, and offering a box whose save always fails is the dead-button
+ * shape this REQ forbids.
+ */
+function RetentionPanel({
+  retention,
+  draft,
+  onDraft,
+  onSave,
+  saving,
+  error,
+  notice,
+}: {
+  retention: NotificationRetention | null;
+  draft: string;
+  onDraft: (value: string) => void;
+  onSave: () => void;
+  saving: boolean;
+  error: string | null;
+  notice: string | null;
+}) {
+  if (retention === null) {
+    return (
+      <section aria-labelledby="retention-heading" className="space-y-3" data-retention-state="loading">
+        <h2 id="retention-heading" className="text-[15px] font-semibold">
+          How long the log is kept
+        </h2>
+        <div className="h-16 animate-pulse rounded-lg bg-quiet-soft" aria-busy="true" />
+        {error ? (
+          <p data-retention-error className="text-[12.5px] text-red-700 dark:text-red-300">
+            {error}
+          </p>
+        ) : null}
+      </section>
+    );
+  }
+
+  const run = retention.last_run;
+  const platform = retention.organization_id === null;
+  /** A draft that is not a whole number of days is refused by the server; say so here. */
+  const draftNumber = Number(draft);
+  const draftIntact = draft.trim() !== "" && Number.isInteger(draftNumber);
+  const unchanged = draftIntact && draftNumber === retention.window_days;
+
+  return (
+    <section aria-labelledby="retention-heading" className="space-y-3" data-retention-state="ready">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h2 id="retention-heading" className="text-[15px] font-semibold">
+          How long the log is kept
+        </h2>
+        <p className="text-[12px] text-muted">
+          {retention.rows.toLocaleString()} rows
+          {retention.due > 0 ? (
+            <> · the next sweep removes {retention.due.toLocaleString()}</>
+          ) : (
+            <> · nothing is due for removal</>
+          )}
+        </p>
+      </div>
+
+      {/* **The counted rows and the window are one statement on the server.** A panel that
+          added them up from two queries would draw a "12 due" line that the sweeper — reading
+          a different clock — contradicts, which is the same lie this screen shipped once. */}
+      <form
+        data-retention-form
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSave();
+        }}
+        className="flex flex-wrap items-end gap-3 rounded-lg border border-line px-3 py-3"
+      >
+        <label className="flex flex-col gap-1 text-[12px]">
+          <span className="text-muted">Days of history to keep</span>
+          <input
+            data-retention-window
+            type="number"
+            inputMode="numeric"
+            min={retention.min_days}
+            max={retention.max_days}
+            disabled={platform || saving}
+            value={draft}
+            onChange={(event) => onDraft(event.target.value)}
+            aria-describedby="retention-bounds"
+            className="w-28 rounded-md border border-line bg-transparent px-2 py-1.5 text-[13px] disabled:opacity-50"
+          />
+        </label>
+        <span id="retention-bounds" className="text-[12px] text-muted">
+          Between {retention.min_days} and {retention.max_days.toLocaleString()} days.
+        </span>
+        <button
+          type="submit"
+          data-retention-save
+          disabled={platform || saving || unchanged || !draftIntact}
+          className="inline-flex items-center gap-2 rounded-md border border-line px-3 py-1.5 text-[12.5px] disabled:opacity-50"
+        >
+          {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : null}
+          {saving ? "Saving…" : "Save window"}
+        </button>
+        {platform ? (
+          <span data-retention-platform className="text-[12px] text-muted">
+            Platform-wide announcements are kept for the default window; a window belongs to one
+            organization.
+          </span>
+        ) : null}
+      </form>
+
+      {notice ? (
+        <p data-retention-notice className="text-[12.5px] text-muted">
+          {notice}
+        </p>
+      ) : null}
+      {error ? (
+        <p data-retention-error className="text-[12.5px] text-red-700 dark:text-red-300">
+          {error}
+        </p>
+      ) : null}
+
+      {/* **"No sweep has ever run" is its own line, not an empty box.** An administrator
+          reading an empty panel cannot tell a sweeper that has never fired from one whose row
+          failed to render, and those two demand opposite actions. */}
+      {run === null ? (
+        <p data-retention-never className="text-[12px] text-muted">
+          No sweep has run here yet. The first one will remove what is older than the window.
+        </p>
+      ) : (
+        <p data-retention-last-run className="text-[12px] text-muted">
+          Last sweep {when(run.finished_at)} · window {run.window_days} days · removed{" "}
+          {run.deliveries_deleted.toLocaleString()} deliveries and{" "}
+          {run.devices_deleted.toLocaleString()} devices
+          {run.failed ? (
+            <span className="ml-1 inline-flex items-center gap-1 text-red-700 dark:text-red-300">
+              <TriangleAlert className="h-3.5 w-3.5" aria-hidden />
+              finished with errors{run.error ? `: ${run.error}` : ""}
+            </span>
+          ) : null}
+        </p>
+      )}
+    </section>
   );
 }
 

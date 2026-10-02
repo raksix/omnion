@@ -24,6 +24,7 @@ use omnion_identity::Site;
 use omnion_identity::sites;
 use omnion_workflows::definition::{StepDefinition, Trigger, WorkflowDefinition};
 use omnion_workflows::model::NewWorkflow;
+use omnion_workflows::projects;
 use omnion_workflows::store::{self, WorkflowUpdate};
 use omnion_workflows::{
     ExecutionStatus, TriggerKind, Workflow, WorkflowError, WorkflowExecution, WorkflowStep, engine,
@@ -58,6 +59,13 @@ pub struct WorkflowBody {
     pub organization_id: Uuid,
     /// Site it is scoped to, when it is.
     pub site_id: Option<Uuid>,
+    /// The project it lives in (REQ-133).
+    ///
+    /// **Added by slice 3 and not optional.** The move dialog's host screen lists the workflows of
+    /// one project and has to be able to say which project each row is in; without the field the
+    /// client would have to re-derive it from the query it already sent, which is the kind of
+    /// assumption that quietly stops being true when a second list arrives.
+    pub project_id: Uuid,
     /// Display name.
     pub name: String,
     /// Free-form description.
@@ -101,6 +109,7 @@ impl WorkflowBody {
             id: workflow.id,
             organization_id: workflow.organization_id,
             site_id: workflow.site_id,
+            project_id: workflow.project_id,
             name: workflow.name.clone(),
             description: workflow.description.clone(),
             enabled: workflow.enabled,
@@ -251,17 +260,13 @@ pub struct ExecutionListResponse {
 // ---------------------------------------------------------------------------------------------
 
 /// Filters of the workflow list.
-#[derive(Debug, Deserialize)]
-pub struct WorkflowListQuery {
-    /// Organization to list (platform accounts only; organization accounts always see their own).
-    pub organization_id: Option<Uuid>,
-    /// Site to filter on.
-    pub site_id: Option<Uuid>,
-}
 
 /// A whole definition: what `POST` creates and `PUT` replaces.
 #[derive(Debug, Deserialize)]
 pub struct WorkflowInput {
+    /// Project to create the workflow in; the organization's default when omitted (REQ-133).
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
     /// Display name.
     pub name: String,
     /// Free-form description.
@@ -294,6 +299,22 @@ pub struct ExecutionListQuery {
     pub limit: Option<i64>,
 }
 
+/// Filters on the definitions list (REQ-133, slice 2).
+/// Filters on the definitions list (REQ-133, slice 2).
+#[derive(Debug, Default, Deserialize)]
+pub struct WorkflowListQuery {
+    /// Organization filter; an account with a primary one may only pass its own.
+    pub organization_id: Option<Uuid>,
+    /// Site filter.
+    pub site_id: Option<Uuid>,
+    /// Project filter — the switcher's `?project=`.
+    ///
+    /// `None` means "the projects you are in", which is the caller's *visibility* and not
+    /// "everything": the store is given both answers separately, and the comment is here because
+    /// for a while the two used to be spelled the same way.
+    pub project_id: Option<Uuid>,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------------------------
@@ -312,8 +333,14 @@ pub async fn list_workflows(
         None => query.organization_id,
     };
 
-    let workflows =
-        store::list_workflows(state.db().pool(), organization_id, query.site_id).await?;
+    let workflows = list_scoped_workflows(
+        &state,
+        &current,
+        organization_id,
+        query.site_id,
+        query.project_id,
+    )
+    .await?;
 
     Ok(Json(WorkflowListResponse {
         workflows: workflows.iter().map(WorkflowBody::build).collect(),
@@ -343,10 +370,17 @@ pub async fn create_workflow(
     let definition = WorkflowDefinition::new(input.trigger, input.steps)?;
     let next_run_at = definition.trigger.validate(OffsetDateTime::now_utc())?;
 
+    // A workflow created without a project lands in the organization's default (REQ-133). The
+    // decision is made by `resolve_target` and nowhere else, which is the whole point of that
+    // function existing: the alternative is each insert path deciding, and 0164's `not null`
+    // turns "a path forgot" into a 23502 on the feature's most basic action.
+    let target = resolve_project(&state, &current, organization_id, input.project_id).await?;
+
     let workflow = store::insert_workflow(
         state.db().pool(),
         NewWorkflow {
             organization_id,
+            project_id: target.id,
             site_id: input.site_id,
             name: name.clone(),
             description: input.description.trim().to_owned(),
@@ -402,7 +436,16 @@ pub async fn update_workflow(
     Path(workflow_id): Path<Uuid>,
     Json(input): Json<WorkflowInput>,
 ) -> Result<Json<WorkflowBody>, ApiError> {
-    let existing = workflow_in_scope(&state, &current, workflow_id).await?;
+    // `can_edit`, not "can see": replacing a definition is an edit of it, and a viewer or an
+    // operator in this project is refused with the role that refused (REQ-133 acceptance 6).
+    let existing = workflow_with_capability(
+        &state,
+        &current,
+        workflow_id,
+        omnion_workflows::projects::ProjectRole::can_edit,
+        "replace a workflow definition",
+    )
+    .await?;
 
     if let Some(site_id) = input.site_id {
         site_in_scope(&state, &current, site_id).await?;
@@ -464,7 +507,18 @@ pub async fn delete_workflow(
     address: ClientAddress,
     Path(workflow_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let workflow = workflow_in_scope(&state, &current, workflow_id).await?;
+    // `can_edit` for a delete, and deliberately not a distinct capability: the matrix has four
+    // roles and six verbs, and inventing a sixth predicate for "remove" would be a permission
+    // that stops biting the moment somebody adds a role (the failure mode this file's doc comment
+    // names). An editor may rewrite the definition, so an editor may remove it.
+    let workflow = workflow_with_capability(
+        &state,
+        &current,
+        workflow_id,
+        omnion_workflows::projects::ProjectRole::can_edit,
+        "delete a workflow",
+    )
+    .await?;
 
     if !store::delete_workflow(state.db().pool(), workflow.id).await? {
         return Err(workflow_not_found());
@@ -492,7 +546,19 @@ pub async fn run_workflow(
     current: CurrentSession,
     Path(workflow_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<ExecutionDetail>), ApiError> {
-    let workflow = workflow_in_scope(&state, &current, workflow_id).await?;
+    // `can_run` and not `can_edit`: this is the one verb where the matrix earns its fourth role.
+    // An operator may start runs and an editor may too, but a **viewer may not** — and before this
+    // tick the route asked only "can you see the workflow", so a viewer could start a run of an
+    // automation somebody else wrote. Acceptance 6 is the sentence that says the very next request
+    // reflects the role, so the role is what this route reads.
+    let workflow = workflow_with_capability(
+        &state,
+        &current,
+        workflow_id,
+        omnion_workflows::projects::ProjectRole::can_run,
+        "start a run",
+    )
+    .await?;
 
     let execution = engine::start_run(
         state.db().pool(),
@@ -583,6 +649,130 @@ pub async fn cancel_execution(
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
+/// The projects this caller may see in one organization, as a store filter.
+///
+/// One function, because this decision now has three call sites (the definitions list, the
+/// automations list, and the create path's target resolution) and three hand-written copies of a
+/// permission rule is three chances for one of them to be right. It delegates to
+/// `is_instance_admin` in the projects module, so the `projects.admin` answer is the same answer
+/// everywhere on this branch.
+async fn caller_projects(
+    state: &AppState,
+    current: &CurrentSession,
+    organization_id: Uuid,
+) -> omnion_workflows::projects::ProjectCaller {
+    omnion_workflows::projects::ProjectCaller {
+        user_id: current.user.id,
+        is_instance_admin: crate::routes::automation_projects::is_instance_admin(
+            state, current, organization_id,
+        )
+        .await,
+    }
+}
+
+/// The definitions a caller may see, project-scoped (REQ-133).
+///
+/// Two filters, and they are different questions: `visible` is "which projects is this person
+/// in", `wanted` is "which one did they ask for". The second can only *narrow* the first — a
+/// caller who asks for a project they are not in gets an empty list, never another project's rows
+/// filtered down, and never a `403` that would confirm the project exists.
+async fn list_scoped_workflows(
+    state: &AppState,
+    current: &CurrentSession,
+    organization_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    wanted: Option<Uuid>,
+) -> Result<Vec<Workflow>, ApiError> {
+    let Some(organization_id) = organization_id else {
+        // A platform account that named no organization has no project scope to apply. It is
+        // not an empty result: it is the pre-slice behaviour for one case only, and the
+        // organization-scoped screens are the ones the scoping rule protects.
+        return Ok(store::list_workflows(state.db().pool(), None, site_id, wanted).await?);
+    };
+
+    let caller = caller_projects(state, current, organization_id).await;
+    let visible = projects::visible_project_ids(state.db().pool(), organization_id, caller)
+        .await
+        .map_err(ApiError::from)?;
+
+    // The REQ's "scoped defaults" half: with no `project_id` in the query, the caller's own stored
+    // selection narrows the list. An explicit `project_id` always wins — a typed filter is a
+    // question, and a remembered answer must not overrule it.
+    //
+    // `default_scope` intersects with `visible`, so a selection naming a project the caller has
+    // since been removed from is ignored rather than honoured: without that, removing a member
+    // would leave them on a default that returns rows they cannot see.
+    let wanted = match wanted {
+        Some(id) => Some(id),
+        None => {
+            projects::default_scope(state.db().pool(), current.user.id, &visible)
+                .await
+                .map_err(ApiError::from)?
+        }
+    };
+
+    let allowed: Vec<Uuid> = match wanted {
+        Some(id) if visible.contains(&id) => vec![id],
+        Some(_) => Vec::new(),
+        None => visible,
+    };
+
+    let scoped = store::list_workflows_in_projects(
+        state.db().pool(),
+        Some(organization_id),
+        site_id,
+        &allowed,
+    )
+    .await?;
+    Ok(scoped)
+}
+
+/// The project a write should land in, refusing a project the caller may not see.
+///
+/// A `403` here, and deliberately so: this is a *write*, and the REQ's rule is that a write names
+/// what is wrong. The `404`-not-`403` rule is about reads, where a refusal would confirm that a
+/// row exists. Here the caller is being told "you may not put work there", which is a statement
+/// about their own action and discloses nothing they did not already know.
+async fn resolve_project(
+    state: &AppState,
+    current: &CurrentSession,
+    organization_id: Uuid,
+    project_id: Option<Uuid>,
+) -> Result<omnion_workflows::projects::Project, ApiError> {
+    let caller = caller_projects(state, current, organization_id).await;
+    let project =
+        projects::resolve_target(state.db().pool(), organization_id, project_id, caller).await?;
+
+    // Creating inside a project is an **edit of that project**, and `resolve_target` alone does
+    // not say so: it answers "which project does this land in", which a viewer passes happily. So
+    // the capability is asked here rather than at each of the two create routes — the same reason
+    // `caller_projects` exists, and the same reason a project-owner session must be refused here
+    // by the API rather than by a hidden button.
+    //
+    // One query more per create, not per request: the create path already writes a row, and this
+    // is the statement that makes acceptance 6 true for `POST /workflows` and `POST /automations`
+    // as well as for the three per-workflow routes.
+    let (allowed, role) = projects::permits(
+        state.db().pool(),
+        organization_id,
+        project.id,
+        caller,
+        omnion_workflows::projects::ProjectRole::can_edit,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    if !allowed {
+        return Err(ApiError::forbidden(
+            "project_capability_required",
+            format!(
+                "your role in this project's team ({role:?}) may not create automations here — \
+                 ask a project owner to change it, it applies immediately"
+            ),
+        ));
+    }
+    Ok(project)
+}
+
 /// Write an audit row; a privileged action is not reported as successful without one.
 async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> {
     omnion_audit::record(state.db().pool(), entry).await?;
@@ -607,7 +797,17 @@ async fn site_in_scope(
     Ok(site)
 }
 
-/// Load a workflow and refuse it when its organization is out of the caller's scope.
+/// Load a workflow the caller may see, or answer `404` (REQ-133, slice 2).
+///
+/// The refusal is `404` and not `403`, and the reason is that a `403` here is an enumeration
+/// oracle with a name attached: "you may not see this workflow" answers the question "is there a
+/// workflow at this id?", which is the one question a member of project B must not be able to ask
+/// about project A. `workflow_not_found` says "no such workflow" for both an id that does not
+/// exist and one that is not yours, and the two are genuinely indistinguishable to the caller.
+///
+/// Three checks, and each is a different failure: the organization is tenancy (403 — the caller
+/// is asking about a tenant they are not in at all, which the guard has already bounded); the
+/// project is the slice-2 boundary (404); and the row's absence is a plain 404.
 async fn workflow_in_scope(
     state: &AppState,
     current: &CurrentSession,
@@ -617,6 +817,68 @@ async fn workflow_in_scope(
         .await?
         .ok_or_else(workflow_not_found)?;
     ensure_same_organization(current, Some(workflow.organization_id))?;
+
+    let caller = caller_projects(state, current, workflow.organization_id).await;
+    if !projects::can_see_workflow(
+        state.db().pool(),
+        workflow.organization_id,
+        workflow.project_id,
+        caller,
+    )
+    .await
+    .map_err(ApiError::from)?
+    {
+        return Err(workflow_not_found());
+    }
+    Ok(workflow)
+}
+
+/// Load a workflow the caller may see **and** hold `capability` in its project.
+///
+/// **This function is the missing caller REQ-133 acceptance 6 is about.** Until this tick,
+/// `workflow_in_scope` was the *only* gate on `PUT /workflows/{id}`, `POST /workflows/{id}/run` and
+/// `DELETE /workflows/{id}`, and it answers exactly one question — "may this caller SEE the row" —
+/// which every member of a project may answer. So the role column, the capability matrix and the
+/// members screen all existed and none of them reached a write: a `viewer` could replace a
+/// definition and an `operator` could delete one. The matrix was correct, tested, and unreachable —
+/// the tenth instance on this branch of a rule that is right and has no caller.
+///
+/// Why the refusal is `403` and not the `404` above it, and the two must not be confused: the
+/// caller can already see the row (they just fetched it to ask), so `403` discloses nothing new and
+/// names the remedy — "ask an owner to change your role" is an action, not a fact about a
+/// resource that does not exist.
+///
+/// The role is read **per call** ([`projects::effective_role`]) rather than once per session:
+/// that is the sentence acceptance 6 makes, and a per-session memo would be the only thing that
+/// could make it false. There is no cache to invalidate because there is no cache — one indexed
+/// primary-key lookup on `automation_project_members`, re-run by construction.
+async fn workflow_with_capability(
+    state: &AppState,
+    current: &CurrentSession,
+    workflow_id: Uuid,
+    capability: fn(omnion_workflows::projects::ProjectRole) -> bool,
+    what: &str,
+) -> Result<Workflow, ApiError> {
+    let workflow = workflow_in_scope(state, current, workflow_id).await?;
+    let caller = caller_projects(state, current, workflow.organization_id).await;
+    let (allowed, role) = projects::permits(
+        state.db().pool(),
+        workflow.organization_id,
+        workflow.project_id,
+        caller,
+        capability,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    if !allowed {
+        return Err(ApiError::forbidden(
+            "project_capability_required",
+            format!(
+                "your role in this project's team ({role:?}) may not {what} — ask a project \
+                 owner to change it, it applies immediately"
+            ),
+        ));
+    }
     Ok(workflow)
 }
 
@@ -663,6 +925,9 @@ mod tests {
         Workflow {
             id: Uuid::nil(),
             organization_id: Uuid::nil(),
+            // A workflow is always in a project (REQ-133): the column is `not null`, so the
+            // fixture carries one rather than the type offering an option the database refuses.
+            project_id: Uuid::nil(),
             site_id: None,
             name: "Nightly digest".to_owned(),
             description: "Publishes the nightly digest".to_owned(),

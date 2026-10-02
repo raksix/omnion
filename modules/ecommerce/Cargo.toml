@@ -1,0 +1,22 @@
+[package]
+name = "omnion-module-ecommerce"
+description = "Omnion storefront: the per-site storefront configuration, and later the cart, the checkout session and the visitor account layer (docs/requests/REQ-118). A surface over the commerce engine (REQ-008), never a second one."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The slice-1a gate (scripts/qa/run-storefront-settings.sh) needs a real database, because the
+# thing under test is the agreement between a Rust constant and a `check` constraint — a
+# property of the schema, and no unit test can see a schema.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

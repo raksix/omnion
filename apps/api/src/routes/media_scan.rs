@@ -114,16 +114,10 @@ impl ScanSettingsBody {
         // Same reasoning as the storage settings: `updated_at` against `created_at` is the only
         // column that distinguishes a site that was configured from one that was never
         // touched, and "every column equals the default" cannot answer that question.
-        //
-        // A **zero** delta counts as configured. Rounding the gap down to whole seconds first
-        // made this a race against the clock: a save and the read that follows it inside the
-        // same second left a difference of a few hundred milliseconds, `whole_seconds()`
-        // truncated it to `0`, and a site that had just been configured reported itself as
-        // never touched. The panel's own "you have not set this up yet" state then appeared
-        // on a working configuration, and the fix is to ask the question the timestamps can
-        // actually answer — "were these two instants ever different" — rather than "were they
-        // at least a second apart".
-        let configured = settings.updated_at != settings.created_at;
+        let configured = (settings.updated_at - settings.created_at)
+            .whole_seconds()
+            .abs()
+            >= 1;
         Self {
             site_id: settings.site_id,
             enabled: settings.enabled,

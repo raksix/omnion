@@ -12,7 +12,6 @@ import { useCallback, useEffect, useState } from "react";
 import { Plus, RefreshCw, Trash2, UsersRound, X } from "lucide-react";
 
 import { useSession } from "@/lib/session";
-import { tenantMissingReason, tenantRequiredMessage } from "@/components/tenant-picker";
 import {
   ApiError,
   createIamBinding,
@@ -123,14 +122,6 @@ export function GroupsView() {
   );
 
   const create = async () => {
-    // The API answers `400 organization_required` when a platform account writes without a
-    // tenant. Caught here so the reader is told which control to use instead of reading a
-    // sentence about a field the form does not show.
-    const missing = tenantMissingReason(platformAccount, activeOrg);
-    if (missing) {
-      setError(missing);
-      return;
-    }
     setBusy(true);
     setError(null);
     try {
@@ -147,10 +138,7 @@ export function GroupsView() {
       await openGroup(created.id);
     } catch (cause) {
       setError(
-        tenantRequiredMessage(cause) ??
-          (cause instanceof ApiError
-            ? `${cause.message} (${cause.code})`
-            : "The group was not created."),
+        cause instanceof ApiError ? `${cause.message} (${cause.code})` : "The group was not created.",
       );
     } finally {
       setBusy(false);

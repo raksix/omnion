@@ -24,25 +24,13 @@ serde_json.workspace = true
 percent-encoding.workspace = true
 sqlx.workspace = true
 time.workspace = true
-# The API Explorer's own per-user budget (REQ-033, slice 2). It is a second counting path on
-# purpose — the budget has to be keyed on the *user* and held under a prefix of its own, so
-# spending Explorer calls can never exhaust an API budget — but it reuses the same counter
-# machinery the request-path limiter uses, so there is only one INCR/EXPIRE implementation.
-redis.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 tokio-stream = { version = "0.1", features = ["sync", "time"] }
 omnion-audit = { path = "../../crates/audit" }
-omnion-cdn = { path = "../../crates/cdn" }
-omnion-environment = { path = "../../crates/environment" }
-# The deployment centre (REQ-024). `store` is on because `routes/deployment.rs` and
-# `deployment_check.rs` are its persistence layer; the feature is off by default so the
-# decision types can be unit-tested with no pool.
-omnion-deployment = { path = "../../crates/deployment", features = ["store"] }
 omnion-ai-hub = { path = "../../crates/ai-hub" }
 omnion-automation = { path = "../../crates/automation" }
 omnion-content = { path = "../../crates/content" }
-omnion-developer = { path = "../../crates/developer", features = ["store"] }
 omnion-core = { path = "../../crates/core" }
 omnion-events = { path = "../../crates/events" }
 # System health (REQ-014). Its own crate rather than a module of the security centre: the
@@ -55,10 +43,12 @@ omnion-identity = { path = "../../crates/identity" }
 omnion-backup = { path = "../../crates/backup" }
 omnion-media = { path = "../../crates/media" }
 omnion-notifications = { path = "../../crates/notifications" }
-omnion-regions = { path = "../../crates/regions", features = ["store"] }
 omnion-security = { path = "../../crates/security" }
 omnion-module-analytics = { path = "../../modules/analytics" }
+omnion-module-crm-intake = { path = "../../modules/crm-intake" }
+omnion-module-ecommerce = { path = "../../modules/ecommerce" }
 omnion-onboarding = { path = "../../crates/onboarding" }
+omnion-developer = { path = "../../crates/developer" }
 omnion-permissions = { path = "../../crates/permissions" }
 omnion-policy-engine = { path = "../../crates/policy-engine" }
 omnion-search = { path = "../../crates/search" }

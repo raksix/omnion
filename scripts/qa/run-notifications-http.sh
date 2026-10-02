@@ -20,13 +20,38 @@ export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_INCREMENTAL=0
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/.tmp-target}"
 
-DB="omnion_qa_notif_http"
+# Overridable, and it must be: the name is what makes this a *disposable* database, and two
+# writers running the same gate concurrently against one name drop each other's tables — which
+# reads as "the API refused to create the owner because this installation already has accounts",
+# a sentence with nothing to do with the gate.
+DB="${QA_DB:-omnion_qa_w8_notif_http}"
 PORT="${QA_API_PORT:-18086}"
 URL="http://127.0.0.1:$PORT"
 PGHOST=127.0.0.1
 PGPORT=5433
 export PGPASSWORD=omnion
 PSQL=(psql -h "$PGHOST" -p "$PGPORT" -U omnion -d postgres -v ON_ERROR_STOP=1 -q)
+# **The sign-in bucket is shared across every writer on this box and this gate is not the only
+# thing filling it.** The counter lives in Redis (`RatePolicy::counter_key` →
+# `omnion:rl:sign_in:<bucket>:<hash of client>`), keyed on the client, and every gate on this
+# host reaches the API over loopback — so nine sibling loops and their gates all count as
+# `127.0.0.1`. Measured here: `omnion:rl:sign_in:5969621:96bfa983b55ca27f = 25` against a
+# ceiling of 10, on a gate that makes *three* sign-ins.
+#
+# Three member-session claims then answered `401 unauthenticated` and read like a broken scope
+# guard. They were the limiter refusing the member's login; the discarded `>/dev/null` on that
+# curl is what moved the diagnosis three steps away. **A refusal that is reported as a
+# permission problem is a rate-limit problem nine times out of ten on a shared box.**
+#
+# Pointing the API at a Redis database index of this gate's own fixes the measurement without
+# touching product code and without colliding with a sibling. The limiter itself is covered by
+# gates that drive it deliberately; this one is about the notification contract.
+QA_REDIS_DB="${QA_NOTIF_HTTP_REDIS_DB:-14}"
+redis-cli -h 127.0.0.1 -p "${QA_REDIS_PORT:-6380}" -n "$QA_REDIS_DB" ping >/dev/null 2>&1 || {
+  echo "  FAIL Redis db $QA_REDIS_DB is not reachable — the gate cannot make its own sign-ins" >&2
+  exit 1
+}
+redis-cli -h 127.0.0.1 -p "${QA_REDIS_PORT:-6380}" -n "$QA_REDIS_DB" flushdb >/dev/null 2>&1 || true
 
 pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1"; FAILED=1; }
@@ -85,7 +110,7 @@ export OMNION_CSRF_SECRET="${OMNION_CSRF_SECRET:-qa-local-throwaway-value}"
 # the symptom was an `already_installed` refusal from a binary that had no notification route
 # in it at all.
 OMNION_DATABASE_URL="postgres://omnion:omnion@$PGHOST:$PGPORT/$DB" \
-OMNION_REDIS_URL="redis://127.0.0.1:6380" \
+OMNION_REDIS_URL="redis://127.0.0.1:${QA_REDIS_PORT:-6380}/$QA_REDIS_DB" \
 OMNION_PORT="$PORT" \
 OMNION_ENV=development \
   "$CARGO_TARGET_DIR/debug/omnion-api" >/tmp/notif-http-api.log 2>&1 &
@@ -161,9 +186,15 @@ else
   pass "created the member through the IAM route"
   # Sign the member in with its own session — a real login, so the scope is proved with a real
   # cookie rather than a hand-made header.
-  curl -s -c "$COOKIE_B" -X POST "$URL/api/v1/auth/login" \
+  # The body is captured, not discarded: a refusal here surfaces three claims later as a 401
+  # on a completely different route, and the reader loses the only sentence that said why.
+  member_login=$(curl -s -c "$COOKIE_B" -X POST "$URL/api/v1/auth/login" \
     -H 'content-type: application/json' \
-    -d '{"email":"member@qa.test","password":"qa-password-123"}' >/dev/null
+    -d '{"email":"member@qa.test","password":"qa-password-123"}')
+  if ! echo "$member_login" | grep -q 'session\|user\|access'; then
+    echo "  FAIL the member could not sign in: $member_login" >&2
+    exit 1
+  fi
   # The scope vocabulary is `global | organization | site | department | module | resource` —
   # `platform` is the word the docs use and the API does not accept it, which is a
   # deserialize error rather than a 400, so it is easy to misread as a broken gate.

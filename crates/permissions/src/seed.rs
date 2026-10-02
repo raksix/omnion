@@ -105,26 +105,6 @@ const BASE_ROLES: &[BaseRole] = &[
             "domains.manage",
             "webhooks.read",
             "events.read",
-            "cdn.read",
-            // Reading which integrations exist and what they called is an auditor's question
-            // and it fits a manager; *minting* a key is a much larger power and stays with
-            // owner/administrator (who hold `BasePermissions::All`). If the two had been given
-            // together, the read would have arrived with the write and the split above would
-            // have been a distinction in name only.
-            "developer.keys.read",
-            // The API Explorer's *reference* half. Sending a call is deliberately absent: a
-            // manager may read which operations exist and what they take, and may not use the
-            // reference to act as the person sitting at the screen. The run key stays with
-            // owner/administrator, who hold `BasePermissions::All` — a read-only developer role
-            // must not be able to reach `POST /pages` through a form instead of through a key.
-            "developer.read",
-            // Reading which OAuth applications this tenant registered and what they may be
-            // granted is an integrator's debugging question and fits a manager.
-            // `developer.oauth.manage` is deliberately absent, exactly as
-            // `developer.keys.manage` is: rotating a client secret starts an overlap in which
-            // two credentials are valid, and a manager who can see which integrations exist
-            // must not be able to mint one that authenticates as this organization.
-            "developer.oauth.read",
             "search.read",
             "search.manage",
             "analytics.read",
@@ -168,6 +148,20 @@ const BASE_ROLES: &[BaseRole] = &[
             "sites.read",
             "search.read",
             "analytics.read",
+            // The lead inbox (REQ-117): a moderator is the person who answers the quote
+            // requests, so it grants reading and working a lead. It does NOT grant
+            // `crm.intake.manage` — editing a field mapping decides what the business stores
+            // about every person who writes in, which is a different promise from working the
+            // leads that already arrived. Nor `crm.leads.convert`, which is a promise to the
+            // person who wrote in: it turns them into a contact and an opportunity, and a
+            // moderator who works the queue is not the person who decides that.
+            "crm.leads.read",
+            "crm.leads.manage",
+            // Handing a lead over IS the queue moderator's job — the rules route by country and
+            // by product, and a person in a region the rules do not cover is exactly when a
+            // human decides. Unlike `convert` this promise is to the team rather than to the
+            // person who wrote in, so it belongs with working the queue.
+            "crm.leads.assign",
             // The bell is on every route, so every role that can open the panel needs to read
             // its own inbox. `notifications.manage` is deliberately NOT here: it is the
             // channel-configuration power slice 2 introduces, and a role that may read an
@@ -207,6 +201,10 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.read",
             "media.read",
             "search.read",
+            // The member may see the lead inbox. Reading somebody's submitted quote request
+            // is not the same power as acting on it, and a sales team where the person who
+            // picks up a lead cannot open it is a sales team that asks somebody else to.
+            "crm.leads.read",
             // The member is the smallest role that can open the panel at all, and the bell sits
             // in the header of every screen — so this row decides whether a member sees a badge
             // they cannot click, or a header with a hole in it. Read only, never manage: the
@@ -319,6 +317,44 @@ pub async fn bind_owner(pool: &PgPool, user_id: Uuid) -> Result<Option<Uuid>> {
             role_id: owner.id,
             user_id,
             scope: Scope::Global,
+            granted_by: None,
+            expires_at: None,
+        },
+    )
+    .await?;
+
+    Ok(binding.map(|binding| binding.id))
+}
+
+/// Give one account the Owner role *inside* one organization (idempotent).
+///
+/// The companion to [`bind_owner`], and the reason the first run can be used afterwards. A
+/// global Owner binding answers every permission question, so a brand-new installation never
+/// lacked power — it lacked *scope*: `users.organization_id` was still `null` and no
+/// organization-scoped binding existed, so every surface that asks "which tenant?" answered
+/// `no_organization` to the account that had just created the tenant.
+///
+/// Granting the role at organization scope is what makes the account a member of the tenant
+/// its own first run created, and it is deliberately not a move: the global binding stays, and
+/// an account that later joins another organization is a different operation with its own
+/// permission.
+pub async fn bind_owner_in(pool: &PgPool, user_id: Uuid, organization_id: Uuid) -> Result<Option<Uuid>> {
+    // The *role* is the platform-level base role; the *binding* is what carries the scope.
+    // Looking the role up with the organization would ask for a per-tenant copy of a base role
+    // that does not exist, and answer `RoleNotFound` on the first run of every installation —
+    // which is exactly the moment this function has to work. `seed_base_roles` writes the
+    // catalogue at platform scope, and a tenant-specific role would be a different, opt-in
+    // thing with its own lifecycle.
+    let owner = roles::find_role_by_key(pool, None, "owner")
+        .await?
+        .ok_or(crate::error::PermissionsError::RoleNotFound)?;
+
+    let binding = bindings::grant_if_missing(
+        pool,
+        NewBinding {
+            role_id: owner.id,
+            user_id,
+            scope: Scope::Organization { organization_id },
             granted_by: None,
             expires_at: None,
         },
@@ -547,10 +583,16 @@ mod tests {
                 "content.pages.read",
                 "media.read",
                 "search.read",
+                "crm.leads.read",
                 "notifications.read"
             ],
-            "the member reads content, media, the search box and its own inbox"
+            "the member reads content, media, the search box, the lead inbox and its own inbox"
         );
+        // The member can *see* a lead and cannot touch one. This pair is the whole of the
+        // CRM surface at member level, and a future slice that adds `crm.leads.manage` here
+        // is the change this line exists to make somebody think twice about.
+        assert!(!keys.contains(&"crm.leads.manage"));
+        assert!(!keys.contains(&"crm.intake.manage"));
         assert!(!keys.contains(&"iam.roles.manage"));
         assert!(!keys.contains(&"users.delete"));
         assert!(
@@ -576,6 +618,23 @@ mod tests {
             !keys.contains(&"notifications.admin"),
             "reading everybody's delivery log is not a member's power"
         );
+        // REQ-133 slice 1: no base role that *enumerates* its permissions holds
+        // `projects.admin`. The two instance-wide roles are `BasePermissions::All` and hold it
+        // by construction — that is what "all" means, and asserting otherwise would be
+        // asserting the role system does not work. The claim worth locking is the narrower
+        // one: a manager, an editor or a member cannot read a project they are not a member
+        // of, however many project keys they accumulate, because the one key that overrides
+        // membership is not in a hand-written list.
+        for base in BASE_ROLES {
+            if matches!(base.permissions, BasePermissions::All) {
+                continue;
+            }
+            assert!(
+                !base.permissions.keys().contains(&"projects.admin"),
+                "the base role {} must not carry the instance-wide project power",
+                base.key
+            );
+        }
 
         let editor = BASE_ROLES
             .iter()

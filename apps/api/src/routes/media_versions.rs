@@ -524,11 +524,8 @@ async fn serve_bytes(
     // Validated against the **version's** checksum, not the file's. A historical version has its
     // own bytes at its own key, and answering it `304` against the current file's checksum would
     // tell a caller it already holds a picture it has never seen.
-    let conditional = crate::routes::media::conditional_headers(
-        request_headers,
-        &version.checksum,
-        Some(version.created_at),
-    );
+    let conditional =
+        crate::routes::media::conditional_headers(request_headers, &version.checksum, Some(version.created_at));
     if conditional.verdict == omnion_media::validators::Conditional::NotModified {
         return crate::routes::media::not_modified(&conditional);
     }

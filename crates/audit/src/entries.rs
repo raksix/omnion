@@ -1,5 +1,6 @@
 //! Audit entries: append-only rows describing who did what, to which target.
 
+use serde::Serialize;
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -33,7 +34,7 @@ impl ActorType {
 }
 
 /// A stored audit row.
-#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub struct AuditEntry {
     /// Creation order (identity column).
     pub id: i64,
@@ -53,6 +54,12 @@ pub struct AuditEntry {
     pub metadata: serde_json::Value,
     /// Peer address of the actor, when known.
     pub ip_address: Option<String>,
+    /// The automation project the action happened inside, when it happened inside one.
+    ///
+    /// **`None` for a platform-level row, and that is data rather than absence.** The project
+    /// audit screen filters on this column, and a reader asking "what happened to this project"
+    /// must not be shown a role creation from the same tenant.
+    pub project_id: Option<Uuid>,
     /// When the action was recorded.
     pub created_at: OffsetDateTime,
 }
@@ -140,21 +147,59 @@ impl NewAuditEntry {
         self.ip_address = ip_address;
         self
     }
+
 }
 
 /// Columns read back from `audit_log`, with `inet` rendered as text.
 const AUDIT_COLUMNS: &str = "id, organization_id, actor_user_id, actor_type, action, \
-     target_type, target_id, metadata, ip_address::text as ip_address, created_at";
+     target_type, target_id, metadata, ip_address::text as ip_address, project_id, created_at";
+
+/// Columns an entry writes. `project_id` is a *separate* parameter rather than part of
+/// [`AUDIT_COLUMNS`]: the column arrived with migration 0164, nullable, and every writer that
+/// does not name a project leaves it null — which is the correct answer for a platform-level row
+/// and the reason a project audit screen has to filter on it rather than on `organization_id`.
+///
+/// Before it existed, the project-scoped mutations (REQ-133) wrote rows that were indistinguishable
+/// from platform rows: `organization_id` was the same, and the trail could not answer "what
+/// happened to this project". A filter over an `organization_id` would have been worse than no
+/// filter, because it would have shown a project the whole tenant's history.
+const AUDIT_INSERT_COLUMNS: &str = "organization_id, actor_user_id, actor_type, action, \
+     target_type, target_id, metadata, ip_address, project_id";
 
 /// Append an entry to the audit trail.
 ///
 /// Callers treat a failure as a failure of the action itself: an unrecorded privileged action
 /// is worse than a reported one, because the trail is what the operator audits afterwards.
 pub async fn record(pool: &PgPool, entry: NewAuditEntry) -> Result<AuditEntry> {
+    write(pool, entry, None).await
+}
+
+/// Append an entry **inside an automation project**, for the project audit screen (REQ-133).
+///
+/// **A second function rather than a field on [`NewAuditEntry`].** The column arrived with
+/// migration 0164 and every writer that does not belong to a project leaves it null, so the
+/// interesting fact is not "the entry has no project" but "this entry has *this* project" — a
+/// distinction a null cannot carry. A field would have said the same thing, and it would have
+/// broken every struct-literal construction of the entry in the workspace (two of them live in
+/// files other waves own), which is a merge hazard dressed as an audit decision. The platform's
+/// own rows keep calling [`record`] and keep their null.
+pub async fn record_for_project(
+    pool: &PgPool,
+    entry: NewAuditEntry,
+    project_id: Uuid,
+) -> Result<AuditEntry> {
+    write(pool, entry, Some(project_id)).await
+}
+
+/// The one insert both entry points share.
+async fn write(
+    pool: &PgPool,
+    entry: NewAuditEntry,
+    project_id: Option<Uuid>,
+) -> Result<AuditEntry> {
     let sql = format!(
-        "insert into audit_log (organization_id, actor_user_id, actor_type, action, target_type, \
-         target_id, metadata, ip_address) \
-         values ($1, $2, $3, $4, $5, $6, $7, cast($8 as inet)) returning {AUDIT_COLUMNS}"
+        "insert into audit_log ({AUDIT_INSERT_COLUMNS}) \
+         values ($1, $2, $3, $4, $5, $6, $7, cast($8 as inet), $9) returning {AUDIT_COLUMNS}"
     );
 
     let stored: AuditEntry = sqlx::query_as(&sql)
@@ -166,7 +211,55 @@ pub async fn record(pool: &PgPool, entry: NewAuditEntry) -> Result<AuditEntry> {
         .bind(entry.target_id.as_deref())
         .bind(entry.metadata)
         .bind(entry.ip_address.as_deref())
+        .bind(project_id)
         .fetch_one(pool)
+        .await?;
+
+    Ok(stored)
+}
+
+/// Append an entry **inside a caller's open transaction**, for a mutation that must be auditable
+/// atomically (REQ-133's project deletion).
+///
+/// **Why this exists and why it is a separate function rather than a pool one.** Deleting a
+/// project takes a row lock on the project (`for update`), checks its dependencies and then
+/// deletes it. The audit row has to be written by that same transaction for two reasons, and
+/// neither is about tidiness:
+///
+/// 1. **`audit_log.project_id` is `on delete set null`.** A trail row written by a *pool* write
+///    after the delete commits is a row with a null project — and the project audit screen it was
+///    written for no longer exists to be read from. The instance-wide stream would show
+///    "somebody deleted a project" with no project to point at, which is exactly the row the
+///    operator is looking for after the fact.
+/// 2. **A delete with no trail is the worst possible gap in a trail.** Every other writer on this
+///    module records after its write through the pool, which is fine for a row that still exists;
+///    for the one action that removes the thing, the write and the record have to commit or roll
+///    back together.
+///
+/// The entry is otherwise built exactly as [`record_for_project`] builds it — same columns, same
+/// `project_id` — so the row is indistinguishable from every other project-scoped entry, which is
+/// what keeps `run-project-audit.sh` measuring the same stream.
+pub async fn record_for_project_in(
+    connection: &mut sqlx::PgConnection,
+    entry: NewAuditEntry,
+    project_id: Uuid,
+) -> Result<AuditEntry> {
+    let sql = format!(
+        "insert into audit_log ({AUDIT_INSERT_COLUMNS}) \
+         values ($1, $2, $3, $4, $5, $6, $7, cast($8 as inet), $9) returning {AUDIT_COLUMNS}"
+    );
+
+    let stored: AuditEntry = sqlx::query_as(&sql)
+        .bind(entry.organization_id)
+        .bind(entry.actor_user_id)
+        .bind(entry.actor_type.as_str())
+        .bind(entry.action)
+        .bind(entry.target_type)
+        .bind(entry.target_id.as_deref())
+        .bind(entry.metadata)
+        .bind(entry.ip_address.as_deref())
+        .bind(project_id)
+        .fetch_one(&mut *connection)
         .await?;
 
     Ok(stored)
@@ -191,144 +284,6 @@ pub async fn recent(
         .await?;
 
     Ok(entries)
-}
-
-/// A filter for one organization's trail.
-///
-/// Deliberately a *type* rather than three loose parameters: the Audit tab always sends all
-/// three, a caller almost never wants one, and the SQL is built from the presence of each field
-/// rather than from a string the caller controls. Every value is still a bind — the *shape* of
-/// the statement varies, its *values* never do.
-#[derive(Debug, Clone, Default)]
-pub struct AuditFilter {
-    /// Only this tenant's rows. `None` is the platform-wide trail.
-    pub organization_id: Option<Uuid>,
-    /// Exact action name, case-insensitive.
-    pub action: Option<String>,
-    /// The account that acted.
-    pub actor_user_id: Option<Uuid>,
-    /// Only rows this actor type (`system` for the ones nobody performed).
-    pub actor_type: Option<String>,
-    /// Only rows at or after this moment.
-    pub since: Option<OffsetDateTime>,
-}
-
-/// The matching rows, newest first, plus how many there are in total.
-///
-/// The count is a second statement rather than a window function because the two are used
-/// differently: the list is a page, the count is a "showing 50 of 812" that has to be right even
-/// when the page is short.
-pub async fn filtered(
-    pool: &PgPool,
-    filter: &AuditFilter,
-    limit: i64,
-) -> Result<(Vec<AuditEntry>, i64)> {
-    let where_clause = "($1::uuid is null or organization_id = $1) \
-        and ($2::text is null or lower(action) = lower($2)) \
-        and ($3::uuid is null or actor_user_id = $3) \
-        and ($4::text is null or actor_type = $4) \
-        and ($5::timestamptz is null or created_at >= $5::timestamptz)";
-
-    let total: i64 = sqlx::query_scalar(&format!(
-        "select count(*) from audit_log where {where_clause}"
-    ))
-    .bind(filter.organization_id)
-    .bind(filter.action.as_deref())
-    .bind(filter.actor_user_id)
-    .bind(filter.actor_type.as_deref())
-    .bind(filter.since)
-    .fetch_one(pool)
-    .await?;
-
-    let rows: Vec<AuditEntry> = sqlx::query_as(&format!(
-        "select {AUDIT_COLUMNS} from audit_log where {where_clause} \
-         order by created_at desc, id desc limit $6"
-    ))
-    .bind(filter.organization_id)
-    .bind(filter.action.as_deref())
-    .bind(filter.actor_user_id)
-    .bind(filter.actor_type.as_deref())
-    .bind(filter.since)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-
-    Ok((rows, total))
-}
-
-/// What one retention sweep removed for one organization.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetentionSweep {
-    /// Organization the sweep ran for.
-    pub organization_id: Uuid,
-    /// The window that was applied, in days.
-    pub retention_days: i32,
-    /// Rows older than this instant were removed.
-    pub cutoff: OffsetDateTime,
-    /// Rows removed.
-    pub rows_removed: i64,
-}
-
-/// The oldest audit row one organization still holds.
-///
-/// The sweep asks this rather than counting: what it needs to know is whether there is
-/// anything at all to do, and a tenant that never sweeps is the common case. `None` when the
-/// organization has no rows older than `cutoff` — which is also the answer for an
-/// organization that has no rows.
-pub async fn oldest_older_than(
-    pool: &PgPool,
-    organization_id: Uuid,
-    cutoff: OffsetDateTime,
-) -> Result<Option<OffsetDateTime>> {
-    let oldest: Option<OffsetDateTime> = sqlx::query_scalar(
-        "select min(created_at) from audit_log \
-         where organization_id = $1 and created_at < $2",
-    )
-    .bind(organization_id)
-    .bind(cutoff)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(oldest)
-}
-
-/// Remove one organization's audit rows older than `cutoff`.
-///
-/// Scoped by `organization_id` in the statement itself, not by a filter the caller passed:
-/// a retention sweep that deleted a row belonging to a *different* tenant would be the worst
-/// bug this platform could ship, and the only place that cannot go wrong is the `where`.
-///
-/// The cutoff is a parameter rather than computed here so the caller (and its test) name the
-/// same instant the run used. Idempotent by construction — the statement removes what is there,
-/// so a retried sweep removes nothing and still reports honestly.
-pub async fn purge_before(
-    pool: &PgPool,
-    organization_id: Uuid,
-    cutoff: OffsetDateTime,
-) -> Result<i64> {
-    let removed =
-        sqlx::query("delete from audit_log where organization_id = $1 and created_at < $2")
-            .bind(organization_id)
-            .bind(cutoff)
-            .execute(pool)
-            .await?
-            .rows_affected() as i64;
-
-    Ok(removed)
-}
-
-/// The distinct action names in one organization's history, for a feed's filter.
-///
-/// Read from the tenant's own rows rather than from a fixed list: the filter then offers what
-/// this organization has actually done, and it cannot drift from the code as actions are added.
-pub async fn distinct_actions(pool: &PgPool, organization_id: Uuid) -> Result<Vec<String>> {
-    let actions: Vec<String> = sqlx::query_scalar(
-        "select distinct action from audit_log where organization_id = $1 order by action",
-    )
-    .bind(organization_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(actions)
 }
 
 /// Every entry recorded **against one record**, newest first.
@@ -362,6 +317,38 @@ pub async fn for_target(
     let entries: Vec<AuditEntry> = sqlx::query_as(&sql)
         .bind(target_id)
         .bind(target_types)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(entries)
+}
+
+/// Every entry recorded **inside one project**, newest first (REQ-133 slice 4).
+///
+/// The project audit screen is this function, and the reason it exists rather than a filter on
+/// [`recent`] is that `organization_id` cannot answer the question: every project mutation carries
+/// the tenant id, so filtering on it hands the reader the whole installation's history and calls it
+/// a project. `project_id` is the only column that is narrow enough to be a boundary.
+///
+/// `action` narrows further (the REQ's "with filters"), and an empty string means every action
+/// rather than none -- a screen whose filter defaults to "show nothing" is indistinguishable from a
+/// project where nothing happened.
+pub async fn for_project(
+    pool: &PgPool,
+    project_id: Uuid,
+    action: Option<&str>,
+    limit: i64,
+) -> Result<Vec<AuditEntry>> {
+    let sql = format!(
+        "select {AUDIT_COLUMNS} from audit_log \
+         where project_id = $1 and ($2 = '' or action = $2) \
+         order by created_at desc, id desc limit $3"
+    );
+
+    let entries: Vec<AuditEntry> = sqlx::query_as(&sql)
+        .bind(project_id)
+        .bind(action.unwrap_or_default())
         .bind(limit)
         .fetch_all(pool)
         .await?;

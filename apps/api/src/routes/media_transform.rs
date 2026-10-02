@@ -458,11 +458,8 @@ async fn serve_original(
     // preset is named — so it is the one a thumbnail in the library grid and a preview pane both
     // hit. A validator added to `/media/{id}/raw` alone would have been one the walk never
     // reaches: the route that *looks* like the read path is this one.
-    let conditional = crate::routes::media::conditional_headers(
-        request_headers,
-        &media.checksum,
-        media.updated_at.or(Some(media.created_at)),
-    );
+    let conditional =
+        crate::routes::media::conditional_headers(request_headers, &media.checksum, media.updated_at.or(Some(media.created_at)));
     if conditional.verdict == omnion_media::validators::Conditional::NotModified {
         return crate::routes::media::not_modified(&conditional);
     }

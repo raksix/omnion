@@ -1,84 +1,57 @@
-//! Omnion developer platform (docs/requests/REQ-033).
+//! Omnion developer portal — the credentials an organization hands to code (REQ-022).
 //!
-//! The developer surface is the one place a person extends Omnion without leaving it: keys
-//! they authenticate with, the requests those keys make, and the tooling that turns a template
-//! into an extension. It is infrastructure, like `omnion-events` and `omnion-audit` — it knows
-//! what a key *is*, not what a deploy or an approval means.
+//! ## What is new here, and why it is a separate crate
 //!
-//! # The property this crate is built around
+//! Everything else in the platform authenticates a **person** or a **machine identity that has
+//! roles bound to it** (`service_account_keys`, REQ-006). A developer API key is neither: it is
+//! a *delegation* the operator configured, carrying its own scope list and no role at all. That
+//! difference is invisible in a request log — both arrive as `Authorization: Bearer …` — and
+//! fatal in the authorization check, so the two are kept in separate crates with separate
+//! stores rather than as two branches of one table.
 //!
-//! **Key material is write-only.** It is minted in [`secret::mint`], handed to the caller once
-//! in a [`Minted`] response, hashed into `api_keys.secret_hash` and never recoverable. That
-//! is enforced in three independent places, deliberately, because the leak it prevents is the
-//! one nobody notices:
+//! ## The one rule this crate keeps
 //!
-//! * [`model::ApiKey`] — the shape a list, a detail read and a CSV export share — has no secret
-//!   field. A query written wrong cannot return one, because there is nowhere to put it.
-//! * [`model::Minted`] is a separate type that only [`store::create`] and
-//!   [`store::rotate`] produce, so "the secret came back a second time" needs a code path that
-//!   does not exist rather than a test that has to remember to fail.
-//! * The stored hash carries a scheme prefix ([`secret`]), so a row this build cannot read is
-//!   an authentication failure — indistinguishable from a wrong secret — instead of a
-//!   comparison against a different algorithm.
+//! **No secret is ever returned twice, and none is ever stored in a form that can be read
+//! back.** A key's plaintext exists in exactly one place: the response that creates or rotates
+//! it. Everything the platform keeps is [`keys::KeyPrefix`] (ten characters, the lookup
+//! namespace) and a SHA-256 hash. That is not a convention — it is why
+//! [`keys::ApiKey`] has no field that could hold a usable credential, so no handler, no
+//! serializer, no `Debug` print and no CSV export can leak one even by accident.
 //!
-//! Slice 1 is the keys-and-logs half. The API Explorer, OAuth apps, the events catalog, the
-//! SDK scaffolds and the CLI device-code flow are slices 2 through 4, and their tables are not
-//! created early to be filled in later.
+//! The corollary is that every read path is written to be **safe by construction**: the list
+//! returns prefixes, the detail returns usage, and the authentication path compares hashes
+//! with a constant-time equality rather than `==` on strings (see [`keys::verify_secret`]).
+//!
+//! ## Scope delegation is not role assignment
+//!
+//! A key's scopes are a **narrowing**, never a widening. [`keys::mintable_from`] refuses to
+//! create a key whose scopes contain anything the creating caller did not hold, which is what
+//! stops a read-only integration from minting an integration that can rotate keys. The rule is
+//! checked against the catalogue rather than against the database: an unknown scope is a
+//! refused key, because a scope the platform cannot resolve is a scope nothing can enforce.
 
 #![forbid(unsafe_code)]
 
-pub mod archive;
-pub mod authn;
-pub mod cli;
 pub mod error;
-/// The request log's two rules, as a module of its own (see the file for why it is not the
-/// 415-line `logs.rs` `origin/main` carries).
-pub mod log_vocab;
+pub mod keys;
+pub mod keys_store;
+pub mod logs;
+pub mod logs_store;
 pub mod model;
-pub mod model_oauth;
-pub mod oauth;
-pub mod oauth_flow;
-pub mod openapi;
-/// The `/developer` overview's numbers, in one snapshot (REQ-022 slice 2, `origin/main`).
-///
-/// This branch independently built the same section root for REQ-033 slice 4, so this module
-/// arrives from a merge rather than from a decision here. It is kept — it is the only reader
-/// that counts keys, requests and refusals in **one** statement, and the section root is better
-/// served by that than by a row of queries — but it is gated on the `store` feature and it is
-/// **not** the screen this branch ships: see `apps/admin/app/developer/page.tsx`, where the
-/// six cards read the lists their own destinations render, which is a claim this module's single
-/// row cannot make (it counts a snapshot, not the screen a person is looking at).
-#[cfg(feature = "store")]
 pub mod overview;
-pub mod scaffold;
-pub mod secret;
-#[cfg(feature = "store")]
-pub mod store;
-#[cfg(feature = "store")]
-pub mod store_cli;
-#[cfg(feature = "store")]
-pub mod store_oauth;
-pub mod templates;
 
-pub use authn::{
-    AuthenticatedKey, KeyRefusal, address_allowed, cidr_contains, decide, scope_allows,
-};
 pub use error::{DeveloperError, Result};
-pub use model::{
-    ApiKey, Environment, KeyStatus, Minted, NewKey, RateTier, RequestLog, RequestLogPage,
-    RequestLogQuery, UsageDay, key_rules,
+pub use keys::{
+    ApiKey, ENVIRONMENT_SANDBOX, ENVIRONMENT_LIVE, ENVIRONMENTS, KEY_NAMESPACE, KeyPrefix, KeyStatus,
+    MAX_NAME_LENGTH, MAX_SCOPES, MIN_NAME_LENGTH, NewKey, Secret, dedupe_scopes, hash_token,
+    is_live_environment, mintable_from, name_is_valid, parse_environment, scope_names_valid,
+    verify_secret,
 };
-pub use model_oauth::{
-    AppEdit, AppStatus, AuthorizationRequest, ConsentRequest, MintedApp, NewApp, OAuthApp,
-    app_rules, authorize,
-};
-#[cfg(feature = "store")]
+pub use logs::MAX_PAGE as MAX_LOG_PAGE;
+pub use model::{IssuedKey, KeyView, UsagePoint};
 pub use overview::{FailureLine, Overview, RECENT_FAILURES, start_of_day};
-pub use secret::{MintedKey, mint};
-
-/// The label the API uses for this surface in the permission catalogue and the event bus.
-///
-/// One constant, because the request names `developer.keys.manage` in a QA step and the route
-/// guard, the audit entry and the event name all have to agree on it — and three hand-typed
-/// copies of a permission key is three chances to spell one of them differently.
-pub const PERMISSION_PREFIX: &str = "developer.";
+pub use keys_store::{
+    KeyPage, KeyQuery, authenticate, create, find, list, revoke, rotate, touch_last_used, usage,
+};
+pub use logs::{ClientIdentity, LogPage, LogQuery, LogRow, STATUS_CLASSES, class_of, path_without_query};
+pub use logs_store::{record, search, window_days};

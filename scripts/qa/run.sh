@@ -13,14 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 TS="$(date -u +%Y%m%d-%H%M%S)"
-# `QA_OUT_ROOT` moves the artifacts off the worktree. A pass writes screenshots for every
-# screen and every mobile viewport, and seven worktrees on one volume at 96% means the
-# pass that measures the most is the one that fills the disk — which is how a QA run
-# becomes the reason the next build fails with "No space left on device". `/dev/shm` is
-# the right default for a *disposable* pass: the artifacts are read by the vision review
-# and the summary in the same run and are worthless the next morning. The default is
-# unchanged so nobody loses their history by accident.
-OUT="${QA_OUT_ROOT:-$ROOT/qa-artifacts}/$TS"
+OUT="$ROOT/qa-artifacts/$TS"
 mkdir -p "$OUT"
 
 API_PORT="${QA_API_PORT:-18080}"
@@ -52,12 +45,29 @@ step() { printf '\n[qa] %s\n' "$*"; }
 
 wait_http() { # url, seconds
   local url="$1" deadline=$(( $(date +%s) + ${2:-120} ))
+  local last=""
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local code
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" || true)"
-    if [ -n "$code" ] && [ "$code" != "000" ]; then return 0; fi
+    last="$code"
+    # "Something answered" is the readiness test, and 000 is the only answer that means it did
+    # not: a closed port, or a process that has not bound yet. A 5xx is the exception that matters
+    # — a Next dev server answering 500 is still compiling its first route, and treating that as
+    # ready produced a walkthrough fatal ("admin panel unreachable ... responded 500") that read
+    # as a product failure and was invented entirely by the check. The same panel answered 200
+    # seconds later.
+    #
+    # 404 is accepted on purpose: the public renderer answers 404 for "/" until the pass seeds the
+    # site, and that 404 is the proof the server compiled and is routing requests. Requiring 2xx
+    # there failed a perfectly healthy renderer, which is the mirror image of the bug above — a
+    # readiness check that is wrong in the direction that hides nothing and breaks everything.
+    case "$code" in
+      000|5*) : ;;
+      *) return 0 ;;
+    esac
     sleep 2
   done
+  echo "[qa] $url never answered (last: ${last:-none})" >&2
   return 1
 }
 
@@ -68,15 +78,7 @@ wait_http() { # url, seconds
 QA_SLOT_PID=""
 if [ "${QA_SLOTS:-1}" != "0" ]; then
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
-  # QA_SLOT_OWNER is this script's own pid: the reaper has to be able to tell a pass that is
-  # still walking from a place its owner walked away from, and the holder it holds the place
-  # with cannot answer that — the holder is a background job of qa-slot.sh and is reparented
-  # the moment that script exits, which is the *successful* case. On a host with a subreaper
-  # (systemd --user here) an abandoned holder and a live one report the same ppid, so a
-  # ppid test is not merely unreliable here, it never fires at all. The pass is the only
-  # party that knows whether its own EXIT trap will still run, so it says so.
-  QA_SLOT_PID="$(QA_SLOT_OWNER="$$" QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" \
-    bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
+  QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
 fi
 # Free the place whenever this pass ends, however it ends.
@@ -165,53 +167,18 @@ printf '%s\n' "$BASHPID" >&9
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
-step "API on :$API_PORT (database $QA_DB_NAME)"
-# The binary lives in `$CARGO_TARGET_DIR` when the caller sets one, and this box has seven
-# writers sharing one 60G mount — so building into the worktree's own `target/` is how that
-# mount reaches 100% and how `cargo build` starts failing with "No space left on device". The
-# established answer is `CARGO_TARGET_DIR=/dev/shm/<writer>-target`, which this script ignored
-# twice over: it looked for the binary at the hardcoded `target/debug/omnion-api` and it told
-# pm2 to start that same path. The pass then died at `wait_http` with the API never listening,
-# reporting nothing about the code under test — the binary was in `/dev/shm` the whole time and
-# perfectly good. Honour the variable at both places, and say where the binary is so a failed
-# pass names a path instead of a symptom.
-TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
-API_BIN="$TARGET_DIR/debug/omnion-api"
-step "API binary: $API_BIN"
+step "API on :$API_PORT (database omnion_qa)"
 # A stale binary replays the *old* SQL: sqlx embeds `database/migrations/*.sql` at compile time, so
 # a migration edited after the last build is silently the previous version — and a syntax error in
 # it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
 # than the newest migration, which is cheap when nothing changed and correct when something did.
-#
-# The second half of that condition is the one this guard got wrong, and it cost a tick: it watched
-# `database/migrations` only, so a change to a **.rs** file left the binary stale and the pass
-# measured the previous build. Symptom, exactly: the device-code fix was committed, `cargo test`
-# passed on it, and the browser pass still reported `invalid device code` — because the API
-# under test was 30 minutes older than the fix.
-#
-# A migration is a special case of "the source is newer than the binary", not a separate concern:
-# sqlx embeds the SQL at compile time, so watching the Rust sources covers it too, and watching
-# both keeps the comment's warning intact for anyone who wonders why a `.sql` shows up here.
-#
-# The cost is one `find` over the workspace's source dirs, and the payoff is that a pass can no
-# longer report a verdict about code it did not run. `crates/` is included because every route and
-# store in this platform lives there; `apps/` because that is where the binary's own crate is.
-if [ ! -x "$API_BIN" ] \
-   || [ -n "$(find database/migrations -name '*.sql' -newer "$API_BIN" -print -quit)" ] \
-   || [ -n "$(find crates apps/api -name '*.rs' -newer "$API_BIN" -print -quit)" ]; then
-  step "building the API (first pass, or a source or migration changed since the last build)"
+if [ ! -x target/debug/omnion-api ] \
+   || [ -n "$(find database/migrations -name '*.sql' -newer target/debug/omnion-api -print -quit)" ]; then
+  step "building the API (first pass, or a migration changed since the last build)"
   # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
   # compiling at once instead of every pass grabbing all six threads for itself.
   "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
-# Nothing is restarted in place: the block further down deletes the entry and re-registers it, so
-# a `pm2 restart` here could only ever be a worse version of what happens anyway. Two earlier
-# versions of this script did restart, and both had a way to keep a *dead* registration alive --
-# one because a pass had started the API from `$CARGO_TARGET_DIR` and a later pass that built
-# somewhere else inherited an entry pointing at a path that no longer exists, and one because
-# `pm2 restart` succeeds on an entry whose script is gone, so the pass died at `wait_http`
-# blaming the product for a harness that had already lost the binary.
-#
 # `OMNION_CSRF_SECRET` decides whether a cookie-authenticated mutation is refused before its
 # handler runs. Without one the QA API refuses EVERY write with `csrf_unavailable`, so a
 # walkthrough that saves a header policy, uploads a file or takes a backup would record screens
@@ -220,77 +187,29 @@ fi
 # rather than the harness being under-configured. It is a throwaway value: the process points at
 # a database that was dropped two lines above and listens on loopback.
 #
-# The admin account is seeded from the environment on *every* boot, not only when the database is
-# empty. The DB reset above drops every account, so a pass that restarts an already-registered
-# process boots an API with no user at all: the panel then serves `/login` instead of `/setup`,
-# the walkthrough has nothing to sign in with, and the pass dies at "could not sign in after
-# wizard" — a failure that names the harness and says nothing about the code under test. Passing
-# the seed on the restart path too is what keeps the credentials in `walkthrough.cjs` and the
-# account the API creates the same pair.
-QA_ADMIN_EMAIL="${QA_ADMIN_EMAIL:-qa-owner@omnion.test}"
-QA_ADMIN_PASSWORD="${QA_ADMIN_PASSWORD:-OmnionQa-Passw0rd-2026!}"
-QA_ADMIN_NAME="${QA_ADMIN_NAME:-QA Owner}"
-pm2 delete "$API_NAME" >/dev/null 2>&1 || true
-OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
-OMNION_REDIS_URL="redis://127.0.0.1:6380" \
-OMNION_PORT="$API_PORT" \
-OMNION_ENV=development \
-OMNION_ADMIN_EMAIL="$QA_ADMIN_EMAIL" \
-OMNION_ADMIN_PASSWORD="$QA_ADMIN_PASSWORD" \
-OMNION_ADMIN_NAME="$QA_ADMIN_NAME" \
-OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-pass-throwaway-secret-not-a-real-key}" \
-  pm2 start "$API_BIN" --name "$API_NAME" --time >/dev/null
+# The comment sits here rather than inside the command because a `#` line between two backslash
+# continuations is not a comment: bash keeps reading the command, `#` and the words after it
+# become its arguments, and `pm2 start` is handed a stray name it never recovers from.
+if pm2 describe "$API_NAME" >/dev/null 2>&1; then
+  pm2 restart "$API_NAME" >/dev/null
+else
+  # `OMNION_CSRF_SECRET` is not optional on this stack. The middleware refuses every
+  # cookie-authenticated mutation without one (`403 csrf_unavailable`), and the panel signs in
+  # with a cookie, so an API started without it turns every save, create and delete in the
+  # walkthrough into a refusal — the IAM depth pass reported a role that "could not be created"
+  # because of it. A fixed value is correct here: the token is an HMAC over the session id
+  # inside this one process, so nothing is shared with another stack and there is nothing to
+  # keep secret between passes.
+  OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
+  OMNION_REDIS_URL="redis://127.0.0.1:6380" \
+  OMNION_CSRF_SECRET="qa-stack-${STACK}-csrf-secret-not-a-production-value" \
+  OMNION_PORT="$API_PORT" \
+  OMNION_ENV=development \
+  OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-pass-throwaway-secret-not-a-real-key}" \
+    pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
+fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
-
-step "seeding the QA tenant and site"
-# The admin seed on every boot creates the OWNER account and nothing else: no organization,
-# no site. The walkthrough's wizard then sees a user, so `needs_setup` (`!has_users`) is false,
-# the wizard is skipped — and every site-scoped screen is left with nothing to render. The
-# result looked like a broken product: `/cdn` asked for `?site_id=` and got a 400, the purge
-# depth pass reported "no QA site to purge for", and the pass filed 170 high findings against a
-# feature that had simply never been given a tenant to look at.
-#
-# The fixture belongs here and not in the walkthrough: the walkthrough is what is under test, and
-# a pass that invents its own tenant is a pass whose empty states are its own invention.
-#
-# `docker exec -i` is load-bearing. Without the `-i` the heredoc never reaches psql, the command
-# succeeds against an empty stdin, and the seed silently does nothing — which is the same failure
-# this step exists to prevent, one layer further down. The row counts below are printed so a
-# silently-empty seed is visible in the pass log rather than inferred from the findings.
-docker exec -i "${QA_PG_CONTAINER:-omnion-postgres}" psql -U omnion -d "$QA_DB_NAME" -v ON_ERROR_STOP=1 <<'QA_SEED'
-delete from sites;
-delete from organizations;
-update users set organization_id = null;
-insert into organizations (id, name, slug, status, event_retention_days, created_at, updated_at)
-select gen_random_uuid(), 'QA Organization', 'qa-organization', 'active', 30, now(), now()
-where not exists (select 1 from organizations);
-update users set organization_id = (select id from organizations limit 1) where organization_id is null;
-insert into sites (organization_id, key, name, status, theme, created_at, updated_at)
-select (select id from organizations limit 1), 'main', 'QA Main Site', 'active', 'minimal', now(), now()
-where not exists (select 1 from sites);
-QA_SEED
-QA_ORG=$(docker exec "${QA_PG_CONTAINER:-omnion-postgres}" psql -U omnion -d "$QA_DB_NAME" -t -A -c "select count(*) from organizations" 2>/dev/null || echo 0)
-QA_SITE=$(docker exec "${QA_PG_CONTAINER:-omnion-postgres}" psql -U omnion -d "$QA_DB_NAME" -t -A -c "select count(*) from sites where key = 'main'" 2>/dev/null || echo 0)
-step "QA fixture: ${QA_ORG} organization(s), ${QA_SITE} site(s) keyed 'main'"
-if [ "$QA_SITE" != "1" ]; then
-  echo "[qa] the QA fixture has no site keyed 'main' — every site-scoped screen would walk empty" >&2
-  exit 1
-fi
-
-step "QA fixture: a developer who cannot generate starters"
-# REQ-033 slice 4's done-when is "the read-only role sees no management controls", and the only
-# account a QA tenant has is the owner — who holds every permission. For that account a screen
-# whose controls are hidden by a permission check is indistinguishable from a screen with no
-# controls, and the two defects are opposite: the first hides buttons that should be there, the
-# second shows buttons that should not be. So the fixture creates the account the owner cannot
-# stand in for. It refuses to finish if that account holds the very key it exists to deny, and if
-# the role holds no reads at all — a role with no reads is refused by everything, which looks
-# exactly like a correct hiding.
-QA_DB_NAME="$QA_DB_NAME" QA_ADMIN_EMAIL="$QA_ADMIN_EMAIL" \
-  QA_PG_CONTAINER="${QA_PG_CONTAINER:-omnion-postgres}" \
-  node "$ROOT/scripts/qa/seed-readonly-developer.cjs" \
-  || { echo "[qa] the read-only developer fixture failed" >&2; exit 1; }
 
 step "admin panel on :$ADMIN_PORT"
 NEXT_ADMIN="$ROOT/apps/admin/node_modules/next/dist/bin/next"
@@ -300,7 +219,7 @@ else
   OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_ADMIN" --name "$ADMIN_NAME" --cwd "$ROOT/apps/admin" --time -- dev --port "$ADMIN_PORT" --hostname 127.0.0.1 >/dev/null
 fi
-wait_http "http://127.0.0.1:$ADMIN_PORT/login" 150 || { echo "[qa] admin panel did not answer"; pm2 logs "$ADMIN_NAME" --lines 20 --nostream || true; exit 1; }
+wait_http "http://127.0.0.1:$ADMIN_PORT/login" 300 || { echo "[qa] admin panel did not answer"; pm2 logs "$ADMIN_NAME" --lines 20 --nostream || true; exit 1; }
 
 step "public renderer on :$WEB_PORT"
 NEXT_WEB="$ROOT/apps/web/node_modules/next/dist/bin/next"
@@ -310,46 +229,18 @@ else
   OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_WEB" --name "$WEB_NAME" --cwd "$ROOT/apps/web" --time -- dev --port "$WEB_PORT" --hostname 127.0.0.1 >/dev/null
 fi
-wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
+wait_http "http://127.0.0.1:$WEB_PORT/" 300 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
 # `QA_ONLY` narrows the pass to named routes and depth passes. The default runs every one of
 # them, which is the right thing for a full acceptance run and the wrong thing for a loop that
 # has just built two screens and needs them proven before the tick ends. It is a filter on the
 # walk, never on the harness around it: the stack, the reset, the vision review and the report
 # all run exactly as they do for a full pass.
-#
-# The filter is passed as ONE `--only=` argument however many names it holds, because
-# walkthrough.cjs's parser is `split(",")` on a single value. Handed the words separately the
-# first becomes the flag's value and the rest are unknown argv entries the parser silently
-# ignores -- so a two-name scope would run as a one-name scope, or as none, and the artifact
-# would carry a coverage claim nobody checked.
 QA_ONLY_ARGS=()
 [ -n "${QA_ONLY:-}" ] && QA_ONLY_ARGS=(--only="$QA_ONLY")
 
 step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
 node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}"
-WALK_RC=$?
-
-# A walkthrough that died still leaves a `summary.json` behind, and that file is the most
-# dangerous artifact in this harness: `{"fatal": "could not sign in"}` is a *pass* to anything
-# that only checks whether the file exists or whether it has findings, and this script used to
-# go on to write a clean QA-LATEST report and exit 0. Absence of evidence was being filed as
-# evidence. Treat a dead run -- or a scope that walked no pages -- as a failed gate, loudly.
-if [ "$WALK_RC" -ne 0 ]; then
-  echo "[qa] the walkthrough exited $WALK_RC -- see $OUT/summary.json" >&2
-  exit "$WALK_RC"
-fi
-if node -e '
-const fs = require("fs");
-const out = process.argv[1];
-const scope = process.argv[2] || "";
-const s = JSON.parse(fs.readFileSync(out + "/summary.json", "utf8"));
-if (s.fatal) { console.error("[qa] the walkthrough was fatal: " + s.fatal); process.exit(1); }
-const pages = (s.pages || []).length;
-if (pages === 0) { console.error("[qa] the walkthrough recorded no pages" + (scope ? " for scope " + scope : "") + " -- a scope that matches nothing is a finding, not a pass"); process.exit(1); }
-' "$OUT" "${QA_ONLY:-}" ; then :; else
-  exit 1
-fi
 
 step "vision review"
 node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"

@@ -4,89 +4,23 @@
  * The panel's frame: a sidebar with the sections, a sticky header with the current screen and
  * the site switcher, and the screen itself. Below `lg` the sidebar becomes a drawer.
  */
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 
-import {
-  Activity,
-  AppWindow,
-  BarChart3,
-  Bell,
-  Bot,
-  Building2,
-  ClipboardCheck,
-  Code2,
-  Compass,
-  FileText,
-  Fingerprint,
-  Gauge,
-  Globe,
-  Globe2,
-  HardDriveDownload,
-  HeartPulse,
-  Images,
-  Import,
-  KeyRound,
-  Layers,
-  LayoutDashboard,
-  LockKeyhole,
-  LogOut,
-  Menu,
-  Package,
-  Rocket,
-  Radio,
-  Scale,
-  ScrollText,
-  ShieldCheck,
-  SlidersHorizontal,
-  Sparkles,
-  Timer,
-  UserCog,
-  UsersRound,
-  Webhook,
-  X,
-  type LucideIcon,
-} from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, ClipboardCheck, Code2, Copy, FileText, Fingerprint, FolderKanban, GitBranch, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, ShoppingBag, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
 import { SiteSwitcher } from "@/components/site-switcher";
-import { OrganizationSwitcher } from "@/components/organization-switcher";
+import { ProjectSwitcher } from "@/features/projects/project-switcher";
 import { GlobalSearch } from "@/components/global-search";
 import { NotificationBell } from "@/components/notification-bell";
-import { EnvironmentChip, StagingEnvironmentBanner } from "@/components/environment-chip";
-import { MaintenanceWindowBanner } from "@/components/maintenance-window-banner";
-import { TenantStatusBanner } from "@/components/tenant-status-banner";
 import { useDeveloperAccess } from "@/lib/developer-access";
 import { useSession } from "@/lib/session";
-import { useTenantStatus } from "@/lib/tenant-status";
 
-/**
- * One sidebar entry.
- *
- * Two independent reasons an entry can be absent, and both are properties **on the entry**
- * rather than in a filter somewhere else, so "which entries are conditional" is one list a
- * reader can scan instead of a second list that has to be kept in step with it:
- *
- * * `module` — the tenant switched it off (REQ-005 slice 4), and the API answers the module's
- *   routes with `403 organization.module.disabled` either way.
- * * `needsDeveloper` — this account may not open the developer portal. Resolved against a route
- *   the API guards for `developer.read`; the answer is `null` while it is in flight, which
- *   means the group is hidden for that first paint and appears a moment later. A group that
- *   appears, then vanishes, then reappears is a flicker; one that briefly shows an account who
- *   will be refused is a lie. See `lib/developer-access.tsx` for why the sidebar asks at all.
- */
-type NavItem = {
-  href: string;
-  label: string;
-  icon: LucideIcon;
-  module?: string;
-  needsDeveloper?: boolean;
-};
-
-const NAV: readonly NavItem[] = [
+const NAV = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/pages", label: "Pages", icon: FileText },
-{ href: "/media", label: "Media", icon: Images, module: "media" },
+  { href: "/media", label: "Media", icon: Images },
   // Backups sit beside Media rather than under Settings: an operator asking "where are my
   // files and can I get them back" is one question, and burying half of it under a
   // settings sub-path is what makes somebody believe the platform has no restore point.
@@ -97,73 +31,38 @@ const NAV: readonly NavItem[] = [
   // burying the liveness screen under a settings sub-path is how a platform looks healthy
   // to the person who opened the admin panel to find out that it is not.
   { href: "/health", label: "System Health", icon: HeartPulse },
-  { href: "/analytics", label: "Analytics", icon: BarChart3, module: "analytics" },
+  { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/notifications", label: "Notifications", icon: Bell },
-  // Exact-match only: `/cdn` is the overview and `/cdn/rules` is a different screen, so the
-  // overview would otherwise light up for the whole section and the active entry would be
-  // whichever the reader happened to be furthest from.
-  { href: "/cdn", label: "CDN", icon: Gauge },
   // The event console (REQ-016, slice 1). It sits beside Notifications rather than under
   // Settings because both answer the same question from the bus's side — "what does the
   // platform think happened" and "who was told" — and an operator chasing a missing webhook
   // needs both on the same shelf.
   { href: "/events", label: "Events", icon: Activity },
-  // Staging environments (REQ-017, slice 2). Beside Sites rather than under Settings: a staging
-  // copy of a site's content is a fact about the site, and an operator who is editing pages wants
-  // "which copy am I editing" one click from the pages, not four levels down.
-  { href: "/environments", label: "Environments", icon: Layers },
-  // The deployment centre (REQ-024). Beside Environments rather than under Settings, and for
-  // the same reason: "which version is running, and may it be upgraded" is the question an
-  // operator opens the panel to answer, and burying it four levels down is how a deployment
-  // screen becomes the thing nobody looks at.
-  { href: "/deployment", label: "Deployment", icon: Rocket },
+  // Projects (REQ-133). It sits with the automation surfaces rather than under Settings, because
+  // it is not a setting: a project is the bucket the other three of those screens are filed into,
+  // and an entry buried in a settings sub-path reads as a preference. Until this tick the whole
+  // feature had four screens and no navigation entry, so the switcher this slice adds had exactly
+  // one reachable host and a reader had to know the URL.
+  { href: "/automation/projects", label: "Projects", icon: FolderKanban },
   // The endpoints and their delivery history (REQ-016, slice 2). It sits next to Events
   // rather than under Settings because the two are the same investigation from both ends:
   // the feed says what happened, this says who was told and whether they got it.
   { href: "/webhooks", label: "Webhooks", icon: Webhook },
-  // The developer platform (REQ-033, slice 1). Beside Webhooks rather than under Settings: a
-  // developer asking "what can I call, and what has my integration already called" is asking
-  // about the same platform surface from two ends, and both answers belong on one shelf.
-  // `/developer` is the section root the REQ names; the keys and logs screens ship with it and
-  // the overview arrives with slice 4, so the root is registered once it exists rather than
-  // pointing at a screen that has not been built.
-  // The Explorer (REQ-033, slice 2) sits *before* the keys: a developer who opens the
-  // developer section is usually trying to make a call, and the reference is the first
-  // question, not the third. The key screen is where you answer "how do I authenticate"
-  // once the Explorer has told you what the call is.
-  // The section root comes first and carries the plain name: a section with six children and no
-  // landing page can only be entered by knowing which child you wanted, which is the one question
-  // the root exists to answer. It is placed before the Explorer deliberately — the Explorer is the
-  // first child, not the section.
-  { href: "/developer", label: "Developer", icon: Code2 },
-  { href: "/developer/api-explorer", label: "Developer · API Explorer", icon: Compass },
-  { href: "/developer/keys", label: "Developer · API keys", icon: KeyRound },
-  // The OAuth app registry (REQ-033, slice 3) sits *after* the keys and not before them: a
-  // developer arrives here with one of two questions — "how do I authenticate my own server?"
-  // (keys) or "let somebody else sign in" (an app) — and only the second one needs a registry.
-  { href: "/developer/oauth-apps", label: "Developer · OAuth apps", icon: AppWindow },
-  // The catalogue follows the app registry and not /events, because the question changes: the
-  // registry answers "let somebody else sign in", and the catalogue answers "what will arrive
-  // when they do" — which is the next thing a developer building a subscriber needs to read.
-  // The same registry is on /events for an operator watching the feed; this is the contract.
-  { href: "/developer/events", label: "Developer · Event catalogue", icon: Radio },
-  // The tooling (REQ-033, slice 4) sits *after* the reference surfaces rather than before them,
-  // and the order is the argument: a developer reads what the platform does, then what it emits,
-  // and only then starts building against it. Putting "generate a starter" next to the API keys
-  // would be the same as putting a "create" button above the documentation of what it creates.
-  { href: "/developer/sdks", label: "Developer · SDKs and CLI", icon: Package },
-  { href: "/developer/logs", label: "Developer · Logs", icon: ScrollText },
-  // The edge region registry (REQ-035 slice 1). It sits directly after Deployment rather
-  // than under Settings, and the reason is the order of an operator's questions: "which
-  // version is running" (Deployment) and "where is it running, and is it answering" (Regions)
-  // are the same investigation, and splitting them across a nav section and a settings page
-  // is how the second one never gets opened. `Globe2` rather than `Globe` because `/sites`
-  // already owns the plain one and two identical icons in one nav is a labelling bug a user
-  // cannot report precisely.
-  { href: "/platform/regions", label: "Regions", icon: Globe2 },
   { href: "/sites", label: "Sites", icon: Globe },
-  { href: "/organizations", label: "Organizations", icon: Building2 },
-  { href: "/ai", label: "AI Hub", icon: Sparkles, module: "ai-hub" },
+  { href: "/ai", label: "AI Hub", icon: Sparkles },
+  // The CRM's two entry points. The duplicate queue is a sibling rather than a filter of the
+  // inbox: it answers "which verdicts can I still reverse", and burying it in a dropdown is how
+  // a wrong dedupe verdict becomes permanent.
+  { href: "/crm/leads", label: "Lead inbox", icon: UserCog },
+  { href: "/crm/leads/duplicates", label: "Duplicate leads", icon: Copy },
+  { href: "/crm/settings/intake", label: "Intake sources", icon: KeyRound },
+  { href: "/crm/settings/assignment", label: "Assignment rules", icon: GitBranch },
+  { href: "/crm/settings/sla", label: "Response targets", icon: Timer },
+  // The shop's own configuration (REQ-118, slice 1a). It sits after the CRM entries rather
+  // than next to Sites because it is not a site editor: it is the set of numbers the public
+  // storefront reads on every request, and an operator changing the stepper cap is doing
+  // something to their customers' baskets, not to their site record.
+  { href: "/commerce/storefront", label: "Storefront", icon: ShoppingBag },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
@@ -178,15 +77,23 @@ const NAV: readonly NavItem[] = [
   { href: "/settings/iam/sessions", label: "Sessions", icon: Timer },
   { href: "/settings/iam/devices", label: "Devices", icon: Fingerprint },
   { href: "/settings/search", label: "Search settings", icon: SlidersHorizontal },
-  // The developer portal (REQ-022 slice 2 / REQ-033). Three entries rather than eight: the brief
-  // lists eight, but the OAuth app registry, the event catalogue, the SDK scaffolds and the CLI
-  // are REQ-033 slices 3 and 4, and a nav link to a screen that does not exist is the dead
-  // control the definition of done forbids. These three are the whole of what ships in the nav;
-  // the deeper surfaces are reached from the section root they hang off.
+  // The developer portal (REQ-022, slice 2). Three entries rather than eight: the brief lists
+  // eight, but OAuth apps, plugins, themes, docs and the sandbox are slices 3 and 4, and a nav
+  // link to a screen that does not exist is the dead control the definition of done forbids.
+  // These three are the whole of what slice 2 ships.
   { href: "/developer", label: "Developer", icon: Code2, needsDeveloper: true },
   { href: "/developer/api-keys", label: "API keys", icon: KeyRound, needsDeveloper: true },
   { href: "/developer/logs", label: "Request log", icon: ScrollText, needsDeveloper: true },
 ] as const;
+
+/**
+ * A navigation entry that only exists for accounts allowed into the developer portal.
+ *
+ * The property is on the entry rather than in a filter above, so "which entries are conditional"
+ * is one list a reader can scan instead of a second list somewhere else that has to be kept in
+ * step with it.
+ */
+type NavItem = (typeof NAV)[number];
 
 /**
  * Whether an entry is shown to this account.
@@ -206,7 +113,9 @@ function visible(item: NavItem, canOpen: boolean | null): boolean {
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against
 /// `/settings/iam/users`): the parent highlights only when it is exactly the open screen.
-const EXACT_MATCH_ONLY = new Set<string>(["/settings/iam", "/cdn"]);
+/// `/crm/leads/duplicates` is here for the same reason — without it the inbox entry would
+/// light up on the queue, and two highlighted items at once reads as a broken sidebar.
+const EXACT_MATCH_ONLY = new Set<string>(["/settings/iam", "/crm/leads/duplicates"]);
 
 /** `true` when a navigation entry belongs to the screen that is open. */
 function isActive(href: string, pathname: string): boolean {
@@ -247,51 +156,8 @@ export function AppShell({ title, description, children }: AppShellProps) {
   const pathname = usePathname();
   const router = useRouter();
   const { user, signOut } = useSession();
-  const { disabledModules, modulesLoaded } = useTenantStatus();
   const { canOpen: canOpenDeveloper } = useDeveloperAccess();
   const [navOpen, setNavOpen] = useState(false);
-
-  // A module switched off for this tenant takes its sidebar entry with it. The API refuses the
-  // module's routes with `403 organization.module.disabled` (REQ-005, slice 4), so leaving the
-  // link would be a menu entry that cannot be followed — the REQ's acceptance line asks for the
-  // entry to *hide*, and a hidden entry is the only version of this that is not a bug report.
-  //
-  // `modulesLoaded` is the load-bearing part: before the answer arrives the list is complete,
-  // because a sidebar that empties itself while a request is in flight and refills afterwards
-  // flickers, and a flicker in a menu reads as a broken panel rather than a pending one.
-  const hiddenModules = useMemo(
-    () => (modulesLoaded ? new Set(disabledModules) : new Set<string>()),
-    [disabledModules, modulesLoaded],
-  );
-  // Two independent gates, both applied here so the list is a single filtered answer:
-  // a module switched off for this tenant takes its entry, and an account that cannot open the
-  // developer portal does not see the developer group at all. The second one is a `null` while
-  // its route is in flight, and `visible` treats that as "not yet" — a group that appears, then
-  // vanishes, then reappears is a flicker, and one that briefly shows an account who will be
-  // refused is a lie.
-  const navItems = useMemo(
-    () =>
-      NAV.filter(
-        (item) =>
-          (!item.module || !hiddenModules.has(item.module)) && visible(item, canOpenDeveloper),
-      ),
-    [hiddenModules, canOpenDeveloper],
-  );
-
-  // A person who was already inside a module when it was switched off is left on a screen whose
-  // menu entry no longer exists. Sending them to the overview is the honest answer: the screen
-  // they are on answers `403`, and a panel that shows a dead screen is worse than one that
-  // explains where they are.
-  const inHiddenModule = useMemo(
-    () =>
-      NAV.some(
-        (item) => item.module && hiddenModules.has(item.module) && isActive(item.href, pathname),
-      ),
-    [hiddenModules, pathname],
-  );
-  useEffect(() => {
-    if (inHiddenModule) router.replace("/");
-  }, [inHiddenModule, router]);
 
   const handleSignOut = async () => {
     await signOut();
@@ -313,25 +179,8 @@ export function AppShell({ title, description, children }: AppShellProps) {
         </span>
       </Link>
 
-      {/* The list scrolls; the brand above it and the account block below it do not.
-        *
-        * This frame is `sticky top-0 h-screen`, so it is exactly one viewport tall and, before
-        * this, its contents were not either: `h-full` on a flex column with no `overflow` clips
-        * what does not fit and gives no way to reach it. With ~34 entries the identity/access
-        * shelves put the last links ("Sessions", "Devices", "Search settings") roughly 400px below
-        * a 900px fold — permanently unreachable, with no scrollbar to say so. A QA pass reported
-        * it as three `click-error`s on those exact links while every one of them looked perfectly
-        * normal in a screenshot, because "rendered" and "reachable" are different properties and
-        * only a click measures the second.
-        *
-        * `min-h-0` is load-bearing: a flex child defaults to `min-height: auto`, so it refuses to
-        * shrink below its content and `overflow-y-auto` would never engage. `overscroll-contain`
-        * keeps the wheel inside the list instead of chaining to the page once it reaches the end,
-        * which is what makes the end of the list feel like a wall rather than a dead zone.
-        */}
-      <nav aria-label="Sections" className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
-        <div className="flex flex-col gap-1 pr-1">
-        {navItems.map((item) => {
+      <nav aria-label="Sections" className="flex flex-col gap-1">
+        {NAV.filter((item) => visible(item, canOpenDeveloper)).map((item) => {
           const active = isActive(item.href, pathname);
           const Icon = item.icon;
           return (
@@ -351,7 +200,6 @@ export function AppShell({ title, description, children }: AppShellProps) {
             </Link>
           );
         })}
-        </div>
       </nav>
 
       <div className="mt-auto flex flex-col gap-3 border-t border-line pt-4">
@@ -410,19 +258,6 @@ export function AppShell({ title, description, children }: AppShellProps) {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="sticky top-0 z-30 border-b border-line bg-canvas/85 backdrop-blur">
-          {/* The freeze notice is *inside* the sticky header rather than beside it: a banner that
-              scrolls away is a banner a person reads once and then forgets, and the whole point
-              is that it stays until the tenant is reactivated. */}
-          <TenantStatusBanner />
-          {/* Staging sits directly under the freeze notice and above the title row, for the same
-              reason: a banner that scrolls away is a banner a person reads once and forgets. */}
-          <StagingEnvironmentBanner />
-          {/* The maintenance window (REQ-024, slice 3) sits below both, and inside this sticky
-              header for the same reason with a sharper edge: it is the notice that the operator's
-              next Save is about to be refused, so it has to be in front of them at the moment
-              they press it. No dismiss control, for the reason the staging strip has none -- an
-              operator who may hide "your writes are being refused" will hide it. */}
-          <MaintenanceWindowBanner />
           <div className="flex flex-wrap items-center gap-3 px-4 py-3 sm:px-6">
             <button
               type="button"
@@ -444,12 +279,12 @@ export function AppShell({ title, description, children }: AppShellProps) {
                 row under the header on small ones. */}
             <GlobalSearch title={title} className="order-last w-full lg:order-none lg:w-80" />
             <NotificationBell />
-            {/* The environment chip sits with the other tenant-scoped chrome, before the site
-                switcher: which copy of the content you are in is a *wider* fact than which site,
-                and a person reading left to right meets it first. */}
-            <EnvironmentChip />
-            <OrganizationSwitcher />
             <SiteSwitcher />
+            {/* The project switcher renders itself only on the screens where a project scopes the
+                content, so the header can carry it unconditionally: on `/pages` it renders `null`
+                rather than a disabled pill, because a visible control that does nothing teaches the
+                reader that pages are filed in projects. */}
+            <ProjectSwitcher />
           </div>
         </header>
         <main className="flex-1 px-4 py-6 sm:px-6">{children}</main>

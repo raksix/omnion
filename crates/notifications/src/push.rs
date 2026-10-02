@@ -23,6 +23,8 @@
 //! exposed. A notification body can carry customer data, and an admin screen is exactly where
 //! that data should not be on display by default.
 
+use std::ffi::OsStr;
+
 use sqlx::PgPool;
 use sqlx::postgres::PgQueryResult;
 use uuid::Uuid;
@@ -218,19 +220,13 @@ pub async fn list_subscriptions(pool: &PgPool, user_id: Uuid) -> Result<Vec<Push
 /// cutoff is a fact about time. The 30 days is generous on purpose: a phone that has been off
 /// for a month is a phone whose browser has very likely rotated the service worker, and the
 /// row would only ever collect `410`s.
+///
+/// **The constant survives its function.** The sweep that uses this lives in [`crate::retention`]
+/// and reads this number rather than carrying its own, because "how long is a dead device kept"
+/// has to have one answer between the outbox screen and the sweeper. What was removed is the
+/// `pub async fn prune_stale` that had **zero call sites for its whole life**: a statement
+/// nobody could reach, which is why the devices this names grew for ever on every installation.
 pub const SUBSCRIPTION_STALE_DAYS: i32 = 30;
-
-/// How many devices a pruning pass removed.
-pub async fn prune_stale(pool: &PgPool) -> Result<u64> {
-    let result: PgQueryResult = sqlx::query(
-        "delete from push_subscriptions \
-         where last_seen_at < now() - make_interval(days => $1::int)",
-    )
-    .bind(SUBSCRIPTION_STALE_DAYS)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
-}
 
 /// Delete the devices a push service has said are gone, and report which ones.
 ///
@@ -272,6 +268,13 @@ impl PrunedSubscription {
 /// short enough that an installation does not accumulate a delivery log forever. The sweep is
 /// [`prune_deliveries`]'s job; the constant is here so the admin screen can say how far back
 /// it answers.
+///
+/// **It is the fallback, not the rule.** Each organization keeps its own window in
+/// `organizations.notification_retention_days`, and this is what an installation with no row
+/// gets — the same relationship `organizations.event_retention_days` has to the event bus. The
+/// sweep that reads both is [`crate::retention::sweep_deliveries`], which the runner calls on
+/// every tick; the number used to be published here with nothing behind it, because the only
+/// function that read it (`prune_deliveries`) had no caller.
 pub const OUTBOX_RETENTION_DAYS: i32 = 60;
 
 /// The largest page of outbox rows one read returns.
@@ -346,6 +349,126 @@ impl OutboxCounts {
     }
 }
 
+/// What one reader of the delivery log is allowed to see.
+///
+/// **This type exists because the two read paths spelled the policy separately and
+/// disagreed.** `list_outbox` said `else { n.organization_id is null }` and `outbox_counts`
+/// said `($1::uuid is null and n.organization_id is null) or n.organization_id = $1::uuid`.
+/// Two spellings of one rule is not a rule: the day one of them is edited the screen shows
+/// chips that count rows the list refuses to show, and nobody can tell which half lied.
+///
+/// **The platform branch is a deliberate capability, not the absence of a decision.** An
+/// account with no `users.organization_id` IS the platform owner (`identity::users::
+/// attach_to_organization` is the only thing that ever attaches an account to a tenant, and a
+/// first-run installation has exactly one), so `Platform` reads rows that belong to no tenant
+/// and nothing else. That is *not* "every row on no tenant" — an orgless account asking for
+/// tenant A's log is a different question from an orgless account asking for the platform's,
+/// and the parameter `Option<Uuid>` cannot tell them apart. A caller that wants the
+/// platform's traffic says [`OutboxScope::Platform`]; a caller whose session has no
+/// organization and wants a tenant's rows has nothing to name and must be refused upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxScope {
+    /// One organization's rows: its own, and platform traffic (an announcement the platform
+    /// made is this tenant's business — it is how the platform tells a tenant about an
+    /// outage), never another tenant's.
+    Organization(Uuid),
+    /// The platform's own rows: those stamped with no tenant, and nothing else.
+    Platform,
+}
+
+impl OutboxScope {
+    /// The scope a session's own organization asks for.
+    ///
+    /// **`None` is not `Platform`.** A session with no organization is an account nobody ever
+    /// attached to a tenant, and handing it the platform log means a tenant administrator
+    /// created before the attach finished reads a screen full of rows that are not theirs
+    /// while missing every row that is. The caller must decide what an orgless session means;
+    /// this function refuses to guess, because the guess is what made the two halves of this
+    /// screen disagree.
+    #[must_use]
+    pub fn for_session(organization_id: Option<Uuid>) -> Option<Self> {
+        organization_id.map(Self::Organization)
+    }
+
+    /// The tenant whose policy this scope reads — `None` for the platform's own rows.
+    ///
+    /// **It exists because "the log's retention window" is a per-tenant fact and the scope is
+    /// what says which tenant.** The outbox answers "The log goes back N days", and that number
+    /// is a column on the organization. A caller holding a scope and needing its window had
+    /// three ways to spell the question and two of them were wrong: reaching for the session's
+    /// `Option<Uuid>` re-derives the scope decision, and matching the enum by hand re-implements
+    /// it. So the scope answers for itself, and the one thing it cannot be wrong about is the
+    /// tenant it was built from.
+    ///
+    /// **`Platform` is `None` rather than a synthesized id**, because the platform has no
+    /// organization row to keep a window on — it falls back to the published default, which is
+    /// the same fallback the sweep's work list binds for that arm.
+    #[must_use]
+    pub fn organization(self) -> Option<Uuid> {
+        match self {
+            Self::Organization(id) => Some(id),
+            Self::Platform => None,
+        }
+    }
+}
+
+/// Write the tenancy predicate both delivery-log reads share.
+///
+/// **One function because the two reads were free to disagree, and did.** `list_outbox`
+/// said `else { n.organization_id is null }` while `outbox_counts` said
+/// `($1 is null and n.organization_id is null) or n.organization_id = $1`. A caller that
+/// passes an id, a caller that passes `Platform`, and a future third read all go through
+/// here, so the screen's list and its chips cannot drift apart.
+///
+/// A tenant sees its own rows **and** the platform's. That is deliberate and it is not
+/// "everything": an announcement the platform made about an outage is this tenant's
+/// business, and excluding it would leave an administrator staring at an empty log during
+/// the one incident where the log matters. It is still one organization's traffic at most,
+/// because a tenant's log must never list another tenant's strangers.
+fn push_outbox_scope(builder: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>, scope: OutboxScope) {
+    // **The negative control lives here, not in the gate.** `run-outbox-tenancy-http.sh`
+    // re-runs itself with `QA_NEUTRALISE=outbox-scope` and this predicate is the thing that
+    // has to come out, because the two reads and the retry all route through it — one
+    // switch, and the *exact* pre-fix policy comes back in all three places at once.
+    //
+    // **It is the PRE-FIX policy, not "no filter".** `list_outbox` took `Option<Uuid>` and
+    // wrote `else { n.organization_id is null }`, `outbox_counts` re-spelled the same rule
+    // differently, and `retry_delivery` had no predicate at all. A `true` would be a
+    // BROADER defect than any of those, and a gate that goes red on a defect nobody shipped
+    // proves nothing about the fix — this arm reproduces the drift (the two reads disagree
+    // again, which is the half that matters) rather than inventing a new bug.
+    if std::env::var_os("QA_NEUTRALISE").as_deref() == Some(OsStr::new("outbox-scope")) {
+        match scope {
+            OutboxScope::Organization(organization) => {
+                builder.push("n.organization_id = ");
+                builder.push_bind(organization);
+            }
+            OutboxScope::Platform => {
+                builder.push("n.organization_id is null");
+            }
+        }
+        return;
+    }
+    match scope {
+        // **Two rowsets, not one.** `or n.organization_id is null` is the second clause and it
+        // is deliberate: a platform announcement about an outage belongs in the tenant's log,
+        // and dropping it would leave an administrator staring at an empty screen during the
+        // one incident where the log matters. The `is null` arm can never admit another
+        // tenant, because another tenant's rows carry that tenant's id and not null.
+        OutboxScope::Organization(organization) => {
+            builder.push("(n.organization_id = ");
+            builder.push_bind(organization);
+            builder.push(" or n.organization_id is null)");
+        }
+        // A complete predicate on its own, and NOT the tenant arm with the term dropped: this
+        // is the platform's traffic and nothing else, which is why an orgless session is
+        // answered rather than refused (see [`OutboxScope::for_session`]).
+        OutboxScope::Platform => {
+            builder.push("n.organization_id is null");
+        }
+    }
+}
+
 /// Read one organization's delivery log, failed rows first.
 ///
 /// **Failed first is the ordering, not a filter.** An administrator opening the outbox during
@@ -354,7 +477,7 @@ impl OutboxCounts {
 /// somebody is looking for is the one that just happened.
 pub async fn list_outbox(
     pool: &PgPool,
-    organization_id: Option<Uuid>,
+    scope: OutboxScope,
     query: &OutboxQuery,
 ) -> Result<Vec<OutboxRow>> {
     let limit = query.limit.clamp(1, MAX_OUTBOX_PAGE);
@@ -366,15 +489,7 @@ pub async fn list_outbox(
          where ",
     );
 
-    if let Some(organization) = organization_id {
-        builder.push("n.organization_id = ");
-        builder.push_bind(organization);
-    } else {
-        // No organization on the caller's session means a platform-wide install, where every
-        // row is in scope. Stated as the else branch rather than left implicit so a reader
-        // can see that the unscoped read is deliberate and not an omitted filter.
-        builder.push("n.organization_id is null");
-    }
+    push_outbox_scope(&mut builder, scope);
 
     if !query.statuses.is_empty() {
         builder.push(" and d.status in (");
@@ -408,17 +523,21 @@ pub async fn list_outbox(
 }
 
 /// The four counts, in one grouped statement.
-pub async fn outbox_counts(pool: &PgPool, organization_id: Option<Uuid>) -> Result<OutboxCounts> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
+///
+/// **The same predicate as [`list_outbox`], through the same function.** The counts used to
+/// carry their own copy of the rule (`$1 is null and n.organization_id is null or
+/// n.organization_id = $1`), which is the drift this module's [`OutboxScope`] exists to
+/// remove: a list that hides a tenant's rows under chips that count them is a screen that
+/// lies in two directions at once, and the two halves of it were free to disagree.
+pub async fn outbox_counts(pool: &PgPool, scope: OutboxScope) -> Result<OutboxCounts> {
+    let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
         "select d.status, count(*)::bigint from notification_deliveries d \
-         join notifications n on n.id = d.notification_id \
-         where ($1::uuid is null and n.organization_id is null) \
-            or n.organization_id = $1::uuid \
-         group by d.status",
-    )
-    .bind(organization_id)
-    .fetch_all(pool)
-    .await?;
+         join notifications n on n.id = d.notification_id where ",
+    );
+    push_outbox_scope(&mut builder, scope);
+    builder.push(" group by d.status");
+
+    let rows: Vec<(String, i64)> = builder.build_query_as().fetch_all(pool).await?;
 
     let count = |wanted: &str| {
         rows.iter()
@@ -450,34 +569,63 @@ pub enum RetryOutcome {
 /// "retry" on one is a duplicate delivery scheduled for the future. Both answer
 /// [`RetryOutcome::NotRetryable`] rather than an error, because the caller's next action is
 /// the same either way: do not press the button again.
-pub async fn retry_delivery(pool: &PgPool, id: Uuid) -> Result<RetryOutcome> {
-    let result: PgQueryResult = sqlx::query(
-        "update notification_deliveries \
-         set status = 'pending', attempts = 0, next_attempt_at = now(), error = null, \
-             response_status = null \
-         where id = $1 and status = 'failed'",
-    )
-    .bind(id)
-    .execute(pool)
-    .await?;
+///
+/// **The scope is part of the write, not a check before it.** This used to take a bare uuid,
+/// which made the retry button a cross-tenant *write* primitive: any session holding
+/// `notifications.admin` could requeue a stranger's failed delivery by id, and a retry is not
+/// a read — it hands the message back to the transport, so the effect lands in the other
+/// tenant's inbox. The tenancy predicate is the same [`push_outbox_scope`] the two reads use,
+/// so the button is addressable exactly when the row is visible, and a row outside the scope
+/// answers [`RetryOutcome::NotRetryable`] — the same answer as a row in the wrong state,
+/// because from the caller's side both mean "this button is not for this row" and neither
+/// confirms that the row exists.
+pub async fn retry_delivery(pool: &PgPool, scope: OutboxScope, id: Uuid) -> Result<RetryOutcome> {
+    // **`settled_at = null` is load-bearing, and the pre-fix statement had no such column.**
+    // A retry un-settles the row: it was `failed` (so `mark_failed` stamped `settled_at`) and it
+    // is now queued again. Leaving the stamp would make retention judge a row nobody has
+    // finished with by an instant from a delivery that already ended — the sweep's pending
+    // guard would rescue it today, so a test that only asserts "a pending row is kept" would
+    // pass with this omission in place, and the row would be swept the moment the guard is
+    // rewritten. The other four columns cleared here are the row's own error record; this one
+    // is the clock the sweep reads.
+    let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "update notification_deliveries d set status = 'pending', attempts = 0, \
+             next_attempt_at = now(), error = null, response_status = null, settled_at = null \
+         from notifications n where d.notification_id = n.id and d.id = ",
+    );
+    builder.push_bind(id);
+    // **The status test comes first and is not new.** The pre-fix statement carried
+    // `and status = 'failed'`; dropping it while adding the predicate would have been a
+    // second, unrelated defect — a retry button that requeues a row already delivered —
+    // and a gate that then "proves" the tenancy fix would be proving something nobody
+    // shipped. The order is the scope's, so the binding keeps its position.
+    builder.push(" and d.status = 'failed'");
+
+    // **The negative control is HERE and not in `push_outbox_scope`, because the pre-fix
+    // retry had no scope to neutralise.** This function used to take a bare uuid, so the
+    // faithful reproduction of the defect is to remove the predicate ENTIRELY — and routing
+    // the control through the shared helper instead reproduces nothing: the helper's
+    // pre-fix body is still `n.organization_id = <b>`, which refuses A's row, so the gate
+    // stayed 7/7 green with the leak in place. A control that cannot reproduce the defect
+    // it names is worse than none, because it is read as proof.
+    if std::env::var_os("QA_NEUTRALISE").as_deref() == Some(OsStr::new("outbox-scope")) {
+        let result: PgQueryResult = builder.build().execute(pool).await?;
+        return Ok(if result.rows_affected() > 0 {
+            RetryOutcome::Requeued
+        } else {
+            RetryOutcome::NotRetryable
+        });
+    }
+
+    builder.push(" and ");
+    push_outbox_scope(&mut builder, scope);
+
+    let result: PgQueryResult = builder.build().execute(pool).await?;
     Ok(if result.rows_affected() > 0 {
         RetryOutcome::Requeued
     } else {
         RetryOutcome::NotRetryable
     })
-}
-
-/// Delete delivery rows older than [`OUTBOX_RETENTION_DAYS`], and report how many went.
-pub async fn prune_deliveries(pool: &PgPool) -> Result<u64> {
-    let result: PgQueryResult = sqlx::query(
-        "delete from notification_deliveries \
-         where status in ('sent', 'skipped') \
-           and created_at < now() - make_interval(days => $1::int)",
-    )
-    .bind(OUTBOX_RETENTION_DAYS)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
 }
 
 /// Refuse an endpoint the push service could never accept.
@@ -714,7 +862,10 @@ mod tests {
             .iter()
             .find(|row| row.channel == "webhook")
             .expect("the closed list always carries the webhook channel");
-        assert!(!webhook.ready, "an unconfigured webhook channel claimed to be ready");
+        assert!(
+            !webhook.ready,
+            "an unconfigured webhook channel claimed to be ready"
+        );
         assert!(
             webhook.reason.contains("endpoint"),
             "the reason must name what is missing: {}",
@@ -741,7 +892,10 @@ mod tests {
                 .find(|row| row.channel == "webhook")
                 .expect("the closed list always carries the webhook channel");
             assert!(webhook.ready, "{label} was read as not ready");
-            assert!(!webhook.reason.is_empty(), "a ready channel still explains itself");
+            assert!(
+                !webhook.reason.is_empty(),
+                "a ready channel still explains itself"
+            );
         }
     }
 
@@ -1034,5 +1188,77 @@ mod tests {
     fn the_outbox_page_and_the_inbox_page_share_one_cap() {
         // Asserted in the vocabulary so a future channel cannot quietly get a different one.
         assert_eq!(MAX_OUTBOX_PAGE, crate::vocabulary::MAX_PAGE);
+    }
+
+    #[test]
+    fn an_orgless_session_is_never_mistaken_for_the_platform_scope() {
+        // The whole reason `for_session` returns an `Option`. If this returned
+        // `Some(OutboxScope::Platform)` the caller could not tell "nobody asked" from
+        // "the platform was asked", and the two spellings that used to disagree — a list that
+        // read `organization_id is null` and a counts query that read
+        // `$1 is null and organization_id is null` — would both be reachable again.
+        let none: Option<Uuid> = None;
+        assert_eq!(
+            OutboxScope::for_session(none),
+            None,
+            "an account nobody attached to a tenant has no organization to name, and the type \
+             refuses to pick one for it"
+        );
+    }
+
+    #[test]
+    fn a_tenant_session_scopes_to_that_tenant_and_never_to_the_platform() {
+        let tenant = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+        assert_eq!(
+            OutboxScope::for_session(Some(tenant)),
+            Some(OutboxScope::Organization(tenant)),
+            "a tenant's session asks for its own organization by name"
+        );
+    }
+
+    #[test]
+    fn the_two_scopes_are_distinguishable_so_a_caller_cannot_confuse_them() {
+        // Equality is what makes the `Option` worth having: `Platform` must not equal any
+        // `Organization`, or a caller that passed the wrong one would be refused to compile
+        // nowhere and would silently read a different audience.
+        let tenant = Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222);
+        assert_ne!(OutboxScope::Platform, OutboxScope::Organization(tenant));
+    }
+
+    #[test]
+    fn a_tenants_scope_selects_its_own_rows_plus_the_platforms() {
+        // The predicate is asserted as SQL text because the claim is about the query, not the
+        // type: "my rows and the platform's" must be an explicit `or is null`, and the platform
+        // arm must NOT inherit that wildcard (which is the bug this enum removed).
+        let tenant = Uuid::from_u128(0x3333_3333_3333_3333_3333_3333_3333_3333);
+        let tenant_sql = render_scope(OutboxScope::Organization(tenant));
+        assert!(
+            tenant_sql.contains("n.organization_id ="),
+            "a tenant names its own organization: {tenant_sql}"
+        );
+        assert!(
+            tenant_sql.contains("or n.organization_id is null"),
+            "a tenant also reads the platform's announcements, which is how an outage notice \
+             reaches the log that matters: {tenant_sql}"
+        );
+
+        let platform_sql = render_scope(OutboxScope::Platform);
+        assert!(
+            platform_sql.contains("n.organization_id is null"),
+            "the platform's traffic is the rows stamped to no tenant: {platform_sql}"
+        );
+        assert!(
+            !platform_sql.contains("or n.organization_id"),
+            "the platform arm must not carry the tenant arm's `or is null` — as a standalone \
+             clause it is the same string, so the shape that matters is that it is a complete \
+             predicate on its own: {platform_sql}"
+        );
+    }
+
+    /// The predicate one scope renders, as the SQL text a reader can audit.
+    fn render_scope(scope: OutboxScope) -> String {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new("select 1 where ");
+        push_outbox_scope(&mut builder, scope);
+        builder.sql().to_owned()
     }
 }

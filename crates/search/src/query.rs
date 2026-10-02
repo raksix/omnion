@@ -386,6 +386,15 @@ pub struct SearchRequest {
     pub providers: Vec<&'static str>,
     /// Caller's organization; `None` means a platform-level account (sees everything).
     pub organization_id: Option<Uuid>,
+    /// Projects whose documents the caller may see (REQ-133).
+    ///
+    /// `None` means **no filtering at all**, and that is not the same answer as an empty list.
+    /// It is returned for an instance administrator, because a `Some` carrying every id in the
+    /// organization would be the same answer spelled more expensively — and a filter that
+    /// silently stops applying is how a scoping rule gets un-applied by accident. `Some(vec![])`
+    /// is a real answer with a real consequence: a caller who is a member of no project sees no
+    /// project-scoped rows at all, which is what "scoped to their projects" means for them.
+    pub project_ids: Option<Vec<Uuid>>,
     /// Caller's account id, for `owner:me`.
     pub user_id: Uuid,
     /// One-based page number.
@@ -603,6 +612,18 @@ fn push_conditions_with(
     builder.push("::uuid is null or d.organization_id = ");
     builder.push_bind(request.organization_id);
     builder.push(")");
+
+    // The project clause (REQ-133). Three shapes, and the shape decides which one a bug produces:
+    //   `None`  -> no filtering, an instance administrator;
+    //   `Some`  -> `d.project_id = any($n)` **or** `d.project_id is null`;
+    //   the null arm is not a convenience. Four of the seven providers (pages, media, users, sites)
+    //   belong to no project, so dropping it would empty the search results screen of everything
+    //   except automation rows — a scoping fix that reads as a total outage.
+    if let Some(projects) = &request.project_ids {
+        builder.push(" and (d.project_id is null or d.project_id = any(");
+        builder.push_bind(projects.clone());
+        builder.push("::uuid[]))");
+    }
 
     let query = &request.query;
     let filters = &request.filters;
@@ -1101,6 +1122,7 @@ pub async fn suggest(
     pool: &PgPool,
     organization_id: Option<Uuid>,
     providers: &[&'static str],
+    project_ids: Option<&[Uuid]>,
     prefix: &str,
 ) -> Result<Vec<Suggestion>> {
     let prefix = prefix.trim().to_lowercase();
@@ -1112,6 +1134,7 @@ pub async fn suggest(
         "select d.title, d.url, d.provider from search_documents d \
          where d.provider = any($1::text[]) \
            and ($2::uuid is null or d.organization_id = $2) \
+           and ($5::uuid[] is null or d.project_id is null or d.project_id = any($5::uuid[])) \
            and lower(d.title) like $3 \
          order by d.title asc, d.provider asc \
          limit $4",
@@ -1120,6 +1143,7 @@ pub async fn suggest(
     .bind(organization_id)
     .bind(pattern)
     .bind(SUGGEST_LIMIT)
+    .bind(project_ids.map(<[Uuid]>::to_vec))
     .fetch_all(pool)
     .await?;
     Ok(rows)

@@ -257,7 +257,6 @@ fn validate_subject_kind(kind: &str) -> Result<&'static str, ApiError> {
 /// before the operator ticks anything.
 fn validate_effect_and_bits(effect: &str, capabilities: Capabilities) -> Result<String, ApiError> {
     let effect = if effect.is_empty() { "allow" } else { effect };
-    let effect = if effect.is_empty() { "allow" } else { effect };
     if effect != "allow" && effect != "deny" {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -413,16 +412,21 @@ pub async fn delete_one(
     // account carries no organization, which is not the same question.
     let (site_id, label) = match grant.target() {
         Some(GrantTarget::Folder(id)) => {
-            // Scoped rather than bare: the node is resolved for the audit entry, and a path
-            // from another tenant's library is a fact this tenant may not record.
-            let folder = folder_in_scope(&state, &current, id).await?;
+            let Some(folder) = omnion_media::find_folder(pool, id)
+                .await
+                .map_err(ApiError::from)?
+            else {
+                return Err(grant_not_found());
+            };
             (folder.site_id, format!("folder {}", folder.path))
         }
         Some(GrantTarget::File(id)) => {
-            // The same scope check as the folder arm, for the same reason: the join above
-            // already refused another tenant's grant, and this resolves the node the audit
-            // entry names.
-            let file = file_any_state_in_scope(&state, &current, id).await?;
+            let Some(file) = omnion_media::find_file_any_state(pool, id)
+                .await
+                .map_err(ApiError::from)?
+            else {
+                return Err(grant_not_found());
+            };
             (file.site_id, format!("file {}", file.filename))
         }
         None => return Err(grant_not_found()),
@@ -652,7 +656,6 @@ async fn write_grant(
         state.db().pool(),
         NewAuditEntry::by_user(current.user.id, "media.grant_changed")
             .target(audit_target, grant_target_id(&grant).to_string())
-            .target(node_kind, grant_target_id(&grant).to_string())
             .metadata(json!({
                 "site_id": site_id,
                 "grant_id": grant.id,

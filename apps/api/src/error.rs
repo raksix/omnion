@@ -101,6 +101,17 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, code, message)
     }
 
+    /// `404` — the addressed thing does not exist.
+    ///
+    /// The one caller that reaches for this on purpose is a read of a resource the caller may not
+    /// see (REQ-133's project scoping): the message must then say nothing about permissions,
+    /// because a `404` that reads "you are not allowed" tells the caller the row exists. Build it
+    /// from a phrase about the resource, never from the reason for the refusal.
+    #[must_use]
+    pub fn not_found(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, code, message)
+    }
+
     /// Map a core error onto the API surface.
     ///
     /// A dependency that did not answer becomes `503` (retryable); everything else is an
@@ -146,19 +157,6 @@ impl ApiError {
     /// message is what a person reads, so a test that checks one without the other pins half
     /// the contract — and it is the message that has to name the field and the three legal
     /// values, which is the part a client cannot reconstruct.
-    /// The structured detail, when the refusal carried one.
-    ///
-    /// Exposed because a refusal that can explain itself should be *checked* by the thing that
-    /// refuses: `module_guard` asserts the answer names the module it switched off, and
-    /// `scope` asserts a cross-tenant read carries no detail at all. Without an accessor those
-    /// assertions would have to reach into a private field from another module, and the
-    /// guarantee — "a refusal names its source" — would be untestable rather than merely
-    /// unenforced.
-    #[must_use]
-    pub fn details(&self) -> Option<&Value> {
-        self.details.as_ref()
-    }
-
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -338,8 +336,6 @@ impl From<IdentityError> for ApiError {
                 "domain_not_found",
                 "no such domain on this site",
             ),
-            // Shape problems the store refuses (slug, key, status, host, address) are the
-            // caller's: the field is what they have to fix, so this is a 400.
             // Shape problems the store refuses (slug, key, status, host) are the caller's.
             IdentityError::InvalidOrganization(message)
             | IdentityError::InvalidSite(message)
@@ -352,60 +348,6 @@ impl From<IdentityError> for ApiError {
                     .with_details(serde_json::json!({ "field": field }))
             }
             IdentityError::InvalidNetwork(message) => Self::bad_request("invalid_network", message),
-            // The department tree (REQ-005, the org chart). Four variants, each with the
-            // status the state actually implies, and none of them is a server fault: a client
-            // that reads a `500` here retries a move that can never succeed and shows the
-            // operator an error page instead of the one field they have to change.
-            //   * a shape the store refuses (blank key, unknown status) is the caller's -> 400
-            //   * a key already used in this organization is a state conflict    -> 409
-            //   * a move that would make a node its own ancestor is a state conflict, not a
-            //     bad request: the request is well-formed, the tree is what refuses it
-            //   * a delete refused because role bindings still name the department is the
-            //     same: nothing is malformed, the caller has to revoke or archive first
-            IdentityError::InvalidDepartment(message) => {
-                Self::bad_request("invalid_department", message)
-            }
-            IdentityError::DepartmentKeyTaken => Self::new(
-                StatusCode::CONFLICT,
-                "department_key_taken",
-                "department key is already taken in this organization",
-            ),
-            IdentityError::DepartmentCycle => Self::new(
-                StatusCode::CONFLICT,
-                "department_cycle",
-                "a department cannot be moved inside itself",
-            ),
-            // Refused on purpose, not merely unhandled: the walks assert this one reads as a
-            // `400` while the two above are conflicts, because a department that is still
-            // named by a role binding is a shape the caller sent, not a state that changed.
-            IdentityError::DepartmentNotFound => Self::new(
-                StatusCode::NOT_FOUND,
-                "department_not_found",
-                "no such department",
-            ),
-            // The organization settings screen (REQ-005): a refused field is a `400`, and the
-            // message names the rule that refused it so the panel can put it under the input
-            // instead of in a banner. These two fell through to the catch-all below, which
-            // answered a form the user can fix with a `500 internal_error` — a wrong status
-            // that tells a client the platform broke and shows a retry nobody needs.
-            IdentityError::InvalidSettings(message) => {
-                Self::bad_request("invalid_organization_settings", message)
-            }
-            // The ceilings tab. Same rule, its own code, because "this number is not a limit"
-            // and "this value is not usable" are different sentences to whoever reads them.
-            IdentityError::InvalidLimits(message) => {
-                Self::bad_request("invalid_organization_limits", message)
-            }
-            // A real invitation that this organization's `owner_approval` policy has not
-            // released yet is a `409`, not a `404`: the link is good, the state is temporary,
-            // and the holder has to be told to wait rather than to re-check the address they
-            // typed. It reveals nothing about another organization, because a token nobody
-            // issued already answered `InvitationNotFound`.
-            IdentityError::InvitationAwaitingApproval => Self::new(
-                StatusCode::CONFLICT,
-                "invitation_awaiting_approval",
-                "this invitation is waiting for an owner to release it",
-            ),
             IdentityError::FactorNotFound => Self::new(
                 StatusCode::NOT_FOUND,
                 "factor_not_found",
@@ -1177,14 +1119,6 @@ impl From<AiHubError> for ApiError {
     }
 }
 
-// `ApiError` is `Debug` but not `Display`, so any caller that wants to put a refusal into a
-// log line, a test assertion or a `format!` has to reach for the private `message` field or
-// write `{:?}` and read the whole struct. The `Display` impl above answers that, and it prints
-// the code alongside the message: a refusal read in a test failure names both *what* happened
-// and *why*, where the message alone leaves the reader reaching for the call site. `Display` is
-// the human-facing view of a value and `Debug` is the structural one, and collapsing them
-// would dump `status` and `details` into every test failure that mentions a refusal.
-
 #[derive(Serialize)]
 struct ErrorBody {
     error: ErrorDetail,
@@ -1407,34 +1341,6 @@ mod tests {
 
         let unavailable = ApiError::from(AiHubError::Database(sqlx::Error::PoolTimedOut));
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    /// The department tree (REQ-005). These four had no arm and fell into the catch-all, so a
-    /// blank key, a taken key, a refused move and a delete of an occupied department all
-    /// answered `500 internal_error` — the one status that tells a client the platform broke
-    /// and offers a retry for a request that can never succeed. The test pins the status each
-    /// state implies, because the difference between them is the whole point: `400` names a
-    /// field the caller fixes, `409` names a state somebody has to change first, `404` means
-    /// there is nothing to act on at all.
-    #[test]
-    fn department_errors_map_onto_the_state_they_describe() {
-        let shape = ApiError::from(IdentityError::InvalidDepartment(
-            "name is required".to_owned(),
-        ));
-        assert_eq!(shape.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(shape.code(), "invalid_department");
-
-        let taken = ApiError::from(IdentityError::DepartmentKeyTaken);
-        assert_eq!(taken.status(), StatusCode::CONFLICT);
-        assert_eq!(taken.code(), "department_key_taken");
-
-        let cycle = ApiError::from(IdentityError::DepartmentCycle);
-        assert_eq!(cycle.status(), StatusCode::CONFLICT);
-        assert_eq!(cycle.code(), "department_cycle");
-
-        let missing = ApiError::from(IdentityError::DepartmentNotFound);
-        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-        assert_eq!(missing.code(), "department_not_found");
     }
 
     #[test]

@@ -291,7 +291,12 @@ pub(crate) async fn decide_request(
     // still the account, so its own budget is what it spends.
     let machine_key = crate::guards::bearer_token(headers).is_some();
 
-    let address = peer.or_else(|| peer_from_headers(headers));
+    // One resolver, one rule: `resolve_client_ip` decides whether the peer is a local proxy
+    // whose `X-Forwarded-For` speaks for the caller, or a real client whose own header does
+    // not. This line used to be `peer.or_else(|| peer_from_headers(headers))` — socket first,
+    // header only as a fallback — which is the opposite of the guard this function's own
+    // comment describes and of what the production topology produces.
+    let address = crate::client_ip::resolve_client_ip(peer, headers);
     let user_id = if machine_key {
         None
     } else {
@@ -392,18 +397,6 @@ async fn resolve_user_id(limiter: &RateLimiter, headers: &HeaderMap) -> Option<S
     Some(resolved.user.id.to_string())
 }
 
-/// The client address when the request came through a reverse proxy.
-///
-/// The header is only consulted when the peer is loopback — the address of a local proxy is not
-/// the caller's, and trusting `X-Forwarded-For` from a public peer would let any caller choose its
-/// own limiter identity by setting the header. The deployment behind a proxy terminates TLS there,
-/// so its requests arrive from loopback and this is exactly the case it exists for.
-fn peer_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
-    let forwarded = headers.get("x-forwarded-for")?.to_str().ok()?;
-    let first = forwarded.split(',').next()?.trim();
-    first.parse().ok()
-}
-
 /// The paths that must not be able to lock each other out.
 ///
 /// The public renderer serves cached pages to anonymous traffic and a webhook intake is called
@@ -493,30 +486,50 @@ mod tests {
         }
     }
 
+    /// The limiter no longer has its own proxy rule, so what is asserted here is that the one
+    /// rule it calls produces the **identity the counter is keyed on** — not merely that some
+    /// resolver returns some address.
+    ///
+    /// The test it replaces called `peer_from_headers` directly and passed a `peer` of `Some`,
+    /// asserting the loopback guard that the call site never applied: the production line was
+    /// `peer.or_else(|| peer_from_headers(headers))`, so the header was only read when the
+    /// socket was missing, and a unit test of the helper could not see that. Asserting the
+    /// `ClientId::key` string is what forces the question to be "whose budget is this", which
+    /// is the only form in which the two answers differ.
     #[test]
-    fn a_forwarded_address_is_read_from_the_header_a_proxy_wrote() {
-        let headers = header(
+    fn the_limiter_keys_on_the_forwarded_caller_behind_a_local_proxy() {
+        let forwarded = header(
             &HeaderName::from_static("x-forwarded-for"),
-            "198.51.100.4, 10.0.0.1",
-        );
-        assert_eq!(
-            peer_from_headers(&headers),
-            Some("198.51.100.4".parse().expect("an address parses")),
-            "the left-most entry is the original client, not the proxy that appended its own"
+            "203.0.113.9, 10.0.0.1",
         );
 
+        let behind_proxy = omnion_security::limiter::ClientId {
+            user_id: None,
+            ip: crate::client_ip::resolve_client_ip(
+                Some("127.0.0.1".parse().expect("a literal address parses")),
+                &forwarded,
+            ),
+        };
         assert_eq!(
-            peer_from_headers(&HeaderMap::new()),
-            None,
-            "no header, no address"
+            behind_proxy.key(),
+            "ip:203.0.113.9",
+            "behind the platform's own proxy the visitor spends the visitor's budget"
         );
+
+        // The negative half, and the reason the rule is not "always read the header": the same
+        // header from a public peer is the caller's own invention, so it must not mint an
+        // identity — one forged header per request is exactly the minting attack.
+        let from_internet = omnion_security::limiter::ClientId {
+            user_id: None,
+            ip: crate::client_ip::resolve_client_ip(
+                Some("198.51.100.4".parse().expect("a literal address parses")),
+                &forwarded,
+            ),
+        };
         assert_eq!(
-            peer_from_headers(&header(
-                &HeaderName::from_static("x-forwarded-for"),
-                "not-an-address"
-            )),
-            None,
-            "an unparseable header is no address, not a wrong one"
+            from_internet.key(),
+            "ip:198.51.100.4",
+            "a public peer keeps its own budget whatever it puts in the header"
         );
     }
 

@@ -14,7 +14,7 @@ pub mod entries;
 pub mod error;
 
 pub use entries::{
-    ActorType, AuditEntry, AuditFilter, NewAuditEntry, RetentionSweep, distinct_actions, filtered,
-    for_target, oldest_older_than, purge_before, recent, record,
+    ActorType, AuditEntry, NewAuditEntry, for_project, for_target, recent, record,
+    record_for_project, record_for_project_in,
 };
 pub use error::{AuditError, Result};

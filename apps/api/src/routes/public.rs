@@ -16,11 +16,9 @@
 //! draft. Themes, blocks and translation overlays build on this response in later phases.
 
 use axum::Json;
-use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use omnion_content::{ContentError, pages};
-use omnion_environment::store as environment_store;
 use omnion_identity::Site;
 use omnion_identity::sites;
 use serde::{Deserialize, Serialize};
@@ -28,7 +26,6 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 
 use crate::error::ApiError;
-use crate::routes::cdn_cache;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------------------------
@@ -122,41 +119,16 @@ fn classify_hint(value: &str) -> SiteHint<'_> {
 // ---------------------------------------------------------------------------------------------
 
 /// `GET /api/v1/public/pages/{slug}` — the published page behind an address.
-///
-/// The cache headers come from the site's cache-rule set (REQ-011) rather than from a
-/// literal here, and the validator is the published revision: two reads of one revision
-/// produce the same `ETag` and a conditional read answers `304`, while a re-publish
-/// produces a new one. The body is the *rendered* body, because that is what the cache
-/// stores — hashing the stored rows instead would be a validator for bytes the client
-/// never received.
 pub async fn get_published_page(
     State(state): State<AppState>,
     Path(slug): Path<String>,
     Query(query): Query<PublicPageQuery>,
-    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
-) -> Result<Response, ApiError> {
+) -> Result<Json<PublishedPageResponse>, ApiError> {
     let pool = state.db().pool();
     let site = resolve_site(pool, query.site.as_deref(), &headers).await?;
 
-    // Which environment the visitor is reading is decided HERE and never inferred: a host
-    // addresses the organization's *production* content, and the staging copy of the same slug
-    // is a different row in a different environment (REQ-017, migration 0148). Resolving the
-    // production environment rather than "any row with this slug" is what keeps two failures
-    // apart — the visitor sees the published revision, and a staging draft can never be served
-    // to the public even by accident.
-    //
-    // An organization with no production environment cannot happen while migration 0147's trigger
-    // holds (every organization gets one on insert), but a site whose organization somehow lost
-    // it should answer the *public* 404 rather than a 500 — a visitor learns nothing about an
-    // installation that is missing its own invariant, and a leaked `environment_not_found` would
-    // tell them one exists.
-    let environment_id = match environment_store::production(pool, site.organization_id).await {
-        Ok(environment) => environment.id,
-        Err(_) => return Err(page_not_found(&slug)),
-    };
-
-    let page = match pages::find_page_by_slug(pool, site.id, environment_id, &slug).await {
+    let page = match pages::find_page_by_slug(pool, site.id, &slug).await {
         Ok(page) => page,
         // A public address that is not a slug shape is simply not found — a `400` would leak
         // the panel's validation rules to a visitor.
@@ -173,7 +145,7 @@ pub async fn get_published_page(
         return Err(page_not_found(&slug));
     };
 
-    let body = PublishedPageResponse {
+    Ok(Json(PublishedPageResponse {
         site: PublicSiteBody {
             key: site.key,
             name: site.name,
@@ -187,100 +159,11 @@ pub async fn get_published_page(
         revision: PublicRevisionBody {
             revision_no: revision.revision_no,
             title: revision.title,
-            body: revision.body.clone(),
+            body: revision.body,
             summary: revision.summary,
             published_at: revision.published_at,
         },
-    };
-
-    // The rule set is matched against the *public address* the visitor asked for, not the
-    // API path: a rule author writes `/blog/hello`, and matching `/api/v1/public/pages/blog`
-    // would make every pattern they can express unmatched. The query string travels with it
-    // because a rule may allow-list a parameter; the site hint is stripped from it, because
-    // it selects the site rather than varying the page.
-    let request_path = format!("/{}", slug);
-    let shape = cdn_cache::request_shape(
-        &request_path,
-        public_query(raw_query.as_deref(), query.site.as_deref()).as_deref(),
-        &headers,
-    );
-    let policy = cdn_cache::policy_for(pool, site.id, &shape).await;
-
-    let response = Json(body).into_response();
-    Ok(cdn_cache::apply(
-        response,
-        &policy,
-        cdn_cache::Validator::Page {
-            revision_no: revision.revision_no,
-            body: &revision.body,
-        },
-        &headers,
-    ))
-}
-
-/// The `X-Robots-Tag` a staging address answers with, and nothing else.
-pub const STAGING_ROBOTS_TAG: &str = "noindex, nofollow";
-
-/// Stamp `noindex` on every response that left through a staging host.
-///
-/// REQ-017 slice 4 puts staging behind `noindex`, and the header is the only place it can be
-/// said: a staging host serves a *published* page, so every other signal — the response code,
-/// the content, the absence of a `sitemap` link — says "indexable", and the one fact that makes
-/// the page a mistake is one the renderer cannot see.
-///
-/// It is a **layer, not a line in the handler**, and that placement is the decision. A handler
-/// marks the `200` it returns and nothing else, so a staging address that answers `404` for an
-/// address nobody published would go out unmarked — and the first thing a crawler learns about
-/// that host is then inconsistent: an unindexed page here, an indexed one there, whichever it
-/// happened to reach. The mark belongs where the response *leaves*, because "is this address
-/// staging" is a property of the address and not of the status code.
-///
-/// The cost is one indexed equality probe on `staging_host` for the host the request arrived on
-/// — paid by production requests too. That is the trade the request names: a staging address
-/// cannot be indexed by forgetting to configure something.
-pub async fn noindex_staging_hosts(
-    State(state): State<AppState>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let headers = request.headers().clone();
-    let host = request_host(&headers);
-    let staging = match host {
-        Some(host) => environment_store::find_staging_by_host(state.db().pool(), &host)
-            .await
-            .ok()
-            .flatten()
-            .is_some(),
-        None => false,
-    };
-
-    let mut response = next.run(request).await;
-    if staging {
-        response.headers_mut().insert(
-            HeaderName::from_static("x-robots-tag"),
-            HeaderValue::from_static(STAGING_ROBOTS_TAG),
-        );
-    }
-    response
-}
-
-/// The query string a cache rule may key on: everything except the site hint.
-///
-/// The site hint addresses *which* site answered, so including it in the key would give
-/// the same page two cache entries on one domain and defeat the cache without protecting
-/// anything. Returns `None` when nothing is left, because "no query" and "an empty query"
-/// must key identically.
-fn public_query(raw: Option<&str>, site_hint: Option<&str>) -> Option<String> {
-    let raw = raw?;
-    let kept: Vec<&str> = raw
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .filter(|pair| {
-            let name = pair.split('=').next().unwrap_or(pair);
-            Some(name) != site_hint
-        })
-        .collect();
-    (!kept.is_empty()).then(|| kept.join("&"))
+    }))
 }
 
 /// The `404` of the public surface: one shape for "not here", never "not published".

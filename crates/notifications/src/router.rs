@@ -236,6 +236,17 @@ pub struct RouteReport {
     pub unmatched_rules: u32,
     /// Rules that matched nothing at all because the event name is not in the table.
     pub unknown_event: bool,
+    /// Recipients a rule resolved and this route then refused: somebody outside the event's
+    /// tenant, or an id that is not an account at all.
+    ///
+    /// **A separate count from `unmatched_rules`, and the difference is the point.**
+    /// `unmatched_rules` answers "how many rules produced nothing". This answers "how many
+    /// people were resolved and then dropped" — which is the difference between a rule wired to
+    /// a role nobody holds (wait for the producer) and a rule wired to somebody the event's
+    /// tenant does not own (**fix the rule**). Both read `0 created` otherwise, and the second
+    /// one is a data-integrity problem that looks like a waiting rule for as long as nobody
+    /// counts. Before the fix this number did not exist because nothing was dropped.
+    pub dropped_recipients: u32,
 }
 
 /// The event a module recorded, as the router reads it.
@@ -433,12 +444,34 @@ pub async fn route(pool: &PgPool, event: &RoutedEvent) -> Result<RouteReport> {
 
     let mut report = RouteReport::default();
     for rule in &rules {
-        let recipients = resolve_recipients(pool, rule, event).await?;
-        if recipients.is_empty() {
+        let resolved = resolve_recipients(pool, rule, event).await?;
+        // **The tenancy filter, and it is here rather than inside the two caller-supplied arms
+        // because two of the four rules can name somebody the event's tenant does not own.**
+        // `Actor` returns `event.actor_user_id` verbatim; `PayloadUser` returns an id the
+        // *producer wrote into the payload*, which is caller-supplied data whose only check so
+        // far was that it parses as a uuid. `Permission` and `Role` are already bounded — their
+        // SQL selects inside `event.organization_id` — so a filter inside those two arms would
+        // be a second, weaker copy of what the database already guarantees.
+        //
+        // **Applied per rule, and the filter runs before the write, not after it**, because
+        // `unmatched_rules` counts *rules* that resolved nobody: a rule whose only recipient is
+        // a stranger has not been satisfied, and reporting it as a created row is how the same
+        // event looks successful three times over.
+        let organizations = crate::store::recipient_organizations(pool, &resolved).await?;
+        let kept =
+            crate::audience::addressable_recipients(event.organization_id, &resolved, &|id| {
+                Some(organizations.get(&id).copied().flatten())
+            });
+        if kept.is_empty() {
             report.unmatched_rules += 1;
             continue;
         }
-        for recipient in recipients {
+        // The refusals are a fact the administrator needs, not just a silent subtraction: a rule
+        // pointing at somebody the event's tenant does not own is a mis-wired rule, and
+        // "matched nobody" is the only sentence this report can give about it. Counts, not ids —
+        // the event is not an admin console and the ids belong in nobody's log.
+        report.dropped_recipients += (resolved.len() - kept.len()) as u32;
+        for (recipient, recipient_organization) in kept {
             let mut draft = NewNotification::to(
                 recipient,
                 &rule.category,
@@ -469,7 +502,17 @@ pub async fn route(pool: &PgPool, event: &RoutedEvent) -> Result<RouteReport> {
             // the notification that is supposed to *leave* the panel, and it was the one path
             // that could not. The dedupe branch is unchanged: a collapsed event is the same
             // fact, and its deliveries already exist.
-            if record_with_deliveries(pool, event.organization_id, event.actor_user_id, &draft)
+            //
+            // **The organization bound here is the RECIPIENT's, and that is the whole point of
+            // the filter above.** It used to be `event.organization_id`, which is wrong twice
+            // over: for a tenant event naming a stranger it wrote a row in the wrong tenant, and
+            // for a *platform* event (`organization_id: None`, the documented unscoped branch)
+            // it wrote `null` — invisible to every tenant's `notifications.admin` outbox,
+            // including the tenant whose person the event actually reached, while
+            // `outbox_counts(None)` counted it as the platform's own traffic. With the filter
+            // in place the two columns agree for every in-tenant row and each survivor carries
+            // its own tenant, which is the only assignment true in all three cases.
+            if record_with_deliveries(pool, recipient_organization, event.actor_user_id, &draft)
                 .await?
                 .is_some()
             {

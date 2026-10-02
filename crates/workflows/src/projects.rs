@@ -1,0 +1,1846 @@
+//! Automation projects: the container every automation resource lives in (REQ-133, slice 1).
+//!
+//! A project is a named bucket with its own members. Slice 1 ships the entity, the default
+//! project's backfill, the membership table and the capability matrix; the scoping enforcement
+//! (slice 2), the move (slice 3) and the limits (slice 4) build on this file rather than beside
+//! it.
+//!
+//! Two rules are established here and are the reason the module exists in this shape:
+//!
+//! * **A resource without an explicit project lands in the organization's default**, decided by
+//!   one function ([`default_project`]) rather than by each insert path. Slice 2 makes every
+//!   automation query project-scoped, and the cheapest way to make that safe is for there to be
+//!   exactly one answer to "which project".
+//! * **A read of a resource the caller may not see is `404`, not `403`.** [`can_see`] answers
+//!   "is this project visible at all", which is the question a *read* asks; `403` on a read is an
+//!   enumeration oracle, and slice 2's whole job is to make sure one organization cannot learn
+//!   that another organization has a project called `PAYROLL` by asking for it by id.
+
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+use crate::error::{Result, WorkflowError};
+
+/// Columns of `automation_projects` for one `select`, in [`Project`] order.
+const PROJECT_COLUMNS: &str = "id, organization_id, key, name, description, color, icon, is_default, status, \
+     default_member_role, owner_user_id, created_by, created_at, updated_at";
+
+/// What a member may do inside a project.
+///
+/// The matrix is a function of the role rather than a table of strings, and slice 4 shares this
+/// one definition with the UI — two hand-written matrices drift, and the failure is a permission
+/// that stops biting without anybody noticing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectRole {
+    /// Everything inside the project, including membership and deletion.
+    Owner,
+    /// Create and edit workflows and credentials.
+    Editor,
+    /// Start, retry and cancel runs.
+    Operator,
+    /// Read only.
+    Viewer,
+}
+
+impl ProjectRole {
+    /// Canonical lowercase name stored in the database.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Editor => "editor",
+            Self::Operator => "operator",
+            Self::Viewer => "viewer",
+        }
+    }
+
+    /// Parse a stored or submitted value.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "owner" => Some(Self::Owner),
+            "editor" => Some(Self::Editor),
+            "operator" => Some(Self::Operator),
+            "viewer" => Some(Self::Viewer),
+            _ => None,
+        }
+    }
+
+    /// Whether this role may read the project's contents.
+    #[must_use]
+    pub const fn can_read(self) -> bool {
+        true
+    }
+
+    /// Whether this role may create and edit workflows and credentials.
+    #[must_use]
+    pub const fn can_edit(self) -> bool {
+        matches!(self, Self::Owner | Self::Editor)
+    }
+
+    /// Whether this role may start, retry and cancel runs.
+    #[must_use]
+    pub const fn can_run(self) -> bool {
+        matches!(self, Self::Owner | Self::Editor | Self::Operator)
+    }
+
+    /// Whether this role may manage credentials.
+    #[must_use]
+    pub const fn can_manage_credentials(self) -> bool {
+        matches!(self, Self::Owner | Self::Editor)
+    }
+
+    /// Whether this role may add, remove and re-role members.
+    #[must_use]
+    pub const fn can_manage_members(self) -> bool {
+        matches!(self, Self::Owner)
+    }
+
+    /// Whether this role may change the project's limits and its lifecycle.
+    #[must_use]
+    pub const fn can_administer(self) -> bool {
+        matches!(self, Self::Owner)
+    }
+}
+
+/// The lifecycle of a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectStatus {
+    /// Normal service: runs start, edits land.
+    Active,
+    /// Read-only: history is kept, new work is refused at the API boundary.
+    Archived,
+}
+
+impl ProjectStatus {
+    /// Canonical lowercase name stored in the database.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+        }
+    }
+
+    /// Parse a stored value.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "active" => Some(Self::Active),
+            "archived" => Some(Self::Archived),
+            _ => None,
+        }
+    }
+}
+
+/// A project row.
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct Project {
+    /// Project id.
+    pub id: Uuid,
+    /// Organization the project lives in; a project never spans organizations.
+    pub organization_id: Uuid,
+    /// Short uppercase key.
+    pub key: String,
+    /// Display name.
+    pub name: String,
+    /// Free-form description.
+    pub description: String,
+    /// Hex colour for the switcher and the avatar.
+    pub color: String,
+    /// Icon name from the theme's icon set.
+    pub icon: String,
+    /// Whether this is the organization's default project.
+    pub is_default: bool,
+    /// `active` or `archived`.
+    pub status: String,
+    /// Role a caller who is not a member holds here anyway (REQ-133 acceptance 6).
+    ///
+    /// The default is `viewer`, and that default is the decision: the organization's default
+    /// project is where automations with no explicit project accumulate, so "you are not a
+    /// member" must not read as "you may edit and run everything everybody built". The column
+    /// rather than a constant, because a deployment that *does* want its operators to run
+    /// default-project automations should be able to say so without a code change.
+    pub default_member_role: String,
+    /// Account that owns the project (delegated administration, slice 4).
+    pub owner_user_id: Option<Uuid>,
+    /// Account that created it.
+    pub created_by: Option<Uuid>,
+    /// Creation instant.
+    pub created_at: OffsetDateTime,
+    /// Last write.
+    pub updated_at: OffsetDateTime,
+}
+
+/// One row of the membership table.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ProjectMember {
+    /// Project the membership belongs to.
+    pub project_id: Uuid,
+    /// The member.
+    pub user_id: Uuid,
+    /// Stored role name.
+    pub role: String,
+    /// Who added them.
+    pub added_by: Option<Uuid>,
+    /// When they joined.
+    pub created_at: OffsetDateTime,
+}
+
+impl ProjectMember {
+    /// The parsed role, or `None` for a row written by a future version this binary predates.
+    #[must_use]
+    pub fn parsed_role(&self) -> Option<ProjectRole> {
+        ProjectRole::parse(&self.role)
+    }
+}
+
+/// A project as the panel needs it: the row plus the two numbers its list column shows.
+///
+/// Deliberately **not** a `FromRow` type. `#[serde(flatten)]` over a nested `Project` is fine for
+/// JSON, but a derived `FromRow` would need the inner struct's fields flattened into the outer
+/// one and has no way to say which of the two `id` columns it means — so the counts are read
+/// into a private row type and assembled here. Three call sites already build this by hand, and
+/// a fourth silently binding a *different* row's columns is the kind of mistake a type that
+/// cannot be derived catches at compile time.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProjectSummary {
+    /// The project itself.
+    #[serde(flatten)]
+    pub project: Project,
+    /// Members, counted.
+    pub member_count: i64,
+    /// Workflows in the project, counted.
+    pub workflow_count: i64,
+}
+
+/// The list row as the database returns it: the project columns plus the two correlated counts.
+#[derive(sqlx::FromRow)]
+struct ProjectListRow {
+    #[sqlx(flatten)]
+    project: Project,
+    member_count: i64,
+    workflow_count: i64,
+}
+
+/// The caller as this module sees them.
+///
+/// A caller is either an instance administrator — who sees every project in the organization and
+/// is unaffected by membership — or an account whose projects are exactly the rows they are a
+/// member of. Slice 2 is where that distinction starts refusing things; building it now means
+/// the read path has no "and if they are an admin" special case added later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectCaller {
+    /// The signed-in account.
+    pub user_id: Uuid,
+    /// Whether the caller holds an instance-wide permission.
+    pub is_instance_admin: bool,
+}
+
+/// A project to be written.
+#[derive(Debug, Clone)]
+pub struct NewProject {
+    /// Organization the project belongs to.
+    pub organization_id: Uuid,
+    /// Short uppercase key.
+    pub key: String,
+    /// Display name.
+    pub name: String,
+    /// Description.
+    pub description: String,
+    /// Colour override.
+    pub color: Option<String>,
+    /// Icon override.
+    pub icon: Option<String>,
+    /// Owner, who is also written as the first `owner` member.
+    pub owner_user_id: Uuid,
+    /// Creator, for the audit row.
+    pub created_by: Option<Uuid>,
+}
+
+/// Validate the key the way the migration's constraint does, in Rust and with the same rule.
+///
+/// The alternative — letting the database refuse it — answers `23514`, which reads in a panel as
+/// "the form is broken" rather than "the key has nine characters". The key format is one of the
+/// few validation rules this codebase states twice, and stating it twice means the test can
+/// compare them.
+#[must_use]
+pub fn validate_key(key: &str) -> Result<()> {
+    let ok = (2..=8).contains(&key.len())
+        && key
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+    if ok {
+        return Ok(());
+    }
+    let count = key.chars().count();
+    let because = if key.contains(' ') {
+        "and contains a space"
+    } else if !key
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        "and uses lower case or a symbol"
+    } else {
+        // Reachable only by length, so the message must not claim a character problem it
+        // cannot see: a key of nine digits has no lower case and no space in it.
+        "and is not 2 to 8 characters long"
+    };
+    Err(WorkflowError::invalid(
+        "invalid_project_key",
+        format!(
+            "a project key is 2 to 8 uppercase letters or digits; \
+             “{key}” is {count} character{} {because}",
+            if count == 1 { "" } else { "s" },
+        ),
+    ))
+}
+
+/// List the projects the caller may see, newest first.
+///
+/// The filter is the module's whole tenancy rule: an instance admin sees the organization, a
+/// member sees their own projects. `None` for the caller is a programmer error, not a case —
+/// there is no session in which "nobody" may read a project list, so the function requires one.
+pub async fn list_projects(
+    pool: &PgPool,
+    organization_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Vec<ProjectSummary>> {
+    let sql = format!(
+        "select {PROJECT_COLUMNS}, \
+           (select count(*) from automation_project_members m where m.project_id = p.id) as member_count, \
+           (select count(*) from workflows w where w.project_id = p.id) as workflow_count \
+         from automation_projects p \
+         where p.organization_id = $1 \
+           and ($2 or exists (select 1 from automation_project_members m \
+                              where m.project_id = p.id and m.user_id = $3)) \
+         order by p.is_default desc, p.created_at desc"
+    );
+    let rows = sqlx::query_as::<_, ProjectListRow>(&sql)
+        .bind(organization_id)
+        .bind(caller.is_instance_admin)
+        .bind(caller.user_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ProjectSummary {
+            project: row.project,
+            member_count: row.member_count,
+            workflow_count: row.workflow_count,
+        })
+        .collect())
+}
+
+/// Read one project the caller may see.
+///
+/// `Ok(None)` is the answer for *both* "there is no such project" and "it is not yours": the
+/// caller cannot tell them apart, and that is the point — a `403` here would confirm the row
+/// exists, which is the enumeration oracle slice 2 is built to remove.
+pub async fn find_visible(
+    pool: &PgPool,
+    organization_id: Uuid,
+    project_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Option<Project>> {
+    // The `p.is_default` arm is the defect this tick's gate found, and it is the same sentence as
+    // the one in [`visible_project_ids`]: the organization's default project is visible to every
+    // account in the tenant, because it is where every resource created without an explicit
+    // project lands. Before this, only the LIST carried that clause — so a member of the
+    // organization saw the default project in the switcher, in `GET /projects`, and in every
+    // scoped workflow list, and then got `404` from `GET /projects/{id}` for the very project the
+    // list had just named. Two functions answering "can this caller see this project" with
+    // different answers is the failure mode this module keeps meeting, and the gate caught it in
+    // its first run.
+    //
+    // `resolve_target` and `can_see` build on this, so they inherit the fix: a create with no
+    // explicit project resolves the default, and `can_see(default)` now agrees with the list.
+    let sql = format!(
+        "select {PROJECT_COLUMNS} from automation_projects p \
+         where p.id = $1 and p.organization_id = $2 \
+           and ($3 or p.is_default \
+                or exists (select 1 from automation_project_members m \
+                           where m.project_id = p.id and m.user_id = $4))"
+    );
+    let row = sqlx::query_as::<_, Project>(&sql)
+        .bind(project_id)
+        .bind(organization_id)
+        .bind(caller.is_instance_admin)
+        .bind(caller.user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+/// The projects a caller may see, as ids.
+///
+/// This is the query slice 2 is built on, and it answers a question the per-project read cannot:
+/// **"which projects is this person in?"** asked once, for a whole list, before the caller's
+/// first row is fetched. Two shapes of scoping exist and only one of them is a boundary —
+///
+/// * `is_instance_admin` sees the whole organization;
+/// * a member sees exactly the projects they are a member of;
+/// * **and the organization's DEFAULT project is always visible**, because it is where every
+///   resource created without an explicit project lands.
+///
+/// That last clause is the decision worth arguing for, and the argument is that the alternative
+/// is a fresh installation where the owner cannot see the project their first workflow is in.
+/// 0164 backfills every pre-existing workflow into the default and `resolve_target` sends every
+/// un-targeted new one there; a scoping rule that hides it makes both of those facts invisible
+/// to the person who needs them. The default is also the one project the migration refuses to
+/// archive, so it is never a container that can be read-only — there is no state in which showing
+/// it would leak a dormant queue.
+///
+/// The result is an id list rather than a boolean predicate, because callers bind it into
+/// `project_id = any($2)` on tables this module does not own, and a predicate cannot be
+/// transported into another query's `where` without a second round trip.
+pub async fn visible_project_ids(
+    pool: &PgPool,
+    organization_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Vec<Uuid>> {
+    let rows: Vec<Uuid> = sqlx::query_scalar(
+        "select p.id from automation_projects p \
+         where p.organization_id = $1 \
+           and ($2 or p.is_default \
+                or exists (select 1 from automation_project_members m \
+                           where m.project_id = p.id and m.user_id = $3))",
+    )
+    .bind(organization_id)
+    .bind(caller.is_instance_admin)
+    .bind(caller.user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// The same answer, as a claim about one workflow: may this caller see it?
+///
+/// The function every read path uses instead of comparing organizations, and the reason is a
+/// specific accident: an organization-only check is what slice 1 shipped, and it is correct for
+/// tenancy and silent about projects. Two people in ONE organization, in different projects,
+/// both pass it. This one is the check that makes project membership mean anything.
+pub async fn can_see_workflow(
+    pool: &PgPool,
+    organization_id: Uuid,
+    project_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<bool> {
+    Ok(visible_project_ids(pool, organization_id, caller)
+        .await?
+        .contains(&project_id))
+}
+
+/// A list filter: the caller's visible projects, or `None` when they may see all of them.
+///
+/// `None` here means "do not filter" and is returned for an instance administrator, because a
+/// `Some` carrying every id in the organization would be the same answer spelled more expensively
+/// — and a filter that silently stops applying is how a scoping rule gets un-applied by accident.
+pub async fn visible_project_filter(
+    pool: &PgPool,
+    organization_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Option<Vec<Uuid>>> {
+    if caller.is_instance_admin {
+        return Ok(None);
+    }
+    Ok(Some(
+        visible_project_ids(pool, organization_id, caller).await?,
+    ))
+}
+
+/// Whether a run may start in this project right now.
+///
+/// **This is the archive guard, and it lives here rather than in a handler because the archive
+/// button is not the boundary — `store::create_execution_in` is.** Three of the four ways a run
+/// starts never pass through a route: the scheduler claims and starts them, the event matcher
+/// starts one inside its own transaction, and a retry starts one from the engine. A check in
+/// `run_workflow` therefore reads as "archived projects refuse manual runs", which is true, and
+/// leaves a project archiving its workflows only stopping the one kind of run an operator would
+/// notice first.
+///
+/// The answer is read in the same statement that would have created the run, so a run and the
+/// check that authorised it cannot straddle an archive that lands between them: either this
+/// transaction sees `active` and starts, or it sees `archived` and refuses. A read followed by an
+/// unconditional write is the two-statement version of that race, and it is the same shape as the
+/// round-robin cursor this module already took away from the handlers.
+pub async fn ensure_run_allowed(connection: &mut sqlx::PgConnection, project_id: Uuid) -> Result<()> {
+    let status: Option<String> = sqlx::query_scalar(
+        "select status from automation_projects where id = $1 for share",
+    )
+    .bind(project_id)
+    .fetch_optional(connection)
+    .await?;
+    match status.as_deref().map(ProjectStatus::parse) {
+        Some(Some(ProjectStatus::Archived)) => Err(WorkflowError::invalid(
+            "project_archived",
+            "this workflow's project is archived — restore it before starting new runs",
+        )),
+        // A project that is absent answers the same way it answered absent everywhere else on
+        // this module: the run is refused, because a workflow whose project nobody can see is a
+        // tenancy question, not a scheduling one.
+        None => Err(WorkflowError::invalid(
+            "project_not_found",
+            "this workflow's project no longer exists",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The organization's default project, created on first use.
+///
+/// A resource created without an explicit project lands here, and slice 2 makes every insert
+/// path call this — so it has to be safe under a race. The insert takes
+/// `on conflict do nothing` against the filtered unique index and then reads the row, which is
+/// the same shape this engine's round-robin cursor and claim tables already use: **insert, and
+/// let the row count be the decision.** Two organizations' first automations racing produce one
+/// project and one re-read, never two defaults and never a constraint error.
+pub async fn default_project(pool: &PgPool, organization_id: Uuid) -> Result<Project> {
+    let insert = format!(
+        "insert into automation_projects (organization_id, key, name, description, is_default) \
+         values ($1, 'DEFAULT', 'Default', 'Automations with no explicit project', true) \
+         on conflict do nothing returning {PROJECT_COLUMNS}"
+    );
+    if let Some(project) = sqlx::query_as::<_, Project>(&insert)
+        .bind(organization_id)
+        .fetch_optional(pool)
+        .await?
+    {
+        return Ok(project);
+    }
+
+    let sql = format!(
+        "select {PROJECT_COLUMNS} from automation_projects \
+         where organization_id = $1 and is_default"
+    );
+    let project = sqlx::query_as::<_, Project>(&sql)
+        .bind(organization_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| {
+            WorkflowError::invalid(
+                "default_project_missing",
+                "this organization has no default project",
+            )
+        })?;
+    Ok(project)
+}
+
+/// The project a new resource should land in: the named one when it exists and is usable, the
+/// organization's default otherwise.
+///
+/// The fallback is not an error, and that is the decision worth naming: a caller who passes a
+/// project they cannot see gets the default rather than a refusal, because the alternative is a
+/// silent resource in the wrong bucket. Slice 2 replaces the "or is it visible" half of this
+/// with a refusal — **once the API layer can tell the difference**, which is the same
+/// rule this module keeps learning: a validation rule belongs at the layer that can act on it.
+pub async fn resolve_target(
+    pool: &PgPool,
+    organization_id: Uuid,
+    project_id: Option<Uuid>,
+    caller: ProjectCaller,
+) -> Result<Project> {
+    match project_id {
+        Some(id) => {
+            if let Some(project) = find_visible(pool, organization_id, id, caller).await? {
+                return Ok(project);
+            }
+            default_project(pool, organization_id).await
+        }
+        None => default_project(pool, organization_id).await,
+    }
+}
+
+/// Create a project and its first owner membership in one transaction.
+///
+/// The two writes are one statement's worth of meaning — a project with no owner is a project
+/// nobody can administer, and slice 4's "at least one owner must remain" rule starts from this
+/// row — so they share a transaction rather than being two calls a caller can interleave.
+pub async fn create_project(pool: &PgPool, new: NewProject) -> Result<Project> {
+    validate_key(&new.key)?;
+
+    let mut tx = pool.begin().await?;
+
+    let sql = format!(
+        "insert into automation_projects (organization_id, key, name, description, color, icon, \
+         owner_user_id, created_by) values ($1, $2, $3, $4, coalesce($5, '#C96442'), \
+         coalesce($6, 'folder'), $7, $8) returning {PROJECT_COLUMNS}"
+    );
+    let project = sqlx::query_as::<_, Project>(&sql)
+        .bind(new.organization_id)
+        .bind(&new.key)
+        .bind(&new.name)
+        .bind(&new.description)
+        .bind(new.color.as_deref())
+        .bind(new.icon.as_deref())
+        .bind(new.owner_user_id)
+        .bind(new.created_by)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "insert into automation_project_members (project_id, user_id, role, added_by) \
+         values ($1, $2, 'owner', $3)",
+    )
+    .bind(project.id)
+    .bind(new.owner_user_id)
+    .bind(new.created_by)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(project)
+}
+
+/// The caller's role in a project, or `None` when they are not a member.
+///
+/// An instance administrator who is not a member answers `None` here rather than
+/// [`ProjectRole::Owner`]. The distinction matters: membership is a fact about the row, and slice
+/// 4's "remove the last owner" check must not be satisfied by an administrator who has no
+/// membership to remove.
+pub async fn role_of(
+    pool: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<ProjectRole>> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "select role from automation_project_members where project_id = $1 and user_id = $2",
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(raw.as_deref().and_then(ProjectRole::parse))
+}
+
+/// The role a caller holds in a project **for a capability decision** — REQ-133 acceptance 6.
+///
+/// This is [`role_of`] plus the one rule the membership table cannot express: a caller who may
+/// see the project's **default** without being a member of it (the visibility rule in
+/// [`visible_project_ids`] admits the default for every account) holds that project's
+/// `default_member_role` instead of nothing.
+///
+/// Why the function exists rather than a call to [`role_of`] at each handler: acceptance 6 says
+/// a role change must bite on **the very next request**, and the whole difference between a rule
+/// that bites and a rule that does not is *which function the write path asks*. `role_of`
+/// answers "is there a membership row" — used by the members screen and by the last-owner
+/// check, where a non-member's answer genuinely has to be `None` (an administrator with no
+/// membership is not "the last owner"). A capability check needs the opposite: a non-member in a
+/// visible project is not "nobody", they are a `viewer` unless the project says otherwise.
+/// Conflating the two is how a viewer ends up with owner rights or a non-member with none.
+///
+/// **The freshness property is structural, not cached.** One indexed primary-key lookup, re-run
+/// per call, no memo anywhere on this branch (`crates/permissions/src/groups.rs` states it
+/// outright: "resolution never caches"). There is therefore nothing to invalidate, which is why
+/// migration 0181 adds no revision counter: a number read by nobody would be the greenest
+/// possible lie. `scripts/qa/run-project-role-freshness.sh` proves the property — a grant and a
+/// revoke, with the *same* caller and the *same* session between the two assertions.
+///
+/// [`Organization members`] are still visible in the project when they are not in it, so this
+/// is the answer for writes, never for the roster.
+pub async fn effective_role(
+    pool: &PgPool,
+    organization_id: Uuid,
+    project_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Option<ProjectRole>> {
+    if caller.is_instance_admin {
+        // The instance administrator administers everything, and — deliberately — reads this as
+        // `None` at the *membership* level only. Here it is `Owner`, because a capability check
+        // that answered `None` for an administrator would make every project route 404 for the
+        // one account that exists to reach them.
+        return Ok(Some(ProjectRole::Owner));
+    }
+    if let Some(role) = role_of(pool, project_id, caller.user_id).await? {
+        return Ok(Some(role));
+    }
+    // No membership row. Visible-by-default is the only way to have got this far, so the
+    // project's own answer governs — and `find_visible` is re-read rather than assumed, because
+    // a caller who is a member of NO project at all must still answer `None`.
+    let project = find_visible(pool, organization_id, project_id, caller).await?;
+    Ok(project
+        .and_then(|p| ProjectRole::parse(&p.default_member_role)))
+}
+
+/// Whether a caller may do `capability` in this project, and the role that answered.
+///
+/// `Ok(false)` names the role in the store's error so the handler can build the sentence; the
+/// handler owns the wording because it is the layer the screen reads.
+pub async fn permits(
+    pool: &PgPool,
+    organization_id: Uuid,
+    project_id: Uuid,
+    caller: ProjectCaller,
+    capability: fn(ProjectRole) -> bool,
+) -> Result<(bool, Option<ProjectRole>)> {
+    let role = effective_role(pool, organization_id, project_id, caller).await?;
+    Ok((role.is_some_and(capability), role))
+}
+
+/// Whether a caller may see the project at all — the question a *read* asks.
+pub async fn can_see(
+    pool: &PgPool,
+    organization_id: Uuid,
+    project_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<bool> {
+    Ok(find_visible(pool, organization_id, project_id, caller)
+        .await?
+        .is_some())
+}
+
+/// List a project's members with the account's name, for the members screen.
+///
+/// Joined inside the store rather than by the caller so the screen cannot ask for a project and
+/// be answered with the members of a different one: both ids are in the `where`, and there is
+/// exactly one query.
+pub async fn list_members(pool: &PgPool, project_id: Uuid) -> Result<Vec<ProjectMember>> {
+    let rows = sqlx::query_as::<_, ProjectMember>(
+        "select project_id, user_id, role, added_by, created_at \
+         from automation_project_members where project_id = $1 \
+         order by (role = 'owner') desc, created_at",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Add a member, or change an existing member's role.
+///
+/// One statement rather than an existence check followed by an insert: the obvious
+/// check-then-write answers a race with a unique violation, and the `on conflict` form answers
+/// it with the second write winning — which for a role change is the intended outcome.
+pub async fn upsert_member(
+    pool: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+    role: ProjectRole,
+    added_by: Option<Uuid>,
+) -> Result<ProjectMember> {
+    let member = sqlx::query_as::<_, ProjectMember>(
+        "insert into automation_project_members (project_id, user_id, role, added_by) \
+         values ($1, $2, $3, $4) \
+         on conflict (project_id, user_id) do update set role = excluded.role \
+         returning project_id, user_id, role, added_by, created_at",
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .bind(role.as_str())
+    .bind(added_by)
+    .fetch_one(pool)
+    .await?;
+    Ok(member)
+}
+
+/// Remove a membership, refusing the one that would leave nobody owning the project.
+///
+/// The refusal is the whole reason this is not a bare `delete`: "at least one owner must
+/// remain" is a rule about the *result*, and a delete that succeeds and then reports success
+/// leaves a project that slice 4's delegated administration cannot be administered.
+pub async fn remove_member(pool: &PgPool, project_id: Uuid, user_id: Uuid) -> Result<bool> {
+    let role = role_of(pool, project_id, user_id).await?;
+    if role == Some(ProjectRole::Owner) {
+        let owners: i64 = sqlx::query_scalar(
+            "select count(*) from automation_project_members where project_id = $1 and role = 'owner'",
+        )
+        .bind(project_id)
+        .fetch_one(pool)
+        .await?;
+        if owners <= 1 {
+            return Err(WorkflowError::invalid(
+                "last_project_owner",
+                "this is the last owner of the project — transfer ownership before removing them",
+            ));
+        }
+    }
+
+    let deleted = sqlx::query(
+        "delete from automation_project_members where project_id = $1 and user_id = $2",
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(deleted.rows_affected() > 0)
+}
+
+/// Update a project's own fields.
+///
+/// `key` is validated here rather than in the handler because the handler is not the only
+/// writer slice 4's "rename" screen will have, and a constraint in one place plus a validator in
+/// another is how the two drift.
+pub async fn update_project(
+    pool: &PgPool,
+    project_id: Uuid,
+    key: Option<&str>,
+    name: Option<&str>,
+    description: Option<&str>,
+    color: Option<&str>,
+    icon: Option<&str>,
+) -> Result<Option<Project>> {
+    if let Some(key) = key {
+        validate_key(key)?;
+    }
+    let sql = format!(
+        "update automation_projects set \
+           key = coalesce($2, key), \
+           name = coalesce($3, name), \
+           description = coalesce($4, description), \
+           color = coalesce($5, color), \
+           icon = coalesce($6, icon), \
+           updated_at = now() \
+         where id = $1 returning {PROJECT_COLUMNS}"
+    );
+    let row = sqlx::query_as::<_, Project>(&sql)
+        .bind(project_id)
+        .bind(key)
+        .bind(name)
+        .bind(description)
+        .bind(color)
+        .bind(icon)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+/// One project a person is the last remaining owner of.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct OwnedProject {
+    pub id: Uuid,
+    /// The project's short key, which is what a person reads in a refusal.
+    pub key: String,
+    pub name: String,
+}
+
+/// What a person still holds in the automation layer — the answer to "may this account be
+/// turned off?".
+///
+/// **Two different facts, deliberately not one number.** A project owner blocks; a workflow
+/// author does not. The REQ's sentence names both, but only one of them has a remedy on this
+/// branch: `transfer_ownership` moves a project to somebody else in one transaction, while a
+/// workflow's `created_by` is an authorship stamp the schema itself declares nullable
+/// (`on delete set null`). Refusing a deactivation over authorship would lock an account that
+/// cannot be turned off, with no action available that is not "delete somebody's work" — and
+/// the REQ asks for *reassignment*, not deletion. So `owned` is the refusal and `authored`
+/// is reported beside it, and the count travels into the audit row so the fact is not lost.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+pub struct UserAssignments {
+    /// Projects whose only owner is this person.
+    pub owned: Vec<OwnedProject>,
+    /// Workflows this person created, in any project of theirs.
+    pub authored_workflows: i64,
+}
+
+impl UserAssignments {
+    /// Whether a deactivation has to be refused.
+    pub fn blocks_deactivation(&self) -> bool {
+        !self.owned.is_empty()
+    }
+}
+
+/// Everything a person still holds, read in one statement per question.
+///
+/// `role = 'owner'` on the membership is checked **as well as** `owner_user_id`, because the two
+/// can disagree: `transfer_ownership` writes both in one transaction, but `upsert_member` writes
+/// only the membership, so a project can carry an owner nobody is recorded as owning. A guard
+/// that read the column alone would let that person be switched off.
+pub async fn user_assignments(
+    pool: &PgPool,
+    organization_id: Uuid,
+    user_id: Uuid,
+) -> Result<UserAssignments> {
+    let owned = sqlx::query_as::<_, OwnedProject>(
+        "select p.id, p.key, p.name \
+           from automation_projects p \
+          where p.organization_id = $2 \
+            and (p.owner_user_id = $1 \
+                 or exists (select 1 from automation_project_members m \
+                             where m.project_id = p.id and m.user_id = $1 and m.role = 'owner')) \
+            and not exists (select 1 from automation_project_members m2 \
+                             where m2.project_id = p.id and m2.role = 'owner' and m2.user_id <> $1) \
+          order by p.key",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+
+    let authored_workflows: i64 = sqlx::query_scalar(
+        "select count(*) from workflows w \
+          join automation_projects p on p.id = w.project_id \
+         where w.created_by = $1 and p.organization_id = $2",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(UserAssignments {
+        owned,
+        authored_workflows,
+    })
+}
+
+/// Read a person's assignments for the deactivation decision, refusing the account that still
+/// owns a project.
+///
+/// The refusal **names every project and the remedy**, because the only actions that unblock it
+/// are `POST /projects/{id}/transfer-ownership` and adding a second owner — and an operator
+/// holding only `users.manage` cannot do either, so the sentence has to say who to ask.
+///
+/// The read runs `for share` on the project rows. A check followed by an unconditional write is
+/// the two-statement version of the race where a transfer lands between the read and the update:
+/// the account goes off and the project is left owned by somebody who cannot sign in.
+pub async fn ensure_user_can_be_disabled_in(
+    connection: &mut sqlx::PgConnection,
+    organization_id: Uuid,
+    user_id: Uuid,
+) -> Result<UserAssignments> {
+    let owned = sqlx::query_as::<_, OwnedProject>(
+        "select p.id, p.key, p.name \
+           from automation_projects p \
+          where p.organization_id = $2 \
+            and (p.owner_user_id = $1 \
+                 or exists (select 1 from automation_project_members m \
+                             where m.project_id = p.id and m.user_id = $1 and m.role = 'owner')) \
+            and not exists (select 1 from automation_project_members m2 \
+                             where m2.project_id = p.id and m2.role = 'owner' and m2.user_id <> $1) \
+          order by p.key \
+          for share of p",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .fetch_all(&mut *connection)
+    .await?;
+
+    if !owned.is_empty() {
+        let list = owned
+            .iter()
+            .map(|p| {
+                let mut name: String = p.name.chars().take(24).collect();
+                if p.name.chars().count() > 24 {
+                    name.push('…');
+                }
+                format!("{} ({name})", p.key)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(WorkflowError::invalid(
+            "user_still_owns_projects",
+            format!(
+                "this account is the last owner of {list} — transfer ownership to another account, \
+                 or give the project a second owner, before disabling it"
+            ),
+        ));
+    }
+
+    let authored_workflows: i64 = sqlx::query_scalar(
+        "select count(*) from workflows w \
+          join automation_projects p on p.id = w.project_id \
+         where w.created_by = $1 and p.organization_id = $2",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(UserAssignments {
+        owned,
+        authored_workflows,
+    })
+}
+
+/// [`ensure_user_can_be_disabled_in`] for a caller with only a pool.
+pub async fn ensure_user_can_be_disabled(
+    pool: &PgPool,
+    organization_id: Uuid,
+    user_id: Uuid,
+) -> Result<UserAssignments> {
+    let mut connection = pool.acquire().await?;
+    ensure_user_can_be_disabled_in(&mut connection, organization_id, user_id).await
+}
+
+/// Archive or restore a project.
+///
+/// The default project refuses to archive, and the refusal is the migration's
+/// `automation_projects_default_is_active` constraint rather than a check here: a rule the
+/// database holds is a rule a second code path cannot forget. Archived means **read-only**, and
+/// slice 2 is what starts refusing new runs against this state.
+pub async fn set_status(
+    pool: &PgPool,
+    project_id: Uuid,
+    status: ProjectStatus,
+) -> Result<Option<Project>> {
+    let sql = format!(
+        "update automation_projects set status = $2, updated_at = now() \
+         where id = $1 returning {PROJECT_COLUMNS}"
+    );
+    let row = sqlx::query_as::<_, Project>(&sql)
+        .bind(project_id)
+        .bind(status.as_str())
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+/// Whether this project may take one more workflow definition.
+///
+/// Answers two questions and refuses in the order that makes each remedy the one that works:
+/// the archive rule first (restore it), then the cap (ask the owner to raise it). The archive half
+/// is [`ensure_project_is_writable`], which the update and delete paths call on their own.
+///
+/// **Why one function and not two at the store:** the cap is a question about ADDING a row, so
+/// `delete_workflow` must not ask it — see [`ensure_project_is_writable`] for the reasoning and
+/// for the gate that proved the alternative wrong.
+pub async fn ensure_project_accepts_writes(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+) -> Result<()> {
+    ensure_project_is_writable(connection, project_id).await?;
+
+    // `max_workflows` is a hard cap the REQ promises and the limits screen draws a bar for, so it
+    // is consulted here rather than left to the sweep that only *notices* a crossing. `0` is
+    // unlimited, which is what `read_limits` returns for a project with no row at all — the
+    // `left join` above is what makes a project without a limits row answer "unlimited" instead
+    // of "no limits row", which would otherwise refuse every create on a fresh installation.
+    // `None` from the join means "no limits row", which is the same answer as `0`.
+    let max_workflows: Option<i32> = sqlx::query_scalar(
+        "select max_workflows from automation_project_limits where project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .flatten();
+
+    if let Some(limit) = max_workflows {
+        let current = workflow_count_in(connection, project_id).await?;
+        if let Some((current, limit)) = crate::limits::Limits::exceeded(limit, current) {
+            let (key, owner) = crate::limits::owner_display(connection, project_id).await?;
+            return Err(WorkflowError::invalid(
+                "project_workflow_limit_exceeded",
+                crate::limits::Limits::refusal_message("workflow", current, limit, &key, &owner),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether this project accepts edits at all.
+///
+/// **The archive half of the read-only rule, and nothing else.** *"Archived projects are
+/// read-only — no new runs, no edits"* is one promise with two enforcement points:
+/// [`crate::ensure_run_allowed`] is the run half and this is the write half. Until now only the
+/// first existed, and three gates were green because each measured the clause that had been
+/// implemented.
+///
+/// **`resolve_target` reads `status` nowhere and `permits` asks about a *role*** — neither looks at
+/// whether the container accepts writes. So an editor, an owner **and an instance
+/// administrator** could create, rewrite and delete workflows in an archived project, and the
+/// administrator case is the sharp one: `require_capability` short-circuits to `Owner` before any
+/// project row is read, so the account most likely to reorganise an installation was the one
+/// account for which "archived" did not apply.
+///
+/// **Separate from [`ensure_project_accepts_writes`] on the evidence, not on taste.** The first
+/// version of the fix was one function with a flag, so `delete_workflow` could skip the cap; but a
+/// flag false would then have had to skip the archive rule too, and that one is not negotiable.
+/// `a_delete_is_never_refused_by_the_workflow_cap` in the gate is what forced the split, and it
+/// is the negative control that keeps it honest — a guard that blocks the delete which is the
+/// operator's way back under a cap makes the cap a one-way door.
+pub async fn ensure_project_is_writable(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+) -> Result<()> {
+    let row: Option<String> =
+        sqlx::query_scalar("select status from automation_projects where id = $1 for share")
+            .bind(project_id)
+            .fetch_optional(&mut *connection)
+            .await?;
+
+    match row.as_deref().map(ProjectStatus::parse) {
+        Some(Some(ProjectStatus::Archived)) => Err(WorkflowError::invalid(
+            "project_archived",
+            "this workflow's project is archived — restore it before editing or adding to it",
+        )),
+        // An absent project answers the way it answers absent everywhere on this module: a
+        // write into a container nobody can see is a tenancy question, not an archive one, and
+        // `ensure_run_allowed` gives the identical answer for the identical reason.
+        None => Err(WorkflowError::invalid(
+            "project_not_found",
+            "this workflow's project no longer exists",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The workflow count on an open connection, for the write guard.
+///
+/// [`workflow_count`] takes a pool because the list column and the limits screen call it that
+/// way; borrowing a caller's transaction is the point here, so that the count this guard decides
+/// on is read at the same isolation as the insert that follows it.
+async fn workflow_count_in(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+) -> Result<i64> {
+    let count: i64 = sqlx::query_scalar("select count(*) from workflows where project_id = $1")
+        .bind(project_id)
+        .fetch_one(&mut *connection)
+        .await?;
+    Ok(count)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deletion (REQ-133, acceptance 16 / "Settings": archive, export, delete).
+//
+// The REQ's API table has documented `DELETE /api/v1/projects/{id}` — "typed confirmation,
+// dependency check" — and its settings screen has a delete action, for as long as the rest of the
+// surface has existed. Neither existed anywhere: no `delete_project` in this module, no route,
+// no button. Migration 0164 even documented the `on delete restrict` choice as protecting
+// "deletion with its own dependency check (slice 4)", and slice 4 shipped the caps, the transfer
+// and the archive guards without ever writing the function the comment names. So an installation
+// could create projects for ever and never remove one, and the REQ's event table's
+// `automation.project.deleted` was emitted by nothing.
+//
+// **The default project cannot be deleted, and that is the database's rule rather than a check
+// here.** `automation_projects_one_default_uidx` is a filtered unique index, so deleting the
+// default does not violate it — the rule that protects the default is the OTHER one, and the
+// refusal has to be stated here or the delete would succeed and leave an organization with no
+// place to put a resource. Every insert path resolves through [`default_project`], so a
+// successful delete of the default is a broken installation rather than a tidy one.
+
+/// What deleting a project would take with it, or leave behind.
+///
+/// **A report, not a boolean**, and the shape is the point: the REQ asks for "a dependency check"
+/// and a refusal that says *how many* workflows are in the way is an answer an operator can act
+/// on, where "this project has dependencies" is a wall. Each kind carries its own resolution hint
+/// because the remedies differ — workflows are moved, members are dismissed, history is
+/// destroyed — and a refusal that names none of them is the dialog telling a user to go and find
+/// out.
+///
+/// The counts are read **in the deleting transaction, with the project row held `for update`**
+/// (see [`delete_project`]), so a report cannot describe a project that a concurrent create
+/// changed between the report and the delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectDependencies {
+    /// The project.
+    pub project_id: Uuid,
+    /// Its key, so the refusal names it rather than an id.
+    pub project_key: String,
+    /// Workflow definitions that must be moved or deleted first.
+    pub workflows: i64,
+    /// Member rows that would be cascaded away.
+    pub members: i64,
+    /// Execution rows that would be cascaded away with their workflows.
+    ///
+    /// Read through `workflow_executions` rather than counted from the workflows above, because
+    /// the two answers differ the moment a workflow was moved into this project from one that
+    /// had history: a project with one workflow and four hundred runs is exactly the case where
+    /// "this will be destroyed" is the fact the operator needs.
+    pub executions: i64,
+    /// Audit rows already recorded **inside** this project. They survive: `audit_logs.project_id`
+    /// is `on delete set null`, and a trail that deletes itself along with the container is not a
+    /// trail.
+    pub audit_rows: i64,
+}
+
+impl ProjectDependencies {
+    /// Whether the delete may proceed.
+    ///
+    /// **Workflows and history are the blockers; members and the trail are not.** A member row is
+    /// cascaded deliberately (the people are being dismissed, and keeping a membership in a
+    /// project that no longer exists would make every one of their scoped queries read a
+    /// `project_not_found`), and an audit row with a null project is a documented state the
+    /// instance-wide stream already renders. Refusing on either would make the project
+    /// undeletable for reasons an operator cannot fix on this screen.
+    #[must_use]
+    pub const fn blocks_delete(&self) -> bool {
+        self.workflows > 0
+    }
+}
+
+/// Read what stands in the way of deleting a project.
+///
+/// Takes a connection because its only caller is [`delete_project`], which holds the project row
+/// `for update` while it runs: a dependency count read through a pool on its own would be a
+/// count of a state that may already be gone.
+pub async fn project_dependencies(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+) -> Result<ProjectDependencies> {
+    let project_key: String = sqlx::query_scalar("select key from automation_projects where id = $1")
+        .bind(project_id)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| {
+            WorkflowError::invalid("project_not_found", "this project no longer exists")
+        })?;
+
+    let workflows: i64 =
+        sqlx::query_scalar("select count(*) from workflows where project_id = $1")
+            .bind(project_id)
+            .fetch_one(&mut *connection)
+            .await?;
+    let members: i64 =
+        sqlx::query_scalar("select count(*) from automation_project_members where project_id = $1")
+            .bind(project_id)
+            .fetch_one(&mut *connection)
+            .await?;
+    let executions: i64 = sqlx::query_scalar(
+        "select count(*) from workflow_executions e join workflows w on w.id = e.workflow_id \
+         where w.project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    let audit_rows: i64 =
+        sqlx::query_scalar("select count(*) from audit_log where project_id = $1")
+    .bind(project_id)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(ProjectDependencies {
+        project_id,
+        project_key,
+        workflows,
+        members,
+        executions,
+        audit_rows,
+    })
+}
+
+/// The typed confirmation the REQ asks for, and the one that makes the delete a deliberate act.
+///
+/// **Why the project KEY and not the name or the id.** The name is free text an operator can
+/// change without thinking, and the id is on screen. The key is the short form people write in a
+/// ticket (`PLAT`, `OPS`), it is unique per organization, and it is the one identifier that both
+/// identifies the project *and* cannot be produced by muscle memory from a list — typing `PAY`
+/// when the project is `PAYROLL` fails, which is the entire purpose of a typed confirmation. This
+/// is the same argument the account-deletion confirmations on this platform make.
+///
+/// The check is an **exact** equality on the key, and a wrong answer is a
+/// [`WorkflowError::invalid`] naming the expected value: a confirmation that fails silently
+/// leaves a user retyping into a field that never said what it wanted.
+///
+/// **No `trim()`, and the first version had one — my own gate caught it.** Trimming makes
+/// `"OPS "` an acceptable answer, which is a pasted key with a trailing space, which is the most
+/// common way a typed confirmation gets satisfied without anybody having read it. It is also the
+/// exact disagreement this dialog family keeps meeting: the panel compares `typed === key` and the
+/// store compared `typed.trim() === key`, so the dialog would refuse what the server accepted, and
+/// the "the message is not the negation" rule applies here in a new place — a check that is *nearly*
+/// exact is not exact, and "nearly" is where muscle memory lives.
+pub fn ensure_delete_confirmation(
+    dependencies: &ProjectDependencies,
+    confirmation: &str,
+) -> Result<()> {
+    if confirmation != dependencies.project_key {
+        return Err(WorkflowError::invalid(
+            "project_delete_confirmation_mismatch",
+            format!(
+                "type the project key ({}) exactly to confirm the deletion",
+                dependencies.project_key
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Delete a project, once its dependencies and its typed confirmation are satisfied.
+///
+/// **Everything that can refuse this does so before the `delete` statement, in the order that
+/// gives each refusal the remedy that works:**
+///
+/// 1. **The default project.** An organization with no default has nowhere to put a resource
+///    created without an explicit project — every insert path resolves through
+///    [`default_project`] — so the refusal is *"this is the default project; it cannot be
+///    deleted"* rather than a cap to raise or a workflow to move. It is checked first because it
+///    is the one refusal no amount of cleanup fixes.
+/// 2. **The typed confirmation**, so a client that got this far without meaning to cannot delete
+///    a project by sending a `DELETE` with an empty body.
+/// 3. **The dependencies.** A project holding workflows is refused **by count**, naming the key
+///    and the number, because `on delete restrict` would otherwise answer a 23503 that names a
+///    constraint and not a project.
+///
+/// The project row is held **`for update`** across the whole check, so a workflow created between
+/// the dependency read and the `delete` cannot slip in and take the row down with it. That is the
+/// check-then-write race this module has removed from the run path and the move path, on the last
+/// write path that had it.
+///
+/// Cascades: members, limits, usage counters, limit notices and switcher recents go with it
+/// (`on delete cascade` in 0164/0170/0172/0176), and `audit_log.project_id` is set to null — the
+/// trail stays. Workflows and their runs are `on delete restrict`, which is why step 3 exists.
+///
+/// **The write is a separate function, and it is separate because the audit row has to go in
+/// between.** `audit_log.project_id` is a foreign key with `on delete set null`, so a trail row
+/// naming this project is legal only while the project exists — writing one *after* the `delete`
+/// in the same transaction answers 23503, because the constraint is checked immediately and
+/// `set null` runs against rows that are already there, not against a row inserted afterwards.
+/// A single function that both checked and deleted would have forced the caller to write the
+/// audit row after a delete that had already happened, which is the one order that cannot work.
+/// So [`project_delete_checks`] decides and [`commit_project_delete`] writes, and the handler puts
+/// the audit row between them.
+pub async fn project_delete_checks(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+    confirmation: &str,
+) -> Result<ProjectDependencies> {
+    // `for update` and the default flag in one read: the lock is taken here rather than later so
+    // every refusal below is decided against a project that cannot change underneath the check,
+    // and the lock is HELD until the transaction ends — which is what lets the delete below trust
+    // the dependency count it read a moment ago.
+    let is_default: Option<bool> = sqlx::query_scalar(
+        "select is_default from automation_projects where id = $1 for update",
+    )
+    .bind(project_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+
+    match is_default {
+        None => {
+            return Err(WorkflowError::invalid(
+                "project_not_found",
+                "this project no longer exists",
+            ));
+        }
+        Some(true) => {
+            return Err(WorkflowError::invalid(
+                "project_is_default",
+                "the default project cannot be deleted — every automation created without a \
+                 project of its own lands here",
+            ));
+        }
+        Some(false) => {}
+    }
+
+    let dependencies = project_dependencies(connection, project_id).await?;
+    ensure_delete_confirmation(&dependencies, confirmation)?;
+
+    if dependencies.blocks_delete() {
+        return Err(WorkflowError::invalid(
+            "project_has_dependencies",
+            format!(
+                "{} holds {} workflow(s) — move or delete them before deleting the project",
+                dependencies.project_key, dependencies.workflows
+            ),
+        ));
+    }
+
+    Ok(dependencies)
+}
+
+/// Remove the project row, once every check has passed and the audit row has been written.
+///
+/// Public so the handler can order the two, and documented so the order is not an accident
+/// somebody tidies away: **the audit row goes in first, this goes second.** Both are in the same
+/// transaction, so a failure anywhere rolls the whole thing back together.
+pub async fn commit_project_delete(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+) -> Result<()> {
+    sqlx::query("delete from automation_projects where id = $1")
+        .bind(project_id)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
+/// Count the workflows in a project, for the list column and the limit screen.
+pub async fn workflow_count(pool: &PgPool, project_id: Uuid) -> Result<i64> {
+    let count: i64 = sqlx::query_scalar("select count(*) from workflows where project_id = $1")
+        .bind(project_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The switcher (REQ-133, acceptance 3): what this person last worked in, and in what order.
+//
+// Four functions, and the split is the design rather than an accident. `list_switcher_entries` is
+// the read, `select_project` is the write, and they are separate because **a read that also wrote
+// the recents would make every page view reorder the list** — the entry you are looking at would
+// climb to rank 0 because you looked at it, which is the same ranking as "recently used" for
+// about four seconds and the opposite of it after that.
+
+/// One row of the switcher: the project plus this person's relationship to it.
+#[derive(Debug, Clone, Serialize)]
+pub struct SwitcherEntry {
+    /// The project itself, flattened so the panel can render a row from one object.
+    #[serde(flatten)]
+    pub project: Project,
+    /// The caller's role, or `None` for an instance administrator who is not a member.
+    pub caller_role: Option<ProjectRole>,
+    /// `true` when this is the project the switcher has selected for this caller.
+    pub selected: bool,
+    /// The recents rank, or `None` for a project that is not in the recents yet.
+    ///
+    /// A nullable rank rather than a zero-filled one: rank 0 is a *fact* ("you were here a
+    /// minute ago") and an absent rank is a different fact ("this is a project you have never
+    /// opened"), and the switcher orders on it.
+    pub recent_rank: Option<i16>,
+    /// Whether this person may administer the project — the switcher marks it rather than hiding
+    /// the entry, because an entry you can see but cannot manage is a legitimate state.
+    pub can_manage: bool,
+}
+
+/// The switcher's list for one caller: the projects they are in, their recents first.
+///
+/// **This is the query the `?mine=1` parameter asked for and nothing read.** It differs from
+/// [`list_projects`] in three ways, and each difference is a decision the switcher needs rather
+/// than a variation:
+///
+/// 1. **`mine` means membership, not visibility.** An instance administrator sees every project
+///    in the organization through `list_projects`, and the switcher would then be a list — which
+///    is the thing the REQ explicitly refuses ("a switcher that lists forty projects is a list").
+///    So membership is the filter and the administrator's extra reach shows up as a single
+///    `All projects` entry in the UI, never as forty rows here.
+///
+///    **Membership is the filter, and the recents are the exception — and the gate found the
+///    exception missing.** The first version filtered on `p.is_default or <membership>`, which
+///    meant an administrator who switched into a project they are not a member of (the case
+///    delegated administration exists for) got a switcher that named a project it then refused to
+///    list: the header said "PAY", the dropdown did not contain it, and the only way to leave was
+///    to reload. So a project in *this person's recents* is listed whatever their membership,
+///    while the rest of the organization stays out. The clause is not `or $2` — that would be the
+///    forty-project list again, reached by a different route.
+/// 2. **Recents come first, and the rest is stable.** Ordering by rank with `nulls last` is what
+///    makes "recents first" true; ordering by creation would make it a coincidence.
+/// 3. **The organization's default is always present.** Exactly as in [`visible_project_ids`]: it
+///    is where an un-targeted resource lands, so a switcher without it cannot even show where
+///    the reader's own first workflow went.
+///
+/// `selected` is answered from the *stored* selection rather than from a query parameter, because
+/// "what does this person have chosen" and "what did the URL ask for" are different questions when
+/// the two disagree, and only one of them is durable.
+pub async fn list_switcher_entries(
+    pool: &PgPool,
+    organization_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Vec<SwitcherEntry>> {
+    // `ProjectRole` and `recent_rank` are decoded as their stored shapes and parsed here, rather
+    // than bound as the domain types. Two reasons, and both are the store's own conventions:
+    //
+    // * `ProjectRole` is not a sqlx type. A scalar subquery for the role returns NULL for a
+    //   project the caller is not a member of, so the decode target is `Option<String>` and the
+    //   parse is the *only* place that decides an unknown stored role is no role at all. Binding
+    //   `ProjectRole` directly would need a `Type` impl and would raise `UnexpectedNull` on
+    //   exactly the rows an instance administrator's switcher is made of.
+    // * `recent_rank` is nullable by design, and a nullable column bound to a non-optional `i16`
+    //   raises `ColumnDecode: UnexpectedNullError` — the third time this branch has hit that
+    //   shape (the claim table's `to_regclass` and `transfer_ownership`'s `owner_user_id` were the
+    //   first two). The rule learned then applies here: **ask "is it there?" in the database, or
+    //   declare the column optional.** `Option<i16>` is the declaration.
+    //
+    //   `i16` and not `i32`, and the gate found that: the column is a `smallint` (`INT2`) and a
+    //   `Rust i32` decodes as `INT4`, so the read raised `mismatched types; Rust type Option<i32>
+    //   (as SQL type INT4) is not compatible with SQL type INT2` — on every row of every
+    //   switcher load, while all three tests that never reach the decode stayed green. The
+    //   column's width is the *store's* choice and the decoder has to match it; `i32` is only
+    //   right for an `int`.
+    let rows: Vec<SwitcherRow> = sqlx::query_as(&format!(
+        "select {PROJECT_COLUMNS}, \
+           (select m.role from automation_project_members m \
+             where m.project_id = p.id and m.user_id = $3) as caller_role, \
+           (select r.rank from automation_project_recent r \
+             where r.user_id = $3 and r.project_id = p.id) as recent_rank \
+         from automation_projects p \
+         where p.organization_id = $1 \
+           and (p.is_default \
+                or exists (select 1 from automation_project_recent r \
+                           where r.user_id = $3 and r.project_id = p.id) \
+                or exists (select 1 from automation_project_members m \
+                           where m.project_id = p.id and m.user_id = $3)) \
+         order by (select r.rank from automation_project_recent r \
+                    where r.user_id = $3 and r.project_id = p.id) asc nulls last, \
+                  p.is_default desc, p.name",
+    ))
+    .bind(organization_id)
+    .bind(caller.is_instance_admin)
+    .bind(caller.user_id)
+    .fetch_all(pool)
+    .await?;
+
+    let selected = selected_project(pool, organization_id, caller).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            // An unknown stored role reads as "no role", not as a panic and not as a default
+            // that would grant a power the database did not say. A `viewer` who somehow holds
+            // `ownerx` gets a switcher entry and no administration.
+            let caller_role = row.caller_role.as_deref().and_then(ProjectRole::parse);
+            let is_selected = selected == Some(row.project.id);
+            SwitcherEntry {
+                can_manage: caller.is_instance_admin
+                    || caller_role.is_some_and(ProjectRole::can_administer),
+                recent_rank: row.recent_rank,
+                project: row.project,
+                caller_role,
+                selected: is_selected,
+            }
+        })
+        .collect())
+}
+
+/// The switcher's query row, before the stored shapes are parsed into domain types.
+///
+/// A struct rather than a tuple for a plain mechanical reason — `sqlx` implements `FromRow` for
+/// tuples up to nine elements but a flat tuple of a *flattened* row plus two nullable scalars is
+/// the shape it refuses, and the error names a missing `Type` impl for `Project` rather than
+/// saying "too many columns". Two nullable columns in a row are also exactly the pair that needs
+/// named types to be readable at the call site.
+#[derive(sqlx::FromRow)]
+struct SwitcherRow {
+    #[sqlx(flatten)]
+    project: Project,
+    caller_role: Option<String>,
+    recent_rank: Option<i16>,
+}
+
+/// The project this caller has selected, or `None` when they have never chosen one.
+///
+/// `None` is a real state and the switcher has to be able to say it out loud: a caller who has
+/// not chosen is looking at everything, which is the correct default for an installation with one
+/// project and a confusing one for a caller with nine. Returning the default project here instead
+/// would make the two indistinguishable.
+pub async fn selected_project(
+    pool: &PgPool,
+    organization_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Option<Uuid>> {
+    let row: Option<Uuid> = sqlx::query_scalar(
+        "select p.id from automation_projects p \
+         join automation_project_selection s on s.project_id = p.id \
+         where s.user_id = $2 and p.organization_id = $1",
+    )
+    .bind(organization_id)
+    .bind(caller.user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Select a project for this caller, and move it to the front of their recents.
+///
+/// **One transaction, because the two halves are one event.** A selection that persisted but did
+/// not reorder is a switcher whose "most recent" is a fact about when the feature shipped, and a
+/// reorder that happened without the selection is a recents list that promotes projects the person
+/// did not choose. Doing them separately is also a read-then-write, and this branch has taken four
+/// such shapes away from callers already.
+///
+/// The shift is a single statement that moves *every* row up by one and pushes the previous rank 0
+/// out of the window:
+///
+/// ```sql
+/// update automation_project_recent \
+///    set rank = case when rank = 0 then null else rank - 1 end \
+///  where user_id = $1 and rank > 0
+/// ```
+///
+/// The `rank = null` on the old head is the demotion a plain `on conflict do nothing` upsert cannot
+/// express, and it is why the primary key is `(user_id, project_id)` while the unique index is on
+/// `(user_id, rank)`: re-selecting a project already at rank 3 must land it at 0 without a
+/// duplicate, and the update above has already freed the 0 it is about to claim.
+///
+/// A project the caller cannot see is refused **before** any write, and the refusal is the
+/// documented `404` rather than a `403`: the same rule every other project read obeys, and a
+/// switcher that answered "that project exists" would be the enumeration oracle slice 2 exists to
+/// remove. An instance administrator is not a member of most projects, and the switcher must still
+/// be able to switch *into* one they manage, so the check admits the instance administrator
+/// through the same [`find_visible`] every other read uses rather than through a membership test
+/// that would refuse it.
+pub async fn select_project(
+    pool: &PgPool,
+    organization_id: Uuid,
+    project_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Project> {
+    if !find_visible(pool, organization_id, project_id, caller).await?.is_some() {
+        return Err(WorkflowError::invalid(
+            "project_not_found",
+            "no such project",
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // 1. Evict the row the shift is about to push out of the window, BEFORE the shift -- and ONLY
+    //    when the window is full. Doing it after (as the first version did, by nulling the old
+    //    head) left the head in place and the claim below hit the unique index with 23505, so
+    //    every second switch on a user's second project raised and only the first ever worked.
+    //
+    //    The `count(*) >= 8` guard is the part the gate caught next, and it is not a detail: with
+    //    three recents the unconditional delete removed the *oldest of those three* and the shift
+    //    then promoted the second-oldest, so selecting a fourth project silently erased the reader's
+    //    history instead of keeping it. The window is eight, so a full one holds ranks 0..7 and the
+    //    shift would produce rank 8 -- which is exactly when one row has to go. The threshold is
+    //    8 and not 7, and the gate caught that too: a window capped at seven when it says eight
+    //    silently loses a project the reader can still see listed.
+    sqlx::query(
+        "delete from automation_project_recent \
+          where user_id = $1 \
+            and (select count(*) from automation_project_recent where user_id = $1) >= 8 \
+            and rank = (select max(rank) from automation_project_recent where user_id = $1)",
+    )
+    .bind(caller.user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // 2. Lift every remaining row one place, which frees rank 0. The `rank >= 0` rather than
+    //    `rank > 0` is the other half of the same correction: rank 0 is a real row that has to
+    //    move too, and a predicate that skips it is a head that never advances.
+    sqlx::query(
+        "update automation_project_recent set rank = rank + 1 where user_id = $1 and rank >= 0",
+    )
+    .bind(caller.user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // 3. The claim. `on conflict (user_id, project_id) do update set rank = 0` rather than
+    //    `do nothing`, and the difference is the whole re-selection case: the shift above moved the
+    //    project this call is about to claim UP one place if it was already in the list, so a plain
+    //    `do nothing` would leave it demoted and the switch would appear to do nothing. The row
+    //    count is not consulted -- nothing here branches on it, because "moved to the front" and
+    //    "already at the front" produce the same correct state.
+    sqlx::query(
+        "insert into automation_project_recent (user_id, project_id, rank) \
+         values ($1, $2, 0) \
+         on conflict (user_id, project_id) do update set rank = 0, used_at = now()",
+    )
+    .bind(caller.user_id)
+    .bind(project_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "insert into automation_project_selection (user_id, project_id) values ($1, $2) \
+         on conflict (user_id) do update set project_id = excluded.project_id, updated_at = now()",
+    )
+    .bind(caller.user_id)
+    .bind(project_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let sql = format!("select {PROJECT_COLUMNS} from automation_projects p where p.id = $1");
+    let project = sqlx::query_as::<_, Project>(&sql)
+        .bind(project_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(project)
+}
+
+/// Forget the caller's selection — the switcher's "All projects" entry, which is a *choice* and
+/// not merely the absence of one.
+///
+/// It is a named function rather than a `DELETE` on the route because the alternative is ambiguous
+/// at the storage layer: a row that does not exist and a row that was cleared are the same absence,
+/// and only the second one means "this person decided to see everything". `set_selection` below
+/// carries the same reasoning for the direction that has a column to write.
+pub async fn clear_selection(pool: &PgPool, user_id: Uuid) -> Result<bool> {
+    let deleted = sqlx::query("delete from automation_project_selection where user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected() > 0)
+}
+
+/// Read one caller's stored selection without the membership join, for the routes that only need
+/// the id.
+///
+/// Deliberately not reused by [`selected_project`]: that one answers *inside an organization*
+/// because a selection left behind by a member of a previous organization must not resolve here,
+/// and a "select the id, then check it" order would be a read the caller cannot be stopped from
+/// observing.
+pub async fn stored_selection(pool: &PgPool, user_id: Uuid) -> Result<Option<Uuid>> {
+    let row: Option<Uuid> =
+        sqlx::query_scalar("select project_id from automation_project_selection where user_id = $1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row)
+}
+
+/// The project a **list** should default to: the caller's stored selection, if it is one they may
+/// still see, and `None` otherwise.
+///
+/// REQ-133's API table promises lists gain "a `project_id` filter **and scoped defaults**", and
+/// only the filter half existed. The switcher stored a selection, the switcher read it back to
+/// label its own button, and nothing that *lists workflows* ever consulted it — so selecting
+/// OPS and then opening the workflow list showed every project the caller could see, which is the
+/// one thing the control promises it will not do. The stored row was written by three functions
+/// and read by none of them: this is the thirteenth instance of this module's signature defect,
+/// and the first where the dead thing was a *default* rather than a value.
+///
+/// Three rules, and each is a refusal rather than a convenience:
+///
+/// * **The selection is intersected with visibility, not trusted.** A membership row can be
+///   deleted after the selection was made — a project owner who removes a member leaves that
+///   member's stored selection naming a project they can no longer see. Reading the selection on
+///   its own would then *widen* a list for the person who just lost access, which is the opposite
+///   of what a default is for. This is why the function takes the visible set as an argument
+///   rather than reading it itself: the caller already has it, and a second read is a second
+///   moment for it to change.
+/// * **A selection naming a project outside the organization is ignored,** not applied. The
+///   `organization_id` join in [`selected_project`] exists for that, and a default is the one
+///   place where silently honouring a stale row would put a reader on a foreign tenant's screen.
+/// * **`None` means "no selection to apply" and is not an error,** which is what keeps the
+///   caller's own question — filter, or filter plus a narrower default? — a one-line `match`.
+pub async fn default_scope(
+    pool: &PgPool,
+    user_id: Uuid,
+    visible: &[Uuid],
+) -> Result<Option<Uuid>> {
+    let Some(selected) = stored_selection(pool, user_id).await? else {
+        return Ok(None);
+    };
+    Ok(visible.contains(&selected).then_some(selected))
+}
+
+/// What a shared link's `?project=` actually resolves to, and why.
+///
+/// Acceptance 3 says the selection "is encoded in URLs so a shared link reproduces the view". The
+/// switcher **writes** that parameter and, before this function, nothing on the branch **read** it
+/// — a twelfth instance of this module's signature defect, and the first where the dead thing was
+/// the *reader* rather than the writer. The consequence is specific and silent: a colleague who
+/// opens your link sees their own stored selection, not the project you sent them, and the header
+/// still reads "All projects" while the URL says otherwise.
+///
+/// Three answers, and the third is the one a boolean cannot carry:
+///
+/// * `Some((id, true))` — the link names a project this caller may see, and the panel scopes to it.
+/// * `Some((id, false))` — the link names a project this caller may **not** see. The id is
+///   returned rather than `None` so the panel can say "you do not have access to this project"
+///   instead of silently falling back to the caller's own selection, which reads as the link being
+///   broken. [`find_visible`] is the only thing consulted, so "may see" means exactly what it means
+///   everywhere else on this surface — one answer per question, not two.
+/// * `None` — no project named. That is "All projects", which is a different state from a link
+///   pointing somewhere you may not go, and conflating them is how an access refusal becomes a
+///   404-looking empty screen.
+pub async fn resolve_linked_project(
+    pool: &PgPool,
+    organization_id: Uuid,
+    linked: Option<Uuid>,
+    caller: ProjectCaller,
+) -> Result<Option<(Uuid, bool)>> {
+    let Some(linked) = linked else {
+        return Ok(None);
+    };
+    let visible = find_visible(pool, organization_id, linked, caller)
+        .await?
+        .is_some();
+    Ok(Some((linked, visible)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_key_is_uppercase_and_short() {
+        assert!(validate_key("PLAT").is_ok());
+        assert!(validate_key("OPS2").is_ok());
+        assert!(validate_key("AB").is_ok());
+        assert!(validate_key("ABCDEFGH").is_ok());
+    }
+
+    #[test]
+    fn a_key_that_is_too_long_or_wrong_case_is_refused_by_name() {
+        let too_long = validate_key("ABCDEFGHI").unwrap_err();
+        assert_eq!(too_long.code(), "invalid_project_key");
+        assert!(too_long.to_string().contains("2 to 8"), "{too_long}");
+
+        let lower = validate_key("plat").unwrap_err();
+        assert!(lower.to_string().contains("lower case"), "{lower}");
+
+        let spaced = validate_key("A B").unwrap_err();
+        assert!(spaced.to_string().contains("space"), "{spaced}");
+
+        assert!(validate_key("A").is_err());
+        assert!(validate_key("PLAT!").is_err());
+    }
+
+    #[test]
+    fn a_multi_character_key_is_described_in_the_plural() {
+        // "TOOLONGKEY" is ten valid characters, so the message must blame LENGTH. The
+        // earlier fixture was "too-long" — eight characters — which failed on its lower case
+        // before the length rule was ever consulted, and the assertion was quietly testing
+        // the wrong branch. A key that is long AND clean is the only way to reach it.
+        let error = validate_key("TOOLONGKEY").unwrap_err();
+        assert!(error.to_string().contains("10 characters"), "{error}");
+        assert!(
+            error.to_string().contains("not 2 to 8 characters long"),
+            "{error}"
+        );
+        assert!(
+            validate_key("A")
+                .unwrap_err()
+                .to_string()
+                .contains("1 character ")
+        );
+    }
+
+    #[test]
+    fn a_key_that_is_only_too_long_does_not_get_told_it_uses_lower_case() {
+        // Nine digits: no lower case, no symbol, no space. Claiming otherwise is a message
+        // that sends the reader looking for a problem the key does not have.
+        let error = validate_key("123456789").unwrap_err().to_string();
+        assert!(!error.contains("lower case"), "{error}");
+        assert!(!error.contains("symbol"), "{error}");
+        assert!(error.contains("not 2 to 8 characters long"), "{error}");
+    }
+
+    #[test]
+    fn the_role_matrix_is_strictly_nested() {
+        // The nesting is the claim: every role can do strictly less than the one above it, and
+        // every role can read. A viewer that could edit would be a different product.
+        assert!(ProjectRole::Owner.can_administer());
+        assert!(ProjectRole::Owner.can_manage_members());
+        assert!(ProjectRole::Owner.can_edit());
+        assert!(ProjectRole::Owner.can_run());
+        assert!(ProjectRole::Owner.can_manage_credentials());
+
+        assert!(ProjectRole::Editor.can_edit());
+        assert!(ProjectRole::Editor.can_run());
+        assert!(ProjectRole::Editor.can_manage_credentials());
+        assert!(!ProjectRole::Editor.can_administer());
+        assert!(!ProjectRole::Editor.can_manage_members());
+
+        assert!(ProjectRole::Operator.can_run());
+        assert!(!ProjectRole::Operator.can_edit());
+        assert!(!ProjectRole::Operator.can_administer());
+
+        assert!(ProjectRole::Viewer.can_read());
+        assert!(!ProjectRole::Viewer.can_run());
+        assert!(!ProjectRole::Viewer.can_edit());
+        assert!(!ProjectRole::Viewer.can_manage_credentials());
+    }
+
+    #[test]
+    fn roles_round_trip_through_their_stored_names() {
+        for role in [
+            ProjectRole::Owner,
+            ProjectRole::Editor,
+            ProjectRole::Operator,
+            ProjectRole::Viewer,
+        ] {
+            assert_eq!(ProjectRole::parse(role.as_str()), Some(role));
+        }
+        assert_eq!(ProjectRole::parse("admin"), None);
+        assert_eq!(ProjectRole::parse(""), None);
+    }
+
+    #[test]
+    fn status_round_trips_and_an_unknown_value_is_rejected() {
+        assert_eq!(ProjectStatus::parse("active"), Some(ProjectStatus::Active));
+        assert_eq!(
+            ProjectStatus::parse("archived"),
+            Some(ProjectStatus::Archived)
+        );
+        assert_eq!(ProjectStatus::parse("deleted"), None);
+    }
+}

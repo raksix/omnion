@@ -73,23 +73,13 @@ pub mod ai;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
+pub mod automation_projects;
 pub mod backups;
-pub mod cdn;
-pub mod cdn_cache;
-pub mod cdn_purge;
 pub mod commands;
 pub mod content;
-pub mod deployment;
-pub mod deployment_cluster;
-pub mod deployment_ops;
-pub mod deployment_run;
-pub mod developer;
-pub mod developer_oauth;
-pub mod developer_portal_extras;
-pub mod developer_scaffolds;
-pub mod developer_sdks;
-pub mod environments;
-pub mod explorer;
+pub mod crm_assignment;
+pub mod crm_intake;
+pub mod storefront;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -98,6 +88,7 @@ pub mod iam_approvals;
 pub mod iam_policy;
 pub mod iam_providers;
 pub mod iam_provisioning;
+pub mod developer;
 pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
@@ -115,12 +106,9 @@ pub mod media_versions;
 pub mod notifications;
 pub mod notifications_admin;
 pub mod notifications_test;
-pub mod oauth_flow;
 pub mod onboarding;
-pub mod promotions;
 pub mod public;
 pub mod readyz;
-pub mod regions;
 pub mod restore_jobs;
 pub mod scim;
 pub mod search;
@@ -132,10 +120,6 @@ pub mod security_limiter;
 pub mod security_secrets;
 pub mod sso;
 pub mod tenancy;
-pub mod tenancy_departments;
-pub mod tenancy_limits;
-pub mod tenancy_member_detail;
-pub mod tenancy_members;
 pub mod webauthn;
 pub mod webhooks;
 pub mod workflows;
@@ -150,11 +134,222 @@ use std::convert::Infallible;
 use crate::guards;
 use crate::state::AppState;
 
-/// Body cap of the public invitation routes (REQ-005): a preview sends nothing and an
-/// acceptance carries a display name and a password, so a few kilobytes is generous.
-const INVITATION_BODY_LIMIT: usize = 16 * 1024;
+/// The automation project surface (REQ-133, slice 1).
+///
+/// The powers are split by what they are over, not by which screen lives on them:
+///
+/// * `projects.read` — the list, the detail, the switcher. A member reads their projects; an
+///   instance administrator reads the organization's.
+/// * `projects.manage` — creating, renaming and archiving a project. `projects.members.manage`
+///   is deliberately *not* folded into it: on a delegated team the person who may rename the
+///   project is very often not the person who may add its colleagues, and one key would let
+///   either of them do the other's job.
+/// * `projects.admin` — the instance-wide power the guard does not grant on its own: it is what
+///   makes an administrator see every project rather than only their memberships. It is absent
+///   from the base roles, so an installation that never grants it has fully delegated projects.
+///
+/// Reads answer `404` for a project the caller may not see, inside the handler
+/// (`automation_projects::find_visible`): the guard proves the caller holds `projects.read` in
+/// their own organization, and the store decides which projects inside it they may see.
+fn automation_projects_surface(state: &AppState) -> Router<AppState> {
+    Router::new()
+        .route(
+            "/projects",
+            get(automation_projects::list_projects)
+                .layer(guards::require(state, "projects.read"))
+                .merge(post(automation_projects::create_project)),
+        )
+        .route(
+            "/projects/{id}",
+            get(automation_projects::get_project)
+                .layer(guards::require(state, "projects.read"))
+                .merge(
+                    put(automation_projects::update_project)
+                        .layer(guards::require(state, "projects.manage")),
+                )
+                // The one destructive route on this surface, and the REQ's API table has carried it
+                // since the module shipped. `projects.manage` rather than a key of its own: the
+                // membership matrix already answers "may administer this project" for the owner
+                // role, and a separate permission would be a second way to say the same thing.
+                .merge(
+                    delete(automation_projects::delete_project)
+                        .layer(guards::require(state, "projects.manage")),
+                ),
+        )
+        // `/archive` and `/restore` are literal segments under `/projects/{id}/…`, and axum ranks
+        // a static segment ahead of the parameter route above it.
+        .route(
+            "/projects/{id}/archive",
+            post(automation_projects::archive_project)
+                .layer(guards::require(state, "projects.manage")),
+        )
+        .route(
+            "/projects/{id}/restore",
+            post(automation_projects::restore_project)
+                .layer(guards::require(state, "projects.manage")),
+        )
+        // The export the settings row has named since slice 1 and the REQ's Risks section names
+        // again as the "export-first hint" that makes deleting a project with dependencies safe.
+        //
+        // `projects.read`, not `projects.manage`, and that is the load-bearing choice: the handler
+        // writes nothing and locks nothing, so requiring management would mean a viewer may read
+        // every workflow on screen and may not read them in a file — "read it here but not there"
+        // is the split (`visible_project_ids` vs `find_visible`) this surface has already paid for
+        // once. Project visibility itself is resolved in the handler through `find_visible`, so a
+        // foreign project is a `404` whose body never names it.
+        .route(
+            "/projects/{id}/export",
+            get(automation_projects::export_project)
+                .layer(guards::require(state, "projects.read")),
+        )
+        // `/workflows/{id}/move` lives under workflows, not projects: the path names what is
+        // being moved and the project is the destination. Declared here beside the other project
+        // routes so the one permission that guards it is visible with the rest of the surface.
+        //
+        // `workflows.manage`, NOT a new `workflows.move`: this surface already names three
+        // workflow permissions and inventing a fourth means a role that could edit a workflow
+        // could not move one, with no word anywhere saying why. Inside the handler the project
+        // capability is checked on both ends, so the workflow permission stays coarse on purpose.
+        .route(
+            "/workflows/{id}/move",
+            post(automation_projects::move_workflow)
+                .layer(guards::require(state, "workflows.manage")),
+        )
+        // Limits and usage. `projects.limits.manage` writes and `projects.read` reads, matching the
+        // REQ's table — an editor can see where the project stands, only an owner moves the caps.
+        .route(
+            "/projects/{id}/limits",
+            get(automation_projects::get_limits)
+                .layer(guards::require(state, "projects.read"))
+                .merge(
+                    put(automation_projects::put_limits)
+                        .layer(guards::require(state, "projects.limits.manage")),
+                ),
+        )
+        .route(
+            "/projects/{id}/usage",
+            get(automation_projects::get_limits)
+                .layer(guards::require(state, "projects.read")),
+        )
+        .route(
+            "/projects/{id}/transfer-ownership",
+            post(automation_projects::transfer_ownership)
+                .layer(guards::require(state, "projects.manage")),
+        )
+        // The project audit stream. `projects.audit.read` rather than `projects.read`: reading a
+        // project's history is what an auditor is for, and a project owner who is not an auditor
+        // can manage the project without being able to read everybody else's actions in it.
+        // Inside the handler the project is resolved through `find_visible` first, so the id is
+        // not a way to read another tenant's trail.
+        .route(
+            "/projects/{id}/audit",
+            get(automation_projects::project_audit)
+                .layer(guards::require(state, "projects.audit.read")),
+        )
+        .route(
+            "/projects/{id}/members",
+            post(automation_projects::upsert_member)
+                .layer(guards::require(state, "projects.members.manage")),
+        )
+        .route(
+            "/projects/{id}/members/{user_id}",
+            delete(automation_projects::remove_member)
+                .layer(guards::require(state, "projects.members.manage")),
+        )
+        // The switcher (REQ-133, acceptance 3). A separate path rather than `?mine=1` on
+        // `/projects`, and the comment is the reason: the REQ's API table documents
+        // `GET /api/v1/projects?mine=1`, and the parameter was declared on the query struct for
+        // five slices without a reader. A dedicated path cannot be reached by a query string that
+        // a later writer silently ignores, and the switcher's own answer is not the project list
+        // with a flag turned on — it carries the recents rank, the caller's role and the stored
+        // selection, and a client that got `/projects` and filtered it client-side would have had
+        // to reconstruct all three.
+        //
+        // `projects.read` on both verbs, deliberately. Choosing a project changes what *this
+        // person* sees, not the project: an editor who may read every project they are in needs
+        // the switcher, and a permission for "which bucket am I looking at" would be a third way
+        // to say "can read", and this branch already learned that two spellings of one power
+        // drift. The store still refuses a project the caller cannot *see*, so a wider guard
+        // cannot become a wider reach.
+        .route(
+            "/projects/switcher",
+            get(automation_projects::switcher)
+                .layer(guards::require(state, "projects.read"))
+                .merge(
+                    post(automation_projects::set_selection)
+                        .layer(guards::require(state, "projects.read")),
+                ),
+        )
+}
 
 /// Build the application router around the shared [`AppState`].
+/// The CRM assignment and SLA surface.
+///
+/// The rules and the policies carry `crm.intake.manage`; the simulator carries
+/// `crm.leads.read`. It is a function rather than an inline `Router` so the two layers are
+/// declared once, here, and cannot be quietly merged into one permission by a later edit.
+fn crm_assignment_surface(state: &AppState) -> Router<AppState> {
+    let assignment = Router::new()
+        .route(
+            "/crm/assignment/rules",
+            get(crm_assignment::list_rules).merge(post(crm_assignment::create_rule)),
+        )
+        // `/order` is static and must be declared before `/rules/{id}` so axum ranks it
+        // ahead of the parameter route — "order" read as a rule id is a 400, not a reorder.
+        .route(
+            "/crm/assignment/rules/order",
+            put(crm_assignment::reorder_rules),
+        )
+        .route(
+            "/crm/assignment/rules/{id}",
+            get(crm_assignment::get_rule)
+                .merge(patch(crm_assignment::update_rule))
+                .merge(delete(crm_assignment::delete_rule)),
+        )
+        .route("/crm/assignment/targets", get(crm_assignment::list_targets))
+        .route_layer(guards::require(state, "crm.intake.manage"));
+    let sla = Router::new()
+        .route(
+            "/crm/sla/policies",
+            get(crm_assignment::list_policies).merge(post(crm_assignment::create_policy)),
+        )
+        .route(
+            "/crm/sla/policies/{id}",
+            get(crm_assignment::get_policy)
+                .merge(patch(crm_assignment::update_policy))
+                .merge(delete(crm_assignment::delete_policy)),
+        )
+        .route_layer(guards::require(state, "crm.sla.manage"));
+    let simulate = Router::new()
+        .route("/crm/assignment/simulate", post(crm_assignment::simulate))
+        .route_layer(guards::require(state, "crm.leads.read"));
+    assignment.merge(sla).merge(simulate)
+}
+
+/// The storefront configuration surface (REQ-118, slice 1a).
+///
+/// One router, one permission, and **only the routes whose tables exist**. The catalogue, the
+/// cart and the checkout are a surface over the commerce engine (REQ-008), which is unbuilt —
+/// declaring a route here that reads `commerce_products` would be a route that 500s on every
+/// request, so they ship with the commerce engine rather than ahead of it.
+///
+/// `/vocabulary` is declared **before** `/{site_id}` for the same reason the CRM router
+/// declares `/order` first: axum ranks static segments ahead of parameters, but the explicit
+/// ordering means the intent is in the file rather than inferred from a matcher.
+fn storefront_surface(state: &AppState) -> Router<AppState> {
+    Router::new()
+        .route("/commerce/storefront", get(storefront::list_sites))
+        .route(
+            "/commerce/storefront/vocabulary",
+            get(storefront::vocabulary),
+        )
+        .route(
+            "/commerce/storefront/{site_id}",
+            get(storefront::get_settings).merge(put(storefront::update_settings)),
+        )
+        .route_layer(guards::require(state, "commerce.storefront.manage"))
+}
+
 pub fn router(state: AppState) -> Router {
     let roles = get(iam::list_roles)
         .layer(guards::require(&state, "iam.roles.read"))
@@ -399,167 +594,6 @@ pub fn router(state: AppState) -> Router {
                 .layer(guards::require(&state, "organizations.manage")),
         );
 
-    // The tenant's own people (REQ-005, slice 1): memberships and invitations of one
-    // organization, plus the public invitation routes and the switcher's two session-scoped
-    // routes under `/me`. Reads need `organizations.read`, writes `organizations.manage`; the
-    // public invitation preview carries no guard because the token is its own credential, so
-    // it is rate-limited and answers uninformatively instead.
-    let organization_members = get(tenancy_members::list_members)
-        .layer(guards::require(&state, "organizations.read"))
-        .merge(
-            post(tenancy_members::add_member)
-                .layer(guards::require(&state, "organizations.manage")),
-        );
-
-    // The member drawer's read is the `GET` of the same resource (REQ-005, slice 4) rather than a
-    // `/detail` sub-path: a member *is* the row, and a screen that had to ask for a second
-    // address to see one member would be a second route to keep in step with this one.
-    let organization_member = get(tenancy_member_detail::get_member)
-        .layer(guards::require(&state, "organizations.read"))
-        .merge(
-            patch(tenancy_members::update_member)
-                .layer(guards::require(&state, "organizations.manage")),
-        )
-        .merge(
-            delete(tenancy_members::remove_member)
-                .layer(guards::require(&state, "organizations.manage")),
-        );
-
-    let organization_invitations = get(tenancy_members::list_invitations)
-        .layer(guards::require(&state, "organizations.read"))
-        .merge(
-            post(tenancy_members::create_invitation)
-                .layer(guards::require(&state, "organizations.manage")),
-        );
-
-    let organization_invitation = delete(tenancy_members::revoke_invitation)
-        .layer(guards::require(&state, "organizations.manage"));
-
-    // The `owner_approval` queue (REQ-005, slice 3). Reading it is the same `organizations.read`
-    // the Members tab already has; releasing is `organizations.manage` *plus* the owner check
-    // inside the handler, because "who may release" is a per-tenant fact the permission catalogue
-    // cannot express — a manager manages the organization and still cannot approve here.
-    let organization_invitation_queue = get(tenancy_members::list_queued_invitations)
-        .layer(guards::require(&state, "organizations.read"));
-
-    let organization_invitation_approval = post(tenancy_members::approve_invitation)
-        .layer(guards::require(&state, "organizations.manage"));
-
-    // Departments (REQ-005, slice 2). Reads ride `organizations.read`, writes
-    // `organizations.manage`; binding a role to a department is an IAM change, so it asks for
-    // `iam.bindings.manage` as well rather than being reachable by a tenant administrator alone.
-    let organization_departments = get(tenancy_departments::list_departments)
-        .layer(guards::require(&state, "organizations.read"))
-        .merge(
-            post(tenancy_departments::create_department)
-                .layer(guards::require(&state, "organizations.manage")),
-        );
-    let organization_department = get(tenancy_departments::get_department)
-        .layer(guards::require(&state, "organizations.read"))
-        .merge(
-            patch(tenancy_departments::update_department)
-                .layer(guards::require(&state, "organizations.manage")),
-        )
-        .merge(
-            post(tenancy_departments::archive_department)
-                .layer(guards::require(&state, "organizations.manage")),
-        )
-        .merge(
-            delete(tenancy_departments::delete_department)
-                .layer(guards::require(&state, "organizations.manage")),
-        );
-    let department_members = post(tenancy_departments::add_department_member)
-        .layer(guards::require(&state, "organizations.manage"))
-        .merge(
-            delete(tenancy_departments::remove_department_member)
-                .layer(guards::require(&state, "organizations.manage")),
-        );
-    let department_roles = post(tenancy_departments::bind_department_role)
-        .layer(guards::require(&state, "organizations.manage"))
-        .layer(guards::require(&state, "iam.bindings.manage"))
-        .merge(
-            delete(tenancy_departments::unbind_department_role)
-                .layer(guards::require(&state, "organizations.manage"))
-                .layer(guards::require(&state, "iam.bindings.manage")),
-        );
-    let member_departments = get(tenancy_departments::list_member_departments)
-        .layer(guards::require(&state, "organizations.read"));
-
-    // The member drawer (REQ-005, slice 4): one read of everything the drawer shows, and the
-    // three binding operations beside it. The read rides `organizations.read`; the writes need
-    // *both* `organizations.manage` (they are changes to this tenant's people) and
-    // `iam.bindings.manage` (they are role grants) — exactly as the department-role route above
-    // already does, because a grant is a grant whoever asks for it through a tenant path.
-    let organization_member_role_bindings: MethodRouter<AppState, Infallible> =
-        post(tenancy_member_detail::grant_member_role)
-            .layer(guards::require(&state, "organizations.manage"))
-            .layer(guards::require(&state, "iam.bindings.manage"));
-    let organization_member_role_binding: MethodRouter<AppState, Infallible> =
-        patch(tenancy_member_detail::extend_member_role)
-            .merge(delete(tenancy_member_detail::revoke_member_role))
-            .layer(guards::require(&state, "organizations.manage"))
-            .layer(guards::require(&state, "iam.bindings.manage"));
-
-    // Settings, modules, limits and usage (REQ-005, slice 3). Reads ride
-    // `organizations.read`, writes `organizations.manage`. The usage route is a `GET` that
-    // answers either a JSON payload or a CSV download, so it is one handler behind a query
-    // flag rather than two routes — the numbers on screen and the numbers in the file then
-    // come from the same call and cannot drift apart.
-    let organization_settings = get(tenancy_limits::get_settings)
-        .layer(guards::require(&state, "organizations.read"))
-        .merge(
-            put(tenancy_limits::update_settings)
-                .layer(guards::require(&state, "organizations.manage")),
-        );
-
-    let organization_modules = get(tenancy_limits::get_modules)
-        .layer(guards::require(&state, "organizations.read"))
-        .merge(
-            put(tenancy_limits::update_modules)
-                .layer(guards::require(&state, "organizations.manage")),
-        );
-
-    let organization_limits = get(tenancy_limits::get_limits)
-        .layer(guards::require(&state, "organizations.read"))
-        .merge(
-            put(tenancy_limits::update_limits)
-                .layer(guards::require(&state, "organizations.manage")),
-        );
-
-    let organization_usage =
-        get(tenancy_limits::get_usage).layer(guards::require(&state, "organizations.read"));
-
-    // The Audit tab. `audit.read`, not `organizations.read`: a trail names every privileged act
-    // in the tenant, and "can see the member list" is not a reason to be able to see it. The
-    // tenant is still resolved from the session, so the id in the path is a selection rather
-    // than an access decision.
-    let organization_audit =
-        get(tenancy_limits::get_audit).layer(guards::require(&state, "audit.read"));
-
-    // The switcher's two routes are session-scoped by design (the request's own table says
-    // "session only"): they only ever return the caller's own memberships and switch to one
-    // they already hold. A permission guard here would be a dead end - the caller's role
-    // binding lives in the organization they are leaving, so the second switch would answer
-    // `403` and the panel could never come back. The membership check inside the handler is
-    // the real authorization: a caller with no membership in the named tenant is refused.
-    let my_organizations = get(tenancy_members::my_organizations);
-
-    let switch_organization = post(tenancy_members::switch_organization);
-
-    // The public invitation routes carry no permission guard — the token is the credential —
-    // so they get their own small body cap (a preview sends nothing, an acceptance carries a
-    // name and a password) instead of the router-wide limit.
-    let invitation_preview = Router::new()
-        .route(
-            "/invitations/{token}",
-            get(tenancy_members::preview_invitation),
-        )
-        .route(
-            "/invitations/{token}/accept",
-            post(tenancy_members::accept_invitation),
-        )
-        .layer(DefaultBodyLimit::max(INVITATION_BODY_LIMIT));
-
     let organization = get(tenancy::get_organization)
         .layer(guards::require(&state, "organizations.read"))
         .merge(
@@ -591,54 +625,14 @@ pub fn router(state: AppState) -> Router {
 
     // Content: pages and their revision history (docs/05-VERSIONING.md §4–§7). Reading the
     // history needs the read key; every mutation carries its own.
-    // The content surface is also the developer surface (REQ-033, slice 1): it is what a
-    // developer's first integration calls, so it is the surface that accepts an API key.
-    //
-    // Both guards are installed, session first. `guards::require` resolves the cookie and
-    // `developer_auth::require_or_key` stands aside when it finds one, so a signed-in panel is
-    // unaffected and a bearer token gets the *key's* scope list rather than a role's — which is
-    // the whole difference between the two machine paths documented in `developer_auth`.
-    //
-    // The scope-enforcement boundary this creates is the acceptance criterion: a key holding
-    // only `content.pages.read` reaches `GET /pages` and is refused on `POST /pages` with a 403
-    // naming the permission it lacks.
     let pages = get(content::list_pages)
         .layer(guards::require(&state, "content.pages.read"))
-        .layer(crate::developer_auth::require_or_key(
-            &state,
-            "content.pages.read",
-        ))
-        .merge(
-            post(content::create_page)
-                .layer(guards::require(&state, "content.pages.create"))
-                .layer(crate::developer_auth::require_or_key(
-                    &state,
-                    "content.pages.create",
-                )),
-        );
+        .merge(post(content::create_page).layer(guards::require(&state, "content.pages.create")));
 
     let page = get(content::get_page)
         .layer(guards::require(&state, "content.pages.read"))
-        .layer(crate::developer_auth::require_or_key(
-            &state,
-            "content.pages.read",
-        ))
-        .merge(
-            patch(content::update_page)
-                .layer(guards::require(&state, "content.pages.update"))
-                .layer(crate::developer_auth::require_or_key(
-                    &state,
-                    "content.pages.update",
-                )),
-        )
-        .merge(
-            delete(content::delete_page)
-                .layer(guards::require(&state, "content.pages.delete"))
-                .layer(crate::developer_auth::require_or_key(
-                    &state,
-                    "content.pages.delete",
-                )),
-        );
+        .merge(patch(content::update_page).layer(guards::require(&state, "content.pages.update")))
+        .merge(delete(content::delete_page).layer(guards::require(&state, "content.pages.delete")));
 
     let page_publish =
         post(content::publish_page).layer(guards::require(&state, "content.pages.publish"));
@@ -955,16 +949,7 @@ pub fn router(state: AppState) -> Router {
 
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
-    //
-    // The `noindex` layer sits *above* the handler rather than inside it, because "is this
-    // address staging" is a fact about the host and not about the status the handler chose
-    // (REQ-017 slice 4). A handler marks its own `200` and forgets the `404`; a layer marks
-    // whatever leaves, so a staging host is never indexable at one path and indexable at
-    // another.
-    let public_pages = get(public::get_published_page).layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        public::noindex_staging_hosts,
-    ));
+    let public_pages = get(public::get_published_page);
 
     // A published page points at its own assets, so the library's read side is public too.
     let public_media = get(media::public_media);
@@ -1121,369 +1106,6 @@ pub fn router(state: AppState) -> Router {
                 .layer(guards::require(&state, "workflows.manage")),
         );
 
-    // The CDN / edge surface (docs/requests/REQ-011, slice 1): reading rules and settings is
-    // `cdn.read`, writing a rule is `cdn.manage`, and invalidating cached content is the
-    // separate `cdn.purge` — a blunt act an operator may grant without letting the same
-    // account rewrite the policy that decides what may be cached. The purge tables
-    // themselves are slice 2; only the rules and settings ship here.
-    let cdn_rules = get(cdn::list_rules)
-        .layer(guards::require(&state, "cdn.read"))
-        .merge(post(cdn::create_rule).layer(guards::require(&state, "cdn.manage")));
-    let cdn_rule = get(cdn::get_rule)
-        .layer(guards::require(&state, "cdn.read"))
-        .merge(put(cdn::update_rule).layer(guards::require(&state, "cdn.manage")))
-        .merge(delete(cdn::delete_rule).layer(guards::require(&state, "cdn.manage")));
-    // Reorder is its own path, not a second `POST` merged onto `/cdn/rules`. Two handlers
-    // for the same method on one path is not an ambiguous route to axum — it is a panic
-    // while the router is *built*, which takes down every route in the application, not
-    // just this one. It read as a working feature because the API tests had never been
-    // run against this router.
-    let cdn_rule_reorder = post(cdn::reorder_rules).layer(guards::require(&state, "cdn.manage"));
-    let cdn_rule_toggle = post(cdn::toggle_rule).layer(guards::require(&state, "cdn.manage"));
-
-    // The purge surface (REQ-011, slice 2). Three keys, deliberately: reading what the
-    // cache did is `cdn.read`, asking for an invalidation is `cdn.purge`, and making a
-    // failed one run again is `cdn.manage`. Merging them would let anyone who can fix a
-    // typo in a cache rule also flush an entire production zone.
-    let cdn_status = get(cdn_purge::status).layer(guards::require(&state, "cdn.read"));
-    let cdn_purges = get(cdn_purge::list_purges)
-        .layer(guards::require(&state, "cdn.read"))
-        .merge(post(cdn_purge::create_purge).layer(guards::require(&state, "cdn.purge")));
-    let cdn_purge_one = get(cdn_purge::get_purge).layer(guards::require(&state, "cdn.read"));
-    let cdn_purge_retry = post(cdn_purge::retry_purge).layer(guards::require(&state, "cdn.manage"));
-    // Settings and the adapter catalogue. These are read by the provider screen that
-    // shipped with slice 1, so leaving them unregistered would have made two of its three
-    // fetches 404 — a screen that loads, renders an error and has no way to say so.
-    let cdn_settings = get(cdn_purge::get_settings)
-        .layer(guards::require(&state, "cdn.read"))
-        .merge(put(cdn_purge::put_settings).layer(guards::require(&state, "cdn.manage")));
-    let cdn_settings_test =
-        post(cdn_purge::test_settings).layer(guards::require(&state, "cdn.manage"));
-    let cdn_adapters = get(cdn_purge::adapters).layer(guards::require(&state, "cdn.read"));
-
-    // The edge region registry (docs/requests/REQ-035, slice 1). Two keys, and the split is
-    // the point rather than a convention: "which regions exist and how are they doing" is an
-    // operator's question during an incident, and "rename one / move the default / drain one"
-    // is a control-plane action. One key would hand every person reading the health matrix
-    // the ability to move where traffic goes.
-    //
-    // `/regions/health` and `/regions/latency-matrix` are registered as their own paths and
-    // NOT as extra methods on `/regions`: the checker polls them, and a machine caller
-    // should not have to read the panel's card payload to get a matrix.
-    let regions = get(regions::list).layer(guards::require(&state, "platform.regions.read"));
-    let regions_health =
-        get(regions::health).layer(guards::require(&state, "platform.regions.read"));
-    let regions_latency =
-        get(regions::latency).layer(guards::require(&state, "platform.regions.read"));
-    let region_one = get(regions::get_one)
-        .layer(guards::require(&state, "platform.regions.read"))
-        .merge(
-            patch(regions::patch).layer(guards::require(&state, "platform.regions.manage")),
-        );
-
-    // The developer platform (docs/requests/REQ-033, slice 1). Two keys and the split is the
-    // point: reading a key's metadata is an auditor's question, minting one is a much larger
-    // power, so a role that can see which integrations exist cannot thereby add another.
-    //
-    // `/api-keys` merges a GET and a POST, and `/api-keys/{id}` merges a GET and a DELETE, for
-    // the reason `/events/retention` already does: one path with one `MethodRouter` per verb.
-    // Rotate is a **sub-path** rather than a second `POST` on `/api-keys/{id}` — two handlers
-    // for the same method on one path is not an ambiguous route to axum, it is a panic while the
-    // router is *built*, which takes down every route in the application. The REQ-024 wizard
-    // shipped with that bug for one tick and 339 passing tests did not see it.
-    let api_keys = get(developer::list_keys)
-        .layer(guards::require(&state, "developer.keys.read"))
-        .merge(post(developer::create_key).layer(guards::require(&state, "developer.keys.manage")));
-    let api_key_one = get(developer::get_key)
-        .layer(guards::require(&state, "developer.keys.read"))
-        .merge(
-            delete(developer::revoke_key).layer(guards::require(&state, "developer.keys.manage")),
-        );
-    let api_key_rotate =
-        post(developer::rotate_key).layer(guards::require(&state, "developer.keys.manage"));
-    // The request log rides the read key — it is the same question as the key list, answered one
-    // row at a time.
-    let request_logs =
-        get(developer::list_request_logs).layer(guards::require(&state, "developer.keys.read"));
-    // The single-row read is its own path for the same reason `/events/catalogue` is a literal
-    // sibling rather than a child: `{id}` registered first would read `catalogue` as an id. Here
-    // the ids are numbers and the paths do not collide, but the drawer and the page are
-    // different shapes and a `GET` cannot answer both from one route.
-    let request_log_one =
-        get(developer::get_request_log).layer(guards::require(&state, "developer.keys.read"));
-
-    // The API Explorer (REQ-033, slice 2). Three routes and the permission split is the whole
-    // design: *reading* the document is the same question as reading a key's metadata, so a
-    // manager holds it, while *sending* a call acts as the person at the screen and is the one
-    // that has to stay with owner/administrator.
-    //
-    // `/dev/openapi.json` and `/dev/explorer/requests` are two literal siblings rather than a
-    // child and a parent for the reason `/events/catalogue` is: `{id}`-shaped segments and
-    // literal ones rank differently in axum, and a route that reads as "the explorer's config"
-    // beside "run a call" is the clearer shape anyway.
-    let dev_openapi =
-        get(explorer::openapi_document).layer(guards::require(&state, "developer.read"));
-    let dev_explorer_run =
-        post(explorer::run_request).layer(guards::require(&state, "developer.explorer.run"));
-    let dev_operations =
-        get(explorer::list_operations).layer(guards::require(&state, "developer.read"));
-
-    // OAuth applications (REQ-033, slice 3). Panel side only -- the authorization and token
-    // endpoints a third-party client calls are sessionless and live in their own file.
-    //
-    // Every mutating verb is a **sub-path**, never a second method on `/oauth-apps/{id}`, for
-    // the reason the API-key routes above carry in their own comment: axum builds its router at
-    // runtime, so two handlers for one method on one path is a startup panic
-    // (`Overlapping method route`) that `cargo check`, `cargo build` and every passing test
-    // cannot see. Rotate and suspend therefore own their segments, and the detail path carries
-    // a GET, a PATCH and a DELETE.
-    let oauth_apps = get(developer_oauth::list_apps)
-        .layer(guards::require(&state, "developer.oauth.read"))
-        .merge(
-            post(developer_oauth::create_app)
-                .layer(guards::require(&state, "developer.oauth.manage")),
-        );
-    let oauth_app_one = get(developer_oauth::get_app)
-        .layer(guards::require(&state, "developer.oauth.read"))
-        .merge(
-            patch(developer_oauth::edit_app)
-                .layer(guards::require(&state, "developer.oauth.manage")),
-        )
-        .merge(
-            delete(developer_oauth::delete_app)
-                .layer(guards::require(&state, "developer.oauth.manage")),
-        );
-    let oauth_app_rotate = post(developer_oauth::rotate_secret)
-        .layer(guards::require(&state, "developer.oauth.manage"));
-    // Suspend is its own verb rather than a PATCH with a status, because the two are not
-    // symmetric: suspending is reversible, withdrawing is not.
-    let oauth_app_suspend = post(developer_oauth::set_suspended)
-        .layer(guards::require(&state, "developer.oauth.manage"));
-
-    // The sessionless OAuth flow (REQ-033, slice 3c). **No permission guard on any of these**,
-    // and that is not an oversight: a third-party client has no Omnion account and no session,
-    // so `guards::require` would answer `401` to every legitimate call. What authenticates each
-    // endpoint is different and is stated where it happens:
-    //
-    // * `/oauth/authorize` — public. It authenticates nothing; it looks up an app by a public
-    //   client id and, if the redirect URI is one that app registered, sends the browser to it.
-    //   The authorization check is the app's own registration, and every refusal that matters
-    //   is a refusal to redirect.
-    // * `/oauth/consent` — needs a **session**, because a person has to be signed in to consent.
-    //   It is guarded by the platform's CSRF layer rather than a permission key: consenting is
-    //   not an administrative act, and requiring `developer.oauth.manage` would mean an ordinary
-    //   user of a site could not sign a third-party app into their own account.
-    // * `/oauth/token` — public, and authenticates the *client* with its secret in the body.
-    //   It never reads the session, so a signed-in person is irrelevant to it.
-    // * `/oauth/introspect` — public, and authenticates the token it is asked about.
-    //
-    // The CSRF layer is the reason `consent` is a POST and not a GET: the layer already knows a
-    // cookie-authenticated mutation needs a token, and a GET would be both a link and unguessable
-    // proof of nothing.
-    let oauth_authorize = get(oauth_flow::authorize_start);
-    let oauth_consent = post(oauth_flow::consent_submit);
-    let oauth_token = post(oauth_flow::token);
-    let oauth_introspect = get(oauth_flow::introspect);
-
-    // SDK scaffolds and the CLI (REQ-033, slice 4). Five routes, and the split is the point:
-    // **generating** a starter writes a file into a bucket, so it is `developer.sdks.scaffold`
-    // and not the read key -- a read-only developer must not be able to produce an artifact.
-    // **Validating** a manifest and **listing** the templates are pure reads and ride
-    // `developer.read`, the same key the API Explorer's document browsing does: both answer
-    // "what can I build here".
-    let dev_scaffold =
-        post(developer_sdks::scaffold).layer(guards::require(&state, "developer.sdks.scaffold"));
-    let dev_manifest_validate = post(developer_sdks::validate_manifest_endpoint)
-        .layer(guards::require(&state, "developer.read"));
-    let dev_sdk_templates =
-        get(developer_sdks::templates).layer(guards::require(&state, "developer.read"));
-
-    // The recorded generations and the archive (REQ-033, slice 4). All three take the SAME
-    // `developer.sdks.scaffold` key the generator takes, and that is the argument: a read-only
-    // developer must not be able to produce an artefact, and a list of what was produced is part
-    // of producing one. A separate read key here would be a key nobody holds and a list nobody
-    // sees.
-    //
-    // The download is the one that matters for the permission argument, and it is not a
-    // `developer.read`: a read-only developer who can fetch the bytes of a scaffold is holding
-    // the source of an extension, which is the artefact, not a description of it.
-    //
-    // GET and POST share `/dev/sdks/scaffolds` and are **merged**, not chained with `.or()` —
-    // `MethodRouter::or` runs the left router's error handling when it returns one, which is not
-    // what "also accept POST here" means. The roles router at the top of this function is the
-    // pattern.
-    let dev_scaffold_records = get(developer_scaffolds::list)
-        .layer(guards::require(&state, "developer.sdks.scaffold"))
-        .merge(
-            post(developer_scaffolds::record)
-                .layer(guards::require(&state, "developer.sdks.scaffold")),
-        );
-    let dev_scaffold_download = get(developer_scaffolds::download)
-        .layer(guards::require(&state, "developer.sdks.scaffold"));
-
-    // The CLI device-code flow, and the permission split is the phishing defence rather than a
-    // data-visibility question:
-    //
-    // * `start` is a *read* of the tenant's CLI state, so `developer.read`. It mints a code but
-    //   mints nothing usable: the token only exists once a human approves.
-    // * `approve` is `developer.keys.manage`, exactly as the request's own API table says. A
-    //   session that cannot mint a key cannot mint a CLI token, and the token is a credential for
-    //   the same tenant. This is the permission that makes approving somebody else's login a
-    //   privileged act.
-    // * `poll` carries **no guard and no session**, and that is not an oversight: the device
-    //   code *is* the credential for this endpoint, it is worthless until approved, and a
-    //   terminal cannot hold a cookie. The route's own doc says where the security is.
-    let cli_device_start =
-        post(developer_sdks::device_start).layer(guards::require(&state, "developer.read"));
-    let cli_device_approve = post(developer_sdks::device_approve)
-        .layer(guards::require(&state, "developer.keys.manage"));
-    let cli_device_poll = post(developer_sdks::device_poll);
-    // The lookup is a *read* of a pending code -- it shows a person what they are about to
-    // approve -- so it rides the read key rather than the manage one. Requiring manage here would
-    // mean a developer who cannot approve could not even look at what a code wants, which is the
-    // opposite of the useful half.
-    let cli_device_lookup =
-        get(developer_sdks::device_lookup).layer(guards::require(&state, "developer.read"));
-
-    // The deployment centre (REQ-024, slice 1). Six reads and one write, and the write is
-    // `deployment.manage` because "check for updates now" reaches out to the network and
-    // rewrites the release cache — it is not a read even though it answers a question.
-    //
-    // `deployment.read` covers all six, rather than one key per surface: every value they
-    // return is already visible on the environment cards, which the same key gates. A finer
-    // split would create a key that means "may see what is installed" and a second that means
-    // "may see what could be installed", and the second is the one an operator needs to compare
-    // a release's notes against the running core — so it would be the key nobody holds.
-    let deployment_version =
-        get(deployment::get_version).layer(guards::require(&state, "deployment.read"));
-    let deployment_environments =
-        get(deployment::list_environments).layer(guards::require(&state, "deployment.read"));
-    let deployment_environment_one =
-        get(deployment::get_environment).layer(guards::require(&state, "deployment.read"));
-    let deployment_releases =
-        get(deployment::list_releases).layer(guards::require(&state, "deployment.read"));
-    let deployment_release_one =
-        get(deployment::get_release).layer(guards::require(&state, "deployment.read"));
-    let deployment_history =
-        get(deployment::list_history).layer(guards::require(&state, "deployment.read"));
-    let deployment_checks =
-        get(deployment::get_checks).layer(guards::require(&state, "deployment.read"));
-    // The one write in slice 1. Named `checks/run` rather than merged onto the checks route so
-    // a panel that links to `/deployment/checks` can never turn a GET into a network call.
-    let deployment_checks_run =
-        post(deployment::run_check_now).layer(guards::require(&state, "deployment.manage"));
-
-    // The deploy wizard (REQ-024, slice 2). Pre-flight and deploy are two POSTs, and they are
-    // **sub-paths** rather than two methods on `/deployment/environments/{environment}`: a path
-    // carrying two POSTs is not a thing axum can merge, and asking it to panics at startup —
-    // `Overlapping method route`, which `cargo check` cannot see because the conflict is built at
-    // runtime. The client has always called `/preflight` and `/deploy` (apps/admin/lib/api.ts), and
-    // the handlers have always documented those paths; only the mount disagreed. So the
-    // environment route is a plain GET again and each write owns a segment — the same rule
-    // `/deployment/cluster/{environment}/restart` already followed.
-    let deployment_environment_deploy =
-        post(deployment_run::start_deploy).layer(guards::require(&state, "deployment.manage"));
-    // The job routes. Reading a job and its log is `deployment.read` — they return the same
-    // values the history screen already shows — while cancel is `deployment.manage`, because
-    // stopping a run is an action on the environment, not a read of it.
-    let deployment_job = get(deployment_run::get_job)
-        .layer(guards::require(&state, "deployment.read"))
-        .merge(
-            post(deployment_run::cancel_job).layer(guards::require(&state, "deployment.manage")),
-        );
-    // The log, as a stream and as a cursor poll. One key, one route, one handler: the two shapes
-    // answer the same URL and differ only by `?cursor=`, so they are dispatched inside
-    // `deployment_run::log` rather than registered as two GETs on one segment.
-    let deployment_job_log =
-        get(deployment_run::log).layer(guards::require(&state, "deployment.read"));
-
-    // Rollback and the maintenance window (REQ-024, slice 3).
-    //
-    // Rollback is `deployment.rollback` — its own key, not `deployment.manage`, because the
-    // request's permission table says so and because the two deserve different answers when
-    // they are missing: an operator who may deploy but not roll back is a normal configuration
-    // (they fix forward), and an operator who may roll back but not deploy is another (they
-    // handle incidents). One key for both would make one of those configurations impossible.
-    let deployment_rollback =
-        post(deployment_ops::start_rollback).layer(guards::require(&state, "deployment.rollback"));
-    // The window is read by every admin session (the shell banner) and written by
-    // `deployment.maintenance`, which is a *different* key from `deployment.manage` on purpose:
-    // opening a maintenance window is what an operator does *instead of* deploying, and
-    // requiring the deploy key to stop the world would mean the only people allowed to pause a
-    // release are the ones allowed to start one.
-    let deployment_maintenance =
-        get(deployment_ops::list_maintenance).layer(guards::require(&state, "deployment.read"));
-
-    // The cluster panel (REQ-024, slice 4). The read is `deployment.cluster.read` and not
-    // `deployment.read` on purpose: it is a *different kind* of information — host-level replica
-    // and resource numbers, read from the runtime rather than from this database — and an
-    // account allowed to read a deploy's history is not automatically an account whose job is to
-    // see how much CPU the cluster is using. The two writes are `deployment.manage`, the same key
-    // as "check for updates now", because both reach out of the database and change something
-    // outside it.
-    let deployment_cluster = get(deployment_cluster::get_cluster)
-        .layer(guards::require(&state, "deployment.cluster.read"));
-    let deployment_cluster_samples = get(deployment_cluster::get_samples)
-        .layer(guards::require(&state, "deployment.cluster.read"));
-    let deployment_cluster_restart = post(deployment_cluster::restart_workload)
-        .layer(guards::require(&state, "deployment.manage"));
-    let deployment_cluster_sample =
-        post(deployment_cluster::run_sample).layer(guards::require(&state, "deployment.manage"));
-    let deployment_maintenance_one = put(deployment_ops::update_maintenance)
-        .layer(guards::require(&state, "deployment.maintenance"));
-
-    // Staging environments (REQ-017). Reading the list and one environment is `deployment.read`;
-    // creating one, re-cloning it and cancelling a clone is `deployment.preview`; archiving one
-    // is `deployment.rollback`. Three keys rather than one, because looking at a staging copy,
-    // filling it and throwing it away are three different amounts of trust.
-    let environments = get(environments::list_environments)
-        .layer(guards::require(&state, "deployment.read"))
-        .merge(
-            post(environments::create_environment)
-                .layer(guards::require(&state, "deployment.preview")),
-        );
-    let environment_one = get(environments::get_environment)
-        .layer(guards::require(&state, "deployment.read"))
-        .merge(
-            delete(environments::archive_environment)
-                .layer(guards::require(&state, "deployment.rollback")),
-        );
-    // Re-clone is its own path (the request's own API table puts it at `/clone`), so it gets a
-    // POST-only router rather than being merged onto `/environments/{id}`.
-    let environment_one_clone =
-        post(environments::start_clone).layer(guards::require(&state, "deployment.preview"));
-    let environment_jobs =
-        get(environments::list_clone_jobs).layer(guards::require(&state, "deployment.read"));
-    // Cancel is its own path rather than a merged `POST` on the job collection: it acts on one
-    // job and is destructive, and a collection-level POST that cancels "the current one" is a
-    // route whose meaning depends on state the caller cannot see.
-    let environment_job_cancel =
-        post(environments::cancel_clone).layer(guards::require(&state, "deployment.preview"));
-    // The change set is a *read*: it says what staging holds that production does not, and every
-    // row in it is a row the same caller can already open in the editor. Slice 3's promotion is
-    // what writes, and it is guarded separately as `deployment.promote` — so the tab can be read
-    // by somebody who can look at a staging copy without being able to push it to production.
-    let environment_changes =
-        get(environments::list_changes).layer(guards::require(&state, "deployment.read"));
-
-    // Promotions (REQ-017 slice 3). Reading a promotion is `deployment.read`; *requesting* one
-    // and withdrawing it is `deployment.preview`, because a request records an intent and changes
-    // nothing — an account that fills a staging copy must be able to say "this is ready" without
-    // being able to push it. Approving is `deployment.deploy`: the only route in this request that
-    // writes to production.
-    let environment_promotions = get(promotions::list_promotions)
-        .layer(guards::require(&state, "deployment.read"))
-        .merge(
-            post(promotions::request_promotion)
-                .layer(guards::require(&state, "deployment.preview")),
-        );
-    let promotion_one =
-        get(promotions::get_promotion).layer(guards::require(&state, "deployment.read"));
-    let promotion_approve =
-        post(promotions::approve_promotion).layer(guards::require(&state, "deployment.deploy"));
-    let promotion_cancel =
-        post(promotions::cancel_promotion).layer(guards::require(&state, "deployment.preview"));
-
     // Search (docs/requests/REQ-002): the one search box and its index. Searching is
     // `search.read` — the box every signed-in account holds — and the handler narrows the
     // answer to the providers the caller's own read permissions cover; rebuilding the index
@@ -1605,6 +1227,21 @@ pub fn router(state: AppState) -> Router {
             "/notifications/outbox/{id}/retry",
             post(notifications_admin::retry_outbox),
         )
+        // **Read and write are one permission, not two.** `notifications.admin` already means
+        // "the organization-wide delivery log and the router's rules" (catalogue `notifications.
+        // admin`), so a window that decides how long that log keeps its rows is part of the same
+        // surface — splitting it would need a new catalogued key, and a key with no route behind
+        // it is a promise the platform cannot keep (the catalogue's own note, on
+        // `notifications.admin` itself, which sat uncatalogued for two slices).
+        //
+        // The window is set by `PATCH` and read by `GET` on the SAME path, which is why the
+        // handler for the write delegates to the read rather than re-assembling the answer: two
+        // bodies describing one fact is the defect class this branch keeps meeting.
+        .route(
+            "/notifications/outbox/retention",
+            get(notifications_admin::outbox_retention)
+                .merge(patch(notifications_admin::set_outbox_retention)),
+        )
         .route_layer(guards::require(&state, "notifications.admin"));
     let notifications_routes = Router::new()
         .route(
@@ -1669,20 +1306,6 @@ pub fn router(state: AppState) -> Router {
     // actually needs, so nesting it under a broader builder would add a permission the route
     // never asked for. The guards are split by blast radius — reading a key list is not
     // issuing a credential, and neither is reading the traffic record.
-    //
-    // **The add/add resolution.** `crates/developer` and this module were created independently
-    // on `main` (REQ-022 slice 1) and here (REQ-033), so the merge had to pick a side. It kept
-    // this branch's, which answers every endpoint main's slice registered except two; those two
-    // are grafted in `routes/developer_portal_extras.rs`. Main's *paths* are kept byte-for-byte
-    // here as aliases onto this branch's handlers rather than as a second reader over the same
-    // table: two handlers answering the same question drift the day a column is added, and main's
-    // `list_logs` would be a second answer to `/request-logs` with a narrower payload.
-    //
-    // The alias costs nothing at runtime beyond a route entry, and it is why a merge did not have
-    // to touch main's admin screens. The one deliberate difference: main's `developer.logs.read`
-    // is not re-registered, because this branch reads the traffic record under `keys.read` — it
-    // is the same question as the key list, answered one row at a time, and the split is already
-    // argued at the `/request-logs` route below.
     let developer_routes = Router::new()
         // The overview's card row (REQ-022, slice 2). `developer.read` rather than a narrower
         // key: the screen exists to be the first thing a key author sees, and a permission
@@ -1695,8 +1318,7 @@ pub fn router(state: AppState) -> Router {
         // read a key author needs before they have a key.
         .route(
             "/developer/scopes",
-            get(developer_portal_extras::list_scopes)
-                .layer(guards::require(&state, "developer.read")),
+            get(developer::list_scopes).layer(guards::require(&state, "developer.read")),
         )
         .route(
             "/developer/api-keys",
@@ -1718,16 +1340,13 @@ pub fn router(state: AppState) -> Router {
             "/developer/api-keys/{id}/rotate",
             post(developer::rotate_key).layer(guards::require(&state, "developer.keys.manage")),
         )
-        // Main's `/developer/logs` paths, answered by this branch's reader. Same rows, same
-        // filters, one implementation — see the comment above on why this is an alias and not
-        // a second `list_logs`.
         .route(
             "/developer/logs",
-            get(developer::list_request_logs).layer(guards::require(&state, "developer.keys.read")),
+            get(developer::list_logs).layer(guards::require(&state, "developer.logs.read")),
         )
         .route(
             "/developer/logs/{id}",
-            get(developer::get_request_log).layer(guards::require(&state, "developer.keys.read")),
+            get(developer::get_log).layer(guards::require(&state, "developer.logs.read")),
         );
     // One guarded route deliberately accepts a developer key, because the REQ's own acceptance
     // criterion is "a key authenticates on a guarded endpoint and is rejected after
@@ -1735,26 +1354,12 @@ pub fn router(state: AppState) -> Router {
     // permission chosen is `content.pages.read` because it is a real, catalogued read that a
     // publisher's integration genuinely needs, so the walk exercises the production shape
     // rather than a purpose-made one.
-    //
-    // It is guarded by **`developer_auth::require_or_key`, not `guards::require_or_developer_key`**,
-    // and the difference is not stylistic. Both accept a key in place of a session and both check
-    // its scopes, but only the `developer_auth` layer records the use afterwards — the request-log
-    // row and the `last_used_at` bump. The `guards` twin authenticates and then returns, so
-    // `last_used_at` stayed null for every request made through this route and the panel's
-    // "Last used" column read "never" for a key that had just called in. The walk
-    // `a_key_authenticates_a_guarded_call_and_dies_the_moment_it_is_revoked` caught it the first
-    // time it reached a database: the request returned 200 and the row said the key was unused.
-    //
-    // `guards::require_or_developer_key` is therefore unused. It is kept out of the router rather
-    // than deleted here — `guards.rs` is shared with every other writer's routes, so removing it
-    // belongs to whoever owns that file. What belongs to this REQ is that **no route this branch
-    // adds is guarded by the twin**: one guard that authenticates and one that authenticates
-    // *and accounts* is exactly the pair that lets a column silently stop being true.
     let developer_guarded = Router::new().route(
         "/developer/sandbox/probe",
-        get(developer_portal_extras::sandbox_probe).layer(
-            crate::developer_auth::require_or_key(&state, "content.pages.read"),
-        ),
+        get(developer::sandbox_probe).layer(guards::require_or_developer_key(
+            &state,
+            "content.pages.read",
+        )),
     );
 
     let security_reports = Router::new()
@@ -2134,6 +1739,188 @@ pub fn router(state: AppState) -> Router {
         .merge(notifications_routes)
         .route("/notifications/{id}", notifications_entry)
         .route("/notifications/{id}/read", notifications_read)
+        // CRM intake (REQ-117, slice 1). The public capture endpoint carries no guard: it
+        // authenticates by the source's own hashed key, and the panel surface splits into
+        // three powers — reading the inbox, working a lead, and editing the capture surface
+        // that decides what is stored about the people who write in.
+        //
+        // `/leads/duplicates` is declared before `/leads/{id}` because axum ranks static
+        // segments ahead of parameters, and "duplicates" read as a lead id would be a `400`
+        // a panel shows as "this screen is broken".
+        .route("/crm/intake/{source_key}", post(crm_intake::capture))
+        .route(
+            "/crm/intake/sources",
+            get(crm_intake::list_sources)
+                .layer(guards::require(&state, "crm.intake.manage"))
+                .merge(
+                    post(crm_intake::create_source)
+                        .layer(guards::require(&state, "crm.intake.manage")),
+                ),
+        )
+        .route(
+            "/crm/intake/sources/{id}",
+            get(crm_intake::get_source)
+                .layer(guards::require(&state, "crm.intake.manage"))
+                .merge(
+                    patch(crm_intake::update_source)
+                        .layer(guards::require(&state, "crm.intake.manage")),
+                )
+                .merge(
+                    delete(crm_intake::delete_source)
+                        .layer(guards::require(&state, "crm.intake.manage")),
+                ),
+        )
+        .route(
+            "/crm/intake/sources/{id}/rotate-key",
+            post(crm_intake::rotate_key).layer(guards::require(&state, "crm.intake.manage")),
+        )
+        .route(
+            "/crm/intake/sources/{id}/test",
+            post(crm_intake::test_mapping).layer(guards::require(&state, "crm.intake.manage")),
+        )
+        .route(
+            "/crm/intake/autoresponder/templates",
+            get(crm_intake::autoresponder_templates)
+                .layer(guards::require(&state, "crm.intake.manage")),
+        )
+        .route(
+            "/crm/intake/autoresponder/preview",
+            post(crm_intake::preview_autoresponder)
+                .layer(guards::require(&state, "crm.intake.manage")),
+        )
+        .route(
+            "/crm/leads",
+            get(crm_intake::list_leads).layer(guards::require(&state, "crm.leads.read")),
+        )
+        .route(
+            "/crm/leads/duplicates",
+            get(crm_intake::duplicates).layer(guards::require(&state, "crm.leads.read")),
+        )
+        // The counters on their own. Declared **before** `/crm/leads/{id}`: axum prefers the
+        // literal segment, and a uuid parse of the word "metrics" is a 400 a panel renders as a
+        // broken screen rather than as the route it is. The same reason `duplicates` sits above.
+        .route(
+            "/crm/leads/metrics",
+            get(crm_intake::metrics).layer(guards::require(&state, "crm.leads.read")),
+        )
+        .route(
+            "/crm/leads/{id}",
+            get(crm_intake::get_lead)
+                .layer(guards::require(&state, "crm.leads.read"))
+                .merge(
+                    patch(crm_intake::patch_lead)
+                        .layer(guards::require(&state, "crm.leads.manage")),
+                )
+                .merge(
+                    delete(crm_intake::delete_lead)
+                        .layer(guards::require(&state, "crm.leads.manage")),
+                ),
+        )
+        .route(
+            "/crm/leads/{id}/respond",
+            post(crm_intake::respond).layer(guards::require(&state, "crm.leads.manage")),
+        )
+        // Assignment is its own key, not a wing of `crm.leads.manage`: what a lead *says* and
+        // who is answerable for it are different decisions, and the person who most often needs
+        // to hand a lead over is usually the one who may edit it.
+        // The duplicate verdict is reversed through a named endpoint, not a PATCH on the
+        // lead: only the store knows which contact the dedupe matched, so an endpoint that
+        // took a `contact_id` from the panel would either make the panel guess or accept an
+        // id for a row it has not matched. `crm.leads.manage` — the same power as rejecting
+        // a lead, because it changes what a lead is.
+        .route(
+            "/crm/leads/{id}/duplicate-decision",
+            post(crm_intake::duplicate_decision)
+                .layer(guards::require(&state, "crm.leads.manage")),
+        )
+        .route(
+            "/crm/leads/{id}/assign",
+            post(crm_intake::assign).layer(guards::require(&state, "crm.leads.assign")),
+        )
+        // Conversion is its own key, not `crm.leads.manage`: turning a lead into a contact,
+        // an opportunity and eventually a customer is a promise to somebody outside the
+        // panel, and a support agent who may edit a lead row has no business making that
+        // promise.
+        //
+        // There is deliberately no `/crm/leads/flow` here. It answered "which of the flow's
+        // modules is installed" as a second read, and the stepper never made it: the lead
+        // detail already returns the four steps computed, each `Blocked` step naming the
+        // module it is waiting for. A second read of the same fact is a second place the
+        // answer and the screen can disagree, and a client free to prefer it is a client
+        // free to render a stepper the server did not write.
+        .route(
+            "/crm/leads/{id}/convert",
+            post(crm_intake::convert).layer(guards::require(&state, "crm.leads.convert")),
+        )
+        // The hand-over roster. `crm.leads.read`, not `crm.leads.assign`: the inbox already
+        // shows who owns what, and a screen that shows an owner column while hiding the list
+        // of owners teaches the reader that the column is an id.
+        .route(
+            "/crm/leads/owners",
+            get(crm_intake::owners).layer(guards::require(&state, "crm.leads.read")),
+        )
+        // The bulk hand-over. `crm.leads.assign`, because a batch of twenty hand-overs is
+        // twenty hand-overs and no more powerful than the one it replaces.
+        .route(
+            "/crm/leads/bulk-assign",
+            post(crm_intake::bulk_assign).layer(guards::require(&state, "crm.leads.assign")),
+        )
+        // The bulk bar's other three verbs, in ONE endpoint rather than three.
+        //
+        // `crm.leads.manage` — the same key `/{id}/respond`, `/{id}/spam` and `/{id}/reject`
+        // already carry, one row at a time. A batch needing a *different* key would mean the
+        // power was cheap per row and expensive in bulk, which is a privilege nobody was
+        // granted and no operator expects. The verb is a closed enum in the body, so a typo is
+        // a `400` naming the three real names rather than an `else` arm that "responded" twenty
+        // leads.
+        .route(
+            "/crm/leads/bulk-action",
+            post(crm_intake::bulk_action).layer(guards::require(&state, "crm.leads.manage")),
+        )
+        // The export. `crm.leads.read`: it writes one audit row and downloads a document of
+        // what the caller may already read, which is the same contract as every other export
+        // on this platform (the security findings CSV is exactly this shape).
+        //
+        // Declared here, before `/crm/leads/{id}`, and so is `bulk-assign` — axum ranks a
+        // static segment ahead of a parameter, so both would match anyway; the ordering puts
+        // the intent in the file rather than leaving it to a matcher.
+        .route(
+            "/crm/leads/export",
+            get(crm_intake::export_leads).layer(guards::require(&state, "crm.leads.read")),
+        )
+        .route(
+            "/crm/leads/retention/sweep",
+            post(crm_intake::retention_sweep).layer(guards::require(&state, "crm.leads.manage")),
+        )
+        .route(
+            "/crm/leads/{id}/reject",
+            post(crm_intake::reject).layer(guards::require(&state, "crm.leads.manage")),
+        )
+        .route(
+            "/crm/leads/{id}/spam",
+            post(crm_intake::mark_spam).layer(guards::require(&state, "crm.leads.manage")),
+        )
+        // CRM assignment and SLA (docs/requests/REQ-117, slice 2). Three powers, split by
+        // what they are over rather than by which screen they live on:
+        //
+        // * `crm.intake.manage` — the assignment chain. Editing a rule decides, for every
+        //   lead from now on, which person answers it, so it is the same power as editing
+        //   the intake sources themselves and carries that key.
+        // * `crm.sla.manage` — the response targets. A policy is a promise to a submitter
+        //   about how fast somebody answers, and it is its own key because "who answers"
+        //   and "how fast" go to different people in most organizations: a team lead sets
+        //   the target, a sales manager sets the routing.
+        // * `crm.leads.read` — the simulator, and only the simulator. It reads the rules,
+        //   answers a hypothetical, writes nothing and advances no cursor, so it needs no
+        //   management power. That is what lets a support lead ask "who would get this"
+        //   without being able to change who gets it.
+        //
+        // The rules themselves are ONE router with two layers rather than two routers: the
+        // chain and the policies are different tables but the same screen, and splitting
+        // them into separate `.merge()`s would let a later edit give one of them the other's
+        // key without anybody noticing.
+        .merge(crm_assignment_surface(&state))
+        .merge(storefront_surface(&state))
         .route(
             "/analytics/settings",
             analytics_settings_read.merge(analytics_settings_write),
@@ -2148,7 +1935,6 @@ pub fn router(state: AppState) -> Router {
         .merge(analytics_goals_write)
         .merge(analytics_privacy)
         .merge(analytics_collect)
-        .merge(invitation_preview)
         .route(
             "/iam/permissions",
             get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),
@@ -2221,66 +2007,8 @@ pub fn router(state: AppState) -> Router {
             "/iam/audit",
             get(iam::list_audit).layer(guards::require(&state, "audit.read")),
         )
-        .route("/me/organizations", my_organizations)
-        .route("/me/organization", switch_organization)
         .route("/organizations", organizations)
         .route("/organizations/{id}", organization)
-        .route("/organizations/{id}/members", organization_members)
-        .route("/organizations/{id}/members/{user_id}", organization_member)
-        .route("/organizations/{id}/invitations", organization_invitations)
-        .route("/organizations/{id}/departments", organization_departments)
-        .route(
-            "/organizations/{id}/departments/{department_id}",
-            organization_department,
-        )
-        .route(
-            "/organizations/{id}/departments/{department_id}/members",
-            department_members,
-        )
-        .route(
-            "/organizations/{id}/departments/{department_id}/members/{user_id}",
-            delete(tenancy_departments::remove_department_member)
-                .layer(guards::require(&state, "organizations.manage")),
-        )
-        .route(
-            "/organizations/{id}/departments/{department_id}/roles",
-            department_roles,
-        )
-        .route(
-            "/organizations/{id}/departments/{department_id}/roles/{binding_id}",
-            delete(tenancy_departments::unbind_department_role)
-                .layer(guards::require(&state, "organizations.manage"))
-                .layer(guards::require(&state, "iam.bindings.manage")),
-        )
-        .route(
-            "/organizations/{id}/members/{user_id}/departments",
-            member_departments,
-        )
-        .route(
-            "/organizations/{id}/members/{user_id}/role-bindings",
-            organization_member_role_bindings,
-        )
-        .route(
-            "/organizations/{id}/members/{user_id}/role-bindings/{binding_id}",
-            organization_member_role_binding,
-        )
-        .route("/organizations/{id}/settings", organization_settings)
-        .route("/organizations/{id}/modules", organization_modules)
-        .route("/organizations/{id}/limits", organization_limits)
-        .route("/organizations/{id}/usage", organization_usage)
-        .route("/organizations/{id}/audit", organization_audit)
-        .route(
-            "/organizations/{id}/invitations/{invitation_id}",
-            organization_invitation,
-        )
-        .route(
-            "/organizations/{id}/invitations/queue",
-            organization_invitation_queue,
-        )
-        .route(
-            "/organizations/{id}/invitations/{invitation_id}/release",
-            organization_invitation_approval,
-        )
         .route("/sites", sites)
         .route("/sites/{id}", site)
         .route("/sites/{id}/domains", domains)
@@ -2359,10 +2087,10 @@ pub fn router(state: AppState) -> Router {
         .route("/media/quarantine", media_quarantine)
         .route("/media/quarantine/{id}/release", media_quarantine_release)
         .route("/media/folders/{id}/grants", media_folder_grants)
-        .route("/media/grants/{grant_id}", media_grant_delete)
         .route("/media/folders/{id}/grants", media_folder_grant_write)
         .route("/media/{id}/grants", media_file_grants)
         .route("/media/{id}/grants", media_file_grant_write)
+        .route("/media/grants/{grant_id}", media_grant_delete)
         .route("/media/grant-subjects", media_subjects)
         .route("/media/{id}/grant-effective", media_grant_effective)
         // Retention. `retention`, `retention/runs` and `retention/repair` are *static*
@@ -2442,138 +2170,6 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/models", ai_models)
         .route("/ai/models/{id}", ai_model)
         .route("/ai/chat", ai_chat)
-        .route("/cdn/rules", cdn_rules)
-        .route("/cdn/rules/reorder", cdn_rule_reorder)
-        .route("/cdn/rules/{id}", cdn_rule)
-        .route("/cdn/rules/{id}/toggle", cdn_rule_toggle)
-        // The developer platform (REQ-033, slice 1). Mounted in the order the literal segments
-        // require: `/api-keys/{id}/rotate` is registered before nothing in particular here, but
-        // `/request-logs` and `/request-logs/{id}` are two shapes of the same verb, and axum
-        // matches the longer literal first only because the parameterised one is a different
-        // arity — registering both is safe, registering two *methods* on one is not.
-        .route("/api-keys", api_keys)
-        .route("/api-keys/{id}", api_key_one)
-        .route("/api-keys/{id}/rotate", api_key_rotate)
-        .route("/request-logs", request_logs)
-        .route("/request-logs/{id}", request_log_one)
-        .route("/dev/openapi.json", dev_openapi)
-        .route("/dev/operations", dev_operations)
-        .route("/dev/explorer/requests", dev_explorer_run)
-        .route("/oauth-apps", oauth_apps)
-        .route("/oauth-apps/{id}", oauth_app_one)
-        .route("/oauth-apps/{id}/rotate", oauth_app_rotate)
-        .route("/oauth-apps/{id}/suspend", oauth_app_suspend)
-        .route("/oauth/authorize", oauth_authorize)
-        .route("/oauth/consent", oauth_consent)
-        .route("/oauth/token", oauth_token)
-        .route("/oauth/introspect", oauth_introspect)
-        // SDK scaffolds (REQ-033, slice 4). `/dev/sdks/templates` is a literal sibling of
-        // `/dev/sdks/scaffold` rather than a child: axum ranks `{id}` segments below literal
-        // ones, and a `scaffold` verb that were a child of `templates` would read as a template
-        // named "scaffold". Same reason `/dev/openapi.json` sits beside
-        // `/dev/explorer/requests`.
-        .route("/dev/sdks/templates", dev_sdk_templates)
-        .route("/dev/sdks/scaffold", dev_scaffold)
-        .route("/dev/manifests/validate", dev_manifest_validate)
-        // The recorded generations and the archive itself. `POST /dev/sdks/scaffold` above is the
-        // *preview*: it returns the file tree and writes nothing, which is what a person wants
-        // while choosing a name. These are the durable half — a row per generation, and the zip
-        // as a file. `GET` and `POST` on `/dev/sdks/scaffolds` are different methods on the same
-        // path, so the literal segment stays above `{id}` for the same reason
-        // `/dev/sdks/templates` is a sibling: axum ranks a `{id}` above a literal only when the
-        // methods differ, and sharing the path here would make one of them unreachable.
-        .route("/dev/sdks/scaffolds", dev_scaffold_records)
-        .route("/dev/sdks/scaffolds/{id}/download", dev_scaffold_download)
-        // The device-code flow. `poll` and `approve` are separate segments rather than two
-        // methods on one path, for the `Overlapping method route` reason the OAuth block above
-        // records: axum builds its router at runtime, so a collision there is a startup panic
-        // that `cargo check` and every passing test cannot see.
-        .route("/dev/cli/device-code", cli_device_start)
-        .route("/dev/cli/device-code/approve", cli_device_approve)
-        .route("/dev/cli/device-code/poll", cli_device_poll)
-        .route("/dev/cli/device-code/{user_code}", cli_device_lookup)
-        .route("/cdn/status", cdn_status)
-        .route("/cdn/purges", cdn_purges)
-        .route("/cdn/purges/{id}", cdn_purge_one)
-        .route("/cdn/purges/{id}/retry", cdn_purge_retry)
-        .route("/cdn/settings", cdn_settings)
-        .route("/cdn/settings/test", cdn_settings_test)
-        .route("/cdn/adapters", cdn_adapters)
-        // Order matters for the same reason `/cdn/rules/reorder` precedes
-        // `/cdn/rules/{id}`: the literal segments are registered first so a path parameter
-        // can never swallow them. `/regions/health` and `/regions/latency-matrix` are two
-        // literals against `{code}`.
-        .route("/regions", regions)
-        .route("/regions/health", regions_health)
-        .route("/regions/latency-matrix", regions_latency)
-        .route("/regions/{code}", region_one)
-        .route("/deployment/version", deployment_version)
-        .route("/deployment/environments", deployment_environments)
-        .route(
-            "/deployment/environments/{environment}",
-            deployment_environment_one,
-        )
-        // Two POSTs, two segments. Mounted beside the environment route rather than merged onto
-        // it: axum panics at startup on a path carrying two of the same method, and the panel has
-        // called these sub-paths since slice 2.
-        .route(
-            "/deployment/environments/{environment}/preflight",
-            post(deployment_run::preflight).layer(guards::require(&state, "deployment.manage")),
-        )
-        .route(
-            "/deployment/environments/{environment}/deploy",
-            deployment_environment_deploy,
-        )
-        .route("/deployment/releases", deployment_releases)
-        .route("/deployment/releases/{version}", deployment_release_one)
-        .route("/deployment/history", deployment_history)
-        .route("/deployment/checks", deployment_checks)
-        .route("/deployment/checks/run", deployment_checks_run)
-        .route("/deployment/jobs/{id}", deployment_job)
-        .route("/deployment/jobs/{id}/log", deployment_job_log)
-        .route(
-            "/deployment/environments/{environment}/rollback",
-            deployment_rollback,
-        )
-        .route("/deployment/maintenance", deployment_maintenance)
-        // The per-environment window is a `PUT` on its own path rather than a body field on the
-        // list route: the shell banner polls the list in every session, and a poll that could
-        // change a window would be a `GET` with a side effect.
-        .route(
-            "/deployment/maintenance/{environment}",
-            deployment_maintenance_one,
-        )
-        // `/deployment/cluster` answers `404` on a single instance rather than an empty cluster,
-        // so there is no disabled card to tease with. The samples and the restart hang off it
-        // rather than off `/cluster/{environment}`: the environment is a path parameter the
-        // routes read from the snapshot, and splitting it across two shapes would let a caller
-        // read one environment's series while restarting another's.
-        .route("/deployment/cluster", deployment_cluster)
-        .route(
-            "/deployment/cluster/{environment}/samples/{workload}",
-            deployment_cluster_samples,
-        )
-        .route(
-            "/deployment/cluster/{environment}/restart",
-            deployment_cluster_restart,
-        )
-        .route(
-            "/deployment/cluster/{environment}/sample",
-            deployment_cluster_sample,
-        )
-        .route("/environments", environments)
-        .route("/environments/{id}", environment_one)
-        .route("/environments/{id}/clone", environment_one_clone)
-        .route("/environments/{id}/clone-jobs", environment_jobs)
-        .route("/environments/{id}/changes", environment_changes)
-        .route("/environments/{id}/promotions", environment_promotions)
-        .route("/promotions/{id}", promotion_one)
-        .route("/promotions/{id}/approve", promotion_approve)
-        .route("/promotions/{id}/cancel", promotion_cancel)
-        .route(
-            "/environments/{id}/clone-jobs/{job_id}/cancel",
-            environment_job_cancel,
-        )
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)
@@ -2595,6 +2191,9 @@ pub fn router(state: AppState) -> Router {
         .route("/automations", automations)
         .route("/automations/catalogue", automation_catalogue)
         .route("/automations/{id}", automation_entry)
+        // Automation projects (REQ-133). Declared before `/automations/{id}`'s neighbours by
+        // being its own literal root — `/projects` cannot be read as an automation id.
+        .merge(automation_projects_surface(&state))
         .route(
             "/pages/{id}/revisions/{revision_id}/comments",
             page_revision_comments,
@@ -2655,18 +2254,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(readyz::readyz))
-        // The per-organization module switch (REQ-005, slice 4). One layer on the whole API
-        // rather than a guard per module: the layer asks the same path table the panel's
-        // navigation is built from which module owns the matched route, so a screen cannot be
-        // added to a module without the switch governing it, and the core (tenancy, identity,
-        // content, search) is never a module and can never be switched off.
-        //
-        // The switch is a layer on `v1`, so it runs INSIDE the nest, which is what keeps it
-        // below the CSRF layer below: a request must authenticate before either of them answers.
-        .nest(
-            "/api/v1",
-            v1.layer(crate::module_guard::RequireModules::new(state.clone())),
-        )
+        .nest("/api/v1", v1)
         // The limiter is the OUTERMOST layer, ahead of CSRF and ahead of every permission guard,
         // and the order is the design rather than an accident of where the line falls in the chain:
         //
@@ -2693,5 +2281,11 @@ pub fn router(state: AppState) -> Router {
         // authenticated - which is what the guards having run first guarantees.
         .layer(crate::headers_middleware::require_csrf(&state))
         .layer(header_layer.clone())
+        // The CRM's request-id scope, INSIDE the CSRF and header layers: it opens around the
+        // handler only, so a request the CSRF layer refuses never opens a scope and never writes a
+        // trail line. Router-wide rather than per-handler on purpose — a route added tomorrow gets
+        // a correlated audit line without anybody remembering to wrap it, and forgetting is silent
+        // (the line is written, the id reads `null`).
+        .layer(crate::crm_request_id::CorrelateCrm)
         .with_state(state)
 }

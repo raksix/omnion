@@ -843,18 +843,18 @@ async fn site_in_scope(
 
 /// The address a beacon is attributed to.
 ///
-/// `X-Forwarded-For` is read first because the platform's own edge sets it; the socket address
-/// is the fallback. The value is used for the daily hash, the exclusion lists and the rate
-/// limit — never for authorization — and a deployment that does not strip inbound
-/// `X-Forwarded-For` lets a caller pick their own bucket, which is why the rate limit is a
-/// guardrail rather than a defence (see `docs/qa` receipts and the deployment doc).
+/// One rule, shared with every other surface that answers "who is the caller":
+/// `crate::client_ip::resolve_client_ip`. This function used to read `X-Forwarded-For`
+/// **first and unconditionally**, which is the one rule the other two copies had already
+/// rejected — a caller that reaches the platform from the internet writes that header itself,
+/// so believing it hands out a fresh analytics bucket per request and lets one address evict
+/// itself from the exclusion list by asking nicely. It now asks the same question as the rate
+/// limiter and the CRM, and gets the same answer.
+///
+/// The value is used for the daily hash, the exclusion lists and the rate limit — never for
+/// authorization — so the worst case of a wrong guess is a miscount, not a breach.
 fn visitor_address(headers: &HeaderMap, socket: Option<IpAddr>) -> Option<IpAddr> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .and_then(|value| value.trim().parse::<IpAddr>().ok())
-        .or(socket)
+    crate::client_ip::resolve_client_ip(socket, headers)
 }
 
 /// The user agent, or an empty string when the caller sent none (which the bot filter reads as
@@ -1203,16 +1203,30 @@ mod tests {
     }
 
     #[test]
-    fn the_forwarded_address_wins_and_the_socket_is_the_fallback() {
+    fn a_local_proxys_forwarded_caller_wins_and_a_public_peers_does_not() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
             HeaderValue::from_static("203.0.113.9, 10.0.0.1"),
         );
         let socket: IpAddr = "198.51.100.4".parse().unwrap();
+
+        // Behind the platform's own edge the header *is* the caller's — the edge terminates TLS
+        // and its socket address is the proxy's, not a visitor's. This is the direction the
+        // previous version got right, and it is the only direction it was ever correct for.
+        let local_proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            visitor_address(&headers, Some(local_proxy)),
+            Some("203.0.113.9".parse().unwrap())
+        );
+
+        // And this is the direction it got wrong: from the public internet the header is
+        // written by the caller, so believing it gives every visitor a fresh bucket — and
+        // every visitor the power to walk out of their own exclusion list.
         assert_eq!(
             visitor_address(&headers, Some(socket)),
-            Some("203.0.113.9".parse().unwrap())
+            Some(socket),
+            "a beacon from the open internet is counted under the address it arrived from"
         );
 
         let empty = HeaderMap::new();

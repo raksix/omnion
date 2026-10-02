@@ -651,7 +651,6 @@ async fn serve_shared(
     // a revocation is that it is immediate.
     headers.insert(header::CACHE_CONTROL, header_value("no-store")?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
-    headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
     Ok(response)
 }
 

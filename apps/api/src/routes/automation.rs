@@ -183,17 +183,23 @@ pub fn catalogue() -> CatalogueResponse {
 // ---------------------------------------------------------------------------------------------
 
 /// Query of a rule list.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct AutomationListQuery {
-    /// Organization to read; a platform account must name one to narrow the list.
+    /// Organization to list (platform accounts only; organization accounts always see their own).
     pub organization_id: Option<Uuid>,
-    /// Site to narrow the list to.
+    /// Site to filter on.
     pub site_id: Option<Uuid>,
+    /// Project to filter on (REQ-133). `None` means the projects the caller is in.
+    pub project_id: Option<Uuid>,
 }
 
 /// A rule to create or replace.
 #[derive(Debug, Deserialize)]
 pub struct AutomationInput {
+    /// Project to create the rule in; the organization's default when omitted (REQ-133).
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+
     /// Organization that owns the rule.
     pub organization_id: Option<Uuid>,
     /// Site the rule is bound to.
@@ -273,8 +279,63 @@ pub async fn list_automations(
         None => query.organization_id,
     };
 
-    let workflows =
-        store::list_event_workflows(state.db().pool(), organization_id, query.site_id).await?;
+    // Project-scoped (REQ-133, slice 2). An event rule in another project is not a rule this
+    // caller may run, so it is never fetched — and asking for a project they are not in returns
+    // an empty list rather than a `403`, because a refusal there would confirm the project exists.
+    let workflows = match organization_id {
+        Some(organization_id) => {
+            let caller = omnion_workflows::projects::ProjectCaller {
+                user_id: current.user.id,
+                is_instance_admin: crate::routes::automation_projects::is_instance_admin(
+                    &state, &current, organization_id,
+                )
+                .await,
+            };
+            let visible =
+                omnion_workflows::projects::visible_project_ids(state.db().pool(), organization_id, caller)
+                    .await
+                    .map_err(ApiError::from)?;
+            // The stored selection narrows the list when no `project_id` was asked for (REQ-133's
+            // "scoped defaults"), and is ignored when it names a project this caller can no longer
+            // see — the intersection is `default_scope`'s job, not the route's.
+            let wanted = match query.project_id {
+                Some(id) => Some(id),
+                None => {
+                    omnion_workflows::projects::default_scope(
+                        state.db().pool(),
+                        current.user.id,
+                        &visible,
+                    )
+                    .await
+                    .map_err(ApiError::from)?
+                }
+            };
+            let scoped: Vec<Uuid> = match wanted {
+                Some(id) if visible.contains(&id) => vec![id],
+                Some(_) => Vec::new(),
+                None => visible,
+            };
+            let mut out = Vec::new();
+            for project in &scoped {
+                out.extend(
+                    store::list_event_workflows(
+                        state.db().pool(),
+                        Some(organization_id),
+                        query.site_id,
+                        Some(*project),
+                    )
+                    .await?,
+                );
+            }
+            out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            out
+        }
+        // A platform account that named no organization has no project scope to apply.
+        None => {
+            store::list_event_workflows(state.db().pool(), None, query.site_id, query.project_id)
+                .await?
+        }
+    };
 
     let mut automations = Vec::with_capacity(workflows.len());
     for workflow in &workflows {
@@ -302,10 +363,50 @@ pub async fn create_automation(
     let rule = input.rule(organization_id)?;
     let definition = rule.definition()?;
 
+    // A rule created without a project lands in the organization's default (REQ-133) — decided by
+    // `resolve_target`, the same one function the workflows surface uses.
+    let caller = omnion_workflows::projects::ProjectCaller {
+        user_id: current.user.id,
+        is_instance_admin: crate::routes::automation_projects::is_instance_admin(
+            &state, &current, organization_id,
+        )
+        .await,
+    };
+    let target =
+        omnion_workflows::projects::resolve_target(state.db().pool(), organization_id, input.project_id, caller)
+            .await
+            .map_err(ApiError::from)?;
+
+    // **Acceptance 6 at the create boundary.** `resolve_target` answers "which project does this
+    // land in" — a question a `viewer` passes, because the organization's default project is
+    // visible to every account in the tenant. Creating a rule inside a project is an *edit of
+    // that project*, so the capability is asked separately; without it the fourth role is
+    // decorative here while the workflows surface enforces it. One query per create, not per
+    // request.
+    let (allowed, role) = omnion_workflows::projects::permits(
+        state.db().pool(),
+        organization_id,
+        target.id,
+        caller,
+        omnion_workflows::projects::ProjectRole::can_edit,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    if !allowed {
+        return Err(ApiError::forbidden(
+            "project_capability_required",
+            format!(
+                "your role in this project's team ({role:?}) may not create automations here — \
+                 ask a project owner to change it, it applies immediately"
+            ),
+        ));
+    }
+
     let workflow = store::insert_workflow(
         state.db().pool(),
         NewWorkflow {
             organization_id,
+            project_id: target.id,
             site_id: rule.site_id,
             name: rule.name.clone(),
             description: rule.description.clone(),
@@ -365,7 +466,14 @@ pub async fn update_automation(
     Path(automation_id): Path<Uuid>,
     Json(input): Json<AutomationInput>,
 ) -> Result<Json<AutomationBody>, ApiError> {
-    let existing = automation_in_scope(&state, &current, automation_id).await?;
+    let existing = automation_with_capability(
+        &state,
+        &current,
+        automation_id,
+        omnion_workflows::projects::ProjectRole::can_edit,
+        "replace an automation rule",
+    )
+    .await?;
     ensure_same_organization(
         &current,
         input.organization_id.or(Some(existing.organization_id)),
@@ -427,7 +535,14 @@ pub async fn delete_automation(
     Path(automation_id): Path<Uuid>,
     address: ClientAddress,
 ) -> Result<StatusCode, ApiError> {
-    let existing = automation_in_scope(&state, &current, automation_id).await?;
+    let existing = automation_with_capability(
+        &state,
+        &current,
+        automation_id,
+        omnion_workflows::projects::ProjectRole::can_edit,
+        "delete an automation rule",
+    )
+    .await?;
 
     if !store::delete_workflow(state.db().pool(), existing.id).await? {
         return Err(automation_not_found());
@@ -497,6 +612,55 @@ fn automation_not_found() -> ApiError {
     )
 }
 
+/// Load a rule the caller may see **and** hold `capability` in its project.
+///
+/// REQ-133 acceptance 6, same shape as `workflows::workflow_with_capability`, and for the same
+/// reason: `automation_in_scope` answers "does this row belong to this tenant", which a colleague
+/// in another project passes, so a `viewer` could rewrite or delete an event rule. The
+/// `404`-not-`403` rule above is about *reads*; this is a write, and a write names what is wrong.
+///
+/// A member of another project lands on the same refusal through `permits`: no membership row,
+/// `find_visible` fails, the role is `None`, and `None` may not do anything. That is the correct
+/// answer for a write about a project they cannot see — and it is a *side effect* of asking about
+/// the role rather than a second check, which is the reason to ask once.
+async fn automation_with_capability(
+    state: &AppState,
+    current: &CurrentSession,
+    automation_id: Uuid,
+    capability: fn(omnion_workflows::projects::ProjectRole) -> bool,
+    what: &str,
+) -> Result<omnion_workflows::Workflow, ApiError> {
+    let workflow = automation_in_scope(state, current, automation_id).await?;
+    let caller = omnion_workflows::projects::ProjectCaller {
+        user_id: current.user.id,
+        is_instance_admin: crate::routes::automation_projects::is_instance_admin(
+            state,
+            current,
+            workflow.organization_id,
+        )
+        .await,
+    };
+    let (allowed, role) = omnion_workflows::projects::permits(
+        state.db().pool(),
+        workflow.organization_id,
+        workflow.project_id,
+        caller,
+        capability,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    if !allowed {
+        return Err(ApiError::forbidden(
+            "project_capability_required",
+            format!(
+                "your role in this project's team ({role:?}) may not {what} — ask a project owner \
+                 to change it, it applies immediately"
+            ),
+        ));
+    }
+    Ok(workflow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,6 +724,7 @@ mod tests {
     #[test]
     fn a_request_becomes_a_checked_rule() {
         let input = AutomationInput {
+            project_id: None,
             organization_id: None,
             site_id: None,
             name: "  Welcome the editor  ".to_owned(),
@@ -594,6 +759,7 @@ mod tests {
     fn a_rule_the_matcher_could_not_run_is_refused_when_it_is_written() {
         let base = |event: &str, conditions: Vec<Condition>, actions: Vec<StepDefinition>| {
             AutomationInput {
+                project_id: None,
                 organization_id: None,
                 site_id: None,
                 name: "rule".to_owned(),

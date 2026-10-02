@@ -9,7 +9,7 @@
 //!
 //! ## The counters use the log screen's own rules
 //!
-//! [`crate::log_vocab::class_of`] decides what "an error" is, and the log's own retention window
+//! [`crate::logs::class_of`] decides what "an error" is, and the log's own retention window
 //! decides how far back "today" can reach. A count computed by a different rule than the one the
 //! operator filters with is a card that disagrees with the table beside it, and the table wins
 //! every argument.
@@ -33,7 +33,7 @@ use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::log_vocab::{class_of, path_without_query};
+use crate::logs::{class_of, path_without_query};
 
 /// The numbers the overview screen draws.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
