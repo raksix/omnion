@@ -14853,13 +14853,60 @@ note({
     });
     await shot(page, "page-workflow-builder-keyboard");
 
+    // The last verb, `r`, and the row's read of it was the ONLY unguarded fetch in this block:
+    // it asked `/workflows/{id}/runs`, **a route this server does not mount** (the run list is
+    // `/workflows/{id}/executions` — `runs` exists only under `/media/scan` and
+    // `/media/retention`), and then read `body.runs`, which is not the field either; the
+    // payload is `{ workflow_id, executions }`. Two wrong answers that agree: a 404 from an
+    // unmounted path, and a payload key the response never had. `response.ok` swallowed the
+    // first into `null` and `Array.isArray(null?.runs)` swallowed the second into `null`, so
+    // `runsAfterKey` was **structurally null on every run since this row was written** — a gate
+    // that could not go green reading exactly like a gate that could not go red, which is the
+    // shape `keyboard-pass-row.test.ts`'s own header was written for and did not catch,
+    // because nothing in that file read this sentence.
+    //
+    // **The third defect is the one the other two were hiding.** Counting runs cannot say the
+    // keyboard started one: the builder pass above pressed `Run from here` on this same rule
+    // moments earlier, so a non-zero count is satisfied by that run and this row would report
+    // a green `startedFromKey` for a key that was never pressed. `runCountBeforeKey` is taken
+    // from the same endpoint in the same shape immediately before the press, and the note
+    // carries both — a count beside its baseline, never alone.
+    const runCountBeforeKey = await page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/workflows/${id}/executions?limit=50`, {
+        credentials: "same-origin",
+      });
+      if (!response.ok) return null;
+      const body = await response.json();
+      return Array.isArray(body?.executions) ? body.executions.length : null;
+    }, workflowId).catch(() => null);
+
     await page.keyboard.press("r");
     await page.waitForTimeout(3000);
     const runAfterKey = await page.evaluate(async (id) => {
-      const response = await fetch(`/api/v1/workflows/${id}/runs?limit=5`, { credentials: "same-origin" });
+      const response = await fetch(`/api/v1/workflows/${id}/executions?limit=50`, {
+        credentials: "same-origin",
+      });
       if (!response.ok) return null;
       return await response.json();
     }, workflowId).catch(() => null);
+    // The newest run, and only if the key produced one. `executions` is newest-first by
+    // `started_at desc, id desc` (`store::list_executions`), so index 0 is the press under
+    // test — but that is only true *relative to the baseline*, which is why the two travel
+    // together. A key that started nothing leaves the previous run at index 0 and a note that
+    // reported its `trigger` would be reporting the row above's press.
+    const runAfterKeyList = Array.isArray(runAfterKey?.executions) ? runAfterKey.executions : null;
+    const runsAddedByKey =
+      runAfterKeyList !== null && runCountBeforeKey !== null
+        ? Math.max(0, runAfterKeyList.length - runCountBeforeKey)
+        : null;
+    const newestRun = runsAddedByKey > 0 ? runAfterKeyList[0] : null;
+    // `ExecutionSummary` calls the column `trigger` (`pub trigger: String`, built from
+    // `execution.trigger_kind`) — the STORED column is `trigger_kind` and the WIRE key is
+    // `trigger`. The row asked for `trigger_kind` and fell back to `status`, so even on a
+    // correct route it would have reported the run's *state* under a name that promises its
+    // origin.
+    const runTrigger = newestRun?.trigger ?? null;
+    const runStatus = newestRun?.status ?? null;
 
     note({
       step: "keyboard-pass",
@@ -14893,11 +14940,20 @@ note({
       paramWrote: paramReadFrom !== null && (paramReadBack === 31 || paramReadBack === "31"),
       // Steps 4 and 5.
       problemsPanel: problemsRendered,
-      runsAfterKey: Array.isArray(runAfterKey?.runs) ? runAfterKey.runs.length : null,
-      startedFromKey:
-        Array.isArray(runAfterKey?.runs) && runAfterKey.runs.length > 0
-          ? runAfterKey.runs[0].trigger_kind ?? runAfterKey.runs[0].status ?? null
-          : null,
+      // **The run read is now a comparison, not a count.** Three fields travel together and the
+      // note says which of them can be `null`: `runCountBeforeKey`/`runsAfterKey` are `null`
+      // when the ENDPOINT answered with nothing readable (a dead stack, a 401) — which is a
+      // different fact from a key that started no run, and reporting both as `null` is how
+      // this row hid the defect for nine ticks. `runsAddedByKey` is the claim, `runTrigger`
+      // is its subject, and `runStatus` is reported beside it rather than as a fallback for
+      // it: `trigger` says who started the run, `status` says what happened to it, and the old
+      // `trigger_kind ?? status` returned the second under the first's name.
+      runCountBeforeKey,
+      runsAfterKey: runAfterKeyList !== null ? runAfterKeyList.length : null,
+      runsAddedByKey,
+      runStartedFromKey: runsAddedByKey > 0,
+      runTrigger,
+      runStatus,
     });
     await shot(page, "page-workflow-builder-keyboard-final");
   }

@@ -175,3 +175,161 @@ test("the row drives no pointer event, because the criterion is the path", () =>
     );
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// The run read (tick 89). Four defects, one fetch, and a header above that describes the CLASS of
+// bug this file exists to catch — so the class shipped again anyway, three tests below the row it
+// was written about.
+// ---------------------------------------------------------------------------------------------
+
+test("the row asks the server for a route this server actually mounts", () => {
+  // **The first defect: `/workflows/{id}/runs` was never a route.** The run list is
+  // `/workflows/{id}/executions`; `runs` exists only under `/media/scan` and
+  // `/media/retention`. The fetch 404s, `if (!response.ok) return null` swallows the 404, and
+  // `runsAfterKey` is `null` on every run — indistinguishable, in a report, from a keyboard
+  // that starts nothing.
+  //
+  // This assertion is over the Rust router, not over a list written here: a hand-kept
+  // allowlist of "the paths that are real" is the same defect one layer out, and it would drift
+  // the first time a sibling mounted a route. Every path this row fetches has to be one the
+  // router declares.
+  const MOUNTED = readFileSync(new URL("../../../../apps/api/src/routes/mod.rs", import.meta.url), "utf8");
+  for (const segment of ROW_CODE.match(/\/api\/v1\/workflows\/\$\{id\}\/([a-z-]+)/g) ?? []) {
+    const tail = segment.replace("/api/v1/workflows/${id}/", "");
+    assert.match(
+      MOUNTED,
+      new RegExp(`\\.route\\(\\s*"/workflows/\\{id\\}/${tail}"`),
+      `the row fetches /workflows/{id}/${tail}, which the router does not mount — ` +
+        `a 404 here reads exactly like a keyboard that starts nothing`,
+    );
+  }
+  // …and it asserts the row actually fetches one, because a sweep over an empty list is a
+  // sweep that cannot fail. This is the control that bites (tick 87's rule).
+  assert.match(
+    ROW_CODE,
+    /\/api\/v1\/workflows\/\$\{id\}\/[a-z-]+/,
+    "the row must fetch at least one workflow route, or the sweep above proves nothing",
+  );
+});
+
+test("the row reads the payload field the server sends", () => {
+  // **The second defect: `body.runs` is not a field.** `ExecutionListResponse` is
+  // `{ workflow_id, executions }` — the struct renames the *column* (`trigger_kind`) to a
+  // *wire* key (`trigger`) in `ExecutionSummary`, and this row read the column name. Both
+  // halves are asserted against the Rust type, because "the row must not say `.runs`" alone
+  // would pass on a server renamed to `/runs/foo`.
+  const ROUTES = readFileSync(
+    new URL("../../../../apps/api/src/routes/workflows.rs", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    ROUTES,
+    /pub struct ExecutionListResponse\s*\{[\s\S]*?pub executions: Vec<ExecutionSummary>/,
+    "the run list's payload key is `executions` — if this field moved, the row's read moves with it",
+  );
+  assert.match(
+    ROUTES,
+    /pub trigger: String/,
+    "`ExecutionSummary` sends the run's origin as `trigger`; `trigger_kind` is the STORED column",
+  );
+  codeOmits(
+    /\?\.\s*runs\b/,
+    "the row must not read `body.runs`: the payload is `executions`",
+  );
+  codeOmits(
+    /trigger_kind/,
+    "the row must not read `trigger_kind`: `ExecutionSummary` renames the column to `trigger` on the wire",
+  );
+  assert.match(ROW_CODE, /\?\.executions/, "the row must read the payload the server actually sends");
+});
+
+test("a run count is reported beside its baseline, never alone", () => {
+  // **The third defect, and the one the other two were hiding.** The builder pass above pressed
+  // `Run from here` on this same rule moments before the keyboard pass presses `r`, so the
+  // rule already has a run. A count of "1 run exists" is satisfied by the row above's press, and
+  // the old row reported exactly that as `startedFromKey` — a green answer about a key that was
+  // never pressed. The count cannot distinguish "the keyboard started this" from "something
+  // else did, recently", so the before-count is the evidence and it travels with the after.
+  assert.match(
+    ROW_CODE,
+    /runCountBeforeKey/,
+    "the run count needs a baseline taken before the press",
+  );
+  assert.match(
+    ROW_CODE,
+    /Math\.max\(0,\s*runAfterKeyList\.length - runCountBeforeKey\)/,
+    "the claim must be a DIFFERENCE against the baseline, and clamped at zero",
+  );
+  // …and the difference has to reach the NOTE, or the baseline is collected and never read.
+  //
+  // **The first draft of this assertion was satisfied by the DECLARATION.** It searched the
+  // whole row window for the field name, and the window starts at the banner — which includes
+  // `const runCountBeforeKey = …`, above `step:`. Deleting the field from the note object left
+  // the name in the window and the gate green (M7 survived). A field name inside a note is
+  // only evidence if it is inside the note's own braces, so the window here is the object
+  // literal: from `step:` to the `});` that closes it, with nothing before `step:`.
+  //
+  // The window is found by balance, not by a hardcoded line count — two of this REQ's
+  // instruments died on the latter (tick 57's lesson) — and the comment above `rowFor` is the
+  // other half of the same trap: anchoring on the NEXT row's banner pulls in a different note's
+  // fields.
+  const noteStart = ROW.indexOf('step: "keyboard-pass"');
+  const noteEnd = ROW.indexOf("});", noteStart);
+  assert.notEqual(noteEnd, -1, "the keyboard-pass note must close");
+  // …and the window is read with its prose removed, because the note's OWN comment explains the
+  // three fields by name: deleting `runCountBeforeKey,` from the object left it in the comment
+  // directly above and the gate green again (M7 survived twice, for two different reasons).
+  // This is the same rule the first test in this file states — a guard that trips on the
+  // sentence describing the defect cannot police the defect — and it took a second draft to
+  // apply it here, which is worth the record.
+  const note = stripComments(ROW.slice(noteStart, noteEnd + 3));
+  for (const field of ["runCountBeforeKey", "runsAfterKey", "runsAddedByKey"]) {
+    assert.match(
+      note,
+      new RegExp(`\\b${field}\\b`),
+      `the note must carry \`${field}\` — a baseline collected in the row body and absent from ` +
+        `the note is a number no reader sees`,
+    );
+  }
+  // A count beside a baseline is still a count; the claim is the boolean the criterion wants.
+  assert.match(
+    note,
+    /runStartedFromKey:\s*runsAddedByKey > 0/,
+    "the note must name the claim the criterion states — a run the KEY started",
+  );
+});
+
+test("an unreadable endpoint is not reported as a key that started nothing", () => {
+  // The `null` collapse is what let the first defect survive: a 404, a dead stack and a 401 all
+  // arrive as `null`, and so does "the endpoint answered and the list was empty". Those are four
+  // different facts and the row reported one. `runsAddedByKey` stays `null` unless BOTH counts
+  // are numbers, so "the endpoint did not answer" can never read as a zero.
+  assert.match(
+    ROW_CODE,
+    /runsAddedByKey > 0 \? runAfterKeyList\[0\] : null/,
+    "the run whose origin is reported must be one the key produced, not index 0 of a list",
+  );
+  // **The guard has to be about REACHABILITY, not about the presence of a substring.** The first
+  // draft asserted `runAfterKeyList !== null && runCountBeforeKey !== null` appears in the row,
+  // which `&& false` satisfies without changing a single value the note reports (M4 survived):
+  // the condition is still *written* and no longer *used*. This is tick 85's rule — the press was
+  // left unguarded there for the same reason — and it is the "a claim about a use, answered by a
+  // claim about a mention" defect that this file's own header was written to prevent.
+  //
+  // The condition is therefore extracted and checked for a short-circuit on a constant, and the
+  // assignment is checked to actually be that ternary. A strip of the whole guard is caught by
+  // the second half; a `&& false` by the first.
+  const diffStart = ROW_CODE.indexOf("const runsAddedByKey");
+  assert.notEqual(diffStart, -1, "the difference must be assigned somewhere in the row");
+  const diffWindow = ROW_CODE.slice(diffStart, diffStart + 320);
+  assert.match(
+    diffWindow,
+    /^const runsAddedByKey\s*=\s*runAfterKeyList !== null && runCountBeforeKey !== null\s*\n?\s*\?/,
+    "`runsAddedByKey` must be assigned the ternary guarded by BOTH counts being real numbers",
+  );
+  assert.doesNotMatch(
+    diffWindow.slice(0, diffWindow.indexOf("?")),
+    /&&\s*(false|true|0|undefined|null)\b/,
+    "the difference's guard short-circuits on a constant — the condition is written and unused",
+  );
+});
