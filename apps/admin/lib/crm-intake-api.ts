@@ -423,6 +423,84 @@ export function bulkAssignLeads(
   });
 }
 
+/**
+ * The bulk bar's other three verbs, as one call.
+ *
+ * **The report is the hand-over's, unchanged, and the reason is the panel's:** it already renders
+ * `summary` plus the refusals grouped by reason, and a bar that rendered two report shapes would
+ * have two empty states and two places to keep in step. The verb is a closed union rather than a
+ * `string` because the wire enum is closed too — a client that can send `delate` will eventually
+ * send `delate`.
+ */
+export type BulkActionName = "respond" | "spam" | "reject";
+
+/** Every verb, in the order the bar shows them. Drives the buttons, so the panel cannot offer one. */
+export const BULK_ACTIONS: readonly BulkActionName[] = ["respond", "spam", "reject"];
+
+/**
+ * The words a verb is read as on the bar.
+ *
+ * A map keyed on the union, so a verb the server adds and this file does not know is a **type
+ * error here** rather than a button that renders `undefined`. That is the deliberate difference
+ * from the autoresponder's skip labels, which are an open vocabulary on purpose: those words
+ * describe why a decision went the way it did and the server may invent more, while these three
+ * are the actions this build performs.
+ */
+export const BULK_ACTION_LABEL: Record<BulkActionName, string> = {
+  respond: "Mark responded",
+  spam: "Mark spam",
+  reject: "Reject…",
+};
+
+/**
+ * `true` when the verb will not run without a reason.
+ *
+ * Only `reject`, and the reason is REQ-117's own wording ("reject with reason"): a rejection is
+ * the one of these an operator may later have to justify to the person who wrote in. Marking
+ * twenty leads answered needs no excuse.
+ */
+export function bulkActionNeedsReason(action: BulkActionName): boolean {
+  return action === "reject";
+}
+
+/** Run one of the bar's verbs over the selection. */
+export function bulkLeadAction(
+  ids: string[],
+  action: BulkActionName,
+  reason: string,
+): Promise<BulkAssignReport> {
+  return request<BulkAssignReport>("/api/v1/crm/leads/bulk-action", {
+    method: "POST",
+    body: JSON.stringify({ ids, action, reason }),
+  });
+}
+
+/**
+ * The URL the `Export CSV` button points at.
+ *
+ * **A real URL, not a fetch.** The endpoint answers `attachment`, so it is a download and a
+ * `fetch` + `blob` would re-implement the browser's own download sheet with fewer features. With
+ * a selection it names those rows and ignores the filter; without one it is the whole filter,
+ * which is why the button says which of the two it is about to do.
+ */
+export function leadExportHref(
+  filters: LeadFilters = {},
+  selected: string[] = [],
+): string {
+  const params = new URLSearchParams();
+  if (selected.length > 0) {
+    for (const id of selected) params.append("ids", id);
+  } else {
+    if (filters.source) params.set("source", filters.source);
+    for (const status of filters.status ?? []) params.append("status", status);
+    if (filters.owner) params.set("owner", filters.owner);
+    if (filters.q) params.set("q", filters.q);
+    if (filters.product) params.set("product", filters.product);
+  }
+  const query = params.toString();
+  return `/api/v1/crm/leads/export${query ? `?${query}` : ""}`;
+}
+
 /** One person a lead can be handed to, with the load they already hold. */
 export type LeadOwner = {
   id: string;

@@ -6294,6 +6294,99 @@ async function runCrmIntakeDepth(page, report) {
       });
       await shot(page, "page-crm-leads-bulk");
     }
+
+    // The bar's OTHER verbs — `mark responded`, `mark spam`, `reject with reason` — and the
+    // CSV export. REQ-117's inbox row has named all four since the request was written and only
+    // the hand-over existed, so these are four controls this slice added rather than four the
+    // pass had ever seen.
+    //
+    // **Each is observed by its CONSEQUENCE, not by the button's presence**, which is the branch's
+    // standing rule: a button wired to nothing renders exactly like one wired to the endpoint.
+    // The three claims, and what each one measures:
+    //
+    //   1. `respond` — the rows' own status column reads `contacted` afterwards, read back
+    //      through the table rather than through the toast.
+    //   2. `reject` — the save is refused with an empty reason *before* the round trip, and the
+    //      reason box is the only verb's that has one. That asymmetry is the claim; a panel that
+    //      asked for a reason on all three would still be "working" and wrong.
+    //   3. `export` — the anchor points at a URL and the URL answers `attachment` + `text/csv`
+    //      with the header row in the body. Asserting the header is there is what makes it an
+    //      export rather than an error page saved with a `.csv` name.
+    steps.bulkVerbsPresent = await page.evaluate(() => {
+      const found = new Set(
+        Array.from(document.querySelectorAll("[data-lead-bulk-verb]"))
+          .map((node) => node.getAttribute("data-lead-bulk-verb")),
+      );
+      return ["respond", "spam", "reject"].filter((verb) => !found.has(verb));
+    });
+
+    // The rejection's reason gate, observed without pressing anything that writes.
+    await page.locator('[data-lead-bulk-verb="reject"]').first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    steps.rejectPanelOpen = (await page.locator("[data-lead-bulk-verb-panel]").count()) > 0;
+    steps.rejectHasReasonBox = (await page.locator("[data-lead-bulk-verb-reason]").count()) > 0;
+    steps.rejectSaveDisabledWithoutReason = await page
+      .locator("[data-lead-bulk-verb-save]")
+      .first()
+      .isDisabled()
+      .catch(() => false);
+    await page.locator("[data-lead-bulk-verb-reason]").fill("QA · we no longer carry this").catch(() => {});
+    await page.waitForTimeout(400);
+    steps.rejectSaveEnabledWithReason = !(await page
+      .locator("[data-lead-bulk-verb-save]")
+      .first()
+      .isDisabled()
+      .catch(() => true));
+    await page.locator('[data-lead-bulk-verb="respond"]').first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    // Pressing the verb already open must CLOSE it — the same button is a toggle, so the panel
+    // can never stack two confirmations for one selection.
+    steps.verbPanelTogglesClosed =
+      (await page.locator("[data-lead-bulk-verb-panel]").count()) === 0;
+    // `respond` needs no reason: the box is absent, not merely optional.
+    steps.respondHasNoReasonBox =
+      (await page.locator("[data-lead-bulk-verb-reason]").count()) === 0;
+    await page.locator('[data-lead-bulk-verb="respond"]').first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(400);
+    await page.locator("[data-lead-bulk-verb-save]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(2400);
+    steps.verbReport = (
+      await page.locator("[data-lead-bulk-report]").innerText().catch(() => "")
+    ).slice(0, 200);
+    steps.verbReportRendered = steps.verbReport.length > 0;
+    // The STORED value, not the label: `data-lead-status` carries `lead.status` verbatim, so
+    // this cannot be satisfied by a chip that renders the word "Contacted" for any reason.
+    steps.statusesAfterRespond = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("[data-lead-status]")).map((node) =>
+        node.getAttribute("data-lead-status"),
+      ),
+    );
+    steps.respondChangedTheRows = (steps.statusesAfterRespond || []).filter(
+      (status) => status === "contacted",
+    ).length;
+    await shot(page, "page-crm-leads-bulk-verbs");
+
+    // The export. **The anchor's own href plus the route's answer** — a button that renders
+    // correctly and points nowhere is the defect this catches, and the content-type and header
+    // are what separate an export from an error page saved under a .csv name.
+    const exportHref = await page.evaluate(
+      () => document.querySelector("[data-lead-bulk-export]")?.getAttribute("href") ?? "",
+    );
+    steps.exportHref = exportHref;
+    steps.exportNamesSelection = /[?&]ids=/.test(exportHref);
+    steps.exportAnswer = exportHref
+      ? await page.evaluate(async (href) => {
+          const response = await fetch(href, { credentials: "same-origin" });
+          const body = await response.text();
+          return {
+            status: response.status,
+            type: response.headers.get("content-type") ?? "",
+            disposition: response.headers.get("content-disposition") ?? "",
+            firstLine: body.split("\r\n")[0] ?? "",
+            lines: body.trim() ? body.trim().split("\r\n").length : 0,
+          };
+        }, exportHref)
+      : { status: 0, type: "", disposition: "", firstLine: "", lines: 0 };
   }
   await shot(page, "page-crm-leads-owner-names");
   await page.goto(`${URL_ADMIN}/crm/leads/${leadId}`, { waitUntil: "domcontentloaded" }).catch(() => {});

@@ -23,7 +23,19 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Check, Loader2, RefreshCw, Search, TriangleAlert, UserPlus, UserRoundCheck } from "lucide-react";
+import {
+  Ban,
+  Check,
+  Download,
+  Loader2,
+  MessageSquareReply,
+  RefreshCw,
+  Search,
+  ShieldAlert,
+  TriangleAlert,
+  UserPlus,
+  UserRoundCheck,
+} from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
@@ -43,11 +55,17 @@ import {
   slaState,
 } from "@/lib/crm-intake";
 import {
+  BULK_ACTIONS,
+  BULK_ACTION_LABEL,
+  bulkActionNeedsReason,
   bulkAssignLeads,
+  bulkLeadAction,
   fetchIntakeSources,
   fetchLeads,
   fetchLeadMetrics,
   fetchLeadOwners,
+  leadExportHref,
+  type BulkActionName,
   type BulkAssignReport,
   type IntakeSource,
   type Lead,
@@ -92,6 +110,14 @@ export function LeadInbox() {
   const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkReport, setBulkReport] = useState<BulkAssignReport | null>(null);
   const [bulkError, setBulkError] = useState<string | null>(null);
+  // The bar's other verbs. `bulkVerb` is null until a button is pressed, because "no verb
+  // chosen" and "a verb is being confirmed" are different screens — a bar that opened a reason
+  // box the moment it appeared would ask twenty operators for a reason to mark twenty leads
+  // answered.
+  const [bulkVerb, setBulkVerb] = useState<BulkActionName | null>(null);
+  const [bulkVerbReason, setBulkVerbReason] = useState("");
+  const [bulkVerbBusy, setBulkVerbBusy] = useState(false);
+  const [bulkVerbError, setBulkVerbError] = useState<string | null>(null);
   const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -219,6 +245,40 @@ export function LeadInbox() {
       setBulkError(caught instanceof ApiError ? caught.message : "The batch could not be handed over.");
     } finally {
       setBulkBusy(false);
+    }
+  };
+
+  /**
+   * Run one of the bar's other verbs over the selection.
+   *
+   * **The reason box is closed for `respond` and `spam`, and open for `reject` — decided by
+   * `bulkActionNeedsReason`, which is the client's copy of the server's rule.** The duplication
+   * is deliberate and the rule is that one of the two owns the sentence: if this file's answer
+   * and the server's ever differ, the server refuses with a message that names the reason and
+   * the panel shows that message, so the operator sees the server's rule rather than the
+   * browser's guess at it.
+   *
+   * The table is re-read afterwards for the same reason the hand-over re-reads: the status
+   * column and the SLA chip are derived from columns this call wrote, and a table still showing
+   * `new` next to a report saying twenty leads were answered is how an operator stops
+   * believing the screen.
+   */
+  const runBulkVerb = async () => {
+    if (bulkVerb === null) return;
+    setBulkVerbBusy(true);
+    setBulkVerbError(null);
+    try {
+      const report = await bulkLeadAction(selected, bulkVerb, bulkVerbReason.trim());
+      setBulkReport(report);
+      setBulkVerb(null);
+      setBulkVerbReason("");
+      await load(false);
+    } catch (caught) {
+      setBulkVerbError(
+        caught instanceof ApiError ? caught.message : "That batch could not be run.",
+      );
+    } finally {
+      setBulkVerbBusy(false);
     }
   };
 
@@ -545,17 +605,142 @@ export function LeadInbox() {
                 Hand them over
               </button>
             ) : null}
+            {/* The bar's other three verbs. REQ-117's inbox row has read "Bulk: assign,
+                reassign, mark responded, mark spam, reject with reason, export CSV" since the
+                request was written, and only the hand-over existed — so a morning of triage was
+                twenty "Mark responded" presses, and the operator who skips the sixth has
+                answered five leads and left one breaching. The buttons come from
+                `BULK_ACTIONS`, so the panel cannot offer a verb the API would refuse. */}
+            {BULK_ACTIONS.map((verb) => (
+              <button
+                key={verb}
+                type="button"
+                data-lead-bulk-verb={verb}
+                disabled={bulkVerbBusy}
+                onClick={() => {
+                  setBulkReport(null);
+                  setBulkError(null);
+                  setBulkVerbError(null);
+                  setBulkVerbReason("");
+                  // Pressing the verb that is already open closes it: a toggle is what a bar of
+                  // independent actions should do, and a second press that re-opened the same
+                  // box would look like the click did not land.
+                  setBulkVerb((previous) => (previous === verb ? null : verb));
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-[12.5px] text-ink transition hover:bg-raised disabled:opacity-50"
+              >
+                {verb === "respond" ? (
+                  <MessageSquareReply className="size-3.5" aria-hidden />
+                ) : verb === "spam" ? (
+                  <ShieldAlert className="size-3.5" aria-hidden />
+                ) : (
+                  <Ban className="size-3.5" aria-hidden />
+                )}
+                {BULK_ACTION_LABEL[verb]}
+              </button>
+            ))}
+            {/* The export. **A real anchor at a real URL, not a button with a fetch behind it:**
+                the endpoint answers `attachment`, so the browser's own download sheet is both
+                the correct affordance and one that remembers the filename. With a selection it
+                names those rows and ignores the filter; without one it is the whole filter, and
+                the label says which — "Export 20 selected" and "Export the filter" are different
+                promises and an operator who cannot tell them apart will trust neither. */}
+            <a
+              href={leadExportHref(
+                {
+                  status: filters.status,
+                  owner: filters.owner || undefined,
+                  q: filters.q || undefined,
+                  source: filters.source || undefined,
+                },
+                selected,
+              )}
+              download
+              data-lead-bulk-export
+              className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-[12.5px] text-ink transition hover:bg-raised"
+            >
+              <Download className="size-3.5" aria-hidden />
+              {selected.length > 0
+                ? `Export ${selected.length} selected`
+                : "Export the filter (CSV)"}
+            </a>
             <button
               type="button"
               onClick={() => {
                 setSelected([]);
                 setBulkOpen(false);
+                setBulkVerb(null);
               }}
               className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] text-muted"
             >
               Clear
             </button>
           </div>
+
+          {bulkVerb !== null ? (
+            <div
+              data-lead-bulk-verb-panel
+              data-bulk-verb={bulkVerb}
+              className="flex flex-col gap-2 rounded-lg border border-line bg-surface p-2.5"
+            >
+              <p className="text-[11.5px] text-muted">
+                {bulkVerb === "respond"
+                  ? `Mark ${selected.length} as answered. The clock stops at the first answer and never moves again, so pressing this twice is harmless.`
+                  : bulkVerb === "spam"
+                    ? `File ${selected.length} as spam. Each lead is decided on its own: a lead that is already filed stays as it is.`
+                    : `Reject ${selected.length}. A reason is required — it is the sentence you may have to justify to the person who wrote in.`}
+              </p>
+              {bulkActionNeedsReason(bulkVerb) ? (
+                <label className="flex flex-col gap-1 text-[11.5px] text-muted">
+                  <span className="font-medium">Why</span>
+                  <input
+                    data-lead-bulk-verb-reason
+                    value={bulkVerbReason}
+                    onChange={(event) => setBulkVerbReason(event.target.value)}
+                    placeholder="We no longer carry this product"
+                    className="rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-[12.5px] text-ink"
+                  />
+                </label>
+              ) : null}
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  data-lead-bulk-verb-save
+                  disabled={
+                    bulkVerbBusy ||
+                    (bulkActionNeedsReason(bulkVerb) && bulkVerbReason.trim() === "")
+                  }
+                  onClick={() => void runBulkVerb()}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-accent bg-accent-soft px-3 py-1.5 text-[12.5px] text-accent-strong disabled:opacity-50"
+                >
+                  {bulkVerbBusy ? (
+                    <Loader2 className="size-3.5 animate-spin" aria-hidden />
+                  ) : (
+                    <Check className="size-3.5" aria-hidden />
+                  )}
+                  {BULK_ACTION_LABEL[bulkVerb]} · {selected.length}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBulkVerb(null)}
+                  className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] text-muted"
+                >
+                  Cancel
+                </button>
+              </div>
+              {bulkActionNeedsReason(bulkVerb) && bulkVerbReason.trim() === "" ? (
+                <p className="text-[11.5px] text-muted">
+                  A rejection without a reason is refused by the API, so the button says so before
+                  the round trip rather than after it.
+                </p>
+              ) : null}
+              {bulkVerbError ? (
+                <p role="alert" data-lead-bulk-verb-error className="text-[11.5px] text-caution">
+                  {bulkVerbError}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
 
           {bulkOpen ? (
             <div data-lead-bulk-panel className="flex flex-col gap-2 rounded-lg border border-line bg-surface p-2.5">
@@ -814,7 +999,12 @@ function LeadTable({
                   </span>
                 </td>
                 <td className="px-3 py-2.5">
+                  {/* The status chip carries the STORED value, not just the label. The label
+                      is what a person reads ("Contacted"); the attribute is what an assertion
+                      reads — and without it, "the bulk `mark responded` press changed the row"
+                      has nothing to observe except the toast that reported the press. */}
                   <span
+                    data-lead-status={lead.status}
                     className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${LEAD_STATUS_TONE[lead.status] ?? "bg-quiet-soft text-muted"}`}
                   >
                     {LEAD_STATUS_LABEL[lead.status] ?? lead.status}
