@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::PgPool;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::bindings;
@@ -407,7 +408,30 @@ pub async fn effective_permissions_for(
     subject: Subject,
     context: &ResourceContext,
 ) -> Result<EffectivePermissions> {
-    let bindings = bindings::active_for_context(pool, subject, context).await?;
+    // The context-aware load, not `active_for_context`: a role bound to a department has to
+    // reach the people in it, and the department is named by the context rather than by the
+    // subject's own binding rows.
+    //
+    // The scope filter is still applied afterwards, and it is not optional. The department load
+    // only *adds* department-scoped rows; every other binding still has to prove it covers this
+    // context, or a role bound to one site would answer for a request that names a different
+    // one. A department row is the one exception, and it is a safe one: the loader only returns
+    // it after proving the account sits in that department, that the department is active and
+    // that the organization matches. `Scope::applies_to` would compare the *bound* key against
+    // the *requested* key, which is wrong the moment the grant was inherited from an ancestor —
+    // a binding on "division" must reach somebody resolving inside "squad", and an exact
+    // comparison throws it away.
+    let now = OffsetDateTime::now_utc();
+    let context_names_a_department = context.department.is_some();
+    let bindings = bindings::bindings_for_in_context(pool, subject, context)
+        .await?
+        .into_iter()
+        .filter(|binding| binding.is_active_at(now))
+        .filter(|binding| {
+            matches!(binding.scope, Scope::Department { .. }) && context_names_a_department
+                || binding.scope.applies_to(context)
+        })
+        .collect::<Vec<_>>();
     let graph = load_role_graph(pool, context.organization_id).await?;
     let bound: Vec<Uuid> = bindings.iter().map(|binding| binding.role_id).collect();
 

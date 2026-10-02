@@ -105,51 +105,20 @@ pub const DEFAULT_ANALYTICS_POLL_MS: u64 = 15_000;
 /// Default beacon budget of one site and caller per minute (`OMNION_ANALYTICS_COLLECT_PER_MINUTE`).
 pub const DEFAULT_ANALYTICS_COLLECT_PER_MINUTE: u64 = 300;
 
-/// Default delay between two AI health probe ticks (`OMNION_AI_HEALTH_POLL_MS`).
-///
-/// 60 s is the interval the request asks for: often enough that three consecutive failures (the
-/// window in which a provider reads as `down`) arrive within five minutes, rarely enough that a
-/// provider the operator just connected is not dialled five times before they can read the Health
-/// tab.
-pub const DEFAULT_AI_HEALTH_POLL_MS: u64 = 60_000;
-
-/// How many agent runs one API process executes at a time (`OMNION_AI_RUNNER_CONCURRENCY`).
-///
-/// 4, not 1 and not 32. One is a runtime that feels broken while a tool takes four seconds; 32
-/// is a runtime that can have thirty-two provider calls in flight on a four-core box, which is
-/// both a timeout story and a bill. Four is what a small installation actually needs, and the
-/// knob exists for the ones that do not.
-pub const DEFAULT_AI_RUNNER_CONCURRENCY: usize = 4;
-
-/// How long a run may stay `running` before the eval runner fails it (`OMNION_AI_EVAL_TIMEOUT`).
-///
-/// 900 s. The arithmetic that produced the number: a suite's cases run one at a time in this
-/// slice, a model turn is on the order of 10 s, and a case carrying `rubric` is two of those
-/// (the one under test plus the judge). 900 s therefore covers roughly forty such cases with
-/// room for a slow provider, which is the largest suite the panel's own import will realistically
-/// produce. Below that the reaper would fail healthy runs; above it a run abandoned by a crashed
-/// process stays `running` past the point where an operator has given up looking.
-pub const DEFAULT_AI_EVAL_TIMEOUT_SECONDS: i64 = 900;
-
-/// How often the eval runner sweeps for suites whose schedule is due (`OMNION_AI_EVAL_SCHEDULER_MS`).
-///
-/// 60 s. A cron string has a one-minute resolution at best, so a faster sweep can only re-check
-/// the same due suites; a slower one makes "hourly" fire up to a minute late, which is inside
-/// the tolerance every other scheduled job in the platform already accepts.
-pub const DEFAULT_AI_EVAL_SCHEDULER_MS: u64 = 60_000;
-
-/// How often stale runs are failed (`OMNION_AI_EVAL_SWEEP_MS`).
-///
-/// Ten minutes. The sweep's predicate is "running longer than the timeout", so once a run has
-/// been found it is already past that window and no second sweep inside the same window could
-/// find anything new — the interval buys recovery speed for the *next* run, nothing else.
-pub const DEFAULT_AI_EVAL_SWEEP_MS: u64 = 600_000;
-
 /// How often the retention worker sweeps (REQ-010, slice 4).
 pub const DEFAULT_RETENTION_POLL_MS: u64 = 900_000;
 
 /// Sites one retention tick walks before it yields to the next tick.
 pub const DEFAULT_RETENTION_MAX_SITES: i64 = 50;
+
+/// How often the audit sweep wakes up. An hour is deliberate: a tenant's shortest legal window
+/// is 30 days, so a tick that finds nothing to remove is the normal outcome and the only reason
+/// to look more often is to notice a newly-shortened window promptly.
+pub const DEFAULT_AUDIT_RETENTION_SWEEP_SECONDS: u64 = 3_600;
+
+/// Organizations one audit sweep tick walks. A tenant per tick keeps the transaction small and
+/// bounds the work a single slow organization can cost the rest of the platform.
+pub const DEFAULT_AUDIT_RETENTION_SWEEP_BATCH: usize = 200;
 
 /// The same bound as a `u64`, because the environment is read through `read_positive`, which
 /// parses into a `u64` and refuses a negative or zero value.
@@ -588,6 +557,37 @@ impl Default for RetentionConfig {
     }
 }
 
+/// Audit retention sweep knobs (docs/requests/REQ-005, slice 4).
+///
+/// A second config next to [`RetentionConfig`] rather than a second set of knobs on it, because
+/// the two workers are unrelated: this one enforces each tenant's own stored
+/// `organization_settings.audit_retention_days` window over the audit trail, the other sweeps
+/// superseded media versions and site trash. Folding them into one struct would let an operator
+/// who switched media retention off silently switch the audit sweep off too.
+///
+/// On by default because retention that only runs when somebody remembers is not retention: a
+/// setting that is stored, validated and rendered but never read is exactly the kind of
+/// "coming soon" the platform does not ship.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRetentionConfig {
+    /// Whether this process sweeps expired audit rows (`OMNION_AUDIT_RETENTION_SWEEP`).
+    pub sweep_enabled: bool,
+    /// Delay between two sweep ticks, in seconds (`OMNION_AUDIT_RETENTION_SWEEP_SECONDS`).
+    pub sweep_seconds: u64,
+    /// Tenants one tick looks at (`OMNION_AUDIT_RETENTION_SWEEP_BATCH`).
+    pub sweep_batch: usize,
+}
+
+impl Default for AuditRetentionConfig {
+    fn default() -> Self {
+        Self {
+            sweep_enabled: true,
+            sweep_seconds: DEFAULT_AUDIT_RETENTION_SWEEP_SECONDS,
+            sweep_batch: DEFAULT_AUDIT_RETENTION_SWEEP_BATCH,
+        }
+    }
+}
+
 /// Email settings of the `send_email` action (`OMNION_SMTP_*`, `OMNION_MAIL_*`).
 ///
 /// Development defaults point at Mailpit, which the compose stack publishes on `1025`; a
@@ -663,116 +663,6 @@ impl std::fmt::Debug for MailConfig {
             )
             .field("timeout_ms", &self.timeout_ms)
             .finish()
-    }
-}
-
-/// AI Hub knobs (docs/requests/REQ-097, slice 3).
-///
-/// The probe runner of `apps/api` reads these: every `poll_ms` it runs the **same** connection
-/// test the "Probe now" button runs, once per enabled provider, and prunes the history that fell
-/// out of the retention window. Turning the runner off (`OMNION_AI_HEALTH_RUNNER=false`) leaves
-/// the samples untouched — the Health tab then shows only what an operator probed by hand, which
-/// is a real history, just a sparse one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AiHubConfig {
-    /// Whether this process samples provider health (`OMNION_AI_HEALTH_RUNNER`).
-    pub runner_enabled: bool,
-    /// Delay between two probe ticks (`OMNION_AI_HEALTH_POLL_MS`).
-    pub poll_ms: u64,
-    /// How many days of samples and usage rows are kept (`OMNION_AI_HEALTH_RETENTION_DAYS`).
-    ///
-    /// Unsigned on purpose: a negative retention is not a shorter history, it is a `make_interval`
-    /// that deletes everything, and the reader refuses it rather than trusting the spelling.
-    pub retention_days: u64,
-    /// Whether this process runs the agent runner (`OMNION_AI_RUNNER`).
-    ///
-    /// A **third** switch rather than a reading of `runner_enabled`, because the health probe,
-    /// the decision pruner and the agent runner are three different kinds of background work with
-    /// three different risk profiles: the probe makes outbound network calls, the pruner issues a
-    /// bulk delete, and the runner **spends money** — it calls a provider and a tool. An
-    /// installation that wants its providers probed but refuses to let an agent act on its own
-    /// says `OMNION_AI_RUNNER=false`, and the API answers `503 runner_disabled` on a run start
-    /// rather than queueing work nothing will ever pick up. A panel that queued runs forever with
-    /// no worker would look like a bug in the agent.
-    pub agent_runner_enabled: bool,
-    /// How many runs one process executes at a time (`OMNION_AI_RUNNER_CONCURRENCY`).
-    ///
-    /// Default 4, floor 1. Every slot is one in-flight provider call plus one tool, so this is
-    /// the number that decides how many tokens can be in flight at once — it is a money knob and
-    /// not only a thread-pool knob. A floor of 1 rather than 0 because a concurrency of 0 is a
-    /// runner that never runs anything and reports itself healthy.
-    pub runner_concurrency: usize,
-    /// Whether this process prunes the route decision log (`OMNION_AI_LOG_RUNNER`).
-    ///
-    /// A **separate** switch from `runner_enabled`, not a second reading of the same one: the
-    /// health probe dials providers on the network, and the decision pruner only issues a bulk
-    /// delete. An installation that wants to stop outbound probes (a locked-down network, a
-    /// cost policy) still wants its log pruned, and an installation that manages retention
-    /// with an external job does not want a second one deleting rows underneath it. One env
-    /// var for "do not touch my providers" and another for "do not touch my log" is the only
-    /// split that serves both.
-    pub log_runner_enabled: bool,
-    /// Whether this process executes queued eval runs (`OMNION_AI_EVAL_RUNNER`).
-    ///
-    /// A **fourth** switch, and the split is the same one the three above already draw: this
-    /// runner is the second background task that **spends money** — a rubric case costs a second
-    /// model call on top of the one under test, so a suite of twenty rubric cases costs twice a
-    /// chat turn twenty times. An installation that lets an agent talk but refuses to let an
-    /// eval burn a judge budget says `OMNION_AI_EVAL_RUNNER=false`, and the API answers
-    /// `503 runner_disabled` on run start rather than queueing runs that will never be picked
-    /// up and that the history would show as permanently `queued`.
-    ///
-    /// It is not a reading of `agent_runner_enabled` on purpose: an eval run is not an agent
-    /// run, it has no identity and may call no tools, and tying the two would let an operator
-    /// who switched off agent autonomy also switch off the evidence that their agents work —
-    /// which is the switch they most need when they are deciding whether to switch it back on.
-    pub eval_runner_enabled: bool,
-    /// How long a run may stay `running` before the runner fails it (`OMNION_AI_EVAL_TIMEOUT`).
-    ///
-    /// 900 s by default: long enough for a twenty-case suite where each case is a slow model
-    /// turn, short enough that a run whose process died between claim and settle is `error`
-    /// before an operator goes looking for it. The unit is seconds and the floor is 30 —
-    /// below that a healthy run on a slow provider would be failed by the reaper while it was
-    /// still working, which is the one failure this number exists to prevent.
-    pub eval_timeout_seconds: i64,
-    /// How often the eval runner sweeps for suites whose schedule is due (`OMNION_AI_EVAL_SCHEDULER_MS`).
-    ///
-    /// 60 s rather than the agent runner's 250 ms tick: a cron schedule has a resolution of a
-    /// minute anyway, and a sweep that reads every enabled suite is a query per suite per tick —
-    /// cheap once a minute, not four times a second.
-    pub eval_scheduler_ms: u64,
-    /// Whether this process rolls up the per-tool telemetry (`OMNION_AI_TELEMETRY_RUNNER`).
-    ///
-    /// **A sixth switch, and this one is about writes rather than calls.** Every runner above
-    /// dials a provider, scores a suite or deletes rows; this one only re-reads `ai_tool_calls`
-    /// and upserts a roll-up row per tool per day. That makes it the cheapest background task in
-    /// the box by an order of magnitude, and also the one an installation is most likely to
-    /// disable for a reason nobody predicted — an operator who prunes the call log on their own
-    /// schedule does not want a second process reading it, and an operator who restores the
-    /// platform from a snapshot has no use for a roll-up of a window the snapshot predates.
-    ///
-    /// The reader is a **separate** concern from this writer, deliberately: the telemetry screen
-    /// reads `ai_tool_stats_daily` whether or not anything is refreshing it, and an installation
-    /// that turns the runner off still gets the screen — it just gets the numbers the runner last
-    /// wrote. A screen that refused to render because a background task is switched off would
-    /// turn a knob into an outage.
-    pub telemetry_runner_enabled: bool,
-}
-
-impl Default for AiHubConfig {
-    fn default() -> Self {
-        Self {
-            runner_enabled: true,
-            poll_ms: DEFAULT_AI_HEALTH_POLL_MS,
-            retention_days: 30,
-            agent_runner_enabled: true,
-            runner_concurrency: DEFAULT_AI_RUNNER_CONCURRENCY,
-            log_runner_enabled: true,
-            eval_runner_enabled: true,
-            eval_timeout_seconds: DEFAULT_AI_EVAL_TIMEOUT_SECONDS,
-            eval_scheduler_ms: DEFAULT_AI_EVAL_SCHEDULER_MS,
-            telemetry_runner_enabled: true,
-        }
     }
 }
 
@@ -983,7 +873,6 @@ impl std::fmt::Debug for CsrfSecret {
     }
 }
 
-
 /// Fully validated runtime configuration of one Omnion service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -1007,10 +896,10 @@ pub struct Config {
     pub search: SearchConfig,
     /// Analytics collection and rollup knobs (REQ-007).
     pub analytics: AnalyticsConfig,
-    /// AI provider health probe knobs (REQ-097).
-    pub ai_hub: AiHubConfig,
-    /// Retention worker knobs (REQ-010, slice 4).
+    /// Media library retention worker knobs (REQ-010, slice 4).
     pub retention: RetentionConfig,
+    /// Audit retention sweep knobs (REQ-005, slice 4).
+    pub audit_retention: AuditRetentionConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
     /// The installation's Web Push identity (REQ-021, slice 6).
@@ -1223,6 +1112,20 @@ impl Config {
             )?,
         };
 
+        let audit_retention = AuditRetentionConfig {
+            sweep_enabled: read_flag(&read, "OMNION_AUDIT_RETENTION_SWEEP", true)?,
+            sweep_seconds: read_positive(
+                &read,
+                "OMNION_AUDIT_RETENTION_SWEEP_SECONDS",
+                DEFAULT_AUDIT_RETENTION_SWEEP_SECONDS,
+            )?,
+            sweep_batch: read_count(
+                &read,
+                "OMNION_AUDIT_RETENTION_SWEEP_BATCH",
+                DEFAULT_AUDIT_RETENTION_SWEEP_BATCH,
+            )?,
+        };
+
         let analytics = AnalyticsConfig {
             runner_enabled: read_flag(&read, "OMNION_ANALYTICS_RUNNER", true)?,
             poll_ms: read_positive(&read, "OMNION_ANALYTICS_POLL_MS", DEFAULT_ANALYTICS_POLL_MS)?,
@@ -1230,43 +1133,6 @@ impl Config {
                 &read,
                 "OMNION_ANALYTICS_COLLECT_PER_MINUTE",
                 DEFAULT_ANALYTICS_COLLECT_PER_MINUTE,
-            )?,
-        };
-
-        let ai_hub = AiHubConfig {
-            runner_enabled: read_flag(&read, "OMNION_AI_HEALTH_RUNNER", true)?,
-            poll_ms: read_positive(&read, "OMNION_AI_HEALTH_POLL_MS", DEFAULT_AI_HEALTH_POLL_MS)?,
-            retention_days: read_positive(
-                &read,
-                "OMNION_AI_HEALTH_RETENTION_DAYS",
-                AiHubConfig::default().retention_days,
-            )?,
-            log_runner_enabled: read_flag(&read, "OMNION_AI_LOG_RUNNER", true)?,
-            agent_runner_enabled: read_flag(&read, "OMNION_AI_RUNNER", true)?,
-            runner_concurrency: read_positive(
-                &read,
-                "OMNION_AI_RUNNER_CONCURRENCY",
-                DEFAULT_AI_RUNNER_CONCURRENCY as u64,
-            )?
-            .max(1) as usize,
-            eval_runner_enabled: read_flag(&read, "OMNION_AI_EVAL_RUNNER", true)?,
-            telemetry_runner_enabled: read_flag(&read, "OMNION_AI_TELEMETRY_RUNNER", true)?,
-            // The floor of 30 is enforced here rather than trusted from the operator: the number
-            // decides when the reaper fails a run, and a value under thirty would fail healthy
-            // runs on any provider slower than half a second per case. Clamping is the honest
-            // response — refusing to boot an installation over a too-small timeout is a far
-            // worse outcome than a timeout that ignores their number.
-            eval_timeout_seconds: i64::try_from(read_positive(
-                &read,
-                "OMNION_AI_EVAL_TIMEOUT",
-                DEFAULT_AI_EVAL_TIMEOUT_SECONDS as u64,
-            )?)
-            .unwrap_or(DEFAULT_AI_EVAL_TIMEOUT_SECONDS)
-            .max(30),
-            eval_scheduler_ms: read_positive(
-                &read,
-                "OMNION_AI_EVAL_SCHEDULER_MS",
-                DEFAULT_AI_EVAL_SCHEDULER_MS,
             )?,
         };
 
@@ -1306,8 +1172,8 @@ impl Config {
             automation,
             search,
             analytics,
-            ai_hub,
             retention,
+            audit_retention,
             mail,
             push,
             csrf,
@@ -1348,8 +1214,8 @@ impl Default for Config {
             automation: AutomationConfig::default(),
             search: SearchConfig::default(),
             analytics: AnalyticsConfig::default(),
-            ai_hub: AiHubConfig::default(),
             retention: RetentionConfig::default(),
+            audit_retention: AuditRetentionConfig::default(),
             mail: MailConfig::default(),
             push: PushConfig::default(),
             // No secret by default, which is the honest default: a default key would be a key
@@ -1836,141 +1702,6 @@ mod tests {
         assert!(config.mail.authenticates());
         assert_eq!(config.mail.timeout_ms, 1_500);
         assert!(!config.mail.is_usable(), "switched off is not usable");
-    }
-
-    #[test]
-    fn the_ai_health_probe_has_development_defaults_and_is_configurable() {
-        let config = config_from(&[]).expect("defaults must load");
-        assert!(config.ai_hub.runner_enabled);
-        assert_eq!(config.ai_hub.poll_ms, DEFAULT_AI_HEALTH_POLL_MS);
-        assert_eq!(
-            config.ai_hub.retention_days,
-            AiHubConfig::default().retention_days
-        );
-
-        let tuned = config_from(&[
-            ("OMNION_AI_HEALTH_RUNNER", "false"),
-            ("OMNION_AI_HEALTH_POLL_MS", "5000"),
-            ("OMNION_AI_HEALTH_RETENTION_DAYS", "7"),
-        ])
-        .expect("the AI Hub settings are valid");
-        assert!(!tuned.ai_hub.runner_enabled);
-        // The decision pruner is a second switch on purpose: disabling the health probe must
-        // not silently disable the log retention (or the reverse), which is the mistake a
-        // shared env var guarantees somebody will eventually make.
-        assert!(config.ai_hub.log_runner_enabled);
-        let pruner_off = config_from(&[("OMNION_AI_LOG_RUNNER", "false")])
-            .expect("one flag must parse");
-        assert!(!pruner_off.ai_hub.log_runner_enabled);
-        assert!(
-            pruner_off.ai_hub.runner_enabled,
-            "switching the decision pruner off must not switch the health probe off"
-        );
-    }
-
-    #[test]
-    fn the_agent_runner_has_its_own_switch_and_its_own_concurrency() {
-        let config = config_from(&[]).expect("defaults must load");
-        assert!(config.ai_hub.agent_runner_enabled, "the runner is on by default");
-        assert_eq!(
-            config.ai_hub.runner_concurrency, DEFAULT_AI_RUNNER_CONCURRENCY,
-            "four in-flight runs is the documented default"
-        );
-
-        let off = config_from(&[("OMNION_AI_RUNNER", "false")]).expect("one flag must parse");
-        assert!(!off.ai_hub.agent_runner_enabled);
-        // The reason the switch is its own field and not a reading of the health probe's: an
-        // installation that refuses to let an agent spend money must still get its providers
-        // probed, and a shared flag takes both away together.
-        assert!(
-            off.ai_hub.runner_enabled,
-            "switching the agent runner off must leave the health probe running"
-        );
-        assert!(off.ai_hub.log_runner_enabled);
-
-        let narrow = config_from(&[("OMNION_AI_RUNNER_CONCURRENCY", "1")])
-            .expect("one number must parse");
-        assert_eq!(narrow.ai_hub.runner_concurrency, 1);
-
-        // 0 is refused by the positive reader, and a concurrency of zero is a runner that reports
-        // itself healthy and never runs anything.
-        let zero = config_from(&[("OMNION_AI_RUNNER_CONCURRENCY", "0")]);
-        assert!(
-            zero.is_err(),
-            "a runner with no slots would report itself healthy and run nothing"
-        );
-    }
-
-    #[test]
-    fn the_eval_runner_has_a_switch_of_its_own_and_a_floored_timeout() {
-        let config = config_from(&[]).expect("defaults must load");
-        assert!(config.ai_hub.eval_runner_enabled, "the runner is on by default");
-        assert_eq!(
-            config.ai_hub.eval_timeout_seconds, DEFAULT_AI_EVAL_TIMEOUT_SECONDS,
-            "fifteen minutes is the documented default"
-        );
-        assert_eq!(
-            config.ai_hub.eval_scheduler_ms, DEFAULT_AI_EVAL_SCHEDULER_MS,
-            "a schedule is swept once a minute"
-        );
-
-        // The reason this is a fourth switch rather than a reading of the agent runner's: an
-        // eval run is not an agent run — it has no identity and may call no tools — and the
-        // operator who switched off agent autonomy still needs the evidence that their agents
-        // work, which is the thing they most want when deciding whether to switch it back on.
-        let off = config_from(&[("OMNION_AI_EVAL_RUNNER", "false")]).expect("one flag must parse");
-        assert!(!off.ai_hub.eval_runner_enabled);
-        assert!(
-            off.ai_hub.agent_runner_enabled,
-            "switching the eval runner off must leave agent runs working"
-        );
-        assert!(
-            off.ai_hub.runner_enabled,
-            "switching the eval runner off must leave the health probe working"
-        );
-        assert!(
-            config_from(&[("OMNION_AI_RUNNER", "false")])
-            .expect("one flag must parse")
-            .ai_hub
-            .eval_runner_enabled,
-            "switching the agent runner off must leave eval runs working"
-        );
-
-        // A timeout under thirty seconds would fail healthy runs on any provider slower than
-        // half a second a case. It is clamped rather than refused: booting is not the operator's
-        // way to learn their number was too small, and a silent, documented floor is.
-        let tight = config_from(&[("OMNION_AI_EVAL_TIMEOUT", "5")]).expect("a number must parse");
-        assert_eq!(
-            tight.ai_hub.eval_timeout_seconds, 30,
-            "a five-second timeout is clamped to the floor, not honoured"
-        );
-
-        let wide = config_from(&[("OMNION_AI_EVAL_TIMEOUT", "1800")]).expect("a number must parse");
-        assert_eq!(wide.ai_hub.eval_timeout_seconds, 1800, "a real value is kept");
-
-        // 0 is refused by the positive reader: a reaper with a zero window fails the run it is
-        // asked to rescue, on the same statement that finds it.
-        assert!(
-            config_from(&[("OMNION_AI_EVAL_TIMEOUT", "0")]).is_err(),
-            "a zero timeout window would fail every run the sweep found"
-        );
-        assert!(
-            config_from(&[("OMNION_AI_EVAL_SCHEDULER_MS", "0")]).is_err(),
-            "a zero scheduler interval would spin the sweep against every suite"
-        );
-    }
-
-    #[test]
-    fn the_probe_interval_may_not_be_zero() {
-        // A zero interval would spin the runner against every provider as fast as the box
-        // allows; the read helper refuses it rather than letting a typo become a self-inflicted
-        // denial of service on the operator's own API keys.
-        let error = config_from(&[("OMNION_AI_HEALTH_POLL_MS", "0")])
-            .expect_err("a zero probe interval must be refused");
-        assert!(
-            error.to_string().contains("OMNION_AI_HEALTH_POLL_MS"),
-            "got {error}"
-        );
     }
 
     #[test]

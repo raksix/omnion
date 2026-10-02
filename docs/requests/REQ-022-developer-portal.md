@@ -135,7 +135,25 @@ Migration: `database/migrations/0012_developer_portal.sql` (next free number at 
         `require_or_developer_key`), its `last_used_at` is then read **out of PostgreSQL**, and after
         `DELETE` the *identical token bytes* are refused `401`. The row survives the revoke, because a
         request made five minutes earlier must still name the key that made it.
-- [ ] Expiry is enforced (`401` past `expires_at`) and the UI labels the key `expired`.
+- [x] Expiry is enforced (`401` past `expires_at`) and the UI labels the key `expired`.
+      — `an_expiry_past_dies_the_key_and_the_list_says_so`. The criterion has three halves and the walk
+        asserts all of them in order, because the cheapest version of this test passes against a key
+        that never authenticated: **the key works first** (`200` on the sandbox probe with an expiry
+        30 days out), **then the identical bytes stop** once the instant passes, **then the panel
+        says so** — `status: "expired"` in the list, the row under `?status=expired`, the row *absent*
+        from `?status=active`, and the overview counting it under `expired` and not under `active`.
+        The filter half is separate from the label on purpose: a list that labels correctly but filters
+        on the wrong column hides the key under "Active", which is the confusing case rather than the
+        obvious one.
+        The instant is reached by **writing the column**, not through the API: `create_key` refuses an
+        expiry in the past at mint time, which is the right product decision and makes the negative
+        case unreachable from outside. `expires_at <= now()`, not `<` — a key whose second has
+        arrived must not still be live, and an off-by-one there is invisible until somebody sets a
+        one-second expiry.
+        Writing this walk also corrected an assumption in the walk beside it: `list_keys` answers a
+        **bare array**, not `{ "keys": [...] }`. The assertion named the contract it expected and the
+        contract turned out to be a different one, which is the useful outcome — a walk accepting
+        either shape would have proved nothing about which one the server serves.
 - [x] Rotation invalidates the previous secret immediately and keeps usage history.
       — `rotation_kills_the_previous_secret_immediately_and_keeps_the_old_row`. Rotation **inserts a
         successor** with `rotated_from` set and revokes the predecessor in one transaction, rather than

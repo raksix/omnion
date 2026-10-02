@@ -1,29 +1,47 @@
 [package]
 name = "omnion-developer"
-description = "Omnion developer portal: API keys, OAuth apps and the request log (REQ-022)."
+description = "Omnion developer platform: API keys, request logs and the tooling a developer extends the platform with."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = []
+# Enabled by `apps/api`. Everything that touches PostgreSQL lives behind this, so the key
+# material and the filter rules — the two places a mistake is a security bug rather than a
+# missing row — are tested by a `cargo test -p omnion-developer` that needs no database at
+# all. A test module that needs a `PgPool` to check a name length is a test that does not run
+# on a box with seven writers and a hundred database connections.
+store = ["dep:sqlx"]
+
 [dependencies]
-hex.workspace = true
-# The key's own SHA-256 and the client's keyed fingerprint share one hash, and the fingerprint
-# needs a *key* (a pepper) so a log export cannot be reversed into an address list.
-hmac.workspace = true
-rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-sqlx.workspace = true
-# Constant-time hash comparison. Already in the tree via `crates/identity`; a `==` on a
-# digest is a timing oracle, because the token's public prefix is printed on the key list.
-subtle = "2"
+# Every error here is a sentence an operator reads in a panel, so the derive is what turns a
+# variant into one; without it the crate has no way to say anything.
 thiserror.workspace = true
-# `macros` for `time::macros::datetime!` in the tests. The workspace default is
-# `serde-well-known` only, so `time.workspace = true` alone gives a crate that cannot write a
-# timestamp in a test — and the failure reads as `invalid component: day was 02T00`, which looks
-# like a malformed literal rather than a missing feature. A boundary function is exactly the
-# kind of thing that needs a test with real instants in it.
+# `macros` is for `datetime!` in the tests below: the expiry boundary is a *boundary*, and a
+# test that wrote `now + Duration::from_secs(3600)` inline would have to be read carefully to
+# see it was testing the instant on either side of it. The workspace default is `serde-well-known`
+# only, so `time.workspace = true` alone gives a crate that cannot write a timestamp in a test —
+# and the failure reads as `invalid component: day was 02T00`, which looks like a malformed literal
+# rather than a missing feature.
 time = { workspace = true, features = ["macros"] }
+tracing.workspace = true
 uuid.workspace = true
+# Key material is hashed with SHA-256 rather than the Argon2id the identity crate uses for
+# passwords, and `crates/developer/src/secret.rs` argues why at length: a key is 256 bits from
+# the CSPRNG, so there is no dictionary to slow down.
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+# Constant-time comparison, so a caller cannot learn a valid secret one byte at a time by
+# timing a stream of 401s. Small crate, and the alternative is a hand-rolled `==` on the one
+# comparison in the system where timing leaks.
+# The client fingerprint in `store::ClientIdentity` is an HMAC, not a hash: the same address
+# behind the same agent must produce the same value across restarts and a reader must not be
+# able to enumerate addresses from the table.
+hmac.workspace = true
+subtle = "2"
+sqlx = { workspace = true, optional = true }

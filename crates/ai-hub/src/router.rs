@@ -18,7 +18,7 @@
 use sqlx::PgPool;
 
 use crate::error::{AiHubError, Result};
-use crate::model::{AiModel, ModelCapability, Provider, require_capability};
+use crate::model::{AiModel, Provider};
 use crate::store;
 
 /// The provider and the model one request resolves to.
@@ -46,33 +46,8 @@ pub fn model_id(provider: &Provider, model: &AiModel) -> String {
 
 /// Resolve the model one request addresses.
 pub async fn resolve(pool: &PgPool, requested: Option<&str>) -> Result<ResolvedModel> {
-    let resolved = lookup(pool, requested).await?;
+    let requested = requested.map(str::trim).filter(|value| !value.is_empty());
 
-    Ok(resolved)
-}
-
-/// Resolve a model and check it against what the request needs, before anything is dialled.
-///
-/// This is the enforcement point REQ-097 asks for: a stream asked of a model that cannot stream,
-/// an image sent to a model that cannot see, and a tool call made by a model that cannot call
-/// tools are all refused here — inside the process, with the model's key and the capability in
-/// the message — instead of reaching a provider that answers with a 400 nobody can act on.
-pub async fn resolve_for(
-    pool: &PgPool,
-    requested: Option<&str>,
-    needs: &[ModelCapability],
-) -> Result<ResolvedModel> {
-    let resolved = lookup(pool, requested).await?;
-
-    for capability in needs {
-        require_capability(&resolved.model, *capability)?;
-    }
-
-    Ok(resolved)
-}
-
-/// The resolution half of [`resolve`] and [`resolve_for`].
-async fn lookup(pool: &PgPool, requested: Option<&str>) -> Result<ResolvedModel> {
     match requested {
         None => default_model(pool).await,
         Some(value) => {
@@ -165,15 +140,8 @@ mod tests {
             id: Uuid::new_v4(),
             name: name.to_owned(),
             protocol: "openai_compatible".to_owned(),
-            kind: "cloud".to_owned(),
             base_url: "https://api.example.com/v1".to_owned(),
             api_key: None,
-            timeout_ms: 30_000,
-            max_retries: 1,
-            priority: 100,
-            last_health: "unknown".to_owned(),
-            last_checked_at: None,
-            last_error: None,
             enabled,
             is_default,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -192,17 +160,6 @@ mod tests {
             supports_vision: false,
             supports_streaming: true,
             supports_embeddings: false,
-            supports_image_generation: false,
-            supports_audio_generation: false,
-            supports_transcription: false,
-            supports_json_mode: false,
-            max_output_tokens: None,
-            input_cost_micros_per_mtok: None,
-            output_cost_micros_per_mtok: None,
-            price_source: "manual".to_owned(),
-            price_updated_at: None,
-            capabilities_source: "manual".to_owned(),
-            capabilities_verified_at: None,
             enabled,
             is_default: false,
             created_at: OffsetDateTime::UNIX_EPOCH,

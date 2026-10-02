@@ -66,6 +66,8 @@ create table media_grants (
     created_by      uuid        references users (id) on delete set null,
     created_at      timestamptz not null default now(),
     updated_at      timestamptz not null default now(),
+    -- One row per (node, subject). A second `allow` for the same pair is a mistake the
+    -- `upsert` path overwrites rather than accumulating two rows that disagree.
     constraint media_grants_node_xor
         check ((folder_id is null) <> (media_id is null)),
     constraint media_grants_subject_kind_known
@@ -76,23 +78,28 @@ create table media_grants (
         check (effect = 'allow' or can_read or can_write or can_delete or can_share)
 );
 
--- One row per (node, subject). A second `allow` for the same pair is a mistake the upsert
--- path overwrites rather than accumulating two rows that disagree.
+-- One row per (node, subject), expressed as a **unique index** and not as a table
+-- constraint. A table-level `unique` constraint accepts *column names*, not expressions,
+-- so `unique (coalesce(...), coalesce(...), ...)` is a syntax error -- and because the
+-- migrations apply as a set, that one statement stops every later migration from
+-- applying too. The symptom reads like a total regression; the cause is a rule about
+-- where expressions may appear.
 --
--- A **unique index**, not a table constraint: the key is built from `coalesce` over two
--- nullable columns, and PostgreSQL accepts expressions in an index but not inside a `unique`
--- constraint. The first version declared it inline and every migration in the set died with
--- `syntax error at or near "("` — which is a poor way to learn that, because it reads as a
--- typo in the file rather than as a rule about where expressions may appear.
+-- The uniqueness spans `(folder_id, media_id)` with exactly one of the two set, so the
+-- nil uuid is the sentinel: `media_grants_node_xor` guarantees one side is null and the
+-- coalesce can never collapse a folder row onto a file row.
 --
--- The `on conflict` target in `put_grant` names this same expression, so the two have to stay
--- identical. They live in different files and different languages, which is why the expression
--- is written once, as `omnion_media::grants::GRANT_CONFLICT`, and a unit test pins its text.
-create unique index media_grants_unique_subject on media_grants (
-    coalesce(folder_id, '00000000-0000-0000-0000-000000000000'::uuid),
-    coalesce(media_id, '00000000-0000-0000-0000-000000000000'::uuid),
-    subject_kind, subject_id
-);
+-- This expression is duplicated in `crates/media/src/grants.rs` as `GRANT_CONFLICT`,
+-- because the `on conflict` target in `put_grant` must name this exact index. Two files,
+-- two languages, so the drift is real; the API crate's `media_grants` suite pins the two
+-- against each other by text.
+create unique index if not exists media_grants_node_x_subject
+    on media_grants (
+        coalesce(folder_id, '00000000-0000-0000-0000-000000000000'::uuid),
+        coalesce(media_id, '00000000-0000-0000-0000-000000000000'::uuid),
+        subject_kind,
+        subject_id
+    );
 
 comment on table media_grants is
     'Folder and file access grants (REQ-010). A grant can only narrow: a `deny` refuses a '

@@ -1,0 +1,29 @@
+[package]
+name = "omnion-regions"
+description = "Omnion edge regions: the registry, per-service health and region-to-region latency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+# Enabled by `apps/api`. Everything that touches PostgreSQL lives behind this, so the
+# aggregation and validation rules — the two places a mistake is a *wrong status on a panel*
+# rather than a missing row — are proved by a `cargo test -p omnion-regions` that needs no
+# database at all. Seven writers share a PostgreSQL with a hundred connections; a test that
+# needs a pool to check that an empty check set is not `healthy` is a test that does not run.
+store = ["dep:sqlx"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# Every error here is a sentence an operator reads in a panel, so the derive is what turns a
+# variant into one; without it the crate has no way to say anything.
+thiserror.workspace = true
+# `macros` is not needed for slice 1, but the crate's timestamps are `OffsetDateTime` and the
+# workspace pin carries the feature for the migration-backed tests that come with slice 2.
+time.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+sqlx = { workspace = true, optional = true }

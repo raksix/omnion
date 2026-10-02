@@ -172,34 +172,6 @@ pub async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Option<
         .map_err(IdentityError::from)
 }
 
-/// Put an account inside an organization, or take it out again.
-///
-/// **This is the write that makes `users.organization_id` mean anything.** The onboarding wizard
-/// records the first organization in `onboarding_state` and creates the row, but until something
-/// copies that id onto the account itself, every org-scoped route answers
-/// `organization_required` — `scope::resolve_organization` reads `current.user.organization_id`,
-/// not the onboarding state. The failure is silent in the worst way: setup reports success, the
-/// wizard completes all eight steps, and the first screen that asks for tenant data shows an
-/// error banner with a Retry button that can never succeed.
-///
-/// `None` is allowed and means a platform-level account, which is exactly what a superadmin is.
-/// It is not the same as a no-op, so it is a real write rather than a skipped one.
-pub async fn set_user_organization(
-    pool: &PgPool,
-    user_id: Uuid,
-    organization_id: Option<Uuid>,
-) -> Result<Option<User>, IdentityError> {
-    let sql = format!(
-        "update users set organization_id = $2 where id = $1 returning {USER_COLUMNS}"
-    );
-    sqlx::query_as::<_, User>(&sql)
-        .bind(user_id)
-        .bind(organization_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(IdentityError::from)
-}
-
 /// Look an account up by email address.
 pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<User>> {
     let email = normalize_email(email)?;

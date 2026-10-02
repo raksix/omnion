@@ -1,0 +1,36 @@
+[package]
+name = "omnion-cdn"
+description = "Omnion CDN/edge: cache-rule matching, cache-key derivation, header policy and the purge queue model."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+# The invalidation drain (REQ-011 slice 3) logs why an event queued nothing. That reason is
+# the only trace of a mis-set trigger, so it cannot live in a `Result` a caller may drop.
+tracing.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+# The HTTP adapters (`generic_http`, `cloudflare_style`) make real calls: blocking so the
+# synchronous `Provider` trait stays synchronous, with the queue worker awaiting on
+# `spawn_blocking`.
+reqwest = { workspace = true, features = ["blocking", "json"] }
+# The write-only provider credential (REQ-011, slice 4) is sealed with the platform's
+# existing envelope rather than a second one: `omnion-identity` answers "how is a stored
+# secret protected" in exactly one place, with one key variable and one development
+# fallback, and a column sealed any other way would need a key rotation that knows about
+# both. The identity crate does not depend on this one, so the direction stays a DAG.
+omnion-identity = { path = "../identity" }
+
+[dev-dependencies]
+# The trigger table must only name events the platform records, and the event catalogue is
+# the one place that knows. A dev-dependency rather than a real one: `omnion-events` does
+# not depend on this crate, so there is no cycle, but the CDN layer has no business knowing
+# the catalogue at runtime — it consumes event *names*, and a test that asks the registry
+# whether those names exist is the whole of the guarantee.
+omnion-events = { path = "../events" }

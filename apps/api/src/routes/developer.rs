@@ -1,525 +1,490 @@
-//! `/api/v1/developer` — the credential and traffic surface (REQ-022, slice 1).
+//! `/api/v1/api-keys` and `/api/v1/request-logs` — the developer surface's two reads and
+//! three writes (docs/requests/REQ-033, slice 1).
 //!
-//! ## What this module guarantees, and where each guarantee lives
+//! Reading keys and the request log is `developer.keys.read`; minting, rotating and revoking is
+//! `developer.keys.manage`. The split is not a formality: a key is a credential that
+//! authenticates *as this organization*, so an account that can read the key list must not
+//! thereby be able to add one.
 //!
-//! * **A secret is in exactly one response.** [`create_key`] and [`rotate_key`] return
-//!   [`IssuedKey`], whose `token` field is the only field in the crate that can hold a
-//!   plaintext. Every other handler answers [`KeyView`], which has no such field. The
-//!   guarantee is therefore a property of the response type, not of anybody's memory.
-//! * **A key's scopes may only narrow.** [`create_key`] resolves the caller's own granted set
-//!   and refuses any scope they do not hold, with the name in the message. This is the check
-//!   that stops a read-only integration from minting one that can rotate keys.
-//! * **Every credential action is audited and emits an event**, and both carry ids, names,
-//!   environments and scope *names* — never a token and never a hash. A hash is as sensitive
-//!   as the token for an offline-guessing attacker, so it does not travel either.
-//! * **Nothing is echoed back on refusal.** A bad token answers a stable code and a sentence,
-//!   never the presented value; the REQ names this explicitly and an error message is the one
-//!   place a credential habitually leaks.
+//! # The one shape this file must never produce
+//!
+//! [`Minted`] is the only type in `omnion-developer` that carries plaintext, and it exists only
+//! as the return value of `create` and `rotate`. There is deliberately no handler that turns a
+//! stored row back into one — so "the secret came back a second time" is a code path that does
+//! not exist rather than a test that has to remember to fail. Everything else here returns
+//! [`ApiKey`], which has no secret field to fill in.
+//!
+//! # Where the rate tier is checked
+//!
+//! In the handler, from the *resolved* role rather than from the body, because the request says
+//! `high` "requires an owner or admin role" and a check that read the submitted role would be a
+//! check the caller could satisfy by typing it.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use omnion_audit::{NewAuditEntry, record as record_audit};
+use axum::http::StatusCode;
+use omnion_audit::NewAuditEntry;
+use omnion_developer::model::RateTier;
+use omnion_developer::store;
 use omnion_developer::{
-    DeveloperError, ENVIRONMENTS, KeyView, IssuedKey, KeyQuery, KeyStatus, LogQuery, UsagePoint,
-    keys_store, logs_store, mintable_from, scope_names_valid,
+    ApiKey, DeveloperError, Environment, Minted, NewKey, RequestLog, RequestLogPage,
+    RequestLogQuery,
 };
-use omnion_events::{NewEvent, bus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use time::OffsetDateTime;
+use sqlx::Row;
+use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::auth::CurrentSession;
+use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------------------------
-// Error mapping
+// Request and response shapes
 // ---------------------------------------------------------------------------------------------
 
-/// Map a crate error onto the API surface.
+/// Body of `POST /api/v1/api-keys`.
+#[derive(Debug, Deserialize)]
+pub struct CreateKeyInput {
+    /// Display name, 3–60 characters, unique in this organization.
+    pub name: String,
+    /// Permission keys the key carries. At least one.
+    pub scopes: Vec<String>,
+    /// Which environment it authenticates against.
+    pub environment: String,
+    /// `standard`, or `high` for an owner or administrator.
+    #[serde(default)]
+    pub rate_tier: Option<String>,
+    /// CIDR blocks the key may be used from. Omit for "any source".
+    #[serde(default)]
+    pub ip_allowlist: Option<Vec<String>>,
+    /// Days until expiry: 30, 90, 365, or `None` for never.
+    ///
+    /// Days rather than an instant because the panel offers exactly those four choices and a
+    /// date picker would let a developer key expire at 03:14 on a Sunday. `None` here means
+    /// "never expires", which is the same reading as a form that submits the default.
+    #[serde(default)]
+    pub expires_in_days: Option<i64>,
+}
+
+/// The keys list. A wrapper rather than a bare array so a future field (a summary count, the
+/// environments the organization uses) does not change the response shape from an array into an
+/// object and break every client at once.
+#[derive(Debug, Serialize)]
+pub struct KeysResponse {
+    /// The keys, newest first.
+    pub keys: Vec<ApiKey>,
+}
+
+/// A key as the panel sees it, including the usage series on its detail screen.
+#[derive(Debug, Serialize)]
+pub struct KeyDetailResponse {
+    /// The key itself — no secret, and there is no field for one.
+    pub key: ApiKey,
+    /// Daily request/error counters, oldest first.
+    pub usage: Vec<UsagePoint>,
+}
+
+/// One bar of a key's usage chart.
+#[derive(Debug, Serialize)]
+pub struct UsagePoint {
+    /// The day.
+    pub day: Date,
+    /// Requests that day.
+    pub requests: i32,
+    /// Requests that day that did not return 2xx.
+    pub errors: i32,
+    /// 95th percentile latency, when the day had enough samples to mean anything.
+    pub p95_ms: Option<i32>,
+}
+
+/// The one-time response of `create` and `rotate`.
 ///
-/// The four shapes map to four different statuses on purpose: `Conflict` is `409` because the
-/// panel shows a different message for "that name is taken" than for "that input is wrong", and
-/// collapsing them into one `400` would make the duplicate-name case unreadable.
-pub fn map_store(error: DeveloperError) -> ApiError {
-    match error {
-        DeveloperError::Invalid(message) => {
-            ApiError::bad_request("invalid_developer_input", message)
+/// The name says what it is, and the panel's dialog is driven by its presence: this struct is
+/// returned by exactly two handlers and deserialised by exactly one component.
+#[derive(Debug, Serialize)]
+pub struct MintedResponse {
+    /// The key, as stored.
+    #[serde(flatten)]
+    pub key: ApiKey,
+    /// The secret. Shown once, never again.
+    pub secret: String,
+}
+
+impl From<Minted> for MintedResponse {
+    fn from(minted: Minted) -> Self {
+        Self {
+            key: minted.key,
+            secret: minted.plaintext,
         }
-        DeveloperError::Conflict(message) => {
-            ApiError::new(axum::http::StatusCode::CONFLICT, "duplicate_name", message)
-        }
-        DeveloperError::NotFound(message) => {
-            ApiError::new(axum::http::StatusCode::NOT_FOUND, "not_found", message)
-        }
-        DeveloperError::Database(inner) => ApiError::new(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            format!("developer portal store: {inner}"),
-        ),
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Bodies
-// ---------------------------------------------------------------------------------------------
-
-/// Body of `POST /api/v1/developer/api-keys`.
+/// Filters of `GET /api/v1/request-logs`.
+///
+/// Every field is optional and every one of them is validated before the query runs — the
+/// validation lives in [`RequestLogQuery::normalized`] in the crate, and this struct's only job
+/// is to decide what a *missing* filter means. `since_hours` is the one defaulting choice: the
+/// panel's own default range is 24 hours, and a log with no range at all is the fourteen-day
+/// retention window, which nobody reads.
 #[derive(Debug, Deserialize)]
-pub struct CreateKeyBody {
-    /// 3–64 characters, unique per organization and environment.
-    pub name: String,
-    /// At least one, all of them catalogued, all of them held by the caller.
-    pub scopes: Vec<String>,
-    /// `live` or `sandbox`.
-    #[serde(default = "default_environment")]
-    pub environment: String,
-    /// Optional expiry. Refused in the past.
-    pub expires_at: Option<OffsetDateTime>,
-}
-
-fn default_environment() -> String {
-    omnion_developer::ENVIRONMENT_LIVE.to_owned()
-}
-
-/// Body of `GET /api/v1/developer/api-keys`.
-#[derive(Debug, Deserialize)]
-pub struct ListKeysQuery {
-    /// Narrow to one environment.
-    pub environment: Option<String>,
-    /// `active`, `expired` or `revoked`.
-    pub status: Option<String>,
-    /// Free text over name and prefix.
-    pub search: Option<String>,
-    /// Page size, clamped by the store.
-    pub limit: Option<usize>,
-}
-
-/// Body of `GET /api/v1/developer/api-keys/{id}`.
-#[derive(Debug, Serialize)]
-pub struct KeyDetail {
-    /// The key.
-    pub key: KeyView,
-    /// Per-day counters for the usage chart.
-    pub usage: Vec<UsagePoint>,
-    /// The retention window the log screen publishes.
-    pub log_retention_days: u32,
-}
-
-/// Body of `GET /api/v1/developer/logs`.
-#[derive(Debug, Deserialize)]
-pub struct ListLogsQuery {
-    /// Narrow to one key.
+pub struct RequestLogFilters {
+    /// Only this key's requests (by id).
     pub api_key_id: Option<Uuid>,
-    /// Narrow to one method.
-    pub method: Option<String>,
-    /// Narrow to a path prefix.
-    pub path_prefix: Option<String>,
-    /// `2xx` … `5xx`.
+    /// Only this key, by public prefix — what a key row's "View logs" link uses.
+    pub key_prefix: Option<String>,
+    /// Only this exact status.
+    pub status: Option<i16>,
+    /// Only this class: `2xx`, `4xx`, `5xx`.
     pub status_class: Option<String>,
-    /// How far back, in days.
-    pub window_days: Option<u32>,
+    /// Only paths starting with this.
+    pub path_prefix: Option<String>,
+    /// Only this method.
+    pub method: Option<String>,
+    /// How far back, in hours. Defaults to 24.
+    pub since_hours: Option<i64>,
+    /// At least this many milliseconds.
+    pub min_duration_ms: Option<i32>,
     /// Page size.
-    pub limit: Option<usize>,
-    /// Keyset cursor.
-    pub before: Option<i64>,
+    pub limit: Option<i64>,
+    /// Rows to skip.
+    pub offset: Option<i64>,
 }
 
-/// Body of `GET /api/v1/developer/logs/{id}`.
-#[derive(Debug, Serialize)]
-pub struct LogDetail {
-    /// The row.
-    pub row: omnion_developer::LogRow,
-    /// The class the filter names, so the drawer and the toolbar cannot disagree.
-    pub status_class: &'static str,
-    /// The retention window, printed on the screen rather than buried here.
-    pub retention_days: u32,
-}
-
-/// Body of `GET /api/v1/developer/scopes`.
-#[derive(Debug, Serialize)]
-pub struct ScopeCatalogue {
-    /// Grouped by category, which is how the picker renders them.
-    pub categories: Vec<ScopeCategory>,
-    /// The environments a key may carry.
-    pub environments: Vec<&'static str>,
-}
-
-/// One category of the scope picker.
-#[derive(Debug, Serialize)]
-pub struct ScopeCategory {
-    /// The category key, e.g. `content`.
-    pub key: &'static str,
-    /// The scopes in it, with a description the picker shows.
-    pub scopes: Vec<ScopeRow>,
-}
-
-/// One assignable scope.
-#[derive(Debug, Serialize)]
-pub struct ScopeRow {
-    /// The permission key.
-    pub key: &'static str,
-    /// What it allows, in product language.
-    pub description: &'static str,
-    /// Whether the caller may grant it — a scope picker that offers something the caller
-    /// cannot delegate is a form that submits and is then refused by the server.
-    pub grantable: bool,
+/// `days` of `GET /api/v1/api-keys/{id}/usage`.
+#[derive(Debug, Deserialize)]
+pub struct UsageQuery {
+    /// How many days back, default 30.
+    pub days: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------------------------
-// Scopes
+// Handlers — keys
 // ---------------------------------------------------------------------------------------------
 
-/// `GET /api/v1/developer/scopes` — the assignable catalogue, grouped for the picker.
-pub async fn list_scopes(
+/// `GET /api/v1/api-keys` — the organization's keys, metadata only.
+pub async fn list_keys(
     State(state): State<AppState>,
-    session: CurrentSession,
-) -> Result<Json<ScopeCatalogue>, ApiError> {
-    let organization_id = crate::scope::resolve_organization(&session, None)?;
-    let effective = omnion_permissions::effective_permissions(
+    current: CurrentSession,
+) -> Result<Json<KeysResponse>, ApiError> {
+    let organization_id = organization_of(&current)?;
+    let keys = store::list(state.db().pool(), organization_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(KeysResponse { keys }))
+}
+
+/// `GET /api/v1/api-keys/{id}` — one key and its usage chart.
+///
+/// One handler rather than a key route plus a usage route, because the chart is on the detail
+/// screen and a second round trip would make the screen render its header and then change its
+/// shape — the "two fetches, two skeletons, one flash" problem every other detail screen in the
+/// panel already avoids.
+pub async fn get_key(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(key_id): Path<Uuid>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<KeyDetailResponse>, ApiError> {
+    let organization_id = organization_of(&current)?;
+    let key = store::get(state.db().pool(), organization_id, key_id)
+        .await
+        .map_err(ApiError::from)?;
+    let usage = store::usage(
         state.db().pool(),
-        session.user.id,
-        omnion_permissions::Scope::Organization { organization_id },
+        organization_id,
+        key_id,
+        query.days.unwrap_or(30),
     )
     .await
-    .map_err(|error| {
-        ApiError::new(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            format!("could not resolve the caller's permissions: {error}"),
-        )
-    })?;
+    .map_err(ApiError::from)?;
 
-    // Grouped here rather than in the panel: the grouping is a property of the catalogue, and
-    // a panel that re-derives it would drift the day a category is renamed.
-    let mut categories: Vec<ScopeCategory> = Vec::new();
-    for definition in omnion_permissions::catalogue::CATALOGUE {
-        let Some(category) = categories
-            .iter_mut()
-            .find(|entry: &&mut ScopeCategory| entry.key == definition.category)
-        else {
-            categories.push(ScopeCategory {
-                key: definition.category,
-                scopes: Vec::new(),
-            });
-            continue;
-        };
-        category.scopes.push(ScopeRow {
-            key: definition.key,
-            description: definition.description,
-            grantable: effective.allows(definition.key),
-        });
-    }
-
-    Ok(Json(ScopeCatalogue {
-        categories,
-        environments: ENVIRONMENTS.to_vec(),
+    Ok(Json(KeyDetailResponse {
+        key,
+        usage: usage
+            .into_iter()
+            .map(|day| UsagePoint {
+                day: day.day,
+                requests: day.requests,
+                errors: day.errors,
+                p95_ms: day.p95_ms,
+            })
+            .collect(),
     }))
 }
 
-// ---------------------------------------------------------------------------------------------
-// Keys
-// ---------------------------------------------------------------------------------------------
-
-/// `GET /api/v1/developer/api-keys` — the key list.
-pub async fn list_keys(
+/// `POST /api/v1/api-keys` — mint a key. The secret is in this response and nowhere else.
+pub async fn create_key(
     State(state): State<AppState>,
-    session: CurrentSession,
-    Query(query): Query<ListKeysQuery>,
-) -> Result<Json<Vec<KeyView>>, ApiError> {
-    let organization_id = crate::scope::resolve_organization(&session, None)?;
-    let page = keys_store::list(
+    current: CurrentSession,
+    address: ClientAddress,
+    Json(input): Json<CreateKeyInput>,
+) -> Result<(StatusCode, Json<MintedResponse>), ApiError> {
+    let organization_id = organization_of(&current)?;
+    let environment = Environment::parse(&input.environment).map_err(ApiError::from)?;
+    refuse_undelegable_scopes(state.db().pool(), current.user.id, organization_id, &input.scopes)
+        .await?;
+    let rate_tier = match input.rate_tier.as_deref() {
+        None | Some("") | Some("standard") => RateTier::Standard,
+        Some("high") => {
+            // The tier is checked against the *resolved* role, not the body: the body is the
+            // caller's own claim about themselves. `developer.keys.manage` is already required
+            // to reach this handler, so the gate is "managing keys is not the same as being
+            // allowed to lift your own ceiling" — which is the relationship the request asks
+            // for.
+            if !caller_may_elevate(state.db().pool(), current.user.id, organization_id).await? {
+                return Err(ApiError::forbidden(
+                    "rate_tier_not_permitted",
+                    "the high rate tier is reserved for an owner or administrator",
+                )
+                .with_details(json!({ "field": "rate_tier" })));
+            }
+            RateTier::High
+        }
+        Some(other) => {
+            return Err(ApiError::bad_request(
+                "invalid_rate_tier",
+                format!("{other:?} is not a rate tier"),
+            )
+            .with_details(json!({ "field": "rate_tier" })));
+        }
+    };
+
+    let expires_at = expiry_from_days(input.expires_in_days).map_err(ApiError::from)?;
+
+    let minted = store::create(
         state.db().pool(),
-        &KeyQuery {
-            organization_id,
-            environment: query.environment,
-            status: query.status,
-            search: query.search,
-            limit: query.limit.unwrap_or(50),
-            before: None,
+        organization_id,
+        &NewKey {
+            name: input.name,
+            scopes: input.scopes,
+            environment,
+            rate_tier,
+            ip_allowlist: input.ip_allowlist,
+            expires_at,
+            created_by: current.user.id,
         },
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    // The audit entry carries the prefix — the public half, safe to log — and never the
+    // plaintext. `scopes` are permission names, so they are safe too, and the request asks for
+    // "actor, target and scopes" on every mutating developer action.
+    audit(
+        &state,
+        &current,
+        &address,
+        "developer.api_key.created",
+        json!({
+            "key": minted.key.id,
+            "prefix": minted.key.prefix,
+            "name": minted.key.name,
+            "environment": minted.key.environment,
+            "scopes": minted.key.scopes,
+            "rate_tier": minted.key.rate_tier,
+            "has_ip_allowlist": minted.key.ip_allowlist.is_some(),
+            "expires_at": minted.key.expires_at,
+        }),
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(minted.into())))
+}
+
+/// `POST /api/v1/api-keys/{id}/rotate` — a new secret; the old one dies at once.
+pub async fn rotate_key(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(key_id): Path<Uuid>,
+) -> Result<Json<MintedResponse>, ApiError> {
+    let organization_id = organization_of(&current)?;
+    let minted = store::rotate(
+        state.db().pool(),
+        organization_id,
+        key_id,
         OffsetDateTime::now_utc(),
     )
     .await
-    .map_err(map_store)?;
-
-    Ok(Json(page.keys.into_iter().map(KeyView::from).collect()))
-}
-
-/// `GET /api/v1/developer/api-keys/{id}` — one key with its usage window.
-pub async fn get_key(
-    State(state): State<AppState>,
-    session: CurrentSession,
-    Path(id): Path<Uuid>,
-) -> Result<Json<KeyDetail>, ApiError> {
-    let organization_id = crate::scope::resolve_organization(&session, None)?;
-    let now = OffsetDateTime::now_utc();
-    let key = keys_store::find(state.db().pool(), organization_id, id)
-        .await
-        .map_err(map_store)?
-        .ok_or_else(|| {
-            ApiError::new(
-                axum::http::StatusCode::NOT_FOUND,
-                "not_found",
-                "no such API key",
-            )
-        })?;
-
-    let usage = keys_store::usage(state.db().pool(), organization_id, id, 30, now.date())
-        .await
-        .map_err(map_store)?;
-
-    Ok(Json(KeyDetail {
-        key: KeyView::from(key),
-        usage,
-        log_retention_days: logs_store::window_days(),
-    }))
-}
-
-/// `POST /api/v1/developer/api-keys` — create one. **The only response carrying a token.**
-pub async fn create_key(
-    State(state): State<AppState>,
-    session: CurrentSession,
-    body: Json<CreateKeyBody>,
-) -> Result<(axum::http::StatusCode, Json<IssuedKey>), ApiError> {
-    let organization_id = crate::scope::resolve_organization(&session, None)?;
-    let now = OffsetDateTime::now_utc();
-
-    // 1. The catalogue first: a scope nothing can enforce must never reach the table, because
-    //    the list would then show a key that looks powerful and does nothing on the wire.
-    let catalogue = omnion_permissions::catalogue::keys();
-    scope_names_valid(&body.scopes, &catalogue).map_err(map_store)?;
-
-    // 2. Then the delegation rule, against the caller's **own** granted set. This is what
-    //    makes a key a delegation rather than a privilege escalation wearing one.
-    let effective = omnion_permissions::effective_permissions(
-        state.db().pool(),
-        session.user.id,
-        omnion_permissions::Scope::Organization { organization_id },
-    )
-    .await
-    .map_err(|error| {
-        ApiError::new(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            format!("could not resolve the caller's permissions: {error}"),
-        )
-    })?;
-    // `mintable_from` takes `&[&str]` on purpose — a slice of borrowed strings cannot be built
-    // by accident from something that owns a longer lifetime. The bridge is here, once, rather
-    // than by loosening the signature for the convenience of one caller.
-    let granted = effective.granted_keys();
-    let held: Vec<&str> = granted.iter().map(String::as_str).collect();
-    let scopes = mintable_from(&body.scopes, &held).map_err(map_store)?;
-
-    let new_key = omnion_developer::NewKey {
-        organization_id,
-        name: body.name.clone(),
-        environment: body.environment.clone(),
-        scopes,
-        expires_at: body.expires_at,
-        created_by: Some(session.user.id),
-        created_by_name: display_name(&session),
-    };
-
-    let (row, secret) = keys_store::create(state.db().pool(), &new_key, now)
-        .await
-        .map_err(map_store)?;
-
-    // The event carries names and scope **names**, never the token and never the hash.
-    emit_credential_event(
-        &state,
-        organization_id,
-        session.user.id,
-        "developer.api_key.created",
-        &row,
-        now,
-    )
-    .await;
+    .map_err(ApiError::from)?;
 
     audit(
         &state,
-        organization_id,
-        session.user.id,
-        "developer.api_key.created",
-        &row,
-        now,
-    )
-    .await?;
-
-    Ok((
-        axum::http::StatusCode::CREATED,
-        Json(IssuedKey {
-            key: KeyView::from(row),
-            token: secret.token,
+        &current,
+        &address,
+        "developer.api_key.rotated",
+        json!({
+            "key": minted.key.id,
+            "prefix": minted.key.prefix,
+            "name": minted.key.name,
+            "scopes": minted.key.scopes,
         }),
-    ))
-}
-
-/// `POST /api/v1/developer/api-keys/{id}/rotate` — a new secret, the old one dead at once.
-pub async fn rotate_key(
-    State(state): State<AppState>,
-    session: CurrentSession,
-    Path(id): Path<Uuid>,
-) -> Result<Json<IssuedKey>, ApiError> {
-    let organization_id = crate::scope::resolve_organization(&session, None)?;
-    let now = OffsetDateTime::now_utc();
-
-    let (row, secret) = keys_store::rotate(state.db().pool(), organization_id, id, now)
-        .await
-        .map_err(map_store)?;
-
-    emit_credential_event(
-        &state,
-        organization_id,
-        session.user.id,
-        "developer.api_key.rotated",
-        &row,
-        now,
-    )
-    .await;
-
-    audit(
-        &state,
-        organization_id,
-        session.user.id,
-        "developer.api_key.rotated",
-        &row,
-        now,
     )
     .await?;
 
-    Ok(Json(IssuedKey {
-        key: KeyView::from(row),
-        token: secret.token,
-    }))
+    Ok(Json(minted.into()))
 }
 
-/// `DELETE /api/v1/developer/api-keys/{id}` — revoke. Soft: the row and its log stay.
+/// `DELETE /api/v1/api-keys/{id}` — revoke. Idempotent, and it does not delete the row.
+///
+/// A revoked key keeps its history and its name: the request log is the record of what an
+/// integration did, and a delete would take that with it — so "this key was called 40 000
+/// times last month" becomes unanswerable because the key is gone.
 pub async fn revoke_key(
     State(state): State<AppState>,
-    session: CurrentSession,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let organization_id = crate::scope::resolve_organization(&session, None)?;
-    let now = OffsetDateTime::now_utc();
-
-    // Read before revoking, so the audit row and the event can name the key. The read is
-    // organization-scoped, so this cannot become an existence oracle for another tenant's id.
-    let previous = keys_store::find(state.db().pool(), organization_id, id)
-        .await
-        .map_err(map_store)?
-        .ok_or_else(|| {
-            ApiError::new(
-                axum::http::StatusCode::NOT_FOUND,
-                "not_found",
-                "no such API key",
-            )
-        })?;
-
-    keys_store::revoke(state.db().pool(), organization_id, id, now)
-        .await
-        .map_err(map_store)?;
-
-    emit_credential_event(
-        &state,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(key_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let organization_id = organization_of(&current)?;
+    let key = store::revoke(
+        state.db().pool(),
         organization_id,
-        session.user.id,
-        "developer.api_key.revoked",
-        &previous,
-        now,
+        key_id,
+        OffsetDateTime::now_utc(),
     )
-    .await;
+    .await
+    .map_err(ApiError::from)?;
 
     audit(
         &state,
-        organization_id,
-        session.user.id,
+        &current,
+        &address,
         "developer.api_key.revoked",
-        &previous,
-        now,
+        json!({ "key": key.id, "prefix": key.prefix, "name": key.name }),
     )
     .await?;
 
-    Ok(Json(json!({ "revoked": true, "id": id })))
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Logs
+// Handlers — the request log
 // ---------------------------------------------------------------------------------------------
 
-/// `GET /api/v1/developer/logs` — the request log, filtered.
-pub async fn list_logs(
+/// `GET /api/v1/request-logs` — a filtered page of the request log.
+///
+/// Metadata only, and that is the table's schema rather than a filter applied on the way out:
+/// there is no body column, so "why can I not see the payload" is answered by the migration and
+/// cannot be answered wrongly by a redaction list that grows a hole.
+pub async fn list_request_logs(
     State(state): State<AppState>,
-    session: CurrentSession,
-    Query(query): Query<ListLogsQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let organization_id = crate::scope::resolve_organization(&session, None)?;
-    let mut log_query = LogQuery {
-        organization_id,
-        api_key_id: query.api_key_id,
-        method: query.method,
-        path_prefix: query.path_prefix,
-        status_class: query.status_class,
-        window_days: query.window_days,
-        limit: query.limit.unwrap_or(50),
-        before: query.before,
-    };
-    let page = logs_store::search(state.db().pool(), &mut log_query)
+    current: CurrentSession,
+    Query(filters): Query<RequestLogFilters>,
+) -> Result<Json<RequestLogPage>, ApiError> {
+    let organization_id = organization_of(&current)?;
+
+    let query = RequestLogQuery {
+        api_key_id: filters.api_key_id,
+        key_prefix: filters.key_prefix,
+        status: filters.status,
+        status_class: filters.status_class,
+        path_prefix: filters.path_prefix,
+        method: filters.method,
+        since: default_window(filters.since_hours),
+        until: None,
+        min_duration_ms: filters.min_duration_ms,
+        limit: filters.limit.unwrap_or(RequestLogQuery::DEFAULT_LIMIT),
+        offset: filters.offset.unwrap_or(0),
+    }
+    .normalized()
+    .map_err(ApiError::from)?;
+
+    let page = store::list_requests(state.db().pool(), organization_id, &query)
         .await
-        .map_err(map_store)?;
-    Ok(Json(json!({ "rows": page.rows, "next_before": page.next_before })))
+        .map_err(ApiError::from)?;
+    Ok(Json(page))
 }
 
-/// `GET /api/v1/developer/logs/{id}` — one request, with the permission its guard resolved.
-pub async fn get_log(
+/// `GET /api/v1/request-logs/{id}` — one request's metadata.
+///
+/// Its own handler, and the request asks for it, because the panel's row opens a drawer: a list
+/// endpoint that answered `?id=` on its own path would have to guess between a page and a
+/// single row from the same `GET`, and the day it guessed wrong the log would paginate on a
+/// drawer that should have shown one request.
+pub async fn get_request_log(
     State(state): State<AppState>,
-    session: CurrentSession,
-    Path(id): Path<i64>,
-) -> Result<Json<LogDetail>, ApiError> {
-    let organization_id = crate::scope::resolve_organization(&session, None)?;
-    let row = logs_store::find(state.db().pool(), organization_id, id)
-        .await
-        .map_err(map_store)?
-        .ok_or_else(|| {
-            ApiError::new(
-                axum::http::StatusCode::NOT_FOUND,
-                "not_found",
-                "no such request in the log",
-            )
-        })?;
+    current: CurrentSession,
+    Path(log_id): Path<i64>,
+) -> Result<Json<RequestLog>, ApiError> {
+    let organization_id = organization_of(&current)?;
 
-    Ok(Json(LogDetail {
-        status_class: row.status_class(),
-        row,
-        retention_days: logs_store::window_days(),
-    }))
+    let row = sqlx::query(
+        "select id, organization_id, api_key_id, api_key_prefix, actor_user_id, actor_name, permission, \
+         method, path, status, duration_ms, request_id, bytes_in, bytes_out, error_code, \
+         created_at \
+         from api_request_logs where id = $1 and organization_id = $2",
+    )
+    .bind(log_id)
+    .bind(organization_id)
+    .fetch_optional(state.db().pool())
+    .await
+    // The database's own error, mapped through the same helper the row decoder uses, because
+    // `ApiError: From<sqlx::Error>` does not exist in this API — every route that speaks sqlx
+    // directly writes the mapping out, and that is the pattern being followed here.
+    .map_err(decode_error)?
+    .ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "request_log_not_found",
+            "no such request in this organization's log",
+        )
+    })?;
+
+    Ok(Json(log_from_row(&row)?))
 }
 
 // ---------------------------------------------------------------------------------------------
-// Overview
+// Helpers
 // ---------------------------------------------------------------------------------------------
+
+/// The organization a developer key belongs to.
+///
+/// A platform account (`organization_id: None`) has no organization to hold a key, and saying
+/// so plainly beats a `403` that names a permission the caller does hold.
+/// `pub(crate)` because the OAuth routes in `developer_oauth.rs` resolve the tenant the same
+/// way and must not carry a second copy: a handler that read `organization_id` from anywhere
+/// else (the body, a header, an app row) is a cross-tenant write, and the only defence is that
+/// there is exactly one function that answers "which tenant is this" for a session.
+pub(crate) fn organization_of(current: &CurrentSession) -> Result<Uuid, ApiError> {
+    current.user.organization_id.ok_or_else(|| {
+        ApiError::forbidden(
+            "organization_required",
+            "an API key belongs to an organization; a platform account has no key to manage",
+        )
+    })
+}
 
 /// `GET /api/v1/developer/overview` — the card row and the recent failures.
 ///
-/// The whole body is one number set read in one snapshot (see `omnion_developer::overview`), so
-/// the route's own job is only to resolve the organization and hand back the answer. It does not
-/// add a retention field of its own: the retention window the screen prints comes from the same
-/// [`logs_store::window_days`] the log screen and the detail drawer use, so a screen cannot
-/// quote a window the table does not honour.
+/// Arrived from `origin/main` (REQ-022 slice 2) with a merge. It is **not** what the `/developer`
+/// screen renders: that screen's six cards each read the list their own destination already lists
+/// (`apps/admin/features/developer/developer-overview-view.tsx`), so a card cannot disagree with
+/// the screen it opens. This endpoint is the *snapshot* version of the same question and it is
+/// kept for two reasons that are both about honesty rather than use:
+///
+/// * it is the only reader that counts keys, requests and refusals in **one** statement, so a
+///   caller who needs a consistent moment (a status page, a webhook payload) gets one;
+/// * the walk `the_overview_counts_the_same_keys_and_requests_the_tables_show` came with it, and
+///   that walk is the thing that would catch the two views drifting apart.
+///
+/// The retention field it reports comes from the same window the log screen filters with, so a
+/// card cannot quote a window the table does not honour.
 pub async fn overview(
     State(state): State<AppState>,
-    session: CurrentSession,
+    current: CurrentSession,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let organization_id = crate::scope::resolve_organization(&session, None)?;
+    let organization_id = organization_of(&current)?;
     let read = omnion_developer::overview::read(
         state.db().pool(),
         organization_id,
         OffsetDateTime::now_utc(),
     )
     .await
-    .map_err(map_store)?;
+    .map_err(ApiError::from)?;
 
     Ok(Json(json!({
         "keys": {
@@ -530,123 +495,409 @@ pub async fn overview(
         "requests_today": read.requests_today,
         "errors_today": read.errors_today,
         "recent_failures": read.recent_failures,
-        "log_retention_days": logs_store::window_days(),
+        // From the same constant the log screen and the CSV export read, so a card cannot quote
+        // a window the table does not honour. Main's version called `logs_store::window_days()`,
+        // which this branch does not have; the number is the same one, written down once.
+        "log_retention_days": omnion_developer::log_vocab::RETENTION_DAYS,
     })))
 }
 
-// ---------------------------------------------------------------------------------------------
-// Shared
-// ---------------------------------------------------------------------------------------------
-
-/// The name the list columns show. Empty when the account has no display name set, which the
-/// cell renders as "—" rather than as a blank that looks like a rendering fault.
-fn display_name(session: &CurrentSession) -> String {
-    let display = session.user.display_name.trim();
-    if !display.is_empty() {
-        return display.to_owned();
-    }
-    let email = session.user.email.trim();
-    if email.is_empty() {
-        String::new()
-    } else {
-        email.to_owned()
-    }
-}
-
-/// Write the audit row for a credential action.
+/// Refuse a key that carries a scope its issuer does not hold.
 ///
-/// An audit failure is **not** swallowed: the REQ says every credential action writes one, and
-/// an operator whose rotation "worked" but left no record has been handed a false assurance.
-async fn audit(
-    state: &AppState,
+/// **This gate was missing entirely, and the walk that exists to catch it had never run.** It was
+/// written three ticks ago and every run reported `8 passed in 0.08 s` — eight SKIPs, because a
+/// refused database connection and a passing walk print the same line. The first run that reached a
+/// live database answered `201` to a request for a key carrying `iam.users.manage` from an account
+/// holding only `developer.keys.manage`, and the store wrote it. That is a privilege escalation
+/// through the API-key surface: `developer.keys.manage` was supposed to mean "manage the keys you
+/// are allowed to delegate", and it meant "mint a key with any scope in the catalogue".
+///
+/// The check is the caller's **effective** permissions for the same organization scope, which is
+/// what [`list_scopes`] already derives its `grantable` flag from — so the picker and the create
+/// route now answer from one source and cannot disagree. Reading the catalogue instead would be
+/// wrong: a catalogue entry says the permission *exists*, not that this account holds it.
+///
+/// The refusal names the offending scope and points at the field. Naming it matters more than the
+/// status code: an operator who typed `iam.users.manage` by mistake needs to be told *that* is the
+/// problem, not that the request was invalid.
+async fn refuse_undelegable_scopes(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
     organization_id: Uuid,
-    actor: Uuid,
-    action: &'static str,
-    key: &omnion_developer::ApiKey,
-    _now: OffsetDateTime,
+    scopes: &[String],
 ) -> Result<(), ApiError> {
-    record_audit(
-        state.db().pool(),
-        NewAuditEntry::by_user(actor, action)
-            .organization(organization_id)
-            .target("api_key", key.id.to_string())
-            // The metadata is the REQ's "ids, name, environment and scope names; never a
-            // secret or a hash" — carried out literally.
-            .metadata(json!({
-                "name": key.name,
-                "environment": key.environment,
-                "key_prefix": key.key_prefix,
-                "scopes": key.scopes,
-            })),
+    if scopes.is_empty() {
+        // The store already refuses an empty scope list; returning early here keeps this gate
+        // about delegation rather than about validation, so the two errors stay distinguishable.
+        return Ok(());
+    }
+    let effective = omnion_permissions::effective_permissions(
+        pool,
+        user_id,
+        omnion_permissions::Scope::Organization { organization_id },
     )
     .await
     .map_err(|error| {
         ApiError::new(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "audit_failed",
-            format!("the change was stored but its audit row could not be written: {error}"),
+            "internal_error",
+            format!("could not resolve the caller's permissions: {error}"),
         )
     })?;
+
+    if let Some(refused) = scopes.iter().find(|scope| !effective.allows(scope)) {
+        return Err(ApiError::bad_request(
+            "scope_not_delegable",
+            format!(
+                "{refused:?} is not a permission you hold, so a key you create cannot carry it"
+            ),
+        )
+        .with_details(json!({ "scope": refused, "field": "scopes" })));
+    }
     Ok(())
 }
 
-/// Emit the credential event, best effort.
+/// Whether this account may mint a key on the `high` tier.
 ///
-/// The state is already committed when this runs, so a bus failure is logged and not surfaced:
-/// answering `500` would tell the operator their key was not created when it was, and the
-/// audit row above is the authoritative record. This is the same trade every other emitter in
-/// the platform makes, and it is written down here because the next reader will wonder.
-async fn emit_credential_event(
-    state: &AppState,
+/// Read from the role bindings rather than from the request, and deliberately *not* from the
+/// effective permission set: `high` is a statement about how much load the caller is trusted to
+/// put on the platform, and every role that holds `All` — owner, administrator — is trusted with
+/// that. Asking "does this account hold a privileged role" is the question the request's own
+/// words ask ("requires an owner or admin role"), and it is the only version of the question
+/// whose answer a caller cannot influence.
+async fn caller_may_elevate(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
     organization_id: Uuid,
-    actor: Uuid,
-    name: &'static str,
-    key: &omnion_developer::ApiKey,
-    now: OffsetDateTime,
-) {
-    if let Err(error) = bus::emit(
-        state.db().pool(),
-        NewEvent::new(name)
-            .organization(organization_id)
-            .actor(actor)
-            .payload(json!({
-                "key_id": key.id,
-                "name": key.name,
-                "environment": key.environment,
-                "key_prefix": key.key_prefix,
-                "scopes": key.scopes,
-                "status": KeyStatus::from(key.status_at(now)).as_str(),
-            })),
+) -> Result<bool, ApiError> {
+    let count: i64 = sqlx::query_scalar(
+        "select count(*) from role_bindings b join roles r on r.id = b.role_id \
+         where b.revoked_at is null \
+           and (b.expires_at is null or b.expires_at > now()) \
+           and r.key in ('owner', 'administrator') \
+           and ( (b.organization_id = $2) \
+              or (b.scope_type = 'global' and b.organization_id is null) ) \
+           and ( (b.subject_type = 'user' and b.subject_id = $1) \
+              or (b.subject_type = 'group' and b.subject_id in \
+                  (select group_id from group_members where user_id = $1)) )",
     )
+    .bind(user_id)
+    .bind(organization_id)
+    .fetch_one(pool)
     .await
-    {
-        tracing::warn!(error = %error, event = name, "the credential change was stored but its event was not recorded");
+    .map_err(decode_error)?;
+    Ok(count > 0)
+}
+
+/// Turn the panel's four expiry choices into an instant.
+///
+/// `None` means never, which is a legitimate choice and the one a developer testing an
+/// integration wants. A *negative* or absurd number is refused rather than clamped: `expires_in_
+/// days: -1` from a hand-written request means "expire in the past", and storing that produces a
+/// key that is dead on arrival with no explanation — so it is a `400` naming the field.
+fn expiry_from_days(days: Option<i64>) -> Result<Option<OffsetDateTime>, DeveloperError> {
+    let Some(days) = days else {
+        return Ok(None);
+    };
+    if days == 0 {
+        return Ok(None);
+    }
+    if days < 0 || days > 3650 {
+        return Err(DeveloperError::InvalidExpiry(days));
+    }
+    Ok(Some(OffsetDateTime::now_utc() + time::Duration::days(days)))
+}
+
+/// The default time window of the log screen.
+///
+/// Twenty-four hours, matching the panel's own default filter. Absent a default the query would
+/// read the whole fourteen-day retention window, which is both slow and useless: nobody opens
+/// this screen to read two weeks.
+fn default_window(since_hours: Option<i64>) -> Option<OffsetDateTime> {
+    let hours = since_hours.unwrap_or(24);
+    // A negative window would produce `created_at >= now() + n` — an empty page presented as
+    // "no requests", which reads as "the integration is broken" rather than "the filter is
+    // nonsense". Clamped to zero instead: an immediate-past window that returns everything up
+    // to now is the least surprising thing a nonsense filter can mean.
+    if hours <= 0 {
+        return None;
+    }
+    Some(OffsetDateTime::now_utc() - time::Duration::hours(hours))
+}
+
+/// Map one log row onto the shape the API returns.
+///
+/// A hand-written mapping rather than `query_as` for one reason that matters: this is the type
+/// that a caller reads, and adding a column to the table must not be able to add a field to it.
+/// `bytes_in` and `bytes_out` are `Option` because a request that was refused before a body was
+/// read has no size, and `0` would read as "an empty body was sent".
+fn log_from_row(row: &sqlx::postgres::PgRow) -> Result<RequestLog, ApiError> {
+    let status: i16 = row.try_get("status").map_err(decode_error)?;
+    Ok(RequestLog {
+        id: row.try_get("id").map_err(decode_error)?,
+        organization_id: row.try_get("organization_id").map_err(decode_error)?,
+        api_key_id: row.try_get("api_key_id").map_err(decode_error)?,
+        // The three attribution columns migration `0243` added. Read as `Option`/defaulted
+        // because they are nullable by design — a session-authenticated request has no key
+        // prefix, and a row written before this branch shipped has no recorded permission.
+        api_key_prefix: row.try_get("api_key_prefix").map_err(decode_error)?,
+        actor_user_id: row.try_get("actor_user_id").map_err(decode_error)?,
+        actor_name: row.try_get("actor_name").unwrap_or_default(),
+        permission: row.try_get("permission").map_err(decode_error)?,
+        method: row.try_get("method").map_err(decode_error)?,
+        path: row.try_get("path").map_err(decode_error)?,
+        status,
+        duration_ms: row.try_get("duration_ms").map_err(decode_error)?,
+        request_id: row.try_get("request_id").map_err(decode_error)?,
+        bytes_in: row.try_get("bytes_in").map_err(decode_error)?,
+        bytes_out: row.try_get("bytes_out").map_err(decode_error)?,
+        error_code: row.try_get("error_code").map_err(decode_error)?,
+        created_at: row.try_get("created_at").map_err(decode_error)?,
+    })
+}
+
+///
+/// `ApiError` has no `From<sqlx::Error>`, so every route in this API that speaks sqlx directly
+/// writes this mapping out — which means the *string* a database failure produces is a
+/// hand-written decision, and three spellings of it in one file would be three things to keep
+/// aligned. One helper, used by every call site here.
+fn decode_error(error: sqlx::Error) -> ApiError {
+    ApiError::from_core(omnion_core::CoreError::Unavailable {
+        dependency: "developer store".into(),
+        message: error.to_string(),
+    })
+}
+
+/// Write the `developer.*` audit entry a mutation owes.
+///
+/// Propagated rather than logged-and-ignored, matching the rest of the API: a key that was
+/// minted and left no audit row is a credential an operator cannot account for, and a `500`
+/// naming the audit table is a better outcome than a silent gap.
+pub(crate) async fn audit(
+    state: &AppState,
+    current: &CurrentSession,
+    address: &ClientAddress,
+    action: &'static str,
+    metadata: serde_json::Value,
+) -> Result<(), ApiError> {
+    omnion_audit::record(
+        state.db().pool(),
+        NewAuditEntry::by_user(current.user.id, action)
+            .target("api_key", "developer")
+            .metadata(metadata)
+            .ip_address(address.as_text()),
+    )
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Compilation guards for the properties this file claims
+// ---------------------------------------------------------------------------------------------
+
+/// The write-only property, checked by the type system rather than by a test.
+///
+/// `ApiKey` is what every list and detail read returns and it has no `secret` field; the
+/// assertion here is that this module can name it as the response type of *every* read without
+/// a conversion step — so a future read that wanted the secret would have to introduce a
+/// different type, and that type would not exist.
+#[allow(dead_code)]
+fn the_read_shape_cannot_carry_a_secret(key: ApiKey) -> ApiKey {
+    key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    #[test]
+    fn the_four_expiry_choices_the_panel_offers_all_produce_an_instant() {
+        for days in [30, 90, 365] {
+            let expiry = expiry_from_days(Some(days)).expect("a supported choice");
+            assert!(expiry.is_some(), "{days} days must produce an instant");
+        }
+        // "Never" is a real choice, expressed twice: omit the field, or send zero.
+        assert!(expiry_from_days(None).unwrap().is_none());
+        assert!(expiry_from_days(Some(0)).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_expiry_in_the_past_is_refused_rather_than_stored() {
+        // `expires_in_days: -1` is the shape of a hand-written request that wants a key which
+        // never works. Storing it produces a credential that is dead on arrival, and the caller
+        // sees "my key does not authenticate" with nothing on the panel to explain it.
+        assert!(matches!(
+            expiry_from_days(Some(-1)),
+            Err(DeveloperError::InvalidExpiry(-1))
+        ));
+        assert!(matches!(
+            expiry_from_days(Some(-365)),
+            Err(DeveloperError::InvalidExpiry(_))
+        ));
+        // And beyond a decade, which is a typo rather than an intent.
+        assert!(matches!(
+            expiry_from_days(Some(36_500)),
+            Err(DeveloperError::InvalidExpiry(_))
+        ));
+    }
+
+    #[test]
+    fn the_log_screen_defaults_to_a_day_and_never_to_a_window_that_looks_empty() {
+        // No filter at all: 24 hours, matching the panel's own default.
+        let window = default_window(None).expect("a default window");
+        let day_ago = OffsetDateTime::now_utc() - time::Duration::hours(24);
+        assert!(window <= day_ago, "the default must cover at least a day");
+
+        // A negative window would read as `created_at >= now() + n` — an empty page presented as
+        // "no requests", which an operator reads as "the integration is broken".
+        assert!(
+            default_window(Some(-5)).is_none(),
+            "a negative window must not become a future cutoff"
+        );
+        assert!(default_window(Some(0)).is_none());
+        // A week is honoured, because a week is a thing a person asks for.
+        assert!(default_window(Some(24 * 7)).unwrap() < day_ago);
+    }
+
+    #[test]
+    fn the_default_window_never_moves_forwards_in_time() {
+        // The property, stated directly rather than through one input: whatever the filter says,
+        // the cutoff is in the past. This is the assertion that would catch a future edit which
+        // "helpfully" flipped a sign.
+        for hours in [None, Some(-100), Some(0), Some(1), Some(24), Some(8760)] {
+            if let Some(window) = default_window(hours) {
+                assert!(
+                    window <= OffsetDateTime::now_utc(),
+                    "hours={hours:?} produced a cutoff in the future"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_one_time_response_flattens_the_key_and_names_the_field_secret() {
+        // `secret` rather than `plaintext`: the panel's dialog says "this will not be shown
+        // again", and the field name is the first half of that sentence. The flatten means the
+        // response *is* an `ApiKey` with one extra field, so a client that already reads a key
+        // needs no new shape to read a minted one.
+        let minted = Minted {
+            key: ApiKey {
+                id: Uuid::nil(),
+                organization_id: Uuid::nil(),
+                name: "ci".to_owned(),
+                prefix: "omn_000000000000".to_owned(),
+                scopes: vec!["developer.keys.read".to_owned()],
+                environment: Environment::Sandbox,
+                rate_tier: RateTier::Standard,
+                ip_allowlist: None,
+                expires_at: None,
+                last_used_at: None,
+                revoked_at: None,
+                rotated_at: None,
+                created_by: Uuid::nil(),
+                created_at: datetime!(2026-10-01 12:00 UTC),
+                status: omnion_developer::model::KeyStatus::Active,
+            },
+            plaintext: "omn_000000000000.secret".to_owned(),
+        };
+        let rendered = serde_json::to_value(MintedResponse::from(minted)).expect("serialises");
+        assert_eq!(rendered["secret"], "omn_000000000000.secret");
+        // The key's own fields are at the top level, not nested under `key`.
+        assert_eq!(rendered["name"], "ci");
+        assert_eq!(rendered["prefix"], "omn_000000000000");
+        assert!(rendered.get("key").is_none(), "the key must be flattened");
+    }
+
+    #[test]
+    fn a_key_row_never_serialises_to_a_field_named_secret() {
+        // The write-only property as an actual assertion on the bytes a client receives. It is
+        // not "there is no field" but "the name is absent", which is what a test that greps a
+        // response body can also rely on.
+        let rendered =
+            serde_json::to_string(&KeysResponse { keys: Vec::new() }).expect("serialises");
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("hash"));
     }
 }
 
-/// Whether an environment is production.
-///
-/// The sandbox console's red banner reads this, and nothing else may decide it: a second
-/// `== "live"` in a component is how a banner ends up reassuring somebody that a live key is
-/// pointing at a sandbox.
-#[must_use]
-pub fn is_production_environment(environment: &str) -> bool {
-    omnion_developer::is_live_environment(environment)
-}
+// ---------------------------------------------------------------------------------------------
+// Error mapping
+// ---------------------------------------------------------------------------------------------
 
-
-/// `GET /api/v1/developer/sandbox/probe` — the sandbox console's "is my key alive?" call.
+/// Turn a crate error into the API's own, keeping the code and the field detail.
 ///
-/// It exists because a key's whole point is to authenticate **somewhere other than the
-/// portal**, and the portal is the one place a broken key still looks fine: the operator is
-/// signed in with a session, so every screen loads. This route is guarded for a key, so the
-/// answer an integrator gets is the platform's own, not the browser's.
-///
-/// The response names the key's prefix and the permission it was checked against, and nothing
-/// else — the body of a probe that a browser can call is the last place a token should appear.
-pub async fn sandbox_probe() -> Json<serde_json::Value> {
-    Json(json!({
-        "ok": true,
-        "message": "the key authenticated and carried the scope this route requires",
-    }))
+/// Every variant that a form can provoke carries a `field`, because a validation message that
+/// cannot be placed under its input is a message the person has to go and find. The store's
+/// `KeyNameTaken` is the one that matters most here: it is a unique-index violation translated
+/// into "that name is taken" next to the name box rather than a `500` with a PostgreSQL
+/// constraint name in it.
+impl From<DeveloperError> for ApiError {
+    fn from(error: DeveloperError) -> Self {
+        let message = error.to_string();
+        let api = if error.is_client_error() {
+            ApiError::bad_request(error.code(), message)
+        } else {
+            ApiError::from_core(omnion_core::CoreError::Unavailable {
+                dependency: "developer store".into(),
+                message,
+            })
+        };
+        match &error {
+            DeveloperError::InvalidName { .. } | DeveloperError::KeyNameTaken(_) => {
+                api.with_details(json!({ "field": "name" }))
+            }
+            DeveloperError::NoScopes
+            | DeveloperError::EmptyScope
+            | DeveloperError::DuplicateScope(_) => api.with_details(json!({ "field": "scopes" })),
+            DeveloperError::UnknownEnvironment(_) => {
+                api.with_details(json!({ "field": "environment" }))
+            }
+            DeveloperError::UnknownRateTier(_) | DeveloperError::InvalidExpiry(_) => {
+                api.with_details(json!({ "field": "expires_in_days" }))
+            }
+            DeveloperError::InvalidCidr(_) => api.with_details(json!({ "field": "ip_allowlist" })),
+            DeveloperError::UnknownStatusClass(_) | DeveloperError::NegativeDuration => {
+                api.with_details(json!({ "field": "status_class" }))
+            }
+            DeveloperError::KeyNotFound => {
+                // A `404` rather than a `403`, and the same one a missing id produces: a
+                // foreign tenant's key must not be distinguishable from one that never existed,
+                // or the endpoint is an existence oracle for other tenants' key ids.
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "api_key_not_found",
+                    "no API key with that id exists in this organization",
+                )
+            }
+            // Slice 4. Each names the input it came from, which is the whole reason this match
+            // exists: `ScaffoldRefused` already carries its own `code`, so the panel can switch
+            // on it without the API having to know which rule was broken -- but it cannot put
+            // the message under a field unless the field is named here.
+            DeveloperError::UnknownScaffoldKind(_) => api.with_details(json!({ "field": "kind" })),
+            DeveloperError::UnknownScaffoldTarget(_) => {
+                api.with_details(json!({ "field": "target" }))
+            }
+            // The rule carries its own stable code (`invalid_scaffold_name`), so it is forwarded
+            // rather than replaced: a name rule that grows a reason keeps the reason.
+            DeveloperError::ScaffoldRefused { code, .. } => {
+                api.with_details(json!({ "field": "name", "rule": code }))
+            }
+            DeveloperError::ScaffoldNotFound => ApiError::new(
+                StatusCode::NOT_FOUND,
+                "scaffold_not_found",
+                "no such scaffold in this organization",
+            ),
+            // The device-code refusals carry no field: they are answers about a *code*, and the
+            // panel has one input for that. `InvalidDeviceCode` stays a `400` rather than a
+            // `404` on purpose -- it is the same answer for a code that never existed, one that
+            // has expired and one that was already spent, and a `404` would tell a prober which
+            // of the three it hit.
+            DeveloperError::InvalidDeviceCode
+            | DeveloperError::DeviceCodePending
+            | DeveloperError::DeviceCodeSlowDown { .. }
+            | DeveloperError::DeviceCodeApprovalRefused => api,
+            _ => api,
+        }
+    }
 }

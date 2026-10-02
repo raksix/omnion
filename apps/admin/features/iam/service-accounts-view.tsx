@@ -13,6 +13,7 @@ import { Bot, Copy, KeyRound, Plus, RefreshCw, ShieldCheck, Trash2, X } from "lu
 
 import { useSession } from "@/lib/session";
 import { StepUpPrompt } from "@/features/iam/step-up-prompt";
+import { tenantMissingReason, tenantRequiredMessage } from "@/components/tenant-picker";
 import {
   ApiError,
   createIamBinding,
@@ -121,6 +122,15 @@ export function ServiceAccountsView() {
   );
 
   const create = async () => {
+    // A platform account has no tenant of its own, so the create has nothing to write into
+    // until one is chosen. Refusing here rather than sending the request keeps the API's
+    // `400 organization_required` as the *last* line of defence rather than the first thing a
+    // reader meets — and the sentence it would have shown is the one shown here.
+    const missing = tenantMissingReason(platformAccount, activeOrg);
+    if (missing) {
+      setError(missing);
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -140,8 +150,15 @@ export function ServiceAccountsView() {
       await load(activeOrg);
       await openAccount(created.id);
     } catch (cause) {
+      // A platform account whose tenant was not chosen gets the API's own refusal back — and
+      // this is the second place it can arrive from, the first being the guard above, because
+      // a form submitted by keyboard, a walkthrough, or a stale render can still reach the
+      // network without `activeOrg`.
       setError(
-        cause instanceof ApiError ? `${cause.message} (${cause.code})` : "The identity was not created.",
+        tenantRequiredMessage(cause) ??
+          (cause instanceof ApiError
+            ? `${cause.message} (${cause.code})`
+            : "The identity was not created."),
       );
     } finally {
       setBusy(false);

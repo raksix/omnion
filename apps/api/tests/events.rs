@@ -333,6 +333,15 @@ fn patch(uri: &str, body: Value, token: Option<&str>) -> Request<Body> {
     request(Method::PATCH, uri, token, Some(body))
 }
 
+/// A PUT request carrying a JSON body.
+///
+/// The settings and limits routes are `PUT` because the panel's form is the whole row: a
+/// partial update would leave the tab showing a mix of what was sent and what was stored, and
+/// the caller cannot tell which is which.
+fn put(uri: &str, body: Value, token: Option<&str>) -> Request<Body> {
+    request(Method::PUT, uri, token, Some(body))
+}
+
 /// Build a JSON request; `token` becomes the session cookie **and** its CSRF token.
 ///
 /// The credential is packed (`session\x1fcsrf`), so this is the one place the two halves are
@@ -1307,6 +1316,352 @@ async fn webhooks_are_scoped_per_organization_and_permission_guarded() {
     harness.dispose().await;
 }
 
+/// A membership that joins delivers to the joining tenant's endpoints and to nobody else's
+/// (REQ-005, slice 4 — the slice's done-when).
+///
+/// The interesting direction is not "B gets nothing" on its own: a fan-out that matched on the
+/// event *name* alone would pass that, because B's endpoint would still be filtered by the
+/// event's own organization. The direction that catches a broken implementation is a fact that
+/// belongs to **no** tenant: a platform-level event, which must fan out to nobody rather than to
+/// every endpoint that happens to subscribe to the name. The last third of this walk emits one
+/// with the subscriptions already in place, because a tenant membership name is exactly what a
+/// platform fact must never be mistaken for.
+#[tokio::test]
+async fn a_members_join_reaches_only_the_tenant_it_belongs_to() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let receiver_a = Receiver::start(false).await;
+    let receiver_b = Receiver::start(false).await;
+    // A second endpoint *inside* tenant A, subscribed to something else: subscription filtering
+    // and organization filtering are two different rules, and only running both proves either.
+    let receiver_a_quiet = Receiver::start(false).await;
+
+    let org_a = create_organization_row(&harness.db, "joined-a", "Joined A").await;
+    let org_b = create_organization_row(&harness.db, "joined-b", "Joined B").await;
+
+    let (admin_a, token_a) = account(&harness, Some(org_a)).await;
+    grant(
+        &harness,
+        admin_a,
+        org_a,
+        &[
+            "webhooks.read",
+            "webhooks.manage",
+            "events.read",
+            "organizations.read",
+            "organizations.manage",
+        ],
+    )
+    .await;
+
+    let (admin_b, token_b) = account(&harness, Some(org_b)).await;
+    grant(
+        &harness,
+        admin_b,
+        org_b,
+        &[
+            "webhooks.read",
+            "webhooks.manage",
+            "events.read",
+            "organizations.read",
+            "organizations.manage",
+        ],
+    )
+    .await;
+
+    let endpoint_a = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({
+                "name": "Joined A",
+                "url": receiver_a.url,
+                "events": ["organization.member.joined"],
+            }),
+            Some(&token_a),
+        ))
+        .await;
+    assert_eq!(
+        endpoint_a.status,
+        StatusCode::CREATED,
+        "{:?}",
+        endpoint_a.body
+    );
+    let endpoint_a_id = endpoint_a.body["id"].as_str().expect("id").to_owned();
+
+    let quiet = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({
+                "name": "Joined A quiet",
+                "url": receiver_a_quiet.url,
+                "events": ["organization.module.disabled"],
+            }),
+            Some(&token_a),
+        ))
+        .await;
+    assert_eq!(quiet.status, StatusCode::CREATED, "{:?}", quiet.body);
+    let quiet_id = quiet.body["id"].as_str().expect("id").to_owned();
+
+    let endpoint_b = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({
+                "name": "Joined B",
+                "url": receiver_b.url,
+                "events": ["organization.member.joined"],
+            }),
+            Some(&token_b),
+        ))
+        .await;
+    assert_eq!(
+        endpoint_b.status,
+        StatusCode::CREATED,
+        "{:?}",
+        endpoint_b.body
+    );
+    let endpoint_b_id = endpoint_b.body["id"].as_str().expect("id").to_owned();
+
+    // One member joins each tenant through the administrative add-member route. The joiner
+    // accounts hold no tenant of their own, so the only thing that could scope the two events
+    // apart is the organization the route was called on.
+    let (joiner_a, _) = account(&harness, None).await;
+    let joined_a = harness
+        .call(post(
+            &format!("/api/v1/organizations/{org_a}/members"),
+            json!({ "user_id": joiner_a }),
+            Some(&token_a),
+        ))
+        .await;
+    assert_eq!(joined_a.status, StatusCode::CREATED, "{:?}", joined_a.body);
+
+    let (joiner_b, _) = account(&harness, None).await;
+    let joined_b = harness
+        .call(post(
+            &format!("/api/v1/organizations/{org_b}/members"),
+            json!({ "user_id": joiner_b }),
+            Some(&token_b),
+        ))
+        .await;
+    assert_eq!(joined_b.status, StatusCode::CREATED, "{:?}", joined_b.body);
+
+    let report = tick(&harness).await;
+    assert_eq!(
+        report.delivered, 2,
+        "one delivery per tenant, and no other: {report:?}"
+    );
+    assert_eq!(report.retried, 0, "{report:?}");
+    assert_eq!(report.failed, 0, "{report:?}");
+
+    let captured_a = receiver_a.captured();
+    let captured_b = receiver_b.captured();
+    assert_eq!(captured_a.len(), 1, "tenant A received its own join");
+    assert_eq!(captured_b.len(), 1, "tenant B received its own join");
+    assert!(
+        receiver_a_quiet.captured().is_empty(),
+        "an endpoint in the right tenant subscribed to another event stays quiet: {:?}",
+        receiver_a_quiet.captured()
+    );
+
+    // Each delivery names its own tenant and its own member — the two events are not merged
+    // into one payload, and neither endpoint is handed the other tenant's join.
+    assert_eq!(captured_a[0].event, "organization.member.joined");
+    assert_eq!(captured_b[0].event, "organization.member.joined");
+    let body_a = captured_a[0].json();
+    let body_b = captured_b[0].json();
+    assert_eq!(body_a["organization_id"], json!(org_a.to_string()));
+    assert_eq!(body_b["organization_id"], json!(org_b.to_string()));
+    assert_eq!(body_a["payload"]["user_id"], json!(joiner_a.to_string()));
+    assert_eq!(body_b["payload"]["user_id"], json!(joiner_b.to_string()));
+    assert_ne!(
+        body_a["payload"]["user_id"], body_b["payload"]["user_id"],
+        "two tenants' joins are two facts"
+    );
+
+    // The queues say the same thing: each endpoint holds exactly its own delivery, and the
+    // quiet endpoint holds none.
+    let deliveries_a = harness
+        .call(get(
+            &format!("/api/v1/webhooks/{endpoint_a_id}/deliveries"),
+            Some(&token_a),
+        ))
+        .await;
+    let rows_a = deliveries_a.body["deliveries"]
+        .as_array()
+        .expect("deliveries")
+        .clone();
+    assert_eq!(rows_a.len(), 1, "{:?}", deliveries_a.body);
+    assert_eq!(rows_a[0]["event_name"], json!("organization.member.joined"));
+    assert_eq!(rows_a[0]["status"], json!("delivered"));
+
+    let deliveries_b = harness
+        .call(get(
+            &format!("/api/v1/webhooks/{endpoint_b_id}/deliveries"),
+            Some(&token_b),
+        ))
+        .await;
+    let rows_b = deliveries_b.body["deliveries"]
+        .as_array()
+        .expect("deliveries")
+        .clone();
+    assert_eq!(rows_b.len(), 1, "{:?}", deliveries_b.body);
+
+    let quiet_queue = harness
+        .call(get(
+            &format!("/api/v1/webhooks/{quiet_id}/deliveries"),
+            Some(&token_a),
+        ))
+        .await;
+    assert_eq!(
+        quiet_queue.body["deliveries"],
+        json!([]),
+        "an endpoint subscribed to another event queues nothing: {:?}",
+        quiet_queue.body
+    );
+
+    // The event feed is tenant-scoped the same way: each administrator sees their own join and
+    // not the neighbour's.
+    let feed_a = harness
+        .call(get(
+            "/api/v1/events?name=organization.member.joined",
+            Some(&token_a),
+        ))
+        .await;
+    let feed_a_events = feed_a.body["events"].as_array().expect("events").clone();
+    assert_eq!(feed_a_events.len(), 1, "{:?}", feed_a.body);
+    assert_eq!(
+        feed_a_events[0]["organization_id"],
+        json!(org_a.to_string()),
+        "tenant A reads its own join: {:?}",
+        feed_a.body
+    );
+
+    let feed_b = harness
+        .call(get(
+            "/api/v1/events?name=organization.member.joined",
+            Some(&token_b),
+        ))
+        .await;
+    let feed_b_events = feed_b.body["events"].as_array().expect("events").clone();
+    assert_eq!(feed_b_events.len(), 1, "{:?}", feed_b.body);
+    assert_eq!(
+        feed_b_events[0]["organization_id"],
+        json!(org_b.to_string()),
+        "tenant B reads its own join: {:?}",
+        feed_b.body
+    );
+
+    // The direction a name-only fan-out gets wrong: a fact that belongs to *no* tenant is a
+    // platform fact, and the endpoints subscribed to that very name must not receive it.
+    let platform_fact = omnion_events::bus::emit(
+        harness.db.pool(),
+        omnion_events::NewEvent::new("organization.member.joined")
+            .payload(json!({ "user_id": Uuid::nil(), "source": "platform" })),
+    )
+    .await
+    .expect("the platform fact must be recorded");
+    assert_eq!(
+        platform_fact.deliveries, 0,
+        "an event with no organization fans out to nobody: {:?}",
+        platform_fact.event
+    );
+
+    let report = tick(&harness).await;
+    assert_eq!(
+        report.claimed, 0,
+        "nothing was queued, so a tick has nothing to send: {report:?}"
+    );
+    assert_eq!(receiver_a.captured().len(), 1, "A still holds one delivery");
+    assert_eq!(receiver_b.captured().len(), 1, "B still holds one delivery");
+    assert!(receiver_a_quiet.captured().is_empty());
+
+    // The invitation path emits the same event name, so it has to be scoped the same way: the
+    // account that accepts into tenant A is delivered to tenant A's endpoint, and tenant B's
+    // endpoint does not move.
+    let opened = harness
+        .call(put(
+            &format!("/api/v1/organizations/{org_a}/settings"),
+            json!({
+                "locale": "en",
+                "timezone": "UTC",
+                "invite_policy": "self_serve",
+                "audit_retention_days": 365,
+            }),
+            Some(&token_a),
+        ))
+        .await;
+    assert_eq!(opened.status, StatusCode::OK, "{:?}", opened.body);
+    assert_eq!(
+        opened.body["settings"]["invite_policy"],
+        json!("self_serve")
+    );
+
+    let invited = harness
+        .call(post(
+            &format!("/api/v1/organizations/{org_a}/invitations"),
+            json!({ "email": "joined-invitee@omnion.test" }),
+            Some(&token_a),
+        ))
+        .await;
+    assert_eq!(invited.status, StatusCode::CREATED, "{:?}", invited.body);
+    let token = invited.body["token"]
+        .as_str()
+        .expect("a self_serve invitation is live")
+        .to_owned();
+
+    let accepted = harness
+        .call(post(
+            &format!("/api/v1/invitations/{token}/accept"),
+            json!({ "display_name": "Joined Invitee", "password": PASSWORD }),
+            None,
+        ))
+        .await;
+    assert_eq!(accepted.status, StatusCode::OK, "{:?}", accepted.body);
+    assert_eq!(
+        accepted.body["organization_id"],
+        json!(org_a.to_string()),
+        "the acceptance landed in the inviting tenant"
+    );
+
+    let report = tick(&harness).await;
+    assert_eq!(report.delivered, 1, "only the inviting tenant: {report:?}");
+
+    let captured_a = receiver_a.captured();
+    assert_eq!(captured_a.len(), 2, "tenant A received the acceptance too");
+    assert_eq!(
+        receiver_b.captured().len(),
+        1,
+        "tenant B did not move: {:?}",
+        receiver_b.captured()
+    );
+    assert!(receiver_a_quiet.captured().is_empty());
+
+    // The acceptance is the *last* of tenant A's two deliveries, and arrival order is the
+    // runner's, not something to be assumed: both go to the same receiver, so they are picked
+    // out by what they carry rather than by the position they landed in.
+    let via_invitation = captured_a
+        .iter()
+        .map(Captured::json)
+        .find(|body| body["payload"]["via"] == json!("invitation"))
+        .expect("tenant A received the acceptance delivery");
+    assert_eq!(via_invitation["organization_id"], json!(org_a.to_string()));
+    assert_eq!(
+        via_invitation["payload"]["user_id"], accepted.body["user_id"],
+        "the acceptance is delivered about the account it created"
+    );
+    assert_eq!(
+        captured_a
+            .iter()
+            .map(Captured::json)
+            .filter(|body| body["organization_id"] == json!(org_b.to_string()))
+            .count(),
+        0,
+        "nothing in tenant A's receiver names tenant B"
+    );
+
+    harness.dispose().await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Stack helpers
 // ---------------------------------------------------------------------------------------------
@@ -1654,6 +2009,54 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
         assert!(
             name.starts_with(&format!("{group}.")),
             "{name} claims group {group}, which does not prefix it"
+        );
+
+        // The schema and the sample (REQ-033, slice 3d). Three claims, all on the wire rather
+        // than in the crate, because a crate test cannot catch a handler that forgot to pass
+        // them: this is the shape a subscriber's tooling actually receives.
+        let schema = &entry["payload_schema"];
+        assert_eq!(
+            schema["type"], "object",
+            "{name} must ship a schema, not an absent one"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "{name} must close its payload's field set, or a receiver cannot tell a typo from \
+             a field the platform has not shipped"
+        );
+        assert!(
+            schema["$id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("urn:omnion:event:")),
+            "{name} must carry a $id, and it must be a name rather than a fetchable URL"
+        );
+
+        // The schema declares exactly the fields the entry lists. A schema that described a
+        // different payload than `payload_fields` would be two sources of truth, and the drift
+        // would be found by a subscriber rather than by a gate.
+        let declared = schema["properties"]
+            .as_object()
+            .expect("properties is an object")
+            .len();
+        let listed = entry["payload_fields"]
+            .as_array()
+            .expect("payload_fields is an array")
+            .len();
+        assert_eq!(
+            declared, listed,
+            "{name}: the schema declares {declared} properties and the field list has {listed}"
+        );
+
+        // And the acceptance criterion itself: the sample validates against its own schema.
+        // `omnion_events::schema::validate` is the subset the crate documents; running it here
+        // means the wire answer is proved, not just the in-memory pair.
+        let sample = &entry["sample"];
+        let problems = omnion_events::schema::validate(schema, sample);
+        assert!(
+            problems.is_empty(),
+            "the sample {name} serves does not validate against the schema it serves beside: \
+             {problems:#?}"
         );
     }
 

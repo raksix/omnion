@@ -1418,14 +1418,9 @@ dependencies = [
 name = "omnion-ai-hub"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
- "hex",
- "rand 0.8.8",
- "regex",
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "sqlx",
  "thiserror 2.0.21",
  "time",
@@ -1445,9 +1440,12 @@ dependencies = [
  "omnion-audit",
  "omnion-automation",
  "omnion-backup",
+ "omnion-cdn",
  "omnion-content",
  "omnion-core",
+ "omnion-deployment",
  "omnion-developer",
+ "omnion-environment",
  "omnion-events",
  "omnion-health",
  "omnion-identity",
@@ -1457,6 +1455,7 @@ dependencies = [
  "omnion-onboarding",
  "omnion-permissions",
  "omnion-policy-engine",
+ "omnion-regions",
  "omnion-search",
  "omnion-security",
  "omnion-storage",
@@ -1464,6 +1463,7 @@ dependencies = [
  "p256",
  "percent-encoding",
  "rand 0.8.8",
+ "redis",
  "reqwest",
  "rsa",
  "serde",
@@ -1531,6 +1531,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnion-cdn"
+version = "0.1.0"
+dependencies = [
+ "omnion-events",
+ "omnion-identity",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "omnion-cli"
 version = "0.1.0"
 dependencies = [
@@ -1572,6 +1588,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnion-deployment"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "omnion-developer"
 version = "0.1.0"
 dependencies = [
@@ -1583,6 +1611,20 @@ dependencies = [
  "sha2",
  "sqlx",
  "subtle",
+ "thiserror 2.0.21",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-environment"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
  "thiserror 2.0.21",
  "time",
  "uuid",
@@ -1734,6 +1776,19 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-regions"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "tracing",
  "uuid",
 ]
 
@@ -2251,6 +2306,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",

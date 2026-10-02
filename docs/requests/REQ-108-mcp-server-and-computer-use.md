@@ -1,6 +1,6 @@
 # REQ-108 — MCP Server & Computer Use
 
-> **Status:** in-progress (slice 1: `mcp_clients` / `mcp_client_tools` / `mcp_invocations`, the hashed token with a one-time reveal, rotation, revocation and the grant store — `d7212acc`, `dad7a785`; plus two pass-harness fixes that had stopped any QA pass from running at all — `a572779e`. Slice 2: the JSON-RPC surface over HTTP (`initialize` / `ping` / `tools/list` / `tools/call`), the grant → scope → enabled resolution with a `-32003` that names the missing permission, REQ-105's mask on the stored arguments, sandbox mode that proves the plan without writing, the invocation log and the panel routes — **API and walks only, no screen yet**. Slices 3 (workflow tools + the generated docs page) and 4 (computer use) are untouched, and the browser pass is still owed for the whole request) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -128,12 +128,12 @@ store with a retention window and are deleted with the session when retention sa
 
 ### Acceptance criteria
 
-- [x] `POST /api/v1/mcp` with a valid client token answers `initialize` with the server name and protocol version, and an unknown token answers a JSON-RPC error without leaking whether the token exists. *(`initialize_names_the_server_and_an_unknown_token_says_nothing` — the unknown and the revoked token both answer `-32001`, so the two are indistinguishable.)*
-- [x] `tools/list` for a client with three grants returns exactly those three tools, each with a JSON schema, a permission and a sandbox flag. *(`tools_list_returns_exactly_the_grants_and_nothing_else`.)*
-- [x] `tools/call` for a tool the client's scopes cannot support is denied with the missing permission named and no side effect (asserted by row counts before and after). *(`a_denied_call_names_the_permission_and_writes_no_row_anywhere` — page count read before and after, and the same call runs once the scope is widened.)*
+- [ ] `POST /api/v1/mcp` with a valid client token answers `initialize` with the server name and protocol version, and an unknown token answers a JSON-RPC error without leaking whether the token exists.
+- [ ] `tools/list` for a client with three grants returns exactly those three tools, each with a JSON schema, a permission and a sandbox flag.
+- [ ] `tools/call` for a tool the client's scopes cannot support is denied with the missing permission named and no side effect (asserted by row counts before and after).
 - [ ] A gated write tool parks an approval request and returns a "pending approval" response; approving it from the approvals screen executes the write and the invocation row moves to `ok`.
 - [ ] Every invocation writes one audit entry and one `ai_request_logs` row with feature `mcp:<tool>`; the arguments stored are masked by REQ-105 (an email in the arguments is not readable in the log).
-- [x] A revoked client's token stops working immediately while its invocation history remains readable. *(`a_revocation_takes_effect_on_the_next_call_and_keeps_the_history` — the row is still on the tenant's own list afterwards.)*
+- [ ] A revoked client's token stops working immediately while its invocation history remains readable.
 - [ ] Starting a computer-use session stores the start URL, origin list and budget; the first `navigate` refuses an origin outside the list, and the refusal is written as a step with `status = 'refused'`.
 - [ ] `type` into a password or payment field is refused with the refusal reason recorded, and the session raises a handoff request instead.
 - [ ] Screenshots follow the retention setting: with retention off, no screenshot is stored; with retention on, deleting the session removes its screenshots from the media store.

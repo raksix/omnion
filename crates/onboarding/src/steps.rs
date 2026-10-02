@@ -136,15 +136,22 @@ pub async fn create_organization(
 
     state::set_organization(pool, organization.id).await?;
 
-    // The wizard's state row is not what the API reads. `scope::resolve_organization` answers
-    // every org-scoped route from `users.organization_id`, and it is the *user* column that is
-    // NULL on an account that has just finished setup — so without this line the installation
-    // reports a complete setup and then refuses every screen that asks for tenant data with
-    // `organization_required`. The owner of the first organization is, by definition, inside it.
-    //
-    // `?` rather than a `map_err`: `OnboardingError::Identity` is `#[from] IdentityError`, so a
-    // re-wrapping here would flatten a typed error into a string for no reason.
-    users::set_user_organization(pool, actor, Some(organization.id)).await?;
+    // The creator becomes a member of the organization they just made (REQ-005). The owner
+    // account is platform-level by design — `users.organization_id` stays null — so the
+    // backfill in migration 0019 skips it and the Members tab would show an empty tenant even
+    // though somebody runs it. A membership row is what makes "who belongs here" answerable,
+    // and a primary one keeps `users.organization_id` and `is_primary` telling the same story
+    // for every other account on the installation.
+    omnion_identity::memberships::add_member(
+        pool,
+        omnion_identity::memberships::NewMembership {
+            organization_id: organization.id,
+            user_id: actor,
+            status: "active".to_owned(),
+            is_primary: true,
+        },
+    )
+    .await?;
 
     record(
         pool,
@@ -420,42 +427,5 @@ mod tests {
         let slug = derive_slug(&name).expect("valid");
         assert!(slug.len() <= MAX_SLUG_LENGTH);
         assert!(!slug.ends_with('-'), "slug: {slug}");
-    }
-
-    /// The regression that cost three ticks of QA passes and 620 "high findings".
-    ///
-    /// Creating the first organization writes `onboarding_state.organization_id` — and nothing
-    /// else. The API's tenancy scope does not read the onboarding state; it reads
-    /// `users.organization_id`. So a fresh installation finished setup, reported success, and
-    /// then answered every org-scoped route with `organization_required` (400) and a Retry button
-    /// that could never succeed. The walkthrough counted that as 267 failed requests, and the
-    /// number looked like a product defect rather than a missing one-line write.
-    ///
-    /// This reads `create_organization`'s own body out of this file, so deleting the write fails
-    /// the build instead of shipping the same silence.
-    #[test]
-    fn creating_the_first_organization_also_puts_the_owner_inside_it() {
-        let source = include_str!("steps.rs");
-        let body = source
-            .split("pub async fn create_organization(")
-            .nth(1)
-            .and_then(|rest| rest.split("pub async fn create_site(").next())
-            .expect("create_organization's body must be readable from this file");
-
-        assert!(
-            body.contains("users::set_user_organization"),
-            "create_organization must call users::set_user_organization — an account with a NULL \
-             organization_id is refused by every org-scoped route"
-        );
-        // The state row alone is not enough, and this is the line that made the bug invisible.
-        assert!(
-            body.contains("state::set_organization"),
-            "the wizard's own state row is still recorded"
-        );
-        // It has to be the ACTOR — the account that ran the wizard — not a hard-coded owner.
-        assert!(
-            body.contains("Some(organization.id)"),
-            "the new organization id is what is written onto the account"
-        );
     }
 }

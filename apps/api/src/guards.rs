@@ -397,67 +397,89 @@ pub async fn check_kind_reporting(
     // authenticates against `api_keys` must never fall through to the service-account branch
     // and be reported as an unknown machine key, which names the wrong table in the error an
     // integrator reads at 2am.
+    //
+    // **This calls `developer_auth::authenticate_key` rather than re-reading the key.** Main's
+    // slice of the developer portal called `omnion_developer::keys_store::authenticate` here
+    // directly; this branch's crate spells the same check `store::find_by_prefix` +
+    // `authn::decide`, because its token has two halves and its keys carry an IP allowlist, so
+    // "look the row up and compare the secret" is not the whole decision. Two readers for one
+    // credential is the defect worth naming: the one without the allowlist would accept a key
+    // the other refuses, and which of them ran depends on which route the caller hit.
+    // `authenticate_key` is also the only one of the two that records the use, so routing here
+    // is what makes the request log cover this path.
     if kind == GuardKind::SessionOrDeveloperKey {
-        if let Some(bearer) = bearer_token(headers) {
-            let now = time::OffsetDateTime::now_utc();
-            if let Some(key) =
-                omnion_developer::keys_store::authenticate(state.db().pool(), &bearer, now)
-                    .await
-                    .map_err(|error| (crate::routes::developer::map_store(error), None))?
+        if let Some(_bearer) = bearer_token(headers) {
+            // **A key's refusal is attributed to that key.** The row was read and hash-compared
+            // inside `authenticate_key`, so naming it here costs no query and makes the row
+            // visible: the organization is what the log screen filters on, and a refusal stored
+            // with a null organization is a refusal no operator can find. That is why this
+            // function's error type is a tuple rather than a bare `ApiError` — main's portal
+            // slice introduced the second half of the pair, and a guard that throws the
+            // attribution away on the way out is how a key's refusals end up belonging to nobody.
+            let address = None;
+            match crate::developer_auth::authenticate_key(
+                state,
+                headers,
+                address,
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
             {
-                // **The scope check is the authorization.** A key holds no role, so a
-                // permission the route asks for that the key does not carry is a plain refusal
-                // — and the refusal names the missing scope, so the integrator is told which
-                // scope to add rather than which route they hit.
-                // **The scope gap is a refusal that still knows who asked.** The key was read
-                // and hash-compared two lines above, so naming it here costs no query and makes
-                // the row visible: the organization is what the log screen filters on, and a
-                // refusal stored with a null organization is a refusal no operator can find.
-                let principal = crate::request_log_middleware::ResolvedPrincipal {
-                    user_id: None,
-                    user_name: String::new(),
-                    api_key_id: Some(key.id),
-                    api_key_prefix: Some(key.key_prefix.clone()),
-                    organization_id: Some(key.organization_id),
-                    permission: Some(permission.to_owned()),
-                };
+                Ok(principal) => {
+                    let organization_id = principal.organization_id;
+                    let log_principal = crate::request_log_middleware::ResolvedPrincipal {
+                        user_id: None,
+                        user_name: String::new(),
+                        api_key_id: Some(principal.key_id),
+                        api_key_prefix: Some(principal.prefix.clone()),
+                        organization_id: Some(organization_id),
+                        permission: Some(permission.to_owned()),
+                    };
 
-                if !key.scopes.iter().any(|scope| scope == permission) {
-                    tracing::debug!(
-                        permission,
-                        api_key = %key.id,
-                        scopes = ?key.scopes,
-                        "developer key does not carry the scope this route requires"
-                    );
-                    return Err((
-                        ApiError::forbidden(
-                            "scope_missing",
-                            format!(
-                                "this key does not carry the \"{permission}\" scope — rotate it \
-                                 with that scope added"
+                    // **The scope check is the authorization.** A key holds no role, so a
+                    // permission the route asks for that the key does not carry is a plain
+                    // refusal — and the refusal names the missing scope, so the integrator is
+                    // told which scope to add rather than which route they hit.
+                    if !principal.allows(permission) {
+                        tracing::debug!(
+                            permission,
+                            api_key = %principal.key_id,
+                            scopes = ?principal.scopes,
+                            "developer key does not carry the scope this route requires"
+                        );
+                        return Err((
+                            ApiError::forbidden(
+                                "scope_missing",
+                                format!(
+                                    "this key does not carry the \"{permission}\" scope — rotate it with \
+                                     that scope added"
+                                ),
                             ),
-                        ),
-                        Some(principal),
-                    ));
+                            Some(log_principal),
+                        ));
+                    }
+
+                    return Ok(Caller::Machine(MachinePrincipal {
+                        // A key has no subject of its own: it is a delegation *by* somebody, so
+                        // the issuing organization is the closest honest subject. It is never
+                        // resolved against (a developer key is authorized by its scopes above,
+                        // and a revoked issuer must not revoke the integration they delegated —
+                        // that is what the portal's own revoke button is for).
+                        account: omnion_permissions::model::Subject::User(Uuid::nil()),
+                        organization_id,
+                        key_id: principal.key_id,
+                        // Carried rather than read a second time: the prefix is printed on the
+                        // key list precisely so an operator can match a log row to a key, and a
+                        // second query could answer differently from the one that authenticated.
+                        key_prefix: Some(principal.prefix),
+                    }));
                 }
-
-                return Ok(Caller::Machine(MachinePrincipal {
-                    // A key has no subject of its own: it is a delegation *by* somebody, so the
-                    // issuer is the closest honest subject. It is never resolved against (a
-                    // developer key is authorized by its scopes above, and a revoked issuer must
-                    // not revoke the integration they delegated — that is what the portal's own
-                    // revoke button is for).
-                    account: omnion_permissions::model::Subject::User(
-                        key.created_by.unwrap_or_else(Uuid::nil),
-                    ),
-                    organization_id: key.organization_id,
-                    key_id: key.id,
-                    key_prefix: Some(key.key_prefix.clone()),
-                }));
+                // A bad key here is not "no key" — the caller presented one and it was refused.
+                // Answering 401 rather than falling through to the service-account branch is the
+                // whole reason this check comes first. The attribution is dropped rather than
+                // invented: an unreadable row is not a key we can name.
+                Err(error) => return Err((error, None)),
             }
-
-            // Not a developer key. Fall through to the service-account check, so one header can
-            // mean either — which is what the API's own documentation promises.
         }
     }
 

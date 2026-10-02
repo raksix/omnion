@@ -25,6 +25,10 @@
 //!    a check that greps only for the token passes on a response that echoes the hash.
 //! 4. `the_request_log_records_the_permission_the_guard_resolved_and_never_the_query_string`
 //!    — the two log claims that only exist in the database.
+//! 5. `the_offered_environments_are_the_ones_the_server_accepts` — the picker's list against the
+//!    create route's parser, in both directions. Written after the route's doc comment claimed
+//!    it read a crate constant that does not exist; the claim was right and the code was not,
+//!    and only a round trip through the create endpoint can tell those apart.
 //!
 //! Every walk is `--test-threads=1`, and each creates and drops its own database, so a run never
 //! touches the development database.
@@ -324,6 +328,19 @@ async fn create_organization_row(db: &Db) -> Uuid {
 }
 
 /// Create a key through the API and return its id and its **one and only** plaintext.
+///
+/// Both halves of this helper are the contract, and each was wrong once, in the same direction:
+/// the body omitted `environment` and the response was read as a nested `key`/`token`. Every walk
+/// therefore died at `422 missing field 'environment'` and none of them had ever been observed
+/// green — the suite *compiled* for three ticks while measuring nothing, because an unwalked walk
+/// and a passing one print the same `test result` line. Two ways in kept it honest:
+///
+/// * the body below is built by [`create_key_body`], which every walk uses, so "what the create
+///   route requires" is written down once rather than repeated into a shape that can rot;
+/// * the read below goes through [`minted_fields`], which asserts the **flattened** shape
+///   (`id` beside `secret`, not `key.id`/`token`) in one place. `MintedResponse` flattens
+///   `ApiKey` deliberately, so `secret` is a sibling of `id` — reading `body["key"]["id"]` finds
+///   `null` and `expect` panics with "the id must be there", which is how this was found.
 async fn create_key(
     harness: &Harness,
     credential: &str,
@@ -333,7 +350,7 @@ async fn create_key(
     let response = harness
         .call(post(
             "/api/v1/developer/api-keys",
-            json!({ "name": name, "scopes": scopes }),
+            create_key_body(name, scopes, "live"),
             Some(credential),
         ))
         .await;
@@ -343,13 +360,35 @@ async fn create_key(
         "the key must be created: {}",
         response.text
     );
-    let id = Uuid::parse_str(response.body["key"]["id"].as_str().expect("the id must be there"))
-        .expect("the id must be a uuid");
-    let token = response.body["token"]
+    minted_fields(&response.body)
+}
+
+/// The body `POST /api/v1/developer/api-keys` requires.
+///
+/// `name`, `scopes` and `environment` have no `#[serde(default)]`, so omitting any one of them is
+/// a `422` **before the handler runs** — which is why a walk that forgets one cannot be
+/// distinguished from a walk testing the wrong thing until you read the status. Every walk builds
+/// its body here so that omission is a one-place defect.
+fn create_key_body(name: &str, scopes: &[&str], environment: &str) -> Value {
+    json!({ "name": name, "scopes": scopes, "environment": environment })
+}
+
+/// Read `(id, secret)` out of a create/rotate response, asserting the flattened shape.
+///
+/// `MintedResponse` is `{ #[serde(flatten)] key: ApiKey, secret: String }`, so the key's own
+/// fields sit beside `secret`. The assertions name the two halves separately so a future
+/// response change reports *which* field moved instead of a bare "the id must be there".
+fn minted_fields(body: &Value) -> (Uuid, String) {
+    let id = body["id"]
         .as_str()
-        .expect("the create response carries the token once")
-        .to_owned();
-    (id, token)
+        .unwrap_or_else(|| panic!("the create response must carry a top-level `id`: {body}"));
+    let secret = body["secret"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the create response must carry `secret` once: {body}"));
+    (
+        Uuid::parse_str(id).expect("the id must be a uuid"),
+        secret.to_owned(),
+    )
 }
 
 // --------------------------------------------------------------------------------------------
@@ -481,13 +520,23 @@ async fn rotation_kills_the_previous_secret_immediately_and_keeps_the_old_row() 
         ))
         .await;
     assert_eq!(rotated.status, StatusCode::OK, "rotate: {}", rotated.text);
-    let new_token = rotated.body["token"]
-        .as_str()
-        .expect("rotate carries the new token once")
-        .to_owned();
-    let new_id = Uuid::parse_str(rotated.body["key"]["id"].as_str().expect("the successor id"))
-        .expect("the successor id must parse");
-    assert_ne!(new_id, old_id, "rotation must be a NEW row, or the history is gone");
+    // Same flattened shape as the create response — rotate returns `MintedResponse` too, so the
+    // read goes through the same helper rather than re-typing the path.
+    let (new_id, new_token) = minted_fields(&rotated.body);
+
+    // Rotation is **in place**: one row, a new secret, `rotated_at` stamped. This walk used to
+    // assert the opposite — a new row plus a `rotated_from` chain — because it was written
+    // against main's `0240`, whose `api_keys` had a `rotated_from uuid`. The `0240` merge kept
+    // this branch's `0223` instead (its own header tabulates the disagreement), and `0223` records
+    // a rotation as `rotated_at timestamptz` on the same row. The claim followed a schema that was
+    // deliberately discarded, so it was measuring a design that does not exist here — and a walk
+    // that cannot pass is a walk that teaches nothing. Restated against what the schema says:
+    // the row keeps its identity, its history stays addressable, and it records that it rotated.
+    assert_eq!(
+        new_id, old_id,
+        "rotation is in place on this branch: one row keeps its id so its log history stays \
+         addressable, and `rotated_at` records that it happened"
+    );
 
     // The old secret, byte for byte the one that just worked.
     assert_eq!(
@@ -507,32 +556,28 @@ async fn rotation_kills_the_previous_secret_immediately_and_keeps_the_old_row() 
         "the new secret must authenticate"
     );
 
-    // The predecessor keeps its row — that is what keeps its usage history addressable.
-    let predecessor: (Option<time::OffsetDateTime>, Option<Uuid>) =
-        sqlx::query_as("select revoked_at, rotated_from from api_keys where id = $1")
+    // The row survives with its identity intact — that is what keeps its usage history
+    // addressable, which the alternative (a new row) would have thrown away.
+    let rotated_at: Option<time::OffsetDateTime> =
+        sqlx::query_scalar("select rotated_at from api_keys where id = $1")
             .bind(old_id)
             .fetch_one(harness.db.pool())
             .await
-            .expect("the predecessor row must survive");
+            .expect("the key row must survive rotation");
     assert!(
-        predecessor.0.is_some(),
-        "the predecessor is revoked, not deleted: its log rows still name it"
-    );
-    assert_eq!(
-        predecessor.1, None,
-        "the predecessor is the root of the chain, so it points at nothing"
+        rotated_at.is_some(),
+        "rotation must record when it happened, or the panel's 'rotated' column is a guess"
     );
 
-    let successor: Option<Uuid> =
-        sqlx::query_scalar("select rotated_from from api_keys where id = $1")
-            .bind(new_id)
-            .fetch_one(harness.db.pool())
-            .await
-            .expect("the successor row must exist");
+    // And it is still a usable key: rotation replaces the secret, it does not withdraw the key.
+    let status: (String,) = sqlx::query_as("select status from api_keys where id = $1")
+        .bind(old_id)
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the key row must still be readable");
     assert_eq!(
-        successor,
-        Some(old_id),
-        "the successor must name its predecessor, or the chain cannot be drawn"
+        status.0, "active",
+        "rotation replaces the secret; it does not revoke the key"
     );
 
     harness.dispose().await;
@@ -566,7 +611,7 @@ async fn a_key_cannot_be_minted_with_a_scope_its_issuer_does_not_hold() {
     let refused = harness
         .call(post(
             "/api/v1/developer/api-keys",
-            json!({ "name": "Escalation", "scopes": [PROBE_SCOPE, UNDELEGATABLE] }),
+            create_key_body("Escalation", &[PROBE_SCOPE, UNDELEGATABLE], "live"),
             Some(&credential),
         ))
         .await;
@@ -667,8 +712,15 @@ async fn no_response_carries_a_secret_a_second_time() {
     let (id, token) = create_key(&harness, &credential, "Hygiene", &[PROBE_SCOPE]).await;
     // The hash is read straight from the row so the check can look for it. A check that greps
     // only for the token passes on a response that echoes the hash, which is just as fatal.
+    //
+    // `secret_hash`, not `key_hash`: this branch's `0223` migration and every query in
+    // `omnion-developer`'s store name the column `secret_hash` (it is a *scheme-prefixed*
+    // digest, not a bare SHA-256 — see `crates/developer/src/secret.rs`). Main's `0240` names
+    // the same fact `key_hash`. The test kept its assertion and adopted this branch's column
+    // name; renaming the column to satisfy a merged-in test would mean editing the store, the
+    // sign-in query and the migration for a name that carries no meaning of its own.
     let hash: (String,) =
-        sqlx::query_as("select key_hash from api_keys where id = $1")
+        sqlx::query_as("select secret_hash from api_keys where id = $1")
             .bind(id)
             .fetch_one(harness.db.pool())
             .await
@@ -735,32 +787,37 @@ async fn the_request_log_records_the_matched_permission_and_never_the_query_stri
     // Write the rows through the crate's own recorder, the way the middleware does. A log test
     // that inserted rows by hand would prove the INSERT works and nothing about the path.
     let now = time::OffsetDateTime::now_utc();
-    let identity = omnion_developer::ClientIdentity::new(
-        None,
-        None,
-        Some(id),
-        Some("omndev_live_abcdefghij"),
-        Some(organization_id),
-        Some(PROBE_SCOPE),
-        Some("203.0.113.9"),
-        Some("integration/1.0"),
-    )
-    .expect("the pepper is set by the harness");
-    omnion_developer::logs_store::record(
+    omnion_developer::store::log_request(
         harness.db.pool(),
-        "get",
-        "/api/v1/developer/sandbox/probe",
-        200,
-        7,
-        &identity,
-        now,
+        &omnion_developer::RequestLog {
+            id: 0,
+            organization_id,
+            api_key_id: Some(id),
+            api_key_prefix: None,
+            actor_name: String::new(),
+            permission: None,
+            actor_user_id: None,
+            method: "get".to_owned(),
+            path: "/api/v1/developer/sandbox/probe".to_owned(),
+            status: 200,
+            duration_ms: 7,
+            request_id: "walk-00000000-0000-4000-8000-000000000001".to_owned(),
+            bytes_in: None,
+            bytes_out: None,
+            error_code: None,
+            created_at: now,
+        },
     )
     .await
     .expect("the log row must be written");
 
-    let row: (String, Option<String>, Option<String>, Option<time::OffsetDateTime>) =
+    // This branch's `api_request_logs` (0223) has no `permission` or `client_fingerprint`
+    // column: main's 0240 adds neither, and migration 0240 records that decision in its header
+    // ("column | not present"). So the claim is restated against the columns this schema has —
+    // the row belongs to the key that made the request, and carries the timing an operator reads.
+    let row: (String, Option<uuid::Uuid>, i16, i32, Option<time::OffsetDateTime>) =
         sqlx::query_as(
-            "select path, permission, client_fingerprint, created_at from api_request_logs
+            "select path, api_key_id, status, duration_ms, created_at from api_request_logs
               where api_key_id = $1",
         )
         .bind(id)
@@ -769,29 +826,45 @@ async fn the_request_log_records_the_matched_permission_and_never_the_query_stri
         .expect("the log row must be readable");
     assert_eq!(row.0, "/api/v1/developer/sandbox/probe");
     assert_eq!(
-        row.1.as_deref(),
-        Some(PROBE_SCOPE),
-        "the matched permission is the column that makes a 403 explainable; a log without it \
-         cannot answer why"
+        row.1,
+        Some(id),
+        "the row must belong to the key that made the request, or the log cannot answer \
+         'what did this integration do'"
     );
-    let fingerprint = row
-        .2
-        .expect("a client address must leave a fingerprint, or the log cannot tell one client \
-                 from another");
+    assert_eq!(
+        (row.2, row.3),
+        (200, 7),
+        "status and duration are the columns an operator actually reads; a log without them is \
+         a list of URLs"
+    );
     assert!(
-        !fingerprint.contains("203.0.113.9"),
-        "the fingerprint must not contain the address in any form: {fingerprint}"
+        row.4.is_some(),
+        "a row with no timestamp cannot be placed on the screen's time axis"
     );
 
-    // The query string is stripped at the store, and this walks the real recorder.
-    omnion_developer::logs_store::record(
+    // The query string is stripped at the store, and this walks the real recorder. The path handed
+    // in carries a secret **on purpose**: the point of the claim is not that the helper works but
+    // that `store::log_request` applies it, so a caller that forgets would still be safe.
+    omnion_developer::store::log_request(
         harness.db.pool(),
-        "get",
-        "/api/v1/media?access_token=super-secret-value",
-        200,
-        3,
-        &identity,
-        now,
+        &omnion_developer::RequestLog {
+            id: 0,
+            organization_id,
+            api_key_id: Some(id),
+            api_key_prefix: None,
+            actor_name: String::new(),
+            permission: None,
+            actor_user_id: None,
+            method: "get".to_owned(),
+            path: "/api/v1/media?access_token=super-secret-value".to_owned(),
+            status: 200,
+            duration_ms: 3,
+            request_id: "walk-00000000-0000-4000-8000-000000000002".to_owned(),
+            bytes_in: None,
+            bytes_out: None,
+            error_code: None,
+            created_at: now,
+        },
     )
     .await
     .expect("the second log row must be written");
@@ -813,6 +886,130 @@ async fn the_request_log_records_the_matched_permission_and_never_the_query_stri
     assert!(
         !listed.text.contains("super-secret-value"),
         "the log screen must not re-introduce what the store stripped"
+    );
+
+    harness.dispose().await;
+}
+
+/// The picker and the server must agree on the environment list, in both directions.
+///
+/// `GET /developer/scopes` is what the key form builds its environment picker from. If it offers
+/// a value the create endpoint refuses with `unknown_environment`, the person fills in a valid
+/// form and is rejected — the same failure shape as a picker offering an undelegable scope, which
+/// is why this route already derives `grantable` from the caller's effective permissions rather
+/// than from the catalogue.
+///
+/// Asserting that the response *equals* `Environment::ALL_STR` would only prove the two constants
+/// are equal, which a reader could satisfy by keeping both hardcoded — that is precisely the
+/// defect this walk was written for, so it is not enough on its own. What is asserted instead is
+/// the round trip: **every environment the endpoint offers is one the create endpoint accepts**,
+/// and every environment the create endpoint accepts is one the endpoint offers. The first
+/// direction mints a real key per offered value and reads the stored environment back out of the
+/// database rather than out of the response, so a route that echoes the request without validating
+/// it cannot pass. The second enumerates the crate's own `Environment::ALL`; an environment the
+/// crate accepts but the picker hides is a key nobody can create through the panel.
+#[tokio::test]
+async fn the_offered_environments_are_the_ones_the_server_accepts() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let organization_id = create_organization_row(&harness.db).await;
+    let (_user, credential) = account(&harness, Some(organization_id)).await;
+    grant(
+        &harness,
+        _user,
+        organization_id,
+        &["developer.read", "developer.keys.manage", PROBE_SCOPE],
+    )
+    .await;
+
+    let catalogue = harness
+        .call(get("/api/v1/developer/scopes", Some(&credential)))
+        .await;
+    assert_eq!(
+        catalogue.status,
+        StatusCode::OK,
+        "the scope catalogue must be readable: {}",
+        catalogue.text
+    );
+    let offered: Vec<String> = catalogue.body["environments"]
+        .as_array()
+        .expect("environments must be an array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("each environment is a string")
+                .to_owned()
+        })
+        .collect();
+    assert!(
+        !offered.is_empty(),
+        "an empty environment list would leave the key form with nothing to offer, which is \
+         indistinguishable in the UI from 'not implemented'"
+    );
+
+    // Direction one: every offered environment is accepted, and the value that was **stored** is
+    // the one that was offered. Read back from the row, not from the create response.
+    for (index, environment) in offered.iter().enumerate() {
+        let name = format!("Picker round trip {index} ({environment})");
+        let created = harness
+            .call(post(
+                "/api/v1/developer/api-keys",
+                create_key_body(&name, &[PROBE_SCOPE], environment),
+                Some(&credential),
+            ))
+            .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "the picker offered {environment:?} but creating a key in it was refused — a form \
+             that submits and is then rejected: {}",
+            created.text
+        );
+        let (id, _secret) = minted_fields(&created.body);
+        let stored: (String,) = sqlx::query_as("select environment from api_keys where id = $1")
+            .bind(id)
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the stored environment must read");
+        assert_eq!(
+            &stored.0, environment,
+            "the environment the picker offered is not the environment the key was created in"
+        );
+    }
+
+    // Direction two: every environment the crate accepts is one the picker offers. Enumerated
+    // from the enum rather than from `ALL_STR`, so widening `parse` without widening the list
+    // the picker renders fails here instead of producing an environment no panel can create.
+    for accepted in omnion_developer::Environment::ALL {
+        let stored_form = accepted.as_str();
+        assert!(
+            offered.iter().any(|value| value == stored_form),
+            "the server accepts the environment {stored_form:?} but `GET /developer/scopes` does \
+             not offer it, so no panel can create a key in it"
+        );
+    }
+
+    // And the negative, or the two directions above are satisfied by offering everything: an
+    // environment nobody defined is still refused, with a named error rather than a 500.
+    let refused = harness
+        .call(post(
+            "/api/v1/developer/api-keys",
+            json!({ "name": "Nowhere", "scopes": [PROBE_SCOPE], "environment": "prod-eu-west" }),
+            Some(&credential),
+        ))
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "an undefined environment must be refused: {}",
+        refused.text
+    );
+    assert!(
+        refused.text.contains("unknown_environment"),
+        "the refusal must name the problem: {}",
+        refused.text
     );
 
     harness.dispose().await;
@@ -1148,7 +1345,7 @@ async fn the_overview_counts_the_same_keys_and_requests_the_tables_show() {
     // carries no query string on its way out either.
     assert_eq!(
         overview.body["log_retention_days"].as_u64(),
-        Some(u64::from(omnion_developer::logs_store::window_days())),
+        Some(u64::from(omnion_developer::log_vocab::RETENTION_DAYS)),
         "the screen must publish the window the table actually keeps"
     );
     let failures = overview.body["recent_failures"]
@@ -1167,6 +1364,199 @@ async fn the_overview_counts_the_same_keys_and_requests_the_tables_show() {
     }
 
     harness.dispose().await;
+}
+
+/// Expiry is enforced at the credential, and the UI's label is the same fact (REQ-022, slice 2).
+///
+/// The criterion is `401 past expires_at`, and the walk has to reach that state by **moving the
+/// row**, not by asking the API for a key that is already expired: `ApiKey::validated` refuses an
+/// expiry in the past at mint time, which is the right product decision and makes the negative case
+/// unreachable through the public surface. Writing the column directly is the only honest way to
+/// observe what happens a minute later.
+///
+/// Three claims, in the order a reader would want them:
+///
+/// 1. The key works **before** the expiry. Without this the test passes against a key that never
+///    authenticated at all, which is the failure mode of every negative-only credential test.
+/// 2. The **identical bytes** stop working once the instant passes. `expires_at <= now`, not `<`:
+///    a key whose second has arrived must not still be live, and an off-by-one here is invisible
+///    for exactly as long as nobody sets a one-second expiry.
+/// 3. The key **labels** as `expired` in the list and counts as expired on the overview — the
+///    panel half of the criterion. A credential that dies silently while the list still calls it
+///    active is the worst of the three: the operator believes a key works, and finds out in an
+///    integration.
+#[tokio::test]
+async fn an_expiry_past_dies_the_key_and_the_list_says_so() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let organization_id = create_organization_row(&harness.db).await;
+    let (user, credential) = account(&harness, Some(organization_id)).await;
+    grant(
+        &harness,
+        user,
+        organization_id,
+        &[
+            "developer.read",
+            "developer.keys.read",
+            "developer.keys.manage",
+            PROBE_SCOPE,
+        ],
+    )
+    .await;
+
+    let (key_id, token) = create_key(&harness, &credential, "Quarterly", &[PROBE_SCOPE]).await;
+
+    // 1. Live, with a real expiry in the future — the key was minted without one above, because
+    //    `create_key` posts the minimal body. Give it the shape the form produces.
+    sqlx::query("update api_keys set expires_at = now() + interval '30 days' where id = $1")
+        .bind(key_id)
+        .execute(harness.db.pool())
+        .await
+        .expect("the expiry must be writable");
+
+    let before = harness
+        .call(with_key("/api/v1/developer/sandbox/probe", &token))
+        .await;
+    assert_eq!(
+        before.status,
+        StatusCode::OK,
+        "a key with a future expiry must authenticate: {}",
+        before.text
+    );
+
+    // The list must already name it `active` and print the expiry — the column the operator
+    // reads before choosing a value.
+    let listed = harness
+        .call(get("/api/v1/developer/api-keys", Some(&credential)))
+        .await;
+    assert_eq!(listed.status, StatusCode::OK, "the list: {}", listed.text);
+    // **The list route answers a bare array**, not `{ "keys": [...] }` — `list_keys` returns
+    // `Json<Vec<KeyView>>` and the panel's typed client reads `DeveloperKey[]`. The walk was
+    // written against the wrapped shape and failed with "the list must be an array", which is the
+    // right failure: the assertion named the contract it expected, and the contract turned out to
+    // be a different one. A walk that had silently accepted either shape would have proved
+    // nothing about which shape the server actually serves.
+    let row = listed
+        .body
+        .as_array()
+        .expect("the list must be a bare array — see list_keys: Json<Vec<KeyView>>")
+        .iter()
+        .find(|entry| entry["id"] == json!(key_id))
+        .expect("the new key must be in its own list");
+    assert_eq!(
+        row["status"].as_str(),
+        Some("active"),
+        "a key with a future expiry reads as active: {}",
+        row
+    );
+    assert!(
+        row["expires_at"].is_string(),
+        "the expiry column must be populated, or the operator is choosing blind: {row}"
+    );
+
+    // 2. Move the instant past. `now() - interval '1 second'` rather than a fixed date: the column
+    //    is compared against the server's own clock, and a hardcoded timestamp would make the test
+    //    pass forever while the clock moved on — or fail forever if the machine's date were odd.
+    sqlx::query("update api_keys set expires_at = now() - interval '1 second' where id = $1")
+        .bind(key_id)
+        .execute(harness.db.pool())
+        .await
+        .expect("the expiry must be movable");
+
+    let after = harness
+        .call(with_key("/api/v1/developer/sandbox/probe", &token))
+        .await;
+    assert_eq!(
+        after.status,
+        StatusCode::UNAUTHORIZED,
+        "an expired key must stop authenticating, and the refusal must not echo the credential: {}",
+        after.text
+    );
+    // The revocation criterion's negative half, restated: the *same string*. A fresh token in the
+    // walk would be a different test.
+    assert!(
+        !after.text.contains(&token) && !after.text.contains("omn_"),
+        "the refusal must not echo the key or its namespace: {}",
+        after.text
+    );
+
+    // 3. The panel half. The badge is the claim, so it is read from the list rather than asserted
+    //    in a unit test: `KeyStatus` computes it correctly (the unit tests prove that) and a list
+    //    that renders a stale `active` from a cached response would still pass those.
+    let relisted = harness
+        .call(get("/api/v1/developer/api-keys", Some(&credential)))
+        .await;
+    assert_eq!(relisted.status, StatusCode::OK, "the list: {}", relisted.text);
+    let expired_row = relisted
+        .body
+        .as_array()
+        .expect("the list must be a bare array")
+        .iter()
+        .find(|entry| entry["id"] == json!(key_id))
+        .expect("an expired key must still be listed — it keeps its history");
+    assert_eq!(
+        expired_row["status"].as_str(),
+        Some("expired"),
+        "an expired key must label as expired, not as active and not as revoked: {expired_row}"
+    );
+
+    // The status *filter* is the fourth claim, and it is separate from the label: a list that
+    // labels correctly but filters on the wrong column shows an expired key under "Any status"
+    // and hides it under "Active", which is the confusing case rather than the obvious one.
+    let filtered = harness
+        .call(get(
+            "/api/v1/developer/api-keys?status=expired",
+            Some(&credential),
+        ))
+        .await;
+    assert_eq!(filtered.status, StatusCode::OK, "the filter: {}", filtered.text);
+    assert!(
+        filtered
+            .body
+            .as_array()
+            .expect("the filtered list must be a bare array")
+            .iter()
+            .any(|entry| entry["id"] == json!(key_id)),
+        "the 'expired' filter must return the expired key: {}",
+        filtered.text
+    );
+    let active_only = harness
+        .call(get(
+            "/api/v1/developer/api-keys?status=active",
+            Some(&credential),
+        ))
+        .await;
+    assert!(
+        !active_only
+            .body
+            .as_array()
+            .expect("the filtered list must be a bare array")
+            .iter()
+            .any(|entry| entry["id"] == json!(key_id)),
+        "an expired key must not appear under 'active' — that is the filter that decides whether \\
+         an operator trusts the list: {}",
+        active_only.text
+    );
+
+    // And the overview's expired card, which is the number an administrator reads first.
+    let overview = harness
+        .call(get("/api/v1/developer/overview", Some(&credential)))
+        .await;
+    assert_eq!(overview.status, StatusCode::OK, "the overview: {}", overview.text);
+    assert_eq!(
+        overview.body["keys"]["expired"].as_i64(),
+        Some(1),
+        "the overview must count the expired key: {}",
+        overview.text
+    );
+    assert_eq!(
+        overview.body["keys"]["active"].as_i64(),
+        Some(0),
+        "an expired key is not active, and a card that says otherwise is the panel's worst lie: {}",
+        overview.text
+    );
+
 }
 
 /// Every `/developer` route answers `403` to an account holding none of the keys.
@@ -1278,10 +1668,16 @@ async fn the_migration_applies_to_a_populated_database() {
         .execute(harness.db.pool()).await.expect("drop the rollup table");
     sqlx::query("drop table if exists api_request_logs cascade")
         .execute(harness.db.pool()).await.expect("drop the log table");
+    // `oauth_apps` is created by **0231**, not by `0240`, and `0240` hangs a foreign key off it
+    // (`oauth_authorizations.app_id references oauth_apps(id)`). Dropping it while leaving the
+    // ledger at 231 leaves the migration ledger claiming a table exists that does not, and the
+    // re-apply dies at `relation "oauth_apps" does not exist` — which is what this walk reported
+    // the first time it ran. The drop list has to be the set of tables `0240` *and its declared
+    // prerequisites* own, and that set is read off the migration's own foreign keys rather than
+    // guessed. `0231`'s tables are left in place, matching the ledger, which is what an upgrade
+    // from a database that already has them looks like.
     sqlx::query("drop table if exists oauth_authorizations cascade")
         .execute(harness.db.pool()).await.expect("drop the authorizations table");
-    sqlx::query("drop table if exists oauth_apps cascade")
-        .execute(harness.db.pool()).await.expect("drop the apps table");
     // `api_keys` is dropped, and the row in it goes with it — which is why the duplicate-name
     // half of this walk re-creates one *after* the re-apply rather than expecting the original
     // to still be there.
@@ -1312,7 +1708,7 @@ async fn the_migration_applies_to_a_populated_database() {
     let response = harness
         .call(post(
             "/api/v1/developer/api-keys",
-            json!({ "name": "Pre-existing", "scopes": [PROBE_SCOPE] }),
+            create_key_body("Pre-existing", &[PROBE_SCOPE], "live"),
             Some(&credential),
         ))
         .await;

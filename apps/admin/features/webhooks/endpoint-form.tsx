@@ -26,7 +26,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Check, Copy, KeyRound, TriangleAlert, Wand2 } from "lucide-react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 
 import {
   ApiError,
@@ -57,6 +57,26 @@ function fieldForCode(code: string): keyof FieldErrors | null {
 export function EndpointForm({ endpointId }: { endpointId?: string }) {
   const router = useRouter();
   const editing = Boolean(endpointId);
+
+  /**
+   * The event the developer arrived with, from `/developer/events?event=<name>`.
+   *
+   * This is the deep link that makes the catalogue more than a read-only table: a developer who
+   * has just read what `customer.created` carries should be able to subscribe to it without
+   * retyping the name and without hunting for its checkbox in a grouped list.
+   *
+   * Two rules keep it honest, and both matter more than the convenience:
+   *
+   * - It is applied **once**, and only when creating. On edit the stored subscription list wins,
+   *   because the endpoint already has subscriptions and a deep link must not silently add one
+   *   to a receiver that is live and already delivering to someone else.
+   * - It is applied **after the catalogue arrives**, not before. The list this form can subscribe
+   *   to is the `live` names only; a reserved name carried in the URL is simply not found, and
+   *   the form opens with nothing ticked rather than with a name the API would reject on save.
+   *   That is the correct outcome — a reserved name is not subscribable, and the catalogue says
+   *   so in as many words before the link is ever rendered.
+   */
+  const preselect = useSearchParams().get("event");
 
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
@@ -121,6 +141,21 @@ export function EndpointForm({ endpointId }: { endpointId?: string }) {
   }, [catalogue]);
 
   const ceiling = catalogue?.max_subscriptions ?? 32;
+
+  /**
+   * Apply the deep link's event, once the catalogue that can confirm it has arrived.
+   *
+   * `preselect` is in the dependency list and the effect is idempotent (`selected.length === 0`
+   * is the guard), so a catalogue refetch cannot re-apply over an operator's own choices: the
+   * guard is on the *state* rather than on a ref, and a tick the operator made themselves has
+   * made `selected` non-empty. The alternative — a `useRef` to mean "once" — would re-tick the
+   * box whenever the operator deliberately unticked it and the catalogue refreshed.
+   */
+  useEffect(() => {
+    if (editing || !preselect || !catalogue || selected.length > 0) return;
+    if (!groups.some(([, names]) => names.includes(preselect))) return;
+    setSelected([preselect]);
+  }, [preselect, catalogue, groups, editing, selected.length]);
 
   /**
    * A stored subscription list is *expanded* — it carries every name a group wildcard covers.

@@ -3,6 +3,8 @@
 //! Like the core, this crate never decides HTTP status codes: it returns [`IdentityError`]
 //! and the API layer maps it onto the HTTP surface (`apps/api/src/error.rs`).
 
+use crate::memberships::Invitation;
+
 /// Errors returned by the identity store.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
@@ -39,6 +41,41 @@ pub enum IdentityError {
     /// An organization field is not usable (slug shape, blank name, unknown status).
     #[error("invalid organization: {0}")]
     InvalidOrganization(String),
+    /// A membership field is not usable (unknown status).
+    #[error("invalid membership: {0}")]
+    InvalidMembership(String),
+    /// The account already belongs to this organization.
+    #[error("this account is already a member of the organization")]
+    MemberAlreadyPresent,
+    /// No membership carries this (organization, account) pair.
+    #[error("this account is not a member of the organization")]
+    MemberNotFound,
+    /// An invitation field is not usable (message length, shape).
+    #[error("invalid invitation: {0}")]
+    InvalidInvitation(String),
+    /// No invitation carries this token.
+    #[error("this invitation link is not valid")]
+    InvitationNotFound,
+    /// The token was already accepted; an invitation is single-use.
+    #[error("this invitation has already been accepted")]
+    InvitationAlreadyUsed,
+    /// The token was revoked before it was used.
+    #[error("this invitation was revoked")]
+    InvitationRevoked,
+    /// The token is past its expiry.
+    #[error("this invitation has expired")]
+    InvitationExpired,
+    /// The token is real but its organization runs the `owner_approval` policy, so nobody has
+    /// released it yet. This is deliberately its own answer rather than a generic "not valid":
+    /// the holder is somebody a manager invited, and telling them "not valid" would send them
+    /// back to the person who just invited them for no reason. It reveals nothing about any
+    /// *other* organization, because a token nobody issued answers `InvitationNotFound`.
+    #[error("this invitation is waiting for an owner to release it")]
+    InvitationAwaitingApproval,
+    /// The address already holds a live invitation in this organization; the row is carried so
+    /// the API can name the existing invitation instead of mailing the address twice.
+    #[error("this address already has a pending invitation")]
+    InvitationAlreadyPending(Invitation),
     /// The site key is already taken inside the organization.
     #[error("site key is already taken in this organization")]
     SiteKeyTaken,
@@ -57,6 +94,18 @@ pub enum IdentityError {
     /// A domain host is not usable (shape or case).
     #[error("invalid host: {0}")]
     InvalidHost(String),
+    /// A department field is not usable (key shape, blank name, unknown status).
+    #[error("invalid department: {0}")]
+    InvalidDepartment(String),
+    /// No department carries this identifier.
+    #[error("no such department")]
+    DepartmentNotFound,
+    /// The department key is already taken inside the organization.
+    #[error("department key is already taken in this organization")]
+    DepartmentKeyTaken,
+    /// A move or re-parent would make a department its own ancestor.
+    #[error("a department cannot be moved inside itself")]
+    DepartmentCycle,
     /// A security-policy field is out of range or not usable.
     #[error("{field}: {message}")]
     InvalidPolicy {
@@ -89,6 +138,18 @@ pub enum IdentityError {
     /// An account status is not one the schema allows.
     #[error("{0}")]
     InvalidUser(String),
+    /// A settings field is not usable (locale, timezone, invite policy, accent, retention).
+    #[error("invalid organization settings: {0}")]
+    InvalidSettings(String),
+    /// A limit or plan field is not usable (unknown plan, non-positive ceiling).
+    #[error("invalid organization limits: {0}")]
+    InvalidLimits(String),
+    /// A module key is not usable as an address.
+    #[error("invalid module key: {0}")]
+    InvalidModule(String),
+    /// The installation does not ship the module the request named.
+    #[error("this installation does not ship the module {0:?}")]
+    ModuleNotInstalled(String),
 }
 
 /// Result alias used across the identity crate.

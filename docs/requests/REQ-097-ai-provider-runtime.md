@@ -1,11 +1,6 @@
 # REQ-097 — AI Provider Runtime & Local Models
 
-> **Status:** done (5a2f10c) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
-> Slice 1 · 2 shipped, slice 3 in its last stretch: the storage, the HTTP surface, the
-> three panels, the background probe runner, the failover substitution, the default-provider
-> removal guard, the **local-runtime walk** (Ollama / vLLM / llama.cpp, each passing Test,
-> Discover and a streamed chat with no key) and the **mid-stream vendor-error frame** are in
-> and walked. What remains is the every-screen-states sweep and the closing QA pass.
+> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -98,95 +93,24 @@ Providers are installation-level, so these events carry `organization_id = null`
 
 ### Acceptance criteria
 
-- [x] Connecting a provider with each of the three protocols stores it and lists it with the right kind and health `unknown`.
-- [x] A protocol outside `SUPPORTED_PROTOCOLS` is refused with a stable code naming the supported values (API) and a disabled option (UI).
-- [x] The API key is never returned by any endpoint; a stored key shows as "Stored", Replace changes it, Clear removes it, blank keeps it.
-- [x] The connection test reports per-step outcomes and a total latency against a live local endpoint, and names the failing step against a dead one.
-- [x] Discovery against a live endpoint returns a diff; applying it adds, updates and removes exactly the models in the diff, and re-running discovery without changes produces an empty diff.
-- [x] A streamed answer from each adapter produces the same normalised event sequence (`text`… `usage`, `done`), and a mid-stream vendor error surfaces as one `error` event plus a failed usage row.
-  *Shipped. The three adapters' streams were already proven to normalise identically at the
-  decoder level; what was missing is the **mid-stream failure**, and the walk now drives it: the
-  mock answers `200`, streams two words, then puts the vendor's own `{"error":…}` frame inside
-  the stream and closes with `[DONE]`. The platform sends **exactly one** `error` frame carrying
-  the provider's own words, sends **no** `done` (a broken stream has no finish reason and no
-  usage, and reporting either would be a claim about an answer that never completed), keeps the
-  deltas that already reached the caller, and writes one usage row with `outcome = 'error'` on
-  the provider that broke. `ai.chat.failed` carries the same message and no `ai.chat.completed`
-  row exists. The request is **pinned** to the flaky provider while a healthy second provider
-  serving the same key stands by, so "it was not rerouted" is a claim rather than an accident of
-  there being nowhere to go.*
-- [x] A model with `supports_streaming = false` refuses a streaming request with a clear message; a model with `supports_vision = false` refuses an image-bearing request before any call leaves the process.
-- [x] The flags the panel shows equal the flags the router reads (asserted in a test against the same row).
-- [x] The health probe writes a sample per enabled provider per tick, and a provider that starts failing goes `degraded` then `down` with an `ai.provider.health_changed` event each time the status changes.
-  *Shipped. The status is **computed** from the samples — `down` after three consecutive failures, `degraded` on any failure inside 24 h or a latency over 1.5× the provider's own 7-day median, `ok` after two clear successes — and `health_changed` is emitted from the `(from, to)` transition `record_sample` returns, so it fires on a change and not on every tick. The **runner** (`ai_health_runner`, `OMNION_AI_HEALTH_RUNNER`, 60 s default) calls the same `probe_now` the button calls, one sample per enabled provider per tick, and a disabled provider is not dialled at all. The walk asserts exactly one sample per provider, an event per change, no event when the status held, three consecutive failures reaching `down`, and one provider's failure not ending the tick. **The "no event when the status held" case is the fourth tick, not the second** — `ok` needs two clean samples, so tick 2 carries the live provider `degraded → ok` and tick 3 the dead one to `down`; the walk asserts that whole ladder. Fixing that walk exposed a real defect behind it: the latency baseline was a median over **whatever samples existed**, so on a twice-probed loopback provider the median *was* the first sample and the next probe at 2 ms against a 1 ms baseline read as a 1.5× regression — flapping `ok`/`degraded` on jitter and announcing a change every tick (`0a25f3e`, `MIN_BASELINE_SAMPLES = 5`).*
-- [x] "Probe now" writes exactly one sample and refreshes the header without a page reload.
-  *`POST /ai/providers/{id}/probe` calls the same `probe_now` the runner calls, so the button is not a second implementation of the probe. The walk asserts one button press is one row in `ai_provider_health`, and the refreshed header rides back in the probe's own answer — the panel swaps it in with no second request and no reload.*
-- [x] The failover order PUT persists the rank order; the chain preview hides disabled providers and shows rank collisions resolved by name.
-  *Core shipped in slice 3: `set_failover_order` refuses anything that is not a permutation of the **enabled** set (empty, duplicated or unknown ids are all rejected in the same transaction as the write), and `failover_preview` is built from the same ordering function the router walks, so the chain on screen is the chain that runs.*
-- [x] A failing provider is replaced by the next in order for a request that named only a task, the substitution is recorded as `ai.provider.failover_used`, and the caller sees the final provider in the response metadata.
-  *Shipped in `8d1bd05`. The chain the walk runs is `plan(...)` — the same `chain_of` the Failover panel previews, so the picture and the routing cannot disagree. The substitution is announced **before** the substitute's first byte reaches the caller (a failover the operator can only find in a bill is not a failover they can trust), the `ai.chat.completed` row names the provider that actually answered with a `substitutions` count, and each attempt gets its own usage row with the successful one carrying `substituted_from`.*
-- [x] A request pinned as `provider/model` fails with the provider's error and is **not** rerouted, and a request that already received stream bytes is never retried (tests assert exactly one upstream attempt each).
-  *Proven in two halves. The pinned case is a **decision**, not a flag: `failover::plan` returns `Plan::Pinned` carrying one provider and no successor, and the chat route narrows the chain to that single row before walking it — so there is nowhere for the walk to move a pinned request. The first-byte case marks a delta at the one place it is handed to a subscriber (the client may already have received it), and `failover::next` returns `None` once that is set. The walk points the installation default at a dead provider, pins a live one, and asserts the pinned-dead call emits an `error` frame naming its own provider, produces **no** `ai.provider.failover_used`, and writes a usage row with `substituted_from = NULL`.*
-- [x] Provider usage (requests, tokens, errors) equals the rows the runtime recorded for the window, asserted against SQL in the test.
-  *Core shipped in slice 3: `usage_summary` is a sum over `ai_provider_usage` and nothing else — no in-memory counter a restart would reset. A call that reported no tokens is counted as `missing_usage` and contributes nothing, because a stream that ends without a usage frame must not become a real zero in the totals. The local walk closed the loop this criterion is really about and found the gap under it: the `done` frame carried the provider's counts while `record_usage` bound `None` for both, so every call read "unknown" beside an audit row holding the real totals. The counts now ride on the row that **served** the call, the `u64 → int` narrowing saturates, and the walk reads the Usage tab back after the call rather than trusting the frame it had already asserted.*
-- [x] Local endpoints work without a key: an Ollama-shaped, a vLLM-shaped and a llama.cpp-shaped local base URL each pass Test, Discover and a streamed chat.
-  *Shipped. Each runtime gets its own mock prefix reproducing the quirk it really has, so the
-  walk could not pass against one smoothed shape. **Ollama** publishes its models with a **tag**
-  (`llama3.2:latest`) and a bare name 404s, so the connection test — which asks the *first* model
-  the endpoint reports — works only because discovery stores the key in the endpoint's own
-  vocabulary. **vLLM** reports a stream's token counts only under `stream_options.include_usage`;
-  without the adapter sending it the Usage tab reads "unknown" for every local endpoint forever,
-  which is a platform omission, not a provider's silence. **llama.cpp** publishes the **gguf
-  file path** it was started with (`models/….gguf`) — a model key containing a slash, which is
-  exactly where the router's `provider/model` address and the model's own key collide, and it
-  reports no usage at all, so the `done` frame must carry `null` rather than a zero. The walk
-  asserts all three: five steps green (TLS `skipped` with its reason, never ticked), discovery's
-  diff, the second run empty, the streamed answer, the usage **or** the honest null, and the Usage
-  tab counting the llama.cpp call as `missing_usage` rather than as a free one.*
-- [x] Removing a provider removes its models and health samples, and is refused while it is the installation's default (the message tells the operator to set another default first).
-  *Shipped in `b6eb879` + `b20a9ad`. The refusal belongs to the **store**, not the route, and shares the delete's transaction (`select … for update` then delete), so a caller reaching the store by another road cannot walk around it and two racing operators cannot both see a default. `ProviderIsDefault(name)` carries the provider's name, so the message names which one to move first, and it maps to **409 `provider_is_default`** — a conflict, not a `404`: the row is there and the fix is the installation's default, not the id. The walk asserts the refusal, that the row is still default afterwards, that the same removal succeeds once the default moves (the advice the message gave is the way out), that the removed provider's models and health samples go with it while the spare keeps **both** of its own (the cascade is per provider, not a table wipe), and that an unknown id is still a plain `404`. The panel disables the default's Remove **and says why**, because a disabled control with no explanation is a dead one.*
-- [x] Every screen has empty, loading and error states with a real call to action; no dead button and no placeholder text.
-  *Shipped. The Health, Usage and Failover panels already had the full trio; the **hub screen**
-  did not, and the gap was worse than a missing state. A rejected fetch parked the provider and
-  model lists back on `null` — the slot that renders the skeleton — so an outage shimmered for
-  ever behind a banner nobody could act on, and the skeleton was the only honest thing on screen.
-  A failure now lands on its own state: the API's own message, a **Try again** that makes a real
-  second request, and wording that does *not* claim the installation is empty, because telling an
-  operator with three connected providers that they have none invites a duplicate. The two lists
-  keep settling independently, so one outage no longer reads as the whole hub being down. Both
-  empty states grew the action that gets past them (Connect a provider / Add a model) instead of
-  leaving the operator to find the button in the header. The walk provokes every failure **for
-  real** — a 500 on the provider list, a 500 on the model registry, then a dropped connection —
-  and raises a high finding when a skeleton is still on screen while an error is claimed, which is
-  the original bug asserted rather than described.*
-  *The walk itself is written and committed but its **closing pass had not completed** when this
-  slice started: two runs on 2026-09-28 died before the AI depth passes. The first lost its
-  artifact directory mid-run to a sibling's disk reclaim (`ENOENT … clicks.jsonl`), and the second
-  ran 45 minutes under `load 16` with 319 MB free and lost its browser context (`Target page,
-  context or browser has been closed`) at `runAiProviderDepth`. Both are the shared box, not a
-  screen — the pass reached `iam-roles` and `analytics-settings`, and every page walked before
-  that reported clean. Neither failure was a defect to hunt, and neither could be prevented by
-  writing a better screen: the request was being closed on a pass that spends forty of its forty-five
-  minutes on screens this request never touched. So the pass grew a **scope** (`--only=ai`,
-  `acb73eb`): the same wizard, sign-in, roll-up and refusal gate, with the routes and depth passes
-  of one area. A scoped pass is a real report, not a lighter one, and the vision review is skipped
-  on it because a verdict over a fraction of the screens describes a product state that does not
-  exist. The scope is proven by `scripts/qa/probe-pass-scope.cjs` (7/7), which reads the route list
-  and the guards **out of `walkthrough.cjs`** — a typo in a scope would otherwise report a clean
-  sheet of zeros for a pass that walked nothing, and a depth pass nobody tagged falls out of every
-  scope with nobody noticing.*
-- [x] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
-  *Closed on the scoped pass `20260928-150720`: **0 findings — high 0 · medium 0 · low 0** over
-  1 page, 26 clicks, 8 field fills and 53 screenshots, with all **12** provoked failures claimed
-  by a registration and none filed as a defect. `cargo test -p omnion-ai-hub` **86 passed**,
-  `pnpm typecheck` **2/2**, and the three QA probes 12/12, 7/7 and 6/6. The eleven depth
-  assertions all read as claims rather than nulls: the empty state offers its action, three
-  protocols, the field refusal, a connected local provider, the five-step test
-  (`resolve:1 ms | tls:not applicable | auth:0 ms | models:0 ms | stream:4 ms`), a dead endpoint
-  naming `resolve`, the health dots, discovery (2 to add → applied → already up to date), the
-  capability editor with all ten flags, the flag toggle, and the three panels. The states sweep
-  provoked three failures and each recovered through a real retry with no skeleton on screen, and
-  the mobile pass held 44px rows in a full-height sheet.*
+- [ ] Connecting a provider with each of the three protocols stores it and lists it with the right kind and health `unknown`.
+- [ ] A protocol outside `SUPPORTED_PROTOCOLS` is refused with a stable code naming the supported values (API) and a disabled option (UI).
+- [ ] The API key is never returned by any endpoint; a stored key shows as "Stored", Replace changes it, Clear removes it, blank keeps it.
+- [ ] The connection test reports per-step outcomes and a total latency against a live local endpoint, and names the failing step against a dead one.
+- [ ] Discovery against a live endpoint returns a diff; applying it adds, updates and removes exactly the models in the diff, and re-running discovery without changes produces an empty diff.
+- [ ] A streamed answer from each adapter produces the same normalised event sequence (`text`… `usage`, `done`), and a mid-stream vendor error surfaces as one `error` event plus a failed usage row.
+- [ ] A model with `supports_streaming = false` refuses a streaming request with a clear message; a model with `supports_vision = false` refuses an image-bearing request before any call leaves the process.
+- [ ] The flags the panel shows equal the flags the router reads (asserted in a test against the same row).
+- [ ] The health probe writes a sample per enabled provider per tick, and a provider that starts failing goes `degraded` then `down` with an `ai.provider.health_changed` event each time the status changes.
+- [ ] "Probe now" writes exactly one sample and refreshes the header without a page reload.
+- [ ] The failover order PUT persists the rank order; the chain preview hides disabled providers and shows rank collisions resolved by name.
+- [ ] A failing provider is replaced by the next in order for a request that named only a task, the substitution is recorded as `ai.provider.failover_used`, and the caller sees the final provider in the response metadata.
+- [ ] A request pinned as `provider/model` fails with the provider's error and is **not** rerouted, and a request that already received stream bytes is never retried (tests assert exactly one upstream attempt each).
+- [ ] Provider usage (requests, tokens, errors) equals the rows the runtime recorded for the window, asserted against SQL in the test.
+- [ ] Local endpoints work without a key: an Ollama-shaped, a vLLM-shaped and a llama.cpp-shaped local base URL each pass Test, Discover and a streamed chat.
+- [ ] Removing a provider removes its models and health samples, and is refused while it is the installation's default (the message tells the operator to set another default first).
+- [ ] Every screen has empty, loading and error states with a real call to action; no dead button and no placeholder text.
+- [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
 
 ### QA plan
 
@@ -196,11 +120,11 @@ The visual check must see: one primary button per screen, a readable status-dot 
 
 ### Slices
 
-1. **Adapters and the connection test** — protocol trait, the two new adapters, `SUPPORTED_PROTOCOLS` widening, migration `0016` provider columns, `/ai/protocols`, the test endpoint and modal, the wider form. **Shipped.**
+1. **Adapters and the connection test** — protocol trait, the two new adapters, `SUPPORTED_PROTOCOLS` widening, migration `0016` provider columns, `/ai/protocols`, the test endpoint and modal, the wider form.
    *Done when:* all three protocols connect, test and stream against real endpoints, and a failing step is named with the provider's own error.
-2. **Capability flags and discovery** — modality flags on `ai_models`, the Models tab, the discovery diff with apply, router enforcement of each flag, `max_output_tokens`. **Shipped.**
+2. **Capability flags and discovery** — modality flags on `ai_models`, the Models tab, the discovery diff with apply, router enforcement of each flag, `max_output_tokens`.
    *Done when:* a discovery diff applies once and repeats empty, and a flag set to false is refused by both the API and the panel.
-3. **Health, failover and telemetry** — health table, probe runner with pruning, status computation, Health and Usage tabs, failover order UI and substitution logic, the provider events. **In progress** — shipped so far: the **local-runtime walk** (Ollama / vLLM / llama.cpp, each passing Test, Discover and a streamed chat with no key) and the **mid-stream vendor-error frame** (one `error` frame, no `done`, one failed usage row, the deltas that already arrived kept), both now green. The rest: the storage, the rules, the HTTP surface and the three panels (`0027`, `health.rs`, `health_store.rs`, `/health` `/usage` `/probe` `/failover`, and the Health, Usage and Failover panels with `Probe now`, a window switcher, a latency sparkline and a keyboard-reachable order editor), then the **probe runner** (`apps/api/src/ai_health_runner.rs`), the **substitution** in `POST /ai/chat` (`crates/ai-hub/src/failover.rs`), and the **refusal to remove the installation's default provider** (`b6eb879`, `b20a9ad`). **Left:** the Ollama/vLLM/llama.cpp walk, the mid-stream vendor-error frame, and the every-screen-states sweep.
+3. **Health, failover and telemetry** — health table, probe runner with pruning, status computation, Health and Usage tabs, failover order UI and substitution logic, the provider events.
    *Done when:* a provider taken down mid-day shows `down` with samples and an event, a task-routed request fails over once, and a pinned one does not.
 
 ### Risks / notes

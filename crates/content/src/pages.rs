@@ -12,7 +12,6 @@
 //! - restoring copies an older revision forward as a new draft and records where it came from
 //!   — history is never rewritten, which is what makes compare and restore possible.
 
-use sqlx::PgConnection;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -89,12 +88,35 @@ pub async fn find_page(pool: &PgPool, id: Uuid) -> Result<Option<Page>> {
         .map_err(Into::into)
 }
 
-/// Look a page up by site and slug — the address the public renderer resolves (phase P07).
-pub async fn find_page_by_slug(pool: &PgPool, site_id: Uuid, slug: &str) -> Result<Option<Page>> {
+/// Look a page up by site and slug, in one environment — the address the public renderer
+/// resolves (phase P07).
+///
+/// The environment is a **required** argument rather than a filter, and that is the whole point
+/// of the signature. Migration 0148 moved a page's identity from `(site_id, slug)` to
+/// `(site_id, environment_id, slug)`, so the two-column match this function used to run is no
+/// longer a lookup — it is a *multi-row* query the moment any staging environment holds a copy,
+/// and `fetch_optional` over two rows is a protocol error rather than "the first one". Making the
+/// environment mandatory means a caller can no longer forget it: a staging copy cannot silently
+/// break production's public read, because there is no version of this function that looks at
+/// more than one environment.
+///
+/// Which environment is the caller's decision, and it is never a guess: the public renderer asks
+/// for the organization's production environment, because a visitor's host addresses the live
+/// site. See `crate::routes::public`.
+pub async fn find_page_by_slug(
+    pool: &PgPool,
+    site_id: Uuid,
+    environment_id: Uuid,
+    slug: &str,
+) -> Result<Option<Page>> {
     let slug = validate_slug(slug)?;
-    let sql = format!("select {PAGE_COLUMNS} from pages where site_id = $1 and slug = $2");
+    let sql = format!(
+        "select {PAGE_COLUMNS} from pages \
+         where site_id = $1 and environment_id = $2 and slug = $3"
+    );
     sqlx::query_as::<_, Page>(&sql)
         .bind(site_id)
+        .bind(environment_id)
         .bind(&slug)
         .fetch_optional(pool)
         .await
@@ -131,45 +153,14 @@ pub async fn update_page(
     changes: &PageChanges,
     editor: Option<Uuid>,
 ) -> Result<Page> {
-    let mut tx = pool.begin().await?;
-    let updated = update_page_in(&mut tx, id, changes, editor).await?;
-    tx.commit().await?;
-    Ok(updated)
-}
-
-/// [`update_page`]'s body, on a connection the **caller** owns.
-///
-/// The two are not an either/or: this is the one writer, and `update_page` is the two-line
-/// wrapper that opens a transaction around it. A second implementation of "append the next
-/// revision and archive the one it supersedes" is exactly the drift this module is written to
-/// prevent — the two copies would agree until somebody added a column to one.
-///
-/// It exists because REQ-101's change-set apply is **all-or-nothing over several pages**: the
-/// transaction is opened by the caller, and a writer that took `&PgPool` would commit the
-/// first page on its way to the second, so the set would be half applied with the refusal
-/// still ahead of it.
-///
-/// # Errors
-///
-/// [`ContentError::PageNotFound`] when the page does not exist, and whatever a validator
-/// refuses. The caller owns the transaction, so a refusal here leaves the caller's
-/// transaction usable — nothing is committed, nothing is rolled back by this function.
-pub async fn update_page_in(
-    connection: &mut sqlx::PgConnection,
-    id: Uuid,
-    changes: &PageChanges,
-    editor: Option<Uuid>,
-) -> Result<Page> {
-    let current: Page = sqlx::query_as(&format!("select {PAGE_COLUMNS} from pages where id = $1"))
-        .bind(id)
-        .fetch_optional(&mut *connection)
+    let current = find_page(pool, id)
         .await?
         .ok_or(ContentError::PageNotFound)?;
     if changes.is_empty() {
         return Ok(current);
     }
 
-    let tx = &mut *connection;
+    let mut tx = pool.begin().await?;
 
     if let Some(slug) = &changes.slug {
         let slug = validate_slug(slug)?;
@@ -239,6 +230,7 @@ pub async fn update_page_in(
 
     let sql = format!("select {PAGE_COLUMNS} from pages where id = $1");
     let updated: Page = sqlx::query_as(&sql).bind(id).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
 
     Ok(updated)
 }
@@ -391,37 +383,6 @@ pub async fn delete_page(pool: &PgPool, id: Uuid) -> Result<bool> {
         > 0;
 
     tx.commit().await?;
-    Ok(deleted)
-}
-
-/// Delete a page on a connection that is **already inside** a caller's transaction.
-///
-/// This exists because [`delete_page`] opens its own transaction, and an applier that runs its
-/// writes through one all-or-nothing transaction cannot call it: doing so would delete outside
-/// the transaction that is meant to roll the whole set back, which is exactly the guarantee a
-/// change set exists to provide. A set of three operations whose third failed would leave the
-/// first delete committed and the row claiming `failed`.
-///
-/// `delete_page_in` is the same two statements, on the caller's connection, so the row and its
-/// revisions disappear together or not at all.
-pub async fn delete_page_in(connection: &mut PgConnection, id: Uuid) -> Result<bool> {
-    sqlx::query(
-        "delete from translations \
-         where resource_type = $1 and resource_id in \
-         (select id from page_revisions where page_id = $2)",
-    )
-    .bind(crate::model::REVISION_RESOURCE)
-    .bind(id)
-    .execute(&mut *connection)
-    .await?;
-
-    let deleted = sqlx::query("delete from pages where id = $1")
-        .bind(id)
-        .execute(&mut *connection)
-        .await?
-        .rows_affected()
-        > 0;
-
     Ok(deleted)
 }
 

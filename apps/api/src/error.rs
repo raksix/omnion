@@ -146,6 +146,19 @@ impl ApiError {
     /// message is what a person reads, so a test that checks one without the other pins half
     /// the contract — and it is the message that has to name the field and the three legal
     /// values, which is the part a client cannot reconstruct.
+    /// The structured detail, when the refusal carried one.
+    ///
+    /// Exposed because a refusal that can explain itself should be *checked* by the thing that
+    /// refuses: `module_guard` asserts the answer names the module it switched off, and
+    /// `scope` asserts a cross-tenant read carries no detail at all. Without an accessor those
+    /// assertions would have to reach into a private field from another module, and the
+    /// guarantee — "a refusal names its source" — would be untestable rather than merely
+    /// unenforced.
+    #[must_use]
+    pub fn details(&self) -> Option<&Value> {
+        self.details.as_ref()
+    }
+
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -325,6 +338,8 @@ impl From<IdentityError> for ApiError {
                 "domain_not_found",
                 "no such domain on this site",
             ),
+            // Shape problems the store refuses (slug, key, status, host, address) are the
+            // caller's: the field is what they have to fix, so this is a 400.
             // Shape problems the store refuses (slug, key, status, host) are the caller's.
             IdentityError::InvalidOrganization(message)
             | IdentityError::InvalidSite(message)
@@ -337,6 +352,60 @@ impl From<IdentityError> for ApiError {
                     .with_details(serde_json::json!({ "field": field }))
             }
             IdentityError::InvalidNetwork(message) => Self::bad_request("invalid_network", message),
+            // The department tree (REQ-005, the org chart). Four variants, each with the
+            // status the state actually implies, and none of them is a server fault: a client
+            // that reads a `500` here retries a move that can never succeed and shows the
+            // operator an error page instead of the one field they have to change.
+            //   * a shape the store refuses (blank key, unknown status) is the caller's -> 400
+            //   * a key already used in this organization is a state conflict    -> 409
+            //   * a move that would make a node its own ancestor is a state conflict, not a
+            //     bad request: the request is well-formed, the tree is what refuses it
+            //   * a delete refused because role bindings still name the department is the
+            //     same: nothing is malformed, the caller has to revoke or archive first
+            IdentityError::InvalidDepartment(message) => {
+                Self::bad_request("invalid_department", message)
+            }
+            IdentityError::DepartmentKeyTaken => Self::new(
+                StatusCode::CONFLICT,
+                "department_key_taken",
+                "department key is already taken in this organization",
+            ),
+            IdentityError::DepartmentCycle => Self::new(
+                StatusCode::CONFLICT,
+                "department_cycle",
+                "a department cannot be moved inside itself",
+            ),
+            // Refused on purpose, not merely unhandled: the walks assert this one reads as a
+            // `400` while the two above are conflicts, because a department that is still
+            // named by a role binding is a shape the caller sent, not a state that changed.
+            IdentityError::DepartmentNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "department_not_found",
+                "no such department",
+            ),
+            // The organization settings screen (REQ-005): a refused field is a `400`, and the
+            // message names the rule that refused it so the panel can put it under the input
+            // instead of in a banner. These two fell through to the catch-all below, which
+            // answered a form the user can fix with a `500 internal_error` — a wrong status
+            // that tells a client the platform broke and shows a retry nobody needs.
+            IdentityError::InvalidSettings(message) => {
+                Self::bad_request("invalid_organization_settings", message)
+            }
+            // The ceilings tab. Same rule, its own code, because "this number is not a limit"
+            // and "this value is not usable" are different sentences to whoever reads them.
+            IdentityError::InvalidLimits(message) => {
+                Self::bad_request("invalid_organization_limits", message)
+            }
+            // A real invitation that this organization's `owner_approval` policy has not
+            // released yet is a `409`, not a `404`: the link is good, the state is temporary,
+            // and the holder has to be told to wait rather than to re-check the address they
+            // typed. It reveals nothing about another organization, because a token nobody
+            // issued already answered `InvitationNotFound`.
+            IdentityError::InvitationAwaitingApproval => Self::new(
+                StatusCode::CONFLICT,
+                "invitation_awaiting_approval",
+                "this invitation is waiting for an owner to release it",
+            ),
             IdentityError::FactorNotFound => Self::new(
                 StatusCode::NOT_FOUND,
                 "factor_not_found",
@@ -1059,13 +1128,6 @@ impl From<AiHubError> for ApiError {
                 "provider_not_found",
                 "no such AI provider",
             ),
-            // A decision id is a bookmark, and a stale one is a 404 rather than an error: the
-            // detail view opens by id and a pruned row is the expected cause.
-            AiHubError::DecisionNotFound => Self::new(
-                StatusCode::NOT_FOUND,
-                "decision_not_found",
-                "no route decision with that id",
-            ),
             AiHubError::ModelNotFound => Self::new(
                 StatusCode::NOT_FOUND,
                 "model_not_found",
@@ -1086,215 +1148,8 @@ impl From<AiHubError> for ApiError {
                 "provider_disabled",
                 format!("the AI provider \"{name}\" is switched off"),
             ),
-            // Removing the default is a `409` and not a `404`: the row is right there, and what
-            // the caller has to change first is the installation's default, not the id.
-            AiHubError::ProviderIsDefault(name) => Self::new(
-                StatusCode::CONFLICT,
-                "provider_is_default",
-                format!(
-                    "\"{name}\" is the installation default; make another provider the default \
-                     before removing it"
-                ),
-            ),
             AiHubError::InvalidProvider(message) => Self::bad_request("invalid_provider", message),
             AiHubError::InvalidModel(message) => Self::bad_request("invalid_model", message),
-            // An agent and a run are both things the caller *shaped*, so both are 400s with the
-            // message carried through: the limit text ("the goal is 2001 characters; the limit is
-            // 2000") is what the form puts under the field, and replacing it with a generic
-            // sentence would throw away the only part the user can act on.
-            AiHubError::InvalidAgent(message) => Self::bad_request("invalid_agent", message),
-            AiHubError::InvalidRun(message) => Self::bad_request("invalid_run", message),
-            // A workspace refusal is a 400 with the limit text kept: the Workspace tab shows the
-            // message under the path field, and "file too large" without the number is a message
-            // the reader cannot act on. It is deliberately not an `invalid_agent` — the shape
-            // differs and a client that folds them together puts a path error above the name.
-            AiHubError::InvalidFile(message) => Self::bad_request("invalid_file", message),
-            // Skills (REQ-099 slice 3). The three codes map to three different screens, which
-            // is why they are three and not one: `invalid_skill` is a field message under the
-            // skill form, `skill_not_found` is a 404 so a stale key in a URL is a stale bookmark
-            // rather than an error, and `skill_conflict` is a 409 the panel resolves by asking
-            // for another key. `skill_read_only` is a 403 — the row exists, it is just not the
-            // caller's to rewrite, and a 400 would tell them to fix a request that was fine.
-            AiHubError::InvalidSkill(message) => Self::bad_request("invalid_skill", message),
-            AiHubError::SkillNotFound(key) => Self::new(
-                StatusCode::NOT_FOUND,
-                "skill_not_found",
-                format!("no skill `{key}` in this registry"),
-            ),
-            AiHubError::SkillReadOnly(message) => {
-                Self::new(StatusCode::FORBIDDEN, "skill_read_only", message)
-            }
-            AiHubError::SkillConflict(message) => {
-                Self::new(StatusCode::CONFLICT, "skill_conflict", message)
-            }
-            // The tool registry (REQ-100). Same shape as the skills above and for the same
-            // reasons: a limit or a key the panel cannot use is a `400` whose message names the
-            // field, and a tool key that is not in the registry is a `404` so a stale bookmark
-            // reads as a stale bookmark. A *retired* tool is still found on purpose — the detail
-            // screen has to be able to open one and say why it retired.
-            AiHubError::InvalidTool(message) => Self::bad_request("invalid_tool", message),
-            AiHubError::ToolNotFound(key) => Self::new(
-                StatusCode::NOT_FOUND,
-                "tool_not_found",
-                format!("no tool `{key}` in the registry"),
-            ),
-            // AI identities (REQ-100 slice 2). The same three-way split the tools use, and it is
-            // a split rather than a single catch because the three answers mean different things
-            // to the panel: `invalid_identity` lands on a form field, `identity_not_found` is a
-            // deleted row or another tenant's (never confirmable, per the variant's own docs),
-            // and `identity_conflict` is a taken key the operator resolves by choosing another.
-            AiHubError::InvalidIdentity(message) => {
-                Self::bad_request("invalid_identity", message)
-            }
-            AiHubError::IdentityNotFound(id) => Self::new(
-                StatusCode::NOT_FOUND,
-                "identity_not_found",
-                format!("no identity `{id}` in this organization"),
-            ),
-            AiHubError::IdentityConflict(message) => {
-                Self::new(StatusCode::CONFLICT, "identity_conflict", message)
-            }
-            // MCP clients (REQ-108 slice 1). The same three-way split the identities use, and
-            // the tenancy half matters most here: an MCP client id sits in a URL, and a status
-            // code that distinguishes "exists in another tenant" would make the clients table an
-            // existence oracle over every token prefix in the installation. `invalid_mcp_client`
-            // lands on a form field (the message names which), `mcp_client_not_found` is a
-            // deleted row or a foreign one, and `mcp_client_conflict` is a taken name the
-            // operator resolves by choosing another.
-            AiHubError::InvalidMcpClient(message) => {
-                Self::bad_request("invalid_mcp_client", message)
-            }
-            AiHubError::McpClientNotFound(id) => Self::new(
-                StatusCode::NOT_FOUND,
-                "mcp_client_not_found",
-                format!("no MCP client `{id}` in this organization"),
-            ),
-            AiHubError::McpClientConflict(message) => {
-                Self::new(StatusCode::CONFLICT, "mcp_client_conflict", message)
-            }
-            AiHubError::McpClientToolConflict(message) => {
-                Self::new(StatusCode::CONFLICT, "mcp_client_tool_conflict", message)
-            }
-            // The data guard (REQ-105). The same four-way split, and for the same reason: the
-            // rule form's bad field is a `400` naming the field, a rule id from another tenant
-            // (or a platform row, for the update path) is a `404` — never a 403, or the rules
-            // screen becomes an existence oracle for the whole installation's detection rules —
-            // a taken key is a `409` the panel resolves by offering another, and the rule
-            // budget is a `422`: nothing in the caller's request is wrong, the *configuration*
-            // is, and the fix is on the rules screen.
-            AiHubError::InvalidGuardRule(message) => {
-                Self::bad_request("invalid_guard_rule", message)
-            }
-            AiHubError::GuardRuleNotFound(id) => Self::new(
-                StatusCode::NOT_FOUND,
-                "guard_rule_not_found",
-                format!("no guard rule `{id}` in this organization"),
-            ),
-            AiHubError::GuardRuleConflict(message) => {
-                Self::new(StatusCode::CONFLICT, "guard_rule_conflict", message)
-            }
-            AiHubError::InvalidGuardExemption(message) => {
-                Self::bad_request("invalid_guard_exemption", message)
-            }
-            AiHubError::GuardConfiguration(message) => Self::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "guard_configuration",
-                message,
-            ),
-            // A refusal by policy is a `403` and not a `400`: nothing about the payload is
-            // malformed, so sending it again unchanged would be refused again, and the code has
-            // to be exactly `ai_guard_blocked` — the chat surface keys its "this was blocked by
-            // the data guard" banner off that string, and a generic `forbidden` would leave the
-            // user with no idea why their message never reached a model.
-            AiHubError::GuardBlocked {
-                label,
-                rule_key,
-                message,
-            } => Self::new(StatusCode::FORBIDDEN, "ai_guard_blocked", message)
-                .with_details(serde_json::json!({
-                    "label": label,
-                    "rule_key": rule_key,
-                })),
-            // Approvals (REQ-101). The same three-way split, and for the same reason: an
-            // `invalid_approval` is a field on the review or the policy form (a class nobody
-            // has heard of, an expiry of zero, a rejection with no reason), an
-            // `approval_not_found` is a pruned row or **another tenant's** — never a 403,
-            // because an approval id that exists must not be confirmable by its status code,
-            // and the inbox would become an existence oracle for every deletion on record.
-            AiHubError::InvalidApproval(message) => {
-                Self::bad_request("invalid_approval", message)
-            }
-            AiHubError::ApprovalNotFound(id) => Self::new(
-                StatusCode::NOT_FOUND,
-                "approval_not_found",
-                format!("no approval `{id}` in this organization"),
-            ),
-            // The change-set pair (REQ-101 slice 3). Same shapes as the approval pair and for
-            // the same reason: a set that breaks its own rules is a `400` whose message names
-            // the operation, and a set id that is not in this organization is a `404` — never
-            // a 403, or the editor becomes an existence oracle for every proposal in the
-            // installation.
-            AiHubError::InvalidChangeSet(message) => {
-                Self::bad_request("invalid_change_set", message)
-            }
-            AiHubError::ChangeSetNotFound(id) => Self::new(
-                StatusCode::NOT_FOUND,
-                "change_set_not_found",
-                format!("no change set `{id}` in this organization"),
-            ),
-            // The air gap (REQ-106 slice 2). A bad reason is a field on the switch form, so it is
-            // a `400`; an allow-list row that is not there is a `404` — never a 403, or the
-            // settings screen becomes an existence oracle over a list whose whole purpose is to
-            // say what counts as internal. The blocked *call* is not here on purpose: it is a
-            // frame inside the chat stream, because the stream has already opened by the time the
-            // walk reaches the provider, and a status code is no longer available there.
-            // The eval trio (REQ-107 slice 1). A suite or case that breaks its own rules is a
-            // `400` naming the field, because every one of those refusals belongs to one input
-            // in the editor; a taken key is a `409`, which is a different shape on purpose —
-            // the editor RESOLVES it by offering another key and keeping the rest of the form,
-            // where a `400` would make the operator guess which field collided. A suite or case
-            // id that is not in this organization is a `404`, never a 403, or the suite screen
-            // becomes an existence oracle over every key in the installation.
-            AiHubError::InvalidEval(message) => Self::bad_request("invalid_eval", message),
-            AiHubError::EvalSuiteNotFound(key) => Self::new(
-                StatusCode::NOT_FOUND,
-                "eval_suite_not_found",
-                format!("no eval suite `{key}` in this organization"),
-            ),
-            AiHubError::EvalCaseNotFound(id) => Self::new(
-                StatusCode::NOT_FOUND,
-                "eval_case_not_found",
-                format!("no eval case `{id}` in this organization"),
-            ),
-            // A run (REQ-107 slice 2). A `404` for the same tenancy reason as the pair above —
-            // a run id that answered "exists in another tenant" would make the run screen an
-            // existence oracle over every run in the installation. The same code also answers a
-            // second settle of an already-settled run, because the settle's status guard is
-            // what makes a double settle impossible.
-            AiHubError::EvalRunNotFound(id) => Self::new(
-                StatusCode::NOT_FOUND,
-                "eval_run_not_found",
-                format!("no eval run `{id}` in this organization"),
-            ),
-            AiHubError::EvalSuiteKeyTaken(key) => Self::new(
-                StatusCode::CONFLICT,
-                "eval_suite_key_taken",
-                format!("an eval suite with the key `{key}` already exists in this organization"),
-            ),
-            AiHubError::InvalidAirgap(message) => Self::bad_request("invalid_airgap", message),
-            AiHubError::AirgapHostNotFound(id) => Self::new(
-                StatusCode::NOT_FOUND,
-                "airgap_host_not_found",
-                format!("`{id}` is not on the internal-host allow-list"),
-            ),
-            // A model that cannot do what the request needs is a `400` and not a `409`: nothing
-            // about the installation is in conflict, the caller asked for a capability this
-            // model does not claim, and the fix is a flag edit or a different model. The code
-            // and the message both name the capability so a client can branch on it.
-            AiHubError::CapabilityUnsupported { model, capability } => Self::bad_request(
-                "capability_unsupported",
-                format!("the model \"{model}\" does not support {capability}"),
-            ),
             AiHubError::InvalidChatRequest(message) => {
                 Self::bad_request("invalid_chat_request", message)
             }
@@ -1321,6 +1176,14 @@ impl From<AiHubError> for ApiError {
         }
     }
 }
+
+// `ApiError` is `Debug` but not `Display`, so any caller that wants to put a refusal into a
+// log line, a test assertion or a `format!` has to reach for the private `message` field or
+// write `{:?}` and read the whole struct. The `Display` impl above answers that, and it prints
+// the code alongside the message: a refusal read in a test failure names both *what* happened
+// and *why*, where the message alone leaves the reader reaching for the call site. `Display` is
+// the human-facing view of a value and `Debug` is the structural one, and collapsing them
+// would dump `status` and `details` into every test failure that mentions a refusal.
 
 #[derive(Serialize)]
 struct ErrorBody {
@@ -1544,6 +1407,34 @@ mod tests {
 
         let unavailable = ApiError::from(AiHubError::Database(sqlx::Error::PoolTimedOut));
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The department tree (REQ-005). These four had no arm and fell into the catch-all, so a
+    /// blank key, a taken key, a refused move and a delete of an occupied department all
+    /// answered `500 internal_error` — the one status that tells a client the platform broke
+    /// and offers a retry for a request that can never succeed. The test pins the status each
+    /// state implies, because the difference between them is the whole point: `400` names a
+    /// field the caller fixes, `409` names a state somebody has to change first, `404` means
+    /// there is nothing to act on at all.
+    #[test]
+    fn department_errors_map_onto_the_state_they_describe() {
+        let shape = ApiError::from(IdentityError::InvalidDepartment(
+            "name is required".to_owned(),
+        ));
+        assert_eq!(shape.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(shape.code(), "invalid_department");
+
+        let taken = ApiError::from(IdentityError::DepartmentKeyTaken);
+        assert_eq!(taken.status(), StatusCode::CONFLICT);
+        assert_eq!(taken.code(), "department_key_taken");
+
+        let cycle = ApiError::from(IdentityError::DepartmentCycle);
+        assert_eq!(cycle.status(), StatusCode::CONFLICT);
+        assert_eq!(cycle.code(), "department_cycle");
+
+        let missing = ApiError::from(IdentityError::DepartmentNotFound);
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.code(), "department_not_found");
     }
 
     #[test]

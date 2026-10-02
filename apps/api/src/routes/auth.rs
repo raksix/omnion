@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use uuid::Uuid;
 
 use crate::client_ip::ClientAddress;
 use crate::cookies;
@@ -268,6 +269,40 @@ pub(crate) async fn start_session(
     ip_address: Option<String>,
     auth_methods: Vec<String>,
 ) -> Result<Response, ApiError> {
+    start_session_with_body(
+        state,
+        user,
+        user_agent,
+        ip_address,
+        auth_methods,
+        LoginResponse {
+            user: UserBody::from(user),
+            device: DeviceBody {
+                id: Uuid::nil(),
+                label: String::new(),
+                platform: String::new(),
+                browser: String::new(),
+                trusted: false,
+            },
+            expires_in: sessions::SESSION_TTL_SECONDS,
+        },
+    )
+    .await
+}
+
+/// The same session, with a body the caller supplies.
+///
+/// A path that creates an account as part of something else — accepting an invitation
+/// (REQ-005) is the one today — needs the session cookie *and* its own answer, not the login
+/// body. The cookie, the device bookkeeping and the policy lifetimes are identical either way.
+pub(crate) async fn start_session_with_body<T: Serialize>(
+    state: &AppState,
+    user: &omnion_identity::User,
+    user_agent: Option<String>,
+    ip_address: Option<String>,
+    auth_methods: Vec<String>,
+    body: T,
+) -> Result<Response, ApiError> {
     let policy = signin::session_policy_for(state.db().pool(), user.organization_id).await?;
     let trust_days = match user.organization_id {
         Some(organization_id) => {
@@ -310,20 +345,7 @@ pub(crate) async fn start_session(
     // every save is a far worse first sign-in than a header nobody reads.
     let csrf = cookies::csrf_cookie_for(&session.id, state.config().csrf.as_bytes(), secure);
 
-    let mut response = Json(LoginResponse {
-        user: UserBody::from(user),
-        device: DeviceBody {
-            id: device.id,
-            label: device.label,
-            platform: device.platform,
-            browser: device.browser,
-            trusted: device
-                .trusted_until
-                .is_some_and(|until| until > time::OffsetDateTime::now_utc()),
-        },
-        expires_in: sessions::SESSION_TTL_SECONDS,
-    })
-    .into_response();
+    let mut response = Json(body).into_response();
     response.headers_mut().insert(
         SET_COOKIE,
         HeaderValue::from_str(&cookie).expect("session cookie is valid header text"),

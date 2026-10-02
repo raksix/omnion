@@ -12,32 +12,20 @@
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::catalog;
 use crate::error::{AiHubError, Result};
 use crate::model::{
-    AiModel, ApiKeyChange, DiscoveryAction, DiscoveryDiff, MAX_DISPLAY_NAME_LEN, ModelChanges,
-    NewAiModel, NewProvider, Provider, ProviderChanges, diff_discovery, normalize_base_url,
-    validate_kind, validate_model_key, validate_name, validate_priority, validate_protocol,
-    validate_retries, validate_timeout, validate_token_limits,
+    AiModel, ApiKeyChange, ModelChanges, NewAiModel, NewProvider, Provider, ProviderChanges,
+    normalize_base_url, validate_model_key, validate_name, validate_protocol,
 };
 
 /// Columns read back from `ai_providers`.
-const PROVIDER_COLUMNS: &str = "id, name, protocol, kind, base_url, api_key, timeout_ms, \
-     max_retries, priority, last_health, last_checked_at, last_error, enabled, is_default, \
+const PROVIDER_COLUMNS: &str = "id, name, protocol, base_url, api_key, enabled, is_default, \
      created_at, updated_at";
 
-/// Columns read back from `ai_models`, capability flags included.
-///
-/// The list is written out in full rather than `select *` so a new column cannot silently start
-/// flowing into a struct that was not reviewed for it, and so the one place that says "these are
-/// the facts about a model" stays readable.
+/// Columns read back from `ai_models`.
 const MODEL_COLUMNS: &str = "id, provider_id, model_key, display_name, context_window, \
-     supports_tools, supports_vision, supports_streaming, supports_embeddings, \
-     supports_image_generation, supports_audio_generation, supports_transcription, \
-     supports_json_mode, max_output_tokens, input_cost_micros_per_mtok, \
-     output_cost_micros_per_mtok, price_source, price_updated_at, \
-     capabilities_source, capabilities_verified_at, \
-     enabled, is_default, created_at, updated_at";
+     supports_tools, supports_vision, supports_streaming, supports_embeddings, enabled, \
+     is_default, created_at, updated_at";
 
 // ---------------------------------------------------------------------------------------------
 // Providers
@@ -71,10 +59,6 @@ pub async fn find_provider_by_name(pool: &PgPool, name: &str) -> Result<Option<P
 pub async fn create_provider(pool: &PgPool, new: NewProvider) -> Result<Provider> {
     validate_name(&new.name)?;
     validate_protocol(&new.protocol)?;
-    validate_kind(&new.kind)?;
-    validate_timeout(new.timeout_ms)?;
-    validate_retries(new.max_retries)?;
-    validate_priority(new.priority)?;
     let base_url = normalize_base_url(&new.base_url)?;
     let name = new.name.trim().to_owned();
     let api_key = new.api_key.filter(|key| !key.trim().is_empty());
@@ -85,19 +69,14 @@ pub async fn create_provider(pool: &PgPool, new: NewProvider) -> Result<Provider
     }
 
     let sql = format!(
-        "insert into ai_providers (name, protocol, kind, base_url, api_key, timeout_ms, \
-         max_retries, priority, enabled, is_default) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) returning {PROVIDER_COLUMNS}"
+        "insert into ai_providers (name, protocol, base_url, api_key, enabled, is_default) \
+         values ($1, $2, $3, $4, $5, $6) returning {PROVIDER_COLUMNS}"
     );
     let stored: Result<Provider> = sqlx::query_as(&sql)
         .bind(&name)
         .bind(&new.protocol)
-        .bind(&new.kind)
         .bind(&base_url)
         .bind(api_key.as_deref())
-        .bind(new.timeout_ms)
-        .bind(new.max_retries)
-        .bind(new.priority)
         .bind(new.enabled)
         .bind(new.is_default)
         .fetch_one(&mut *tx)
@@ -127,18 +106,6 @@ pub async fn update_provider(
         Some(base_url) => Some(normalize_base_url(&base_url)?),
         None => None,
     };
-    if let Some(kind) = &changes.kind {
-        validate_kind(kind)?;
-    }
-    if let Some(timeout_ms) = changes.timeout_ms {
-        validate_timeout(timeout_ms)?;
-    }
-    if let Some(max_retries) = changes.max_retries {
-        validate_retries(max_retries)?;
-    }
-    if let Some(priority) = changes.priority {
-        validate_priority(priority)?;
-    }
 
     let mut tx = pool.begin().await?;
     if changes.is_default == Some(true) {
@@ -147,11 +114,8 @@ pub async fn update_provider(
 
     let sql = format!(
         "update ai_providers set name = coalesce($2, name), base_url = coalesce($3, base_url), \
-         api_key = case when $4 then $5 else api_key end, \
-         kind = coalesce($6, kind), timeout_ms = coalesce($7, timeout_ms), \
-         max_retries = coalesce($8, max_retries), priority = coalesce($9, priority), \
-         enabled = coalesce($10, enabled), is_default = coalesce($11, is_default), \
-         updated_at = now() \
+         api_key = case when $4 then $5 else api_key end, enabled = coalesce($6, enabled), \
+         is_default = coalesce($7, is_default), updated_at = now() \
          where id = $1 returning {PROVIDER_COLUMNS}"
     );
     let (replace_key, api_key) = match changes.api_key {
@@ -166,10 +130,6 @@ pub async fn update_provider(
         .bind(base_url.as_deref())
         .bind(replace_key)
         .bind(api_key.as_deref())
-        .bind(changes.kind.as_deref())
-        .bind(changes.timeout_ms)
-        .bind(changes.max_retries)
-        .bind(changes.priority)
         .bind(changes.enabled)
         .bind(changes.is_default)
         .fetch_optional(&mut *tx)
@@ -190,26 +150,8 @@ pub async fn update_provider(
 }
 
 /// Remove a provider and every model it serves.
-///
-/// The installation's default is refused here rather than in the route: the check belongs to the
-/// transaction, so a caller that reaches the store by another road cannot leave the platform
-/// without the provider its task-routed requests point at. The check and the delete are one
-/// transaction, so two operators racing to remove two providers cannot both see a default.
 pub async fn delete_provider(pool: &PgPool, id: Uuid) -> Result<()> {
     let mut tx = pool.begin().await?;
-
-    // `for update` closes the window between this read and the delete: a concurrent "set default"
-    // either lands before it (this sees the new default and refuses) or after it (and refuses
-    // against the row this transaction is about to drop).
-    let name: Option<String> =
-        sqlx::query_scalar("select name from ai_providers where id = $1 and is_default for update")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-    if let Some(name) = name {
-        return Err(AiHubError::ProviderIsDefault(name));
-    }
 
     let deleted = sqlx::query("delete from ai_providers where id = $1")
         .bind(id)
@@ -225,49 +167,6 @@ pub async fn delete_provider(pool: &PgPool, id: Uuid) -> Result<()> {
     tx.commit().await?;
 
     Ok(())
-}
-
-/// Record one health verdict for a provider, as the probe runner and `Probe now` both do.
-pub async fn record_health(
-    pool: &PgPool,
-    id: Uuid,
-    status: &str,
-    // The sample row lands with the health table in slice 3; until then the verdict itself is
-    // all the runtime stores, and this argument keeps the call shape the probe runner will use.
-    _latency_ms: i32,
-    error: Option<&str>,
-) -> Result<Provider> {
-    if !crate::model::HEALTH_STATUSES.contains(&status) {
-        return Err(AiHubError::InvalidProvider(format!(
-            "\"{status}\" is not a health status"
-        )));
-    }
-
-    let sql = format!(
-        "update ai_providers set last_health = $2, last_checked_at = now(), last_error = $3, \
-         updated_at = now() where id = $1 returning {PROVIDER_COLUMNS}"
-    );
-    let stored: Option<Provider> = sqlx::query_as(&sql)
-        .bind(id)
-        .bind(status)
-        .bind(error)
-        .fetch_optional(pool)
-        .await?;
-
-    stored.ok_or(AiHubError::ProviderNotFound)
-}
-
-/// The enabled providers in failover order: priority first, then `lower(name)`.
-///
-/// The order is total: two providers may share a priority, and then their names decide, so the
-/// chain a caller walks never depends on insertion order.
-pub async fn failover_chain(pool: &PgPool) -> Result<Vec<Provider>> {
-    let sql = format!(
-        "select {PROVIDER_COLUMNS} from ai_providers where enabled \
-         order by priority, lower(name), id"
-    );
-    let providers: Vec<Provider> = sqlx::query_as(&sql).fetch_all(pool).await?;
-    Ok(providers)
 }
 
 /// Clear the installation's default provider.
@@ -328,24 +227,6 @@ pub async fn find_default_model(pool: &PgPool) -> Result<Option<AiModel>> {
     Ok(model)
 }
 
-/// Whether **any** model has ever been registered, switched off or not.
-///
-/// A separate question from [`find_default_model`], and the answer to a different one. That
-/// function answers "is there a model that can serve right now"; this one answers "has an
-/// operator configured this installation at all". The gap between them is the whole reason a
-/// refusal needs two statuses: an installation with one model that was deliberately switched off
-/// is not the same problem as one that was never set up, and only the second one is answered by
-/// "go and set a default model".
-///
-/// Deliberately unfiltered. A query that added `and enabled` here would be indistinguishable
-/// from the empty case for exactly the operator who needs the distinction most.
-pub async fn any_model_registered(pool: &PgPool) -> Result<bool> {
-    let registered: (bool,) = sqlx::query_as("select exists(select 1 from ai_models)")
-        .fetch_one(pool)
-        .await?;
-    Ok(registered.0)
-}
-
 /// Make a provider's model set agree with a list.
 ///
 /// Keys that are not in the list are removed, keys that are keep their metadata unless the list
@@ -386,12 +267,9 @@ pub async fn replace_models(
 
     let insert = format!(
         "insert into ai_models (provider_id, model_key, display_name, context_window, \
-         supports_tools, supports_vision, supports_streaming, supports_embeddings, \
-         supports_image_generation, supports_audio_generation, supports_transcription, \
-         supports_json_mode, max_output_tokens) \
+         supports_tools, supports_vision, supports_streaming, supports_embeddings) \
          values ($1, $2, $3, $4, coalesce($5, false), coalesce($6, false), \
-         coalesce($7, true), coalesce($8, false), coalesce($9, false), coalesce($10, false), \
-         coalesce($11, false), coalesce($12, false), $13) \
+         coalesce($7, true), coalesce($8, false)) \
          on conflict (provider_id, model_key) do update set \
          display_name = coalesce(excluded.display_name, ai_models.display_name), \
          context_window = coalesce(excluded.context_window, ai_models.context_window), \
@@ -399,18 +277,12 @@ pub async fn replace_models(
          supports_vision = coalesce($6, ai_models.supports_vision), \
          supports_streaming = coalesce($7, ai_models.supports_streaming), \
          supports_embeddings = coalesce($8, ai_models.supports_embeddings), \
-         supports_image_generation = coalesce($9, ai_models.supports_image_generation), \
-         supports_audio_generation = coalesce($10, ai_models.supports_audio_generation), \
-         supports_transcription = coalesce($11, ai_models.supports_transcription), \
-         supports_json_mode = coalesce($12, ai_models.supports_json_mode), \
-         max_output_tokens = coalesce($13, ai_models.max_output_tokens), \
          updated_at = now() \
          returning {MODEL_COLUMNS}"
     );
 
     let mut stored: Vec<AiModel> = Vec::with_capacity(models.len());
     for model in models {
-        validate_token_limits(model.context_window, model.max_output_tokens)?;
         let row: AiModel = sqlx::query_as(&insert)
             .bind(provider_id)
             .bind(model.model_key.trim())
@@ -420,11 +292,6 @@ pub async fn replace_models(
             .bind(model.supports_vision)
             .bind(model.supports_streaming)
             .bind(model.supports_embeddings)
-            .bind(model.supports_image_generation)
-            .bind(model.supports_audio_generation)
-            .bind(model.supports_transcription)
-            .bind(model.supports_json_mode)
-            .bind(model.max_output_tokens)
             .fetch_one(&mut *tx)
             .await?;
         stored.push(row);
@@ -437,12 +304,7 @@ pub async fn replace_models(
     Ok(stored)
 }
 
-/// Change one model: its capability flags, its limits, whether it is on, and whether it is the
-/// installation's default.
-///
-/// The token limits are validated against each other *and* against what the row already holds,
-/// so an edit that lowers the context window under an existing answer ceiling is refused here
-/// rather than leaving a row the router cannot honour.
+/// Change one model (switch it on or off, make it the default).
 pub async fn update_model(pool: &PgPool, id: Uuid, changes: ModelChanges) -> Result<AiModel> {
     let mut tx = pool.begin().await?;
 
@@ -473,129 +335,14 @@ pub async fn update_model(pool: &PgPool, id: Uuid, changes: ModelChanges) -> Res
             .await?;
     }
 
-    let context_window = changes.context_window.or(current.context_window);
-    let max_output_tokens = changes
-        .max_output_tokens
-        .unwrap_or(current.max_output_tokens);
-    validate_token_limits(context_window, max_output_tokens)?;
-
-    // The price is validated **before** anything is written, and both halves are named in one
-    // message. Validating after the update would leave a row whose input price landed and whose
-    // output price did not — a half-applied price is worse than a refused one, because the next
-    // cost estimate would read the new input rate against the old output rate and neither is
-    // what the operator typed.
-    let input_cost = changes
-        .input_cost_micros_per_mtok
-        .unwrap_or(current.input_cost_micros_per_mtok);
-    let output_cost = changes
-        .output_cost_micros_per_mtok
-        .unwrap_or(current.output_cost_micros_per_mtok);
-    catalog::validate_price(input_cost, output_cost)?;
-
-    let price_source = match changes.price_source.as_deref() {
-        None => current.price_source.clone(),
-        Some(source) => {
-            catalog::PriceSource::parse(source).ok_or_else(|| {
-                AiHubError::InvalidModel(format!(
-                    "price source \"{source}\" is not one of ({})",
-                    catalog::PriceSource::ALL
-                        .iter()
-                        .map(|value| value.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-            })?;
-            source.to_owned()
-        }
-    };
-
-    let capabilities_source = match changes.capabilities_source.as_deref() {
-        None => current.capabilities_source.clone(),
-        Some(source) => {
-            catalog::PriceSource::parse(source).ok_or_else(|| {
-                AiHubError::InvalidModel(format!(
-                    "capabilities source \"{source}\" is not one of (manual, discovery, probe)"
-                ))
-            })?;
-            source.to_owned()
-        }
-    };
-
-    let display_name = changes.display_name.as_deref().map(str::trim);
-    if let Some(name) = display_name
-        && name.chars().count() > MAX_DISPLAY_NAME_LEN
-    {
-        return Err(AiHubError::InvalidModel(format!(
-            "a display name may carry at most {MAX_DISPLAY_NAME_LEN} characters"
-        )));
-    }
-
     let sql = format!(
-        "update ai_models set \
-         display_name = coalesce($3, display_name), \
-         context_window = coalesce($4, context_window), \
-         supports_tools = coalesce($5, supports_tools), \
-         supports_vision = coalesce($6, supports_vision), \
-         supports_streaming = coalesce($7, supports_streaming), \
-         supports_embeddings = coalesce($8, supports_embeddings), \
-         supports_image_generation = coalesce($9, supports_image_generation), \
-         supports_audio_generation = coalesce($10, supports_audio_generation), \
-         supports_transcription = coalesce($11, supports_transcription), \
-         supports_json_mode = coalesce($12, supports_json_mode), \
-         max_output_tokens = case when $13 then $14 else max_output_tokens end, \
-         input_cost_micros_per_mtok = case when $16 then $17 else input_cost_micros_per_mtok end, \
-         output_cost_micros_per_mtok = case when $18 then $19 else output_cost_micros_per_mtok end, \
-         price_source = $20, \
-         -- `price_updated_at` is stamped whenever *any* half of the price was written, including
-         -- a write that cleared it. A cleared price has no age -- the column goes back to null
-         -- with the halves -- so the panel reads 'no price' rather than a price from 2024.
-         price_updated_at = case \
-           when $16 or $18 then case when $17 is null and $19 is null then null else now() end \
-           else price_updated_at end, \
-         capabilities_source = $21, \
-         capabilities_verified_at = $22, \
-         enabled = $2, is_default = $15, updated_at = now() \
+        "update ai_models set enabled = $2, is_default = $3, updated_at = now() \
          where id = $1 returning {MODEL_COLUMNS}"
     );
-    let (set_ceiling, ceiling) = match changes.max_output_tokens {
-        None => (false, None),
-        Some(value) => (true, value),
-    };
-    // The two `case when` arms need a boolean *and* a value because a bare `coalesce` cannot
-    // express "set this to null": `coalesce(null, column)` returns the column, so clearing a
-    // price with a coalesce would silently keep the old number. The boolean is the intent flag
-    // and the value is what to write — the same shape `max_output_tokens` above already uses.
-    let (set_input_price, input_price) = match changes.input_cost_micros_per_mtok {
-        None => (false, None),
-        Some(value) => (true, value),
-    };
-    let (set_output_price, output_price) = match changes.output_cost_micros_per_mtok {
-        None => (false, None),
-        Some(value) => (true, value),
-    };
     let _stored: AiModel = sqlx::query_as(&sql)
         .bind(id)
         .bind(enabled)
-        .bind(display_name)
-        .bind(context_window)
-        .bind(changes.supports_tools)
-        .bind(changes.supports_vision)
-        .bind(changes.supports_streaming)
-        .bind(changes.supports_embeddings)
-        .bind(changes.supports_image_generation)
-        .bind(changes.supports_audio_generation)
-        .bind(changes.supports_transcription)
-        .bind(changes.supports_json_mode)
-        .bind(set_ceiling)
-        .bind(ceiling)
         .bind(is_default)
-        .bind(set_input_price)
-        .bind(input_price)
-        .bind(set_output_price)
-        .bind(output_price)
-        .bind(price_source)
-        .bind(capabilities_source)
-        .bind(changes.capabilities_verified_at)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -608,97 +355,6 @@ pub async fn update_model(pool: &PgPool, id: Uuid, changes: ModelChanges) -> Res
     let fresh: AiModel = sqlx::query_as(&sql).bind(id).fetch_one(pool).await?;
 
     Ok(fresh)
-}
-
-/// What a discovery run would do, without writing anything.
-///
-/// The endpoint is asked (or the caller passes what it reported), the stored set is read, and
-/// the two are compared. This never mutates: the panel shows the result and the operator
-/// confirms, which is what makes a diff reviewable.
-pub async fn discovery_diff(
-    pool: &PgPool,
-    provider: &Provider,
-    reported: &[String],
-) -> Result<DiscoveryDiff> {
-    let stored = list_models(pool, Some(provider.id)).await?;
-    let lines = diff_discovery(&stored, reported);
-
-    let mut reported_keys = reported.to_vec();
-    reported_keys.sort();
-    reported_keys.dedup();
-    let mut stored_keys: Vec<String> = stored.iter().map(|model| model.model_key.clone()).collect();
-    stored_keys.sort();
-
-    Ok(DiscoveryDiff {
-        provider_id: provider.id,
-        provider_name: provider.name.clone(),
-        reported: reported_keys,
-        stored: stored_keys,
-        lines,
-    })
-}
-
-/// Apply a discovery diff: add what the endpoint serves, remove what it stopped serving.
-///
-/// The capability flags of the rows that are added are all `false` except streaming, because a
-/// model list carries no capability metadata — the operator is who turns the rest on, and a row
-/// that claimed otherwise would be a guess the router then enforced. A row that is already
-/// stored keeps every flag it had: discovery reconciles *keys*, never capabilities.
-pub async fn apply_discovery(
-    pool: &PgPool,
-    provider: &Provider,
-    reported: &[String],
-) -> Result<DiscoveryDiff> {
-    let diff = discovery_diff(pool, provider, reported).await?;
-
-    let additions: Vec<String> = diff
-        .lines
-        .iter()
-        .filter(|line| line.action == DiscoveryAction::Added)
-        .map(|line| line.model_key.clone())
-        .collect();
-    let removals: Vec<String> = diff
-        .lines
-        .iter()
-        .filter(|line| line.action == DiscoveryAction::Removed)
-        .map(|line| line.model_key.clone())
-        .collect();
-
-    if additions.is_empty() && removals.is_empty() {
-        // Nothing to do: the apply is idempotent, so a double confirm writes nothing and the
-        // second discovery run over the same endpoint reports an empty diff.
-        return Ok(diff);
-    }
-
-    let mut tx = pool.begin().await?;
-    if !removals.is_empty() {
-        sqlx::query("delete from ai_models where provider_id = $1 and model_key = any($2)")
-            .bind(provider.id)
-            .bind(&removals)
-            .execute(&mut *tx)
-            .await?;
-    }
-
-    if !additions.is_empty() {
-        let insert = format!(
-            "insert into ai_models (provider_id, model_key, supports_streaming) \
-             values ($1, $2, true) \
-             on conflict (provider_id, model_key) do nothing"
-        );
-        for key in &additions {
-            validate_model_key(key)?;
-            sqlx::query(&insert)
-                .bind(provider.id)
-                .bind(key)
-                .execute(&mut *tx)
-                .await?;
-        }
-    }
-
-    repair_default_model(&mut tx).await?;
-    tx.commit().await?;
-
-    Ok(diff)
 }
 
 /// Keep the default model honest: clear defaults that are switched off, promote the oldest

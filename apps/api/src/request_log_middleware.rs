@@ -56,7 +56,7 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::http::header;
 use axum::http::{Request, Response, StatusCode};
-use omnion_developer::ClientIdentity;
+use omnion_developer::store::ClientIdentity;
 use time::OffsetDateTime;
 use tower::{Layer, Service};
 use uuid::Uuid;
@@ -323,20 +323,55 @@ async fn write_row(
         address,
         agent,
     )?;
-    omnion_developer::logs_store::record(
+    // **This branch's recorder, not main's.** Both write `api_request_logs` and both strip the
+    // query string as the last thing that touches the raw path — this branch's `log_request` was
+    // given that fix at tick 115 after a walk found `?access_token=…` verbatim in the table.
+    // Main's `logs_store::record` is a second writer against the same table with its own
+    // `ClientIdentity`, its own `LogRow` shape and a different set of columns; a request
+    // middleware that could call either would make "is this row complete?" a question with two
+    // answers, and only one of them is covered by a walk.
+    // **Two columns the table declares `not null` and a request of this shape does not carry.**
+    // `organization_id` is the tenant the log screen filters by, and `request_id` is the value a
+    // caller quotes in a bug report. An anonymous call to a public route has neither a tenant nor
+    // a session, and the honest answers are the *platform's* own identity and a fresh id — which
+    // is what "nobody called this" looks like in a table: a row with no user, no key and no
+    // organization, and `is_anonymous()` above is what the recorder decided that means.
+    //
+    // A row that skipped the insert because it had no organization would lose exactly the
+    // requests an operator most often wants: the ones to a public route that were refused.
+    let organization_id = identity.organization_id.unwrap_or_else(Uuid::nil);
+    omnion_developer::store::log_request(
         state.db().pool(),
-        method,
-        path,
-        // `StatusCode::as_u16`, not a `From` impl: a `StatusCode` is a `u16` underneath, and the
-        // log column is `smallint`. A status above `i16::MAX` is not representable, and this cast
-        // says so — a saturating conversion would record a `70000` refusal as `32767` and put a
-        // row in the log that no HTTP client could have produced.
-        status.as_u16().min(i16::MAX as u16) as i16,
-        duration_ms,
-        &identity,
-        OffsetDateTime::now_utc(),
+        &omnion_developer::RequestLog {
+            id: 0,
+            created_at: time::OffsetDateTime::now_utc(),
+            organization_id,
+            api_key_id: identity.api_key_id,
+            api_key_prefix: identity.api_key_prefix,
+            actor_user_id: identity.user_id,
+            actor_name: identity.user_name,
+            permission: identity.permission,
+            method: method.to_owned(),
+            path: path.to_owned(),
+            // `StatusCode::as_u16`, not a `From` impl: a `StatusCode` is a `u16` underneath, and
+            // the log column is `smallint`. A status above `i16::MAX` is not representable, and
+            // this cast says so — a saturating conversion would record a `70000` refusal as
+            // `32767` and put a row in the log that no HTTP client could have produced.
+            status: status.as_u16().min(i16::MAX as u16) as i16,
+            duration_ms,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            bytes_in: None,
+            bytes_out: None,
+            error_code: None,
+        },
     )
-    .await
+    .await?;
+
+    // The row id is the join key the log screen and an operator's ticket both use, and this
+    // function's contract is "one row, or an error the caller logs" — not "here is the id".
+    // `write_row` is called from `on_response`, which has no way to use it and would have to
+    // carry it as a `#[must_use]`, so the value is deliberately dropped rather than returned.
+    Ok(())
 }
 
 #[cfg(test)]

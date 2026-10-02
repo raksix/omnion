@@ -5,6 +5,30 @@
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
 import type {
+  ApiKey,
+  ApiKeyDetail,
+  ApiKeysResponse,
+  ApiRequestLog,
+  ApiRequestLogPage,
+  MintedApiKey,
+  MintedOAuthApp,
+  OAuthAppDetailResponse,
+  OAuthAppsResponse,
+  OAuthGrant,
+  CdnAdapterInfo,
+  CdnCacheRule,
+  CdnCacheRuleInput,
+  CdnRulesResponse,
+  CdnAdapter,
+  CdnProviderProbe,
+  CdnPurge,
+  CdnPurgeDetail,
+  CdnPurgeFilters,
+  CdnPurgeInput,
+  CdnPurgePage,
+  CdnSettings,
+  CdnSettingsInput,
+  CdnStatus,
   SecurityBulkResult,
   SecurityFinding,
   SecurityFindingFilter,
@@ -47,6 +71,37 @@ import type {
   SignInProtectionDocument,
   SignInProtectionSave,
   SignInProtectionSaved,
+  DeploymentAvailability,
+  DeploymentCheckRow,
+  DeploymentCheckRunResponse,
+  DeploymentChecksResponse,
+  DeploymentEnvironmentCard,
+  DeploymentEnvironmentDetail,
+  DeploymentEnvironmentsResponse,
+  DeploymentHistoryFilters,
+  DeploymentCancelResponse,
+  DeploymentHistoryResponse,
+  DeploymentJobResponse,
+  DeploymentLogChunk,
+  DeploymentMaintenanceResponse,
+  DeploymentMaintenanceWindow,
+  DeploymentPreflight,
+  DeploymentRollbackResponse,
+  DeploymentHistoryRow,
+  DeploymentRelease,
+  DeploymentReleaseDetail,
+  DeploymentReleasesResponse,
+  DeploymentRollbackOffer,
+  DeploymentStep,
+  DeploymentVersion,
+  ClusterMetric,
+  ClusterRestartResponse,
+  ClusterSampleRunResponse,
+  ClusterSamplesResponse,
+  ClusterSparkline,
+  ClusterWorkload,
+  DeploymentClusterResponse,
+  DeploymentProcessCard,
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
   WebhookEndpoint,
@@ -57,6 +112,21 @@ import type {
   WebhookTestReport,
   CreatedMediaShare,
   EventCatalogue,
+  DeviceLookup,
+  RegionDetail,
+  RegionHealthMatrix,
+  RegionLatencyMatrix,
+  RegionOverview,
+  RegionPatchInput,
+  RegionPatchResponse,
+  DeviceStart,
+  ManifestReport,
+  ScaffoldList,
+  ScaffoldRecord,
+  ScaffoldTree,
+  SdkKind,
+  SdkTarget,
+  SdkTemplate,
   EventFilters,
   EventPage,
   RetentionStatus,
@@ -132,6 +202,20 @@ import type {
   NotificationSummary,
   Site,
   User,
+  // Staging environments (REQ-017).
+  Environment,
+  EnvironmentCloneJob,
+  EnvironmentDetailResponse,
+  EnvironmentFilters,
+  EnvironmentListResponse,
+  // Promotions (REQ-017, slice 3).
+  ChangeSetResponse,
+  Promotion,
+  PromotionDetail,
+  PromotionRequested,
+  ExplorerOperations,
+  ExplorerRun,
+  ExplorerRunInput,
 } from "./types";
 // The portal's own shapes live in their own module rather than in `types.ts`, because they come
 // with a *rule* attached (only `IssuedDeveloperKey` may hold a token) that is worth reading
@@ -274,16 +358,7 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-/**
- * The single fetch path every client call goes through.
- *
- * **Exported** because `lib/guard-api.ts` (REQ-105) reuses it instead of writing a second one.
- * The alternative — a local `fetch` in that module — produces a request path that has to
- * remember CSRF, credentials and the JSON content-type rule on its own, and every one of those
- * is a `PUT` that the server silently refuses when it is missing. A second transport would
- * eventually be the copy that drifts.
- */
-export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
@@ -316,6 +391,105 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
   }
 
   return payload as T;
+}
+
+/**
+ * Download a CSV endpoint as a file.
+ *
+ * A separate function rather than a `format=csv` flag on the JSON caller, because the two cannot
+ * share a body parser: the JSON path runs every response through `readJson`, which turns a CSV
+ * into `null` and a `Blob` into a promise that never resolves. The error path *is* shared — a
+ * refusal is JSON whatever the request asked for, so the caller still gets the API's own code and
+ * message rather than a failed download.
+ */
+export async function downloadCsv(
+  path: string,
+  filename: string,
+): Promise<{ filename: string; rows: number }> {
+  let response: Response;
+  try {
+    response = await fetch(path, { credentials: "same-origin", headers: { accept: "text/csv" } });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+
+  if (!response.ok) {
+    const body = (await readJson(response)) as ErrorBody;
+    throw new ApiError(
+      response.status,
+      body.error?.code ?? "unknown_error",
+      body.error?.message ?? `The API answered with status ${response.status}.`,
+      body.error?.details ?? null,
+    );
+  }
+
+  const text = await response.text();
+  const url = URL.createObjectURL(new Blob([text], { type: "text/csv;charset=utf-8" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  // Revoked on the next tick rather than immediately: Firefox cancels an in-flight download whose
+  // URL disappears in the same task, and the file then lands empty.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+
+  return {
+    filename,
+    rows: text.split("\n").filter((line) => line.trim() !== "").length - 1,
+  };
+}
+
+/** One row of the Audit tab. */
+export type OrganizationAuditEntry = {
+  id: number;
+  action: string;
+  actor_type: string;
+  actor_user_id: string | null;
+  /** Display name of the actor, resolved server-side so the feed needs no second request. */
+  actor_name: string | null;
+  target_type: string | null;
+  target_id: string | null;
+  metadata: unknown;
+  ip_address: string | null;
+  created_at: string;
+};
+
+/** The Audit tab's payload: the rows, the filter's choices and the filtered count. */
+export type OrganizationAuditPayload = {
+  organization_id: string;
+  entries: OrganizationAuditEntry[];
+  actions: string[];
+  total: number;
+};
+
+/** The audit filters the tab offers. Empty strings mean "no filter", not "matches nothing". */
+export type OrganizationAuditFilters = {
+  action?: string;
+  actor?: string;
+  since?: string;
+};
+
+/**
+ * Read one organization's audit trail.
+ *
+ * The action list comes back with the rows on purpose: the filter then offers what this tenant
+ * has actually done, and cannot drift from the platform as actions are added.
+ */
+export async function fetchOrganizationAudit(
+  organizationId: string,
+  filters: OrganizationAuditFilters = {},
+): Promise<OrganizationAuditPayload> {
+  const params = new URLSearchParams();
+  if (filters.action) params.set("action", filters.action);
+  if (filters.actor) params.set("actor", filters.actor);
+  // The date input speaks `YYYY-MM-DD`; the API speaks RFC 3339. Converting here keeps the
+  // server's parser strict — a half-understood date is a filter that quietly matches nothing.
+  if (filters.since) params.set("since", `${filters.since}T00:00:00Z`);
+  const query = params.toString();
+
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/audit${query ? `?${query}` : ""}`,
+  );
 }
 
 /** What a password check answered: a session, or the second factor it still needs. */
@@ -450,6 +624,37 @@ export function updateSite(
 export async function fetchOrganizations(): Promise<Organization[]> {
   const body = await request<{ organizations: Organization[] }>("/api/v1/organizations");
   return body.organizations;
+}
+
+/** One tenant in full. */
+export function fetchOrganization(organizationId: string): Promise<Organization> {
+  return request<Organization>(`/api/v1/organizations/${encodeURIComponent(organizationId)}`);
+}
+
+/** Open a new tenant — `POST /api/v1/organizations` (platform accounts only). */
+export function createOrganization(input: { name: string; slug: string }): Promise<Organization> {
+  return request<Organization>("/api/v1/organizations", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Change a tenant (name, status) — `PATCH /api/v1/organizations/{id}`. */
+export function updateOrganization(
+  organizationId: string,
+  changes: { name?: string; status?: string },
+): Promise<Organization> {
+  return request<Organization>(`/api/v1/organizations/${encodeURIComponent(organizationId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+  });
+}
+
+/** Delete a tenant that owns no sites — `DELETE /api/v1/organizations/{id}`. */
+export async function deleteOrganization(organizationId: string): Promise<void> {
+  await request(`/api/v1/organizations/${encodeURIComponent(organizationId)}`, {
+    method: "DELETE",
+  });
 }
 
 /** The sites the account may see, optionally narrowed to one tenant. */
@@ -1482,88 +1687,13 @@ export type AiProvider = {
   id: string;
   name: string;
   protocol: string;
-  kind: AiProviderKind;
   base_url: string;
   has_api_key: boolean;
-  timeout_ms: number;
-  max_retries: number;
-  priority: number;
-  last_health: AiHealthStatus;
-  last_checked_at: string | null;
-  last_error: string | null;
   enabled: boolean;
   is_default: boolean;
   model_count: number;
   created_at: string;
   updated_at: string;
-};
-
-/** Where a provider lives: a hosted API, or one on the operator's own network. */
-export type AiProviderKind = "cloud" | "local";
-
-/** What the last health probe found. `unknown` means it has never been probed. */
-export type AiHealthStatus = "ok" | "degraded" | "down" | "unknown";
-
-/** One protocol the form offers, with the note the panel shows under the select. */
-export type AiProtocol = {
-  protocol: string;
-  note: string;
-  chat_path: string;
-  auth: string;
-};
-
-/** The numeric ranges the form validates against, from the same constants the API uses. */
-export type AiProtocolBounds = {
-  timeout_ms_min: number;
-  timeout_ms_max: number;
-  max_retries_max: number;
-  priority_min: number;
-  priority_max: number;
-};
-
-/** One step of the connection test. */
-export type AiTestStep = {
-  step: string;
-  label: string;
-  status: "pending" | "ok" | "failed" | "skipped";
-  latency_ms: number;
-  error?: string;
-  note?: string;
-};
-
-/** The whole connection test, as the panel renders it. */
-export type AiTestReport = {
-  provider_id: string;
-  provider_name: string;
-  protocol: string;
-  steps: AiTestStep[];
-  total_ms: number;
-  ok: boolean;
-  failing_step?: string;
-  model_count?: number;
-  known_models?: number;
-  summary: string;
-};
-
-/** One named thing a model can do. The vocabulary is closed and comes from the API. */
-export type AiCapability =
-  | "chat"
-  | "streaming"
-  | "tools"
-  | "vision"
-  | "json_mode"
-  | "embeddings"
-  | "image_generation"
-  | "audio_generation"
-  | "transcription"
-  | "list_models";
-
-/** One entry of the closed capability catalog the flag editor renders. */
-export type AiCapabilityInfo = {
-  capability: AiCapability;
-  note: string;
-  /** `false` for a fact about the endpoint rather than a model's to claim. */
-  editable: boolean;
 };
 
 /** One model of the registry, with the provider it belongs to. */
@@ -1578,62 +1708,11 @@ export type AiModel = {
   supports_vision: boolean;
   supports_streaming: boolean;
   supports_embeddings: boolean;
-  supports_image_generation: boolean;
-  supports_audio_generation: boolean;
-  supports_transcription: boolean;
-  supports_json_mode: boolean;
-  max_output_tokens: number | null;
   enabled: boolean;
   is_default: boolean;
   model_id: string;
-  /** The closed vocabulary, so a new flag needs no second edit in the panel. */
-  capability_catalog: AiCapabilityInfo[];
-  /** The capabilities this model actually claims, in catalog order. */
-  capabilities: AiCapability[];
-  /** What it costs, in both precisions (REQ-098 slice 1). */
-  price: AiModelPrice;
-  /** Where the capability flags came from: `manual`, `discovery` or `probe`. */
-  capabilities_source: string;
-  /** When the capability flags were last confirmed against something. */
-  capabilities_verified_at: string | null;
   created_at: string;
   updated_at: string;
-};
-
-/**
- * One model's price.
- *
- * Both the per-million figure the column stores and the per-1K rendering the table shows, so
- * the panel can switch between them without rounding differently from the export. `complete` is
- * the important one: a model with only an input price has an *unknown* cost, and rendering the
- * missing half as zero would make every estimate built from this row too small.
- */
-export type AiModelPrice = {
-  input_micros_per_mtok: number | null;
-  output_micros_per_mtok: number | null;
-  input_micros_per_1k: number | null;
-  output_micros_per_1k: number | null;
-  /** `manual`, `discovery` or `probe`. */
-  source: string;
-  /** What that source means, so the panel does not have to hard-code the wording. */
-  source_note: string;
-  updated_at: string | null;
-  complete: boolean;
-  age_days: number | null;
-  stale: boolean;
-};
-
-/** How a catalog listing is narrowed; every field is optional and independent. */
-export type AiModelQuery = {
-  /** Matches the model key, the display name and the provider name. */
-  q?: string;
-  /** Capabilities a row must **all** claim; empty means no filter. */
-  capabilities?: AiCapability[];
-  providerId?: string;
-  /** `enabled` or `disabled`; absent is both. */
-  status?: "enabled" | "disabled";
-  /** Which column the table is sorted by. */
-  sort?: "model" | "provider" | "context" | "price" | "updated";
 };
 
 /** A model to register on a provider. */
@@ -1645,37 +1724,6 @@ export type AiModelInput = {
   supports_vision?: boolean;
   supports_streaming?: boolean;
   supports_embeddings?: boolean;
-  supports_image_generation?: boolean;
-  supports_audio_generation?: boolean;
-  supports_transcription?: boolean;
-  supports_json_mode?: boolean;
-  max_output_tokens?: number;
-};
-
-/** What one discovery line means for the registry. */
-export type AiDiscoveryAction = "added" | "changed" | "removed";
-
-/** One line of a discovery diff. */
-export type AiDiscoveryLine = {
-  model_key: string;
-  action: AiDiscoveryAction;
-  changed_fields: string[];
-};
-
-/** What a discovery run found, and what applying it would do. Nothing is written by the read. */
-export type AiDiscoveryReport = {
-  provider_id: string;
-  provider_name: string;
-  reported: string[];
-  stored: string[];
-  lines: AiDiscoveryLine[];
-  reported_count: number;
-  stored_count: number;
-  added: number;
-  removed: number;
-  changed: number;
-  /** `true` when applying would change nothing. */
-  up_to_date: boolean;
 };
 
 /** One message of a chat request. */
@@ -1684,35 +1732,10 @@ export type ChatMessageInput = {
   content: string;
 };
 
-/**
- * A change set the answer proposed, filed for review (REQ-101, slice 3g).
- *
- * The platform files it, not the client: a proposal read out of model text is a **claim**, so
- * it becomes a `draft` in the same inbox every other request lands in, and the reviewer edits
- * and confirms it there. A client that rendered its own "here are the changes" block would be
- * describing work the platform has no record of.
- */
-export type ChatProposal = {
-  change_set_id: string;
-  title: string;
-  operations: number;
-  /** `true` when confirming this set would park at least one operation for a second person. */
-  needs_approval: boolean;
-};
-
 /** What a finished chat stream reported. */
 export type ChatDone = {
   finish_reason: string | null;
   chars: number;
-  /**
-   * The requester's own view of the answer (REQ-105 slice 3).
-   *
-   * Present while the guard is masking. Absent on an older server — so the screen falls back to
-   * the streamed text rather than blanking the answer it already rendered.
-   */
-  answer?: string;
-  /** Tokens the guard saw and refused to put back, e.g. an ambiguous `[EMAIL_1]`. */
-  guard_withheld?: string[];
   usage: {
     prompt_tokens: number | null;
     completion_tokens: number | null;
@@ -1726,58 +1749,17 @@ export async function fetchAiProviders(): Promise<AiProvider[]> {
   return body.providers;
 }
 
-/**
- * The model registry, narrowed (REQ-098 slice 1).
- *
- * The narrowing is sent to the server rather than applied here: the API and the table have to
- * agree about which rows a query means, and a client-side filter would make the acceptance
- * criterion that the capability chips narrow the *listing* true of the panel and false of the
- * endpoint. An empty result therefore means the server found nothing — never "the panel hid
- * them".
- */
-export async function fetchAiModels(query: AiModelQuery = {}): Promise<AiModel[]> {
-  const params = new URLSearchParams();
-  // A blank search is omitted rather than sent as `q=`: an empty needle and no needle must mean
-  // the same thing, and the server treats a whitespace-only value as no filter anyway.
-  if (query.q?.trim()) params.set("q", query.q.trim());
-  if (query.capabilities?.length) params.set("capability", query.capabilities.join(","));
-  if (query.providerId) params.set("provider_id", query.providerId);
-  if (query.status) params.set("status", query.status);
-  if (query.sort) params.set("sort", query.sort);
-
-  const suffix = params.toString();
-  const body = await request<{ models: AiModel[] }>(
-    suffix ? `/api/v1/ai/models?${suffix}` : "/api/v1/ai/models",
-  );
+/** The model registry, across every provider. */
+export async function fetchAiModels(): Promise<AiModel[]> {
+  const body = await request<{ models: AiModel[] }>("/api/v1/ai/models");
   return body.models;
-}
-
-/** The protocols the provider form offers, and the ranges it validates against. */
-export async function fetchAiProtocols(): Promise<{
-  protocols: AiProtocol[];
-  bounds: AiProtocolBounds;
-}> {
-  return request<{ protocols: AiProtocol[]; bounds: AiProtocolBounds }>("/api/v1/ai/protocols");
-}
-
-/** Run the connection test against a stored provider, server-side. */
-export function testAiProvider(providerId: string): Promise<AiTestReport> {
-  return request<AiTestReport>(`/api/v1/ai/providers/${encodeURIComponent(providerId)}/test`, {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
 }
 
 /** Connect a provider, optionally with the models it serves. */
 export function connectAiProvider(input: {
   name: string;
   baseUrl: string;
-  protocol?: string;
-  kind?: AiProviderKind;
   apiKey?: string;
-  timeoutMs?: number;
-  maxRetries?: number;
-  priority?: number;
   enabled?: boolean;
   isDefault?: boolean;
   models?: AiModelInput[];
@@ -1787,12 +1769,7 @@ export function connectAiProvider(input: {
     body: JSON.stringify({
       name: input.name,
       base_url: input.baseUrl,
-      protocol: input.protocol,
-      kind: input.kind,
       api_key: input.apiKey && input.apiKey.trim() ? input.apiKey.trim() : null,
-      timeout_ms: input.timeoutMs,
-      max_retries: input.maxRetries,
-      priority: input.priority,
       enabled: input.enabled ?? true,
       is_default: input.isDefault ?? false,
       models: input.models ?? [],
@@ -1807,10 +1784,6 @@ export function updateAiProvider(
     name?: string;
     baseUrl?: string;
     apiKey?: string | null;
-    kind?: AiProviderKind;
-    timeoutMs?: number;
-    maxRetries?: number;
-    priority?: number;
     enabled?: boolean;
     isDefault?: boolean;
   },
@@ -1819,10 +1792,6 @@ export function updateAiProvider(
   if (changes.name !== undefined) body.name = changes.name;
   if (changes.baseUrl !== undefined) body.base_url = changes.baseUrl;
   if (changes.apiKey !== undefined) body.api_key = changes.apiKey;
-  if (changes.kind !== undefined) body.kind = changes.kind;
-  if (changes.timeoutMs !== undefined) body.timeout_ms = changes.timeoutMs;
-  if (changes.maxRetries !== undefined) body.max_retries = changes.maxRetries;
-  if (changes.priority !== undefined) body.priority = changes.priority;
   if (changes.enabled !== undefined) body.enabled = changes.enabled;
   if (changes.isDefault !== undefined) body.is_default = changes.isDefault;
   return request<AiProvider>(`/api/v1/ai/providers/${encodeURIComponent(providerId)}`, {
@@ -1838,169 +1807,6 @@ export function removeAiProvider(providerId: string): Promise<null> {
   });
 }
 
-// ---------------------------------------------------------------------------------------------
-// AI Hub — health, usage and the failover chain (REQ-097 slice 3)
-// ---------------------------------------------------------------------------------------------
-
-/** One probe sample, newest first. `status` is what *this* probe saw. */
-export type AiHealthSample = {
-  id: number;
-  provider_id: string;
-  status: AiHealthStatus;
-  latency_ms: number;
-  http_status: number | null;
-  error: string | null;
-  checked_at: string;
-};
-
-/**
- * The header above the samples.
- *
- * `uptime_percent` is `null` — not `0` and not `100` — when the window holds no sample at all: a
- * provider nobody has probed yet has no uptime, and rendering it as a number is the first lie the
- * panel would tell.
- */
-export type AiHealthSummary = {
-  status: AiHealthStatus;
-  uptime_percent: number | null;
-  p95_latency_ms: number | null;
-  sample_count: number;
-  baseline_latency_ms: number | null;
-  last_checked_at: string | null;
-  last_error: string | null;
-};
-
-/** The Health tab's payload: header, samples and the windows it may offer, in one call. */
-export type AiHealthView = {
-  provider_id: string;
-  provider_name: string;
-  /** The window the *server* applied, echoed back so the label cannot lie. */
-  window: string;
-  summary: AiHealthSummary;
-  samples: AiHealthSample[];
-  windows: string[];
-};
-
-/** One day of a provider's usage. */
-export type AiUsageDay = {
-  day: string;
-  requests: number;
-  errors: number;
-  prompt_tokens: number | null;
-  completion_tokens: number | null;
-};
-
-/**
- * The Usage tab's totals.
- *
- * `missing_usage` is the number of calls that reported no token counts: they are excluded from the
- * sums and reported here, so a stream that ended without a usage frame shows as unknown rather
- * than quietly becoming free.
- */
-export type AiUsageSummary = {
-  requests: number;
-  errors: number;
-  prompt_tokens: number;
-  completion_tokens: number;
-  missing_usage: number;
-  p95_latency_ms: number | null;
-  error_rate_percent: number;
-  /**
-   * REQ-098 slice 5: what the window cost, summed from the snapshots stored on each usage row.
-   *
-   * `null` is not zero. It means no call in the window had a knowable cost — either the model was
-   * never priced, or the endpoint reported no token counts. A window of only free models really
-   * does cost `0`, and the panel shows those two differently, because only one of them is a fact
-   * about the money and the other is a fact about the data.
-   */
-  cost_micros: number | null;
-  /** How many calls in the window had no knowable cost. */
-  uncosted_calls: number;
-  by_day: AiUsageDay[];
-};
-
-/** The Usage tab's payload. */
-export type AiUsageView = {
-  provider_id: string;
-  provider_name: string;
-  window: string;
-  summary: AiUsageSummary;
-  windows: string[];
-};
-
-/** One step of the failover chain, as the preview draws it. */
-export type AiFailoverEntry = {
-  rank: number;
-  id: string;
-  name: string;
-  priority: number;
-  health: AiHealthStatus;
-  is_default: boolean;
-};
-
-/** The chain and the membership it may be drawn from. */
-export type AiFailoverView = {
-  chain: AiFailoverEntry[];
-  providers: string[];
-};
-
-/** What "Probe now" answers with — the refreshed header, so the tab needs no reload. */
-export type AiProbeOutcome = {
-  provider_id: string;
-  ok: boolean;
-  latency_ms: number;
-  failing_step: string | null;
-  transition: { from: AiHealthStatus; to: AiHealthStatus } | null;
-  summary: AiHealthSummary;
-  report: AiTestReport;
-};
-
-/** Read a provider's Health tab over a window (`1h`, `6h`, `24h`, `7d`, `30d`). */
-export function fetchAiProviderHealth(
-  providerId: string,
-  window = "24h",
-): Promise<AiHealthView> {
-  return request<AiHealthView>(
-    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/health?window=${encodeURIComponent(window)}`,
-  );
-}
-
-/** Read a provider's Usage tab over a window. */
-export function fetchAiProviderUsage(
-  providerId: string,
-  window = "24h",
-): Promise<AiUsageView> {
-  return request<AiUsageView>(
-    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/usage?window=${encodeURIComponent(window)}`,
-  );
-}
-
-/** Take one probe sample now, and get the refreshed header back with it. */
-export function probeAiProvider(providerId: string): Promise<AiProbeOutcome> {
-  return request<AiProbeOutcome>(
-    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/probe`,
-    { method: "POST", body: JSON.stringify({}) },
-  );
-}
-
-/** The failover chain as the router walks it right now. */
-export function fetchAiFailover(): Promise<AiFailoverView> {
-  return request<AiFailoverView>("/api/v1/ai/failover");
-}
-
-/**
- * Persist the failover order.
- *
- * The answer is the chain *as the server stored it* — a client that reordered optimistically must
- * render this, not its own guess, or a rejected order would look accepted.
- */
-export function setAiFailoverOrder(providerIds: string[]): Promise<AiFailoverView> {
-  return request<AiFailoverView>("/api/v1/ai/failover", {
-    method: "PUT",
-    body: JSON.stringify({ provider_ids: providerIds }),
-  });
-}
-
 /** Replace the set of models one provider serves. */
 export async function replaceAiProviderModels(
   providerId: string,
@@ -2013,94 +1819,24 @@ export async function replaceAiProviderModels(
   return body.models;
 }
 
-/**
- * Ask a provider which models it serves and get back a **diff** — what applying it would add,
- * change and remove. Nothing is written: the panel shows the diff and the operator confirms by
- * calling `applyAiProviderDiscovery`.
- */
-export function discoverAiProviderModels(providerId: string): Promise<AiDiscoveryReport> {
-  return request<AiDiscoveryReport>(
-    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/discover-models`,
-    { method: "POST", body: JSON.stringify({}) },
-  );
+/** Ask a provider which models it serves. */
+export function discoverAiProviderModels(
+  providerId: string,
+): Promise<{ provider_id: string; provider_name: string; models: string[] }> {
+  return request(`/api/v1/ai/providers/${encodeURIComponent(providerId)}/discover-models`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 }
 
-/** Apply the diff a discovery run reported, after the operator confirmed it. */
-export function applyAiProviderDiscovery(providerId: string): Promise<AiDiscoveryReport> {
-  return request<AiDiscoveryReport>(
-    `/api/v1/ai/providers/${encodeURIComponent(providerId)}/apply-discovery`,
-    { method: "POST", body: JSON.stringify({}) },
-  );
-}
-
-/**
- * Change one model: its capability flags, its token limits, whether it is on, and whether it is
- * the installation's default.
- *
- * `maxOutputTokens: null` forgets the stored ceiling and `undefined` leaves it alone, exactly
- * like the provider key's three cases.
- */
+/** Switch a model on or off, or make it the installation's default. */
 export function updateAiModel(
   modelId: string,
-  changes: {
-    enabled?: boolean;
-    isDefault?: boolean;
-    displayName?: string;
-    contextWindow?: number | null;
-    supportsTools?: boolean;
-    supportsVision?: boolean;
-    supportsStreaming?: boolean;
-    supportsEmbeddings?: boolean;
-    supportsImageGeneration?: boolean;
-    supportsAudioGeneration?: boolean;
-    supportsTranscription?: boolean;
-    supportsJsonMode?: boolean;
-    maxOutputTokens?: number | null;
-    /**
-     * Micros per million tokens, in and out. `null` forgets the stored half and `undefined`
-     * leaves it alone — three cases, because a price has to be erasable or an operator who
-     * mistyped it can only ever make it more wrong.
-     *
-     * A price edit changes the cost of the **next** request only. Nothing recomputes what an
-     * earlier call was billed at, because a bill that changes after the fact is worse than one
-     * that was approximately right.
-     */
-    inputCostMicrosPerMtok?: number | null;
-    outputCostMicrosPerMtok?: number | null;
-    /**
-     * `manual`, `discovery` or `probe`. Omitted by a flag toggle on purpose: restamping the
-     * source on every capability edit would claim the price had been re-verified today.
-     */
-    priceSource?: string;
-    capabilitiesSource?: string;
-    capabilitiesVerifiedAt?: string | null;
-  },
+  changes: { enabled?: boolean; isDefault?: boolean },
 ): Promise<AiModel> {
   const body: Record<string, unknown> = {};
   if (changes.enabled !== undefined) body.enabled = changes.enabled;
   if (changes.isDefault !== undefined) body.is_default = changes.isDefault;
-  if (changes.displayName !== undefined) body.display_name = changes.displayName;
-  if (changes.contextWindow !== undefined) body.context_window = changes.contextWindow;
-  if (changes.supportsTools !== undefined) body.supports_tools = changes.supportsTools;
-  if (changes.supportsVision !== undefined) body.supports_vision = changes.supportsVision;
-  if (changes.supportsStreaming !== undefined) body.supports_streaming = changes.supportsStreaming;
-  if (changes.supportsEmbeddings !== undefined) body.supports_embeddings = changes.supportsEmbeddings;
-  if (changes.supportsImageGeneration !== undefined)
-    body.supports_image_generation = changes.supportsImageGeneration;
-  if (changes.supportsAudioGeneration !== undefined)
-    body.supports_audio_generation = changes.supportsAudioGeneration;
-  if (changes.supportsTranscription !== undefined)
-    body.supports_transcription = changes.supportsTranscription;
-  if (changes.supportsJsonMode !== undefined) body.supports_json_mode = changes.supportsJsonMode;
-  if (changes.maxOutputTokens !== undefined) body.max_output_tokens = changes.maxOutputTokens;
-  if (changes.inputCostMicrosPerMtok !== undefined)
-    body.input_cost_micros_per_mtok = changes.inputCostMicrosPerMtok;
-  if (changes.outputCostMicrosPerMtok !== undefined)
-    body.output_cost_micros_per_mtok = changes.outputCostMicrosPerMtok;
-  if (changes.priceSource !== undefined) body.price_source = changes.priceSource;
-  if (changes.capabilitiesSource !== undefined) body.capabilities_source = changes.capabilitiesSource;
-  if (changes.capabilitiesVerifiedAt !== undefined)
-    body.capabilities_verified_at = changes.capabilitiesVerifiedAt;
   return request<AiModel>(`/api/v1/ai/models/${encodeURIComponent(modelId)}`, {
     method: "PATCH",
     body: JSON.stringify(body),
@@ -2115,31 +1851,12 @@ export function updateAiModel(
  * provider that refuses after the stream opened arrives as that `error` frame, which this helper
  * raises as an `ApiError` so the caller handles one shape either way.
  */
-/**
- * The instruction a chat sends so the model can propose changes (REQ-101, slice 3g).
- *
- * Read from the API rather than written here on purpose: the parser has one exact fence tag
- * and one exact shape, and a copy of the sentence in the panel is a copy that goes stale
- * quietly — the screen keeps working and never once files a set.
- */
-export type ChatProposalInstruction = {
-  instruction: string;
-  fence_tag: string;
-  max_operations: number;
-};
-
-export function fetchChatProposalInstruction(): Promise<ChatProposalInstruction> {
-  return request<ChatProposalInstruction>("/api/v1/ai/chat/proposal-instruction");
-}
-
 export async function streamChat(
   input: { model?: string; messages: ChatMessageInput[] },
   handlers: {
     onStart?: (info: { provider: string; model: string; protocol: string }) => void;
     onDelta?: (content: string) => void;
     onDone?: (done: ChatDone) => void;
-    onProposal?: (proposal: ChatProposal) => void;
-    onProposalError?: (message: string) => void;
   } = {},
 ): Promise<void> {
   const response = await fetch("/api/v1/ai/chat", {
@@ -2196,14 +1913,6 @@ export async function streamChat(
         handlers.onStart?.(payload as { provider: string; model: string; protocol: string });
       } else if (event === "delta") {
         handlers.onDelta?.(String(payload.content ?? ""));
-      } else if (event === "proposal") {
-        handlers.onProposal?.(payload as unknown as ChatProposal);
-      } else if (event === "proposal_error") {
-        // **Not** the `error` branch. That one throws, which the screen renders as a failed
-        // answer — but the answer is complete and on screen; only the follow-up failed.
-        // Throwing here would replace a good reply with an error and hide the proposal the
-        // person was reading about.
-        handlers.onProposalError?.(String(payload.message ?? "The proposal could not be filed."));
       } else if (event === "done") {
         handlers.onDone?.(payload as unknown as ChatDone);
       } else if (event === "error") {
@@ -4308,6 +4017,718 @@ export function fetchIamProvisioningLog(input: {
   return request(`/api/v1/iam/provisioning/log${query ? `?${query}` : ""}`);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Organization memberships, invitations and the switcher (REQ-005, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** A role chip: which role, and what it is called. */
+export type MemberRole = {
+  id: string;
+  key: string;
+  name: string;
+};
+
+/** One row of the Members tab. */
+export type OrganizationMember = {
+  id: string;
+  user_id: string;
+  display_name: string;
+  email: string;
+  user_status: string;
+  status: string;
+  is_primary: boolean;
+  joined_at: string | null;
+  last_active_at: string | null;
+  roles: MemberRole[];
+};
+
+/** One invitation row. */
+export type OrganizationInvitation = {
+  id: string;
+  email: string;
+  role_id: string | null;
+  role_name: string | null;
+  invited_by: string | null;
+  invited_by_name: string | null;
+  status: string;
+  message: string;
+  expires_at: string;
+  accepted_by: string | null;
+  accepted_at: string | null;
+  created_at: string;
+};
+
+/** An invitation with the token that was created with it — returned exactly once. */
+export type CreatedOrganizationInvitation = {
+  invitation: OrganizationInvitation;
+  token: string;
+  accept_url: string;
+};
+
+/** One membership of the signed-in account. */
+export type AccountOrganization = {
+  organization_id: string;
+  name: string;
+  slug: string;
+  organization_status: string;
+  membership_status: string;
+  is_primary: boolean;
+  roles: MemberRole[];
+};
+
+/** The members of one organization. */
+export async function fetchOrganizationMembers(
+  organizationId: string,
+): Promise<{ organization_id: string; members: OrganizationMember[] }> {
+  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/members`);
+}
+
+/** Add an account to an organization. */
+export async function addOrganizationMember(
+  organizationId: string,
+  input: { user_id: string; status?: string; is_primary?: boolean },
+): Promise<OrganizationMember> {
+  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/members`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Change a membership's status, or promote/demote it as the account's home. */
+export async function updateOrganizationMember(
+  organizationId: string,
+  userId: string,
+  input: { status?: string; is_primary?: boolean },
+): Promise<OrganizationMember> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+}
+
+/** Remove an account from an organization. */
+export async function removeOrganizationMember(
+  organizationId: string,
+  userId: string,
+): Promise<void> {
+  await request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}`,
+    { method: "DELETE" },
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The member drawer (REQ-005, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** One role binding as the drawer shows it, with the role's key and name resolved. */
+export type MemberBinding = {
+  id: string;
+  role_id: string;
+  role_key: string;
+  role_name: string;
+  subject_type: string;
+  subject_id: string;
+  scope_type: string;
+  organization_id: string | null;
+  site_id: string | null;
+  department: string | null;
+  module: string | null;
+  resource_id: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  /** Whether it still applies right now. */
+  active: boolean;
+  /** Whether a temporary window has run out. */
+  expired: boolean;
+  created_at: string;
+};
+
+/** One row of the drawer's trail. */
+export type MemberAuditRow = {
+  action: string;
+  actor_user_id: string | null;
+  /** The account's name, or `system` for a row nobody performed. */
+  actor_name: string;
+  target_type: string | null;
+  target_id: string | null;
+  created_at: string;
+};
+
+/**
+ * Everything the member drawer renders, in one response.
+ *
+ * One request rather than four: a person looking at a colleague must never see a half-filled
+ * panel, and an empty binding list that arrived while the identity succeeded is
+ * indistinguishable from "this person holds nothing".
+ */
+export type OrganizationMemberDetail = {
+  organization_id: string;
+  membership_id: string;
+  user_id: string;
+  display_name: string;
+  email: string;
+  user_status: string;
+  status: string;
+  is_primary: boolean;
+  joined_at: string | null;
+  last_active_at: string | null;
+  bindings: MemberBinding[];
+  departments: MemberDepartment[];
+  recent_audit: MemberAuditRow[];
+};
+
+/** `GET /api/v1/organizations/{id}/members/{user_id}` — the member drawer. */
+export async function fetchOrganizationMember(
+  organizationId: string,
+  userId: string,
+): Promise<OrganizationMemberDetail> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}`,
+  );
+}
+
+/**
+ * Grant a role to a member of this organization.
+ *
+ * The scope defaults to `organization` and the server refuses `global`: inside a tenant,
+ * "this person may do this here" is the shape that cannot escape, and a tenant administrator
+ * asking for a platform grant is asking for something the platform owns.
+ */
+export async function grantMemberRole(
+  organizationId: string,
+  userId: string,
+  input: {
+    role_id: string;
+    scope_type?: "organization" | "site" | "department";
+    site_id?: string;
+    department?: string;
+    expires_at?: string;
+  },
+): Promise<MemberBinding> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}/role-bindings`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+/**
+ * Move a temporary grant's expiry.
+ *
+ * The server patches the same row and refuses a date in the past, so "extend" cannot leave two
+ * live bindings for one role — which the effective-permissions screen would render as the same
+ * role twice with two different windows, neither of them the truth.
+ */
+export async function extendMemberRole(
+  organizationId: string,
+  userId: string,
+  bindingId: string,
+  expiresAt: string,
+): Promise<MemberBinding> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}/role-bindings/${encodeURIComponent(bindingId)}`,
+    { method: "PATCH", body: JSON.stringify({ expires_at: expiresAt }) },
+  );
+}
+
+/** Revoke a grant. The row stays in the trail; `revoked_at` is what changes. */
+export async function revokeMemberRole(
+  organizationId: string,
+  userId: string,
+  bindingId: string,
+): Promise<MemberBinding> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}/role-bindings/${encodeURIComponent(bindingId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** The invitations of one organization. */
+export async function fetchOrganizationInvitations(
+  organizationId: string,
+): Promise<{ organization_id: string; invitations: OrganizationInvitation[] }> {
+  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations`);
+}
+
+/** Invite an address into an organization. */
+export async function createOrganizationInvitation(
+  organizationId: string,
+  input: { email: string; role_id?: string | null; message?: string },
+): Promise<CreatedOrganizationInvitation> {
+  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * The invitations waiting for an owner, oldest first.
+ *
+ * The `owner_approval` queue is a work list, so the panel asks for it directly instead of
+ * filtering the whole invitation history on the client — a tenant that has invited two hundred
+ * people would otherwise download two hundred rows to render the three that need a decision.
+ */
+export async function fetchQueuedOrganizationInvitations(
+  organizationId: string,
+): Promise<{ organization_id: string; invitations: OrganizationInvitation[] }> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations/queue`,
+  );
+}
+
+/**
+ * Release a queued invitation and receive its single-use link — once.
+ *
+ * The link is minted by the release, not recovered from the create: a queued invitation never
+ * had a working link, so this is the only moment one exists and it is never readable again.
+ */
+export async function releaseQueuedOrganizationInvitation(
+  organizationId: string,
+  invitationId: string,
+): Promise<CreatedOrganizationInvitation> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations/${encodeURIComponent(
+      invitationId,
+    )}/release`,
+    { method: "POST" },
+  );
+}
+
+/** Revoke a pending invitation. */
+export async function revokeOrganizationInvitation(
+  organizationId: string,
+  invitationId: string,
+): Promise<void> {
+  await request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/invitations/${encodeURIComponent(invitationId)}`,
+    { method: "DELETE" },
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Departments (REQ-005, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/** One row of the Departments tab. */
+export type OrganizationDepartment = {
+  id: string;
+  /** Stable address inside the organization — what a role binding stores. */
+  key: string;
+  name: string;
+  description: string;
+  status: string;
+  parent_id: string | null;
+  parent_key: string | null;
+  member_count: number;
+  role_count: number;
+  /** Depth in the tree, 0 for a root. */
+  depth: number;
+  created_at: string;
+  updated_at: string;
+};
+
+/** A role bound to a department as a whole. */
+export type DepartmentRole = {
+  binding_id: string;
+  role_id: string;
+  role_key: string;
+  role_name: string;
+  granted_by: string | null;
+  expires_at: string | null;
+};
+
+/** One account inside a department. */
+export type DepartmentMember = {
+  user_id: string;
+  display_name: string;
+  email: string;
+  user_status: string;
+  membership_status: string;
+  last_active_at: string | null;
+};
+
+/** One department in full. */
+export type DepartmentDetail = {
+  department: OrganizationDepartment;
+  members: DepartmentMember[];
+  roles: DepartmentRole[];
+};
+
+/** One department of one member — what the member drawer reads. */
+export type MemberDepartment = {
+  id: string;
+  key: string;
+  name: string;
+  status: string;
+};
+
+/** Filters of the Departments tab. */
+export type DepartmentFilters = {
+  status?: string;
+  q?: string;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Organization settings, modules, limits and usage (REQ-005, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** One row of the Settings tab. */
+export type OrganizationSettings = {
+  locale: string;
+  timezone: string;
+  invite_policy: string;
+  default_invite_role_id: string | null;
+  logo_media_id: string | null;
+  accent_color: string | null;
+  audit_retention_days: number;
+  updated_at: string;
+};
+
+/** The Settings payload, with the choices the form offers. */
+export type OrganizationSettingsPayload = {
+  organization_id: string;
+  settings: OrganizationSettings;
+  available_locales: string[];
+  invite_policies: { key: string; description: string }[];
+};
+
+/** One row of the Modules tab. */
+export type OrganizationModule = {
+  key: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  /** Whether the organization made an explicit decision about this module. */
+  explicit: boolean;
+};
+
+/** The Modules payload. */
+export type OrganizationModulesPayload = {
+  organization_id: string;
+  modules: OrganizationModule[];
+};
+
+/** The plan and its ceilings; a `null` limit is unlimited. */
+export type OrganizationLimits = {
+  plan: string;
+  seat_limit: number | null;
+  site_limit: number | null;
+  storage_bytes_limit: number | null;
+  ai_monthly_limit_micros: number | null;
+  updated_at: string;
+};
+
+/** The Limits payload, with the plans the selector offers. */
+export type OrganizationLimitsPayload = {
+  organization_id: string;
+  limits: OrganizationLimits;
+  available_plans: { key: string; description: string }[];
+};
+
+/** What the organization holds, next to the ceilings it is measured against. */
+export type OrganizationUsage = {
+  organization_id: string;
+  seats_used: number;
+  sites_used: number;
+  storage_used_bytes: number;
+  ai_micros_this_month: number;
+  limits: OrganizationLimits;
+  /** Per-metric label naming which limit the bar reads. */
+  sources: {
+    seats: string;
+    sites: string;
+    storage_bytes: string;
+    ai_monthly_micros: string;
+  };
+};
+
+/** The organization settings and the choices the form may offer. */
+export function fetchOrganizationSettings(
+  organizationId: string,
+): Promise<OrganizationSettingsPayload> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/settings`,
+  );
+}
+
+/** Save the whole settings row. */
+export function updateOrganizationSettings(
+  organizationId: string,
+  input: {
+    locale: string;
+    timezone: string;
+    invite_policy: string;
+    default_invite_role_id?: string | null;
+    logo_media_id?: string | null;
+    accent_color?: string | null;
+    audit_retention_days: number;
+  },
+): Promise<OrganizationSettingsPayload> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/settings`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+/** The installed modules with this organization's decision about each. */
+export function fetchOrganizationModules(
+  organizationId: string,
+): Promise<OrganizationModulesPayload> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/modules`,
+  );
+}
+
+/**
+ * Switch a set of modules.
+ *
+ * The whole batch is sent at once on purpose: the API validates every key before writing any
+ * of them, so a batch naming one module this installation does not ship leaves the others
+ * untouched — which a row of independent `PUT`s could not promise.
+ */
+export function updateOrganizationModules(
+  organizationId: string,
+  modules: { module_key: string; enabled: boolean }[],
+): Promise<OrganizationModulesPayload> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/modules`,
+    { method: "PUT", body: JSON.stringify({ modules }) },
+  );
+}
+
+/** The plan and its ceilings. */
+export function fetchOrganizationLimits(
+  organizationId: string,
+): Promise<OrganizationLimitsPayload> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/limits`,
+  );
+}
+
+/** Save the plan and every ceiling. */
+export function updateOrganizationLimits(
+  organizationId: string,
+  input: {
+    plan: string;
+    seat_limit: number | null;
+    site_limit: number | null;
+    storage_bytes_limit: number | null;
+    ai_monthly_limit_micros: number | null;
+  },
+): Promise<OrganizationLimitsPayload> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/limits`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+/** What the organization holds, next to its ceilings. */
+export function fetchOrganizationUsage(organizationId: string): Promise<OrganizationUsage> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/usage`,
+  );
+}
+
+/**
+ * The same numbers as a spreadsheet, from the same call the screen renders.
+ *
+ * The file is fetched rather than built here: a CSV assembled in the browser from an older
+ * payload would be a second reading of the data, and the Billing tab's whole claim is that the
+ * two agree.
+ */
+export async function downloadOrganizationUsage(organizationId: string): Promise<Blob> {
+  const response = await fetch(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/usage?format=csv`,
+    { credentials: "include" },
+  );
+  if (!response.ok) {
+    throw new ApiError(response.status, "usage_export_failed", "The usage file could not be downloaded.");
+  }
+  return response.blob();
+}
+
+/** The department tree, parents before children. */
+export async function fetchOrganizationDepartments(
+  organizationId: string,
+  filters: DepartmentFilters = {},
+): Promise<{ organization_id: string; departments: OrganizationDepartment[] }> {
+  const params = new URLSearchParams();
+  if (filters.status) params.set("status", filters.status);
+  if (filters.q) params.set("q", filters.q);
+  const query = params.toString();
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments${query ? `?${query}` : ""}`,
+  );
+}
+
+/** One department with its members and the roles bound to it. */
+export async function fetchDepartment(
+  organizationId: string,
+  departmentId: string,
+): Promise<DepartmentDetail> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}`,
+  );
+}
+
+/** Create a department. The key is normalized and never changes afterwards. */
+export async function createOrganizationDepartment(
+  organizationId: string,
+  input: { key: string; name: string; description?: string; parent_id?: string | null },
+): Promise<OrganizationDepartment> {
+  return request(`/api/v1/organizations/${encodeURIComponent(organizationId)}/departments`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Rename, re-describe, re-parent or archive a department. */
+export async function updateOrganizationDepartment(
+  organizationId: string,
+  departmentId: string,
+  change: {
+    name?: string;
+    description?: string;
+    parent_id?: string | null;
+    status?: string;
+  },
+): Promise<OrganizationDepartment> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}`,
+    { method: "PATCH", body: JSON.stringify(change) },
+  );
+}
+
+/** Archive a department: it keeps its structure but stops granting. */
+export async function archiveOrganizationDepartment(
+  organizationId: string,
+  departmentId: string,
+): Promise<OrganizationDepartment> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}`,
+    { method: "POST" },
+  );
+}
+
+/** Delete a department; refused while it still holds people, roles or children. */
+export async function deleteOrganizationDepartment(
+  organizationId: string,
+  departmentId: string,
+): Promise<void> {
+  await request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** Put an account into a department. */
+export async function addDepartmentMember(
+  organizationId: string,
+  departmentId: string,
+  userId: string,
+): Promise<void> {
+  await request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}/members`,
+    { method: "POST", body: JSON.stringify({ user_id: userId }) },
+  );
+}
+
+/** Take an account out of a department. */
+export async function removeDepartmentMember(
+  organizationId: string,
+  departmentId: string,
+  userId: string,
+): Promise<void> {
+  await request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}/members/${encodeURIComponent(userId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** The departments one account sits in. */
+export async function fetchMemberDepartments(
+  organizationId: string,
+  userId: string,
+): Promise<MemberDepartment[]> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(userId)}/departments`,
+  );
+}
+
+/** Bind a role to a department as a whole, optionally until a date. */
+export async function bindDepartmentRole(
+  organizationId: string,
+  departmentId: string,
+  input: { role_id: string; expires_at?: string | null },
+): Promise<DepartmentRole> {
+  return request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}/roles`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+/** Revoke a role bound to a department. */
+export async function unbindDepartmentRole(
+  organizationId: string,
+  departmentId: string,
+  bindingId: string,
+): Promise<void> {
+  await request(
+    `/api/v1/organizations/${encodeURIComponent(organizationId)}/departments/${encodeURIComponent(departmentId)}/roles/${encodeURIComponent(bindingId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** The public preview of an invitation link. */
+export async function fetchInvitationPreview(token: string): Promise<{
+  organization_name: string | null;
+  organization_slug: string | null;
+  invited_by_name: string | null;
+  role_name: string | null;
+  email_masked: string | null;
+  expires_at: string | null;
+  usable: boolean;
+  /**
+   * Why the token cannot be used — one coarse value on purpose. `unusable` covers queued,
+   * revoked, expired and never-issued alike, so a public link cannot be walked to find out which
+   * organizations exist. The panel says "ask for a new one" rather than guessing.
+   */
+  reason: string | null;
+}> {
+  return request(`/api/v1/invitations/${encodeURIComponent(token)}`);
+}
+
+/** Accept an invitation — signed in, or with a new account in the same request. */
+export async function acceptInvitation(
+  token: string,
+  input: { display_name?: string; password?: string },
+): Promise<{ organization_id: string; organization_name: string; user_id: string }> {
+  return request(`/api/v1/invitations/${encodeURIComponent(token)}/accept`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** The caller's own organizations — the switcher's list. */
+export async function fetchMyOrganizations(): Promise<{
+  current_organization_id: string | null;
+  organizations: AccountOrganization[];
+  /** Module keys the current tenant has switched off (REQ-005, slice 4). */
+  disabled_modules: string[];
+}> {
+  return request("/api/v1/me/organizations");
+}
+
+/** Switch the session's organization. */
+export async function switchOrganization(
+  organizationId: string,
+): Promise<{ organization_id: string; name: string }> {
+  return request("/api/v1/me/organization", {
+    method: "POST",
+    body: JSON.stringify({ organization_id: organizationId }),
+  });
+}
+
 /* ---------------------------------------------------------------------------------------------
  * Enterprise sign-in providers (REQ-006, slice 4b-2; docs/07-IAM.md §11)
  *
@@ -4455,6 +4876,7 @@ export function fetchSsoProviders(): Promise<{
   providers: { slug: string; name: string; kind: string; start_url: string }[];
 }> {
   return request("/api/v1/auth/sso/providers");
+
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4550,757 +4972,6 @@ export function testMediaStorageConnection(
     method: "POST",
     body: JSON.stringify(input),
   });
-}
-
-// ---------------------------------------------------------------------------------------------
-// Task routing and feature overrides (REQ-098, slice 2)
-// ---------------------------------------------------------------------------------------------
-
-/**
- * Which map a routing read or write addresses.
- *
- * The three cases are the three scopes the resolver walks, and they are spelled the way the
- * endpoints spell them so the panel and the API cannot disagree about which map is on screen.
- */
-export type AiRoutingScope =
-  | { kind: "installation" }
-  | { kind: "organization"; organizationId: string }
-  | { kind: "site"; siteId: string };
-
-/** One candidate in a task's ordered list. */
-export type AiRouteCandidate = {
-  /** 1-based; the primary is 1 and the order is the fallback order. */
-  position: number;
-  /** The model, or null when the row survives a model that was later removed. */
-  model_id: string | null;
-  /** The model key as the panel shows it. */
-  model_label: string | null;
-  /** True when the candidate cannot answer as it stands — the "needs attention" badge. */
-  needs_attention: boolean;
-  /** Why it cannot answer, when it cannot. */
-  refusal: string | null;
-  /** Capabilities this task's requests require here. */
-  requirements: string[];
-  /** Whether the model is switched off. */
-  enabled: boolean;
-};
-
-/** One task row of the routing screen. */
-export type AiTaskRoute = {
-  task: string;
-  description: string;
-  candidates: AiRouteCandidate[];
-  /** True when these candidates were inherited from a wider scope. */
-  inherited: boolean;
-  /** True when nothing is configured for this task anywhere in the chain. */
-  empty: boolean;
-};
-
-/** One feature pin. */
-export type AiFeatureOverride = {
-  feature: string;
-  model_id: string;
-  model_label: string;
-  scope: Record<string, string>;
-  updated_at: string;
-};
-
-/** A known feature key with its description, driving the override form. */
-export type AiFeatureInfo = { key: string; description: string };
-
-/** The whole routing screen in one response. */
-export type AiRouting = {
-  scope: Record<string, string>;
-  tasks: AiTaskRoute[];
-  overrides: AiFeatureOverride[];
-  chain: Record<string, string>[];
-  requirements: string[];
-  features: AiFeatureInfo[];
-  /** The resolution order, served so the legend cannot drift from the resolver. */
-  rules: string[];
-  /** Tasks that cannot resolve at this scope. */
-  unresolved: string[];
-};
-
-/** One line of a resolution walk. */
-export type AiWalkEntry = {
-  position: number | null;
-  model_id: string | null;
-  outcome: "chosen" | "skipped";
-  reason: string;
-  scope: Record<string, string>;
-  source: string;
-};
-
-/** The dry run's answer. */
-export type AiRoutingPreview = {
-  model: { model_id: string; position: number | null; source: string; scope: Record<string, string> } | null;
-  walk: AiWalkEntry[];
-  rule: string;
-  unresolved: boolean;
-  scope: Record<string, string>;
-  rules: string[];
-};
-
-/** The query parameters that select a scope, appended to a routing path. */
-function routingScopeParams(scope: AiRoutingScope): URLSearchParams {
-  const params = new URLSearchParams();
-  if (scope.kind === "organization") params.set("organization_id", scope.organizationId);
-  if (scope.kind === "site") params.set("site_id", scope.siteId);
-  return params;
-}
-
-/** The task map of one scope, with inherited rows marked. */
-export async function fetchAiRouting(scope: AiRoutingScope): Promise<AiRouting> {
-  const params = routingScopeParams(scope);
-  const suffix = params.toString();
-  return request<AiRouting>(
-    suffix ? `/api/v1/ai/routing?${suffix}` : "/api/v1/ai/routing",
-  );
-}
-
-// -------------------------------------------------------------------------------------------
-// AI approvals (REQ-101 slice 1 — the review inbox, the review screen and the class policy)
-// -------------------------------------------------------------------------------------------
-
-/**
- * One approval row as the inbox and the review screen render it.
- *
- * `decidable`, `requires_confirmation` and `confirmation_phrase` are the server's answers, not
- * something the panel re-derives. A client that computed "may this be approved" from `status`
- * and `expires_at` would disagree with the server the moment a clock rounded differently — and a
- * reviewer who is told a row is decidable and then gets `expired` has been told a lie by the
- * screen rather than by the race.
- */
-export type AiApproval = {
-  id: string;
-  organization_id: string;
-  site_id: string | null;
-  run_id: string | null;
-  step_id: string | null;
-  agent_id: string | null;
-  identity_id: string | null;
-  change_set_id: string | null;
-  tool_key: string;
-  tool_class: string;
-  resource_type: string | null;
-  resource_id: string | null;
-  resource_label: string | null;
-  risk: string;
-  title: string;
-  summary: string;
-  operation_count: number;
-  irreversible: boolean;
-  preview: unknown;
-  preview_hash: string;
-  base_revision: string | null;
-  status: string;
-  requested_by: string | null;
-  model_id: string | null;
-  expires_at: string;
-  decided_by: string | null;
-  decided_at: string | null;
-  decision_note: string | null;
-  applied_at: string | null;
-  error: string | null;
-  created_at: string;
-  /** Whether the row is still pending AND unexpired. */
-  decidable: boolean;
-  /** Whether the decision demands a typed phrase, and what it is. */
-  requires_confirmation: boolean;
-  confirmation_phrase: string | null;
-};
-
-/** The inbox filters, exactly the query the API accepts. */
-export type AiApprovalQuery = {
-  status?: string;
-  tool?: string;
-  toolClass?: string;
-  q?: string;
-  limit?: number;
-};
-
-/**
- * The inbox body.
- *
- * `viewer_missing` is the whole reason the row actions can be disabled *and named* rather than
- * enabled-then-refused: the API enforces the same keys with a 403 naming them, so the disabled
- * state is a promise it keeps.
- */
-export type AiApprovalInbox = {
-  approvals: AiApproval[];
-  counts: Record<string, number>;
-  viewer_permissions: string[];
-  viewer_missing: string[];
-};
-
-/** One audit row of a request's trail. */
-export type AiApprovalAuditRow = {
-  id: number;
-  actor_type: string;
-  actor_user_id: string | null;
-  action: string;
-  target_type: string | null;
-  target_id: string | null;
-  metadata: Record<string, unknown>;
-  created_at: string;
-};
-
-/** What a decision answers, whatever it decided. */
-export type AiDecisionResult = {
-  changed: boolean;
-  code: string | null;
-  approval: AiApproval;
-  current_revision?: string;
-};
-
-/** The effective policy of one dangerous class, as the policy screen renders it. */
-export type AiApprovalPolicy = {
-  tool_class: string;
-  label: string;
-  /** `organization` when an organization row overrides the platform default. */
-  source: string;
-  mode: string;
-  typed_confirmation: boolean;
-  expires_minutes: number;
-  /** True when the class is `allow` — the row stripes. */
-  permissive: boolean;
-  irreversible: boolean;
-  updated_at: string;
-  updated_by: string | null;
-};
-
-/** The six dangerous classes, served so the form never hard-codes their names a second time. */
-export type AiApprovalClass = {
-  key: string;
-  label: string;
-  irreversible: boolean;
-};
-
-/** The review inbox. */
-export async function fetchAiApprovals(
-  query: AiApprovalQuery = {},
-): Promise<AiApprovalInbox> {
-  const params = new URLSearchParams();
-  if (query.status && query.status !== "all") params.set("status", query.status);
-  if (query.tool?.trim()) params.set("tool", query.tool.trim());
-  if (query.toolClass && query.toolClass !== "all") params.set("tool_class", query.toolClass);
-  if (query.q?.trim()) params.set("q", query.q.trim());
-  if (query.limit) params.set("limit", String(query.limit));
-
-  const suffix = params.toString();
-  return request<AiApprovalInbox>(
-    suffix ? `/api/v1/ai/approvals?${suffix}` : "/api/v1/ai/approvals",
-  );
-}
-
-/**
- * One request with its audit trail.
- *
- * The trail arrives in the same response as the row on purpose: a reviewer reading a decided
- * request asks "who did this and why" as part of the same screen, and a second request could be
- * answered from a different moment.
- */
-export async function fetchAiApproval(id: string): Promise<{
-  approval: AiApproval;
-  audit: AiApprovalAuditRow[];
-}> {
-  return request(`/api/v1/ai/approvals/${encodeURIComponent(id)}`);
-}
-
-/**
- * Approve one request.
- *
- * `confirmation` is sent ONLY when it is non-empty. Sending `"yes"` — or sending the field's
- * placeholder — is exactly how a checkbox becomes a confirmation, and the API answers
- * `confirmation_mismatch` to a wrong phrase rather than accepting any non-empty string, so an
- * unconditional field would turn every irreversible class into a dead button.
- */
-export function approveAiApproval(
-  id: string,
-  body: { confirmation?: string; currentRevision?: string } = {},
-): Promise<AiDecisionResult> {
-  return request(`/api/v1/ai/approvals/${encodeURIComponent(id)}/approve`, {
-    method: "POST",
-    body: JSON.stringify({
-      ...(body.confirmation?.trim() ? { confirmation: body.confirmation.trim() } : {}),
-      ...(body.currentRevision ? { current_revision: body.currentRevision } : {}),
-    }),
-  });
-}
-
-/**
- * Recompute a request's diff against the target as it is **now**.
- *
- * No body on purpose. The server rebuilds the operation from the frozen preview and reads the
- * row itself — a re-preview that accepted a client-supplied diff would be a diff nobody
- * approved. The answer is the row, so the screen re-renders from the same object the server
- * wrote rather than from a second read that could be a different instant.
- *
- * `refreshed: false` with `code: "unchanged"` is the refusal the request asks for: the
- * recomputed plan is identical, so nothing was written.
- */
-export function rePreviewAiApproval(id: string): Promise<{
-  refreshed: boolean;
-  code: string | null;
-  approval: AiApproval;
-}> {
-  return request(`/api/v1/ai/approvals/${encodeURIComponent(id)}/preview`, {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
-}
-
-/** Reject one request. The reason is mandatory server-side; a blank one is refused there. */
-export function rejectAiApproval(
-  id: string,
-  reason: string,
-): Promise<AiDecisionResult> {
-  return request(`/api/v1/ai/approvals/${encodeURIComponent(id)}/reject`, {
-    method: "POST",
-    body: JSON.stringify({ reason }),
-  });
-}
-
-/** The class policy table, with the six classes' labels. */
-export async function fetchAiApprovalPolicies(): Promise<{
-  policies: AiApprovalPolicy[];
-  classes: AiApprovalClass[];
-}> {
-  return request("/api/v1/ai/approvals/policies");
-}
-
-/**
- * Set one class's organization policy.
- *
- * `confirmation` carries the typed phrase the API demands for `mode: "allow"` — the exact text
- * `set <class> to allow`. It is sent only when the caller typed it, for the same reason the
- * approve path withholds an empty phrase.
- */
-export function putAiApprovalPolicy(
-  toolClass: string,
-  body: {
-    mode: string;
-    typedConfirmation?: boolean;
-    expiresMinutes?: number;
-    confirmation?: string;
-  },
-): Promise<{ policies: AiApprovalPolicy[] }> {
-  return request(`/api/v1/ai/approvals/policies/${encodeURIComponent(toolClass)}`, {
-    method: "PUT",
-    body: JSON.stringify({
-      mode: body.mode,
-      ...(body.typedConfirmation === undefined
-        ? {}
-        : { typed_confirmation: body.typedConfirmation }),
-      ...(body.expiresMinutes === undefined ? {} : { expires_minutes: body.expiresMinutes }),
-      ...(body.confirmation?.trim() ? { confirmation: body.confirmation.trim() } : {}),
-    }),
-  });
-}
-
-/**
- * Drop one class's override, back to the platform default.
- *
- * A reset needs no phrase: removing an override can only tighten towards the fail-closed
- * default, so it carries no risk worth a typed confirmation — and the API enforces that too.
- */
-export function resetAiApprovalPolicy(toolClass: string): Promise<{ policies: AiApprovalPolicy[] }> {
-  return request(`/api/v1/ai/approvals/policies/${encodeURIComponent(toolClass)}`, {
-    method: "DELETE",
-  });
-}
-
-/** Expire what is due, now. */
-export function sweepAiApprovals(): Promise<{ expired: number }> {
-  return request("/api/v1/ai/approvals/sweep", { method: "POST", body: JSON.stringify({}) });
-}
-
-// -------------------------------------------------------------------------------------------
-// The change-set editor (REQ-101 slice 3)
-// -------------------------------------------------------------------------------------------
-
-/** One operation of a proposed set, as the set stores it. */
-export type AiChangeOp = {
-  key: string;
-  kind: "create" | "update" | "delete";
-  resource_type: string;
-  resource_id: string;
-  args: Record<string, unknown>;
-};
-
-/** A change set row. */
-export type AiChangeSet = {
-  id: string;
-  organization_id: string;
-  site_id: string | null;
-  title: string;
-  status: "draft" | "pending" | "confirmed" | "applied" | "discarded" | "failed" | string;
-  operations: AiChangeOp[];
-  base_revisions: Record<string, string>;
-  /** sha256 over the operations and the revisions they were pinned to. */
-  content_hash: string;
-  created_by: string | null;
-  created_by_agent: string | null;
-  created_by_run: string | null;
-  updated_by: string | null;
-  confirmed_at: string | null;
-  applied_at: string | null;
-  discarded_reason: string | null;
-  created_at: string;
-  updated_at: string;
-  /** Whether the operation list may still be edited. Server-owned: it is the same list the
-   * PATCH's `where` clause runs as, so the panel cannot drift from what the API accepts. */
-  editable: boolean;
-  /** Whether confirming would park at least one operation for a second person. */
-  needs_approval: boolean;
-  /** Whether confirming demands a typed phrase — the set deletes content. */
-  irreversible: boolean;
-  /** The phrase itself: the set's title, which the server compares against. */
-  confirmation_phrase: string | null;
-};
-
-/** One field row of a resolved operation. */
-export type AiPlannedField = {
-  arg: string;
-  field: string;
-  before: unknown;
-  after: unknown;
-};
-
-/**
- * One operation resolved against its target **as it is now**.
- *
- * This is what the editor renders instead of a client-side re-plan: `before` is read from the
- * database, not from the operation's own arguments, and `cascades` is a count the server
- * took. A browser cannot compute either.
- */
-export type AiPlannedOp = {
-  key: string;
-  kind: string;
-  resource_type: string;
-  resource_id: string;
-  label: string;
-  diffs: AiPlannedField[];
-  cascades: string[];
-  base_revision: string;
-  gated_class: string | null;
-  no_op: boolean;
-};
-
-/** What a re-plan answers. */
-export type AiRePreviewed = AiChangeSet & {
-  planned: AiPlannedOp[];
-  drifted: string[];
-  needs_approval: boolean;
-};
-
-/** What a set list answers, with the decision keys the viewer holds. */
-export type AiChangeSetList = {
-  sets: AiChangeSet[];
-  viewer_permissions: string[];
-  /** The decision keys the viewer does NOT hold, named so a disabled control can explain
-   * itself. The same split the approval inbox makes, from the same helper. */
-  viewer_missing: string[];
-};
-
-/** What a confirm answers. */
-export type AiSetConfirmed = AiChangeSet & {
-  needs_approval: boolean;
-  approvals: { id: string; operation_key: string; class: string; status: string }[];
-  applied: boolean;
-};
-
-/**
- * Resolve a set's operations against the targets as they are now.
- *
- * No body: the server rebuilds each operation from the stored one and reads the row itself, so
- * a re-plan that accepted a client-supplied diff would be a diff nobody confirmed. The answer
- * is the resolved operations, not a mutated set — a preview that re-pinned the revisions it
- * observed would retire the staleness the confirm route enforces.
- */
-export function replanAiChangeSet(id: string): Promise<AiRePreviewed> {
-  return request(`/api/v1/ai/change-sets/${encodeURIComponent(id)}/preview`, {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
-}
-
-/**
- * Replace a set's operation list.
- *
- * The whole list is sent, not a patch: a set is a list the reviewer owns, and "move the third
- * one to the top" has no vocabulary in a partial patch. `baseContentHash` is the hash the
- * editor was looking at — a mismatch answers `409 content_moved` naming both, and nothing is
- * written.
- */
-export function updateAiChangeSet(
-  id: string,
-  body: {
-    title: string;
-    operations: AiChangeOp[];
-    baseRevisions?: Record<string, string>;
-    baseContentHash?: string;
-  },
-): Promise<AiChangeSet> {
-  return request(`/api/v1/ai/change-sets/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    body: JSON.stringify({
-      title: body.title,
-      operations: body.operations,
-      base_revisions: body.baseRevisions ?? {},
-      // Withheld when absent rather than sent as null: a client that has not implemented the
-      // optimistic check keeps saving, and one that has gets it.
-      ...(body.baseContentHash ? { base_content_hash: body.baseContentHash } : {}),
-    }),
-  });
-}
-
-/**
- * Confirm a set.
- *
- * `confirmationPhrase` is the set's own title and is sent **only** when the reviewer typed it —
- * for the same reason `approveAiApproval` withholds an empty phrase. A set that deletes content
- * is refused by the server without it, whatever the client rendered.
- */
-export function confirmAiChangeSet(
-  id: string,
-  confirmationPhrase?: string,
-): Promise<AiSetConfirmed> {
-  return request(`/api/v1/ai/change-sets/${encodeURIComponent(id)}/confirm`, {
-    method: "POST",
-    body: JSON.stringify({
-      ...(confirmationPhrase?.trim() ? { confirmation_phrase: confirmationPhrase.trim() } : {}),
-    }),
-  });
-}
-
-/** Drop a set. The reason is mandatory server-side; a blank one is refused there. */
-export function discardAiChangeSet(id: string, reason: string): Promise<AiChangeSet> {
-  return request(`/api/v1/ai/change-sets/${encodeURIComponent(id)}/discard`, {
-    method: "POST",
-    body: JSON.stringify({ reason }),
-  });
-}
-
-/** The sets a person may see, newest first. */
-export async function fetchAiChangeSets(
-  query: { status?: string; q?: string; limit?: number } = {},
-): Promise<AiChangeSetList> {
-  const params = new URLSearchParams();
-  if (query.status && query.status !== "all") params.set("status", query.status);
-  if (query.q?.trim()) params.set("q", query.q.trim());
-  if (query.limit) params.set("limit", String(query.limit));
-  const suffix = params.toString();
-  return request(
-    suffix ? `/api/v1/ai/change-sets?${suffix}` : "/api/v1/ai/change-sets",
-  );
-}
-
-/** Replace one task's candidate list at a scope. */
-export async function putAiTaskMap(
-  scope: AiRoutingScope,
-  task: string,
-  candidates: { modelId: string; requirements: string[] }[],
-): Promise<AiRouting> {
-  return request<AiRouting>("/api/v1/ai/routing", {
-    method: "PUT",
-    body: JSON.stringify({
-      task,
-      ...scopeParamsForBody(scope),
-      candidates: candidates.map((candidate) => ({
-        model_id: candidate.modelId,
-        requirements: candidate.requirements,
-      })),
-    }),
-  });
-}
-
-/** Pin (or unpin, with `null`) one feature at a scope. */
-export async function putAiFeatureOverride(
-  scope: AiRoutingScope,
-  feature: string,
-  modelId: string | null,
-): Promise<AiFeatureOverride[]> {
-  return request<AiFeatureOverride[]>("/api/v1/ai/routing/overrides", {
-    method: "PUT",
-    body: JSON.stringify({ feature, ...scopeParamsForBody(scope), model_id: modelId }),
-  });
-}
-
-/** Resolve a hypothetical request without calling a provider. */
-export async function previewAiRouting(input: {
-  scope: AiRoutingScope;
-  task?: string;
-  feature?: string;
-  requested?: string;
-  requires?: string[];
-}): Promise<AiRoutingPreview> {
-  return request<AiRoutingPreview>("/api/v1/ai/routing/preview", {
-    method: "POST",
-    body: JSON.stringify({
-      ...scopeParamsForBody(input.scope),
-      ...(input.task ? { task: input.task } : {}),
-      ...(input.feature ? { feature: input.feature } : {}),
-      ...(input.requested?.trim() ? { requested: input.requested.trim() } : {}),
-      requires: input.requires ?? [],
-    }),
-  });
-}
-
-// -------------------------------------------------------------------------------------------
-// The route decision log (REQ-098, slice 3).
-// -------------------------------------------------------------------------------------------
-
-/** One row of the decision log. */
-export type AiDecisionRow = {
-  id: number;
-  created_at: string;
-  task: string | null;
-  feature: string | null;
-  requested: string | null;
-  resolved_label: string | null;
-  resolved_model_id: string | null;
-  /** 0-based: 0 is the primary, anything above it is a fallback. */
-  fallback_index: number;
-  used_fallback: boolean;
-  unresolved: boolean;
-  rule: string;
-  requirements: string[];
-  reason: string;
-  run_id: string | null;
-};
-
-/** One page of the log. */
-export type AiDecisionPage = {
-  rows: AiDecisionRow[];
-  total: number;
-  offset: number;
-  limit: number;
-};
-
-/** One decision with its full candidate walk. */
-export type AiDecisionDetail = AiDecisionRow & {
-  walk: AiWalkEntry[];
-  scope: string;
-  rules: string[];
-};
-
-/** A task that could not resolve, with the reason. */
-export type AiUnresolvedTask = {
-  task: string;
-  reason: string;
-  occurrences: number;
-  last_failed_at: string | null;
-};
-
-/** The filters the log screen offers. */
-export type AiDecisionFilter = {
-  task?: string;
-  feature?: string;
-  modelId?: string;
-  fallback?: boolean;
-  unresolved?: boolean;
-  from?: string;
-  to?: string;
-  limit?: number;
-  offset?: number;
-};
-
-/** The filters as a query string, shared by the table and the CSV export. */
-function decisionFilterParams(filter: AiDecisionFilter): string {
-  const params = new URLSearchParams();
-  if (filter.task) params.set("task", filter.task);
-  if (filter.feature) params.set("feature", filter.feature);
-  if (filter.modelId) params.set("model_id", filter.modelId);
-  if (filter.fallback) params.set("fallback", "true");
-  if (filter.unresolved) params.set("unresolved", "true");
-  if (filter.from) params.set("from", filter.from);
-  if (filter.to) params.set("to", filter.to);
-  if (filter.limit) params.set("limit", String(filter.limit));
-  if (filter.offset) params.set("offset", String(filter.offset));
-  return params.toString();
-}
-
-/** One page of the decision log. */
-export async function fetchAiDecisions(
-  filter: AiDecisionFilter = {},
-): Promise<AiDecisionPage> {
-  const suffix = decisionFilterParams(filter);
-  return request<AiDecisionPage>(
-    suffix ? `/api/v1/ai/logs/decisions?${suffix}` : "/api/v1/ai/logs/decisions",
-  );
-}
-
-/**
- * The decision log as CSV, for the same filters the table is showing.
- *
- * Returns the text rather than triggering a download itself: the screen owns the button, so the
- * export is a control the walkthrough can click and assert on, and a `window.location`
- * navigation cannot be observed at all. The same filters go into the path as the table's — the
- * two reads are only the same read if the query strings are, which is why one helper builds it.
- */
-export async function fetchAiDecisionsCsv(filter: AiDecisionFilter = {}): Promise<string> {
-  const suffix = decisionFilterParams(filter);
-  const path = suffix
-    ? `/api/v1/ai/logs/decisions.csv?${suffix}`
-    : "/api/v1/ai/logs/decisions.csv";
-
-  let response: Response;
-  try {
-    response = await fetch(path, { credentials: "same-origin", headers: { accept: "text/csv" } });
-  } catch {
-    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
-  }
-  if (!response.ok) {
-    // The refusal is usually a guard's plain-text 401/403 rather than the API's JSON error
-    // shape, so the body is reported as it arrived instead of being parsed into nothing.
-    const text = await response.text();
-    let code = "export_failed";
-    let message = `The export answered with status ${response.status}.`;
-    try {
-      const body = JSON.parse(text) as ErrorBody;
-      code = body.error?.code ?? code;
-      message = body.error?.message ?? message;
-    } catch {
-      // A non-JSON body is still an error; the status stays in the message.
-    }
-    throw new ApiError(response.status, code, message);
-  }
-
-  return response.text();
-}
-
-/** One decision with its walk. */
-export async function fetchAiDecision(id: number): Promise<AiDecisionDetail> {
-  return request<AiDecisionDetail>(`/api/v1/ai/logs/decisions/${id}`);
-}
-
-/** The tasks that cannot resolve, with the reason. */
-export async function fetchAiUnresolved(): Promise<{
-  scope: Record<string, string>;
-  unresolved: AiUnresolvedTask[];
-  ok: boolean;
-}> {
-  return request("/api/v1/ai/routing/unresolved");
-}
-
-/** The newest decision per task, for the routing screen's "Last resolved" column. */
-export async function fetchAiLastResolved(): Promise<Record<string, AiDecisionRow>> {
-  return request<Record<string, AiDecisionRow>>("/api/v1/ai/routing/last-resolved");
-}
-
-/**
- * The scope fields a JSON body carries.
- *
- * The same two keys as the query string, because the endpoints flatten one shape into both. A
- * site carries only its id: the endpoint reads the site's organization from the database rather
- * than trusting the payload, so a client cannot name a site and a different organization.
- */
-function scopeParamsForBody(scope: AiRoutingScope): Record<string, string> {
-  if (scope.kind === "organization") return { organization_id: scope.organizationId };
-  if (scope.kind === "site") return { site_id: scope.siteId };
-  return {};
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5761,6 +5432,36 @@ export function runNotificationRoute(input: {
 }
 
 // ---------------------------------------------------------------------------------------------
+// CDN / edge (REQ-011)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A site's cache rules, in precedence order.
+ *
+ * `unreadable` is part of the response rather than an error: one rule whose pattern no
+ * longer compiles must not take the whole list away, and it must not be dropped either —
+ * a rule that silently stopped matching is what an operator discovers days later.
+ */
+export async function fetchCdnRules(siteId: string): Promise<CdnRulesResponse> {
+  return request(`/api/v1/cdn/rules?site_id=${encodeURIComponent(siteId)}`);
+}
+
+/** Create a cache rule. */
+export async function createCdnRule(input: CdnCacheRuleInput): Promise<CdnCacheRule> {
+  return request("/api/v1/cdn/rules", { method: "POST", body: JSON.stringify(input) });
+}
+
+/** Change one rule. The site is named in the body, not in the path. */
+export async function updateCdnRule(
+  ruleId: string,
+  input: CdnCacheRuleInput,
+): Promise<CdnCacheRule> {
+  return request(`/api/v1/cdn/rules/${encodeURIComponent(ruleId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
 // The event feed and the catalogue (REQ-016, slice 1)
 // ---------------------------------------------------------------------------------------------
 
@@ -5846,6 +5547,124 @@ export function createWebhookEndpoint(input: {
   });
 }
 
+/** Delete a rule. */
+export async function deleteCdnRule(ruleId: string, siteId: string): Promise<void> {
+  await request(
+    `/api/v1/cdn/rules/${encodeURIComponent(ruleId)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** Turn a rule on or off without touching the rest of it. */
+export async function setCdnRuleEnabled(
+  ruleId: string,
+  siteId: string,
+  enabled: boolean,
+): Promise<CdnCacheRule> {
+  return request(`/api/v1/cdn/rules/${encodeURIComponent(ruleId)}/toggle`, {
+    method: "POST",
+    body: JSON.stringify({ site_id: siteId, enabled }),
+  });
+}
+
+/**
+ * Persist a new precedence order.
+ *
+ * The order is sent as the complete list rather than as a delta: a reorder that renumbers
+ * one row is the operation that can leave two rules claiming the same priority, and the
+ * matcher would then pick between them by row order — which is not what the drag showed.
+ */
+export async function reorderCdnRules(siteId: string, order: string[]): Promise<CdnRulesResponse> {
+  return request("/api/v1/cdn/rules/reorder", {
+    method: "POST",
+    body: JSON.stringify({ site_id: siteId, order }),
+  });
+}
+
+/** The settings row for a site, or the installation default when `siteId` is null. */
+export async function fetchCdnSettings(siteId: string | null): Promise<CdnSettings> {
+  const query = siteId === null ? "" : `?site_id=${encodeURIComponent(siteId)}`;
+  return request(`/api/v1/cdn/settings${query}`);
+}
+
+/**
+ * Save the settings row.
+ *
+ * `credential` is only sent when the operator typed one: sending the empty string would
+ * clear a stored credential, because "the field is empty" and "the operator cleared it" are
+ * the same request. The panel therefore omits the field entirely when it is untouched.
+ */
+export async function saveCdnSettings(input: CdnSettingsInput): Promise<CdnSettings> {
+  return request("/api/v1/cdn/settings", { method: "PUT", body: JSON.stringify(input) });
+}
+
+/**
+ * The shipped provider adapters, with the fields each one needs.
+ *
+ * Typed as `CdnAdapter` rather than the bare `CdnAdapterInfo` because the capability flags
+ * are what the console needs: offering "purge by tag" to an adapter that cannot do it
+ * queues work that fails an hour later at drain time, which is the worst moment to find out.
+ */
+export async function fetchCdnAdapters(): Promise<CdnAdapter[]> {
+  const body = await request<{ adapters: CdnAdapter[] }>("/api/v1/cdn/adapters");
+  return body.adapters;
+}
+
+/**
+ * The overview's cards.
+ *
+ * One call rather than four: the provider state, the queue depth, the 24-hour counters and
+ * the recent list are four numbers an operator reads together, and four round trips would
+ * let them disagree with each other on screen — a purge that appears in the recent table
+ * but not the counters, because the counters were fetched a second earlier.
+ */
+export async function fetchCdnStatus(siteId: string): Promise<CdnStatus> {
+  return request(`/api/v1/cdn/status?site_id=${encodeURIComponent(siteId)}`);
+}
+
+/** One page of purge history. */
+export async function fetchCdnPurges(
+  siteId: string,
+  filters: CdnPurgeFilters = {},
+): Promise<CdnPurgePage> {
+  const query = new URLSearchParams({ site_id: siteId });
+  if (filters.status) query.set("status", filters.status);
+  if (filters.kind) query.set("kind", filters.kind);
+  if (filters.since) query.set("since", filters.since);
+  if (filters.until) query.set("until", filters.until);
+  if (typeof filters.limit === "number") query.set("limit", String(filters.limit));
+  if (typeof filters.offset === "number") query.set("offset", String(filters.offset));
+  return request(`/api/v1/cdn/purges?${query.toString()}`);
+}
+
+/** The detail drawer: the purge plus one row per target. */
+export async function fetchCdnPurge(purgeId: string): Promise<CdnPurgeDetail> {
+  return request(`/api/v1/cdn/purges/${encodeURIComponent(purgeId)}`);
+}
+
+/**
+ * Ask for a purge.
+ *
+ * The 500-target cap is the server's, not the form's: the form counts so the operator gets
+ * an answer while typing, and the server refuses so a client that skips the count still
+ * cannot write a purge the worker will split into something the operator never saw.
+ */
+export async function createCdnPurge(input: CdnPurgeInput): Promise<CdnPurge> {
+  return request("/api/v1/cdn/purges", { method: "POST", body: JSON.stringify(input) });
+}
+
+/**
+ * Requeue the failed items of a purge.
+ *
+ * A `409` here is the server saying this purge has nothing to retry, which is a real
+ * answer rather than a failure: the caller asked for the right thing and the state said no.
+ */
+export async function retryCdnPurge(purgeId: string): Promise<CdnPurgeDetail> {
+  return request(`/api/v1/cdn/purges/${encodeURIComponent(purgeId)}/retry`, {
+    method: "POST",
+  });
+}
+
 /** Change an endpoint's name, URL, subscriptions or enabled flag. */
 export function updateWebhookEndpoint(
   id: string,
@@ -5901,6 +5720,12 @@ export function redeliverWebhookDelivery(id: string, deliveryId: string): Promis
   });
 }
 
+/** Run the configured provider's reachability check. */
+export async function testCdnProvider(siteId: string | null): Promise<CdnProviderProbe> {
+  const query = siteId === null ? "" : `?site_id=${encodeURIComponent(siteId)}`;
+  return request(`/api/v1/cdn/settings/test${query}`, { method: "POST" });
+}
+
 /**
  * Force many deliveries again, per id.
  *
@@ -5934,6 +5759,109 @@ export function fetchWebhookStats(id: string, windowHours?: number): Promise<Web
  */
 export function fetchEventCatalogue(): Promise<EventCatalogue> {
   return request<EventCatalogue>("/api/v1/events/catalogue");
+}
+
+// ---------------------------------------------------------------------------------------------
+// SDK scaffolds and the CLI device code (REQ-033, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** The three template cards, with what each contains. */
+export function fetchSdkTemplates(): Promise<SdkTemplate[]> {
+  return request<SdkTemplate[]>("/api/v1/dev/sdks/templates");
+}
+
+/**
+ * Preview a generated starter's file tree.
+ *
+ * Writes nothing: this is the call the name field makes while somebody is still typing, and a
+ * button that records a row per keystroke would fill `sdk_scaffolds` with previews. The durable
+ * half is {@link recordScaffold}, and the screen makes the difference visible by labelling them
+ * "Preview" and "Generate".
+ */
+export function previewScaffold(
+  kind: SdkKind,
+  name: string,
+  target: SdkTarget,
+): Promise<ScaffoldTree> {
+  return request<ScaffoldTree>("/api/v1/dev/sdks/scaffold", {
+    method: "POST",
+    body: JSON.stringify({ kind, name, target }),
+  });
+}
+
+/** Generate and record a starter, returning the row that was written. */
+export function recordScaffold(
+  kind: SdkKind,
+  name: string,
+  target: SdkTarget,
+): Promise<ScaffoldRecord> {
+  return request<ScaffoldRecord>("/api/v1/dev/sdks/scaffolds", {
+    method: "POST",
+    body: JSON.stringify({ kind, name, target }),
+  });
+}
+
+/** This tenant's recorded generations, newest first. */
+export function fetchScaffolds(): Promise<ScaffoldList> {
+  return request<ScaffoldList>("/api/v1/dev/sdks/scaffolds");
+}
+
+/**
+ * The archive's URL, for a download link.
+ *
+ * A plain `<a href>` rather than a fetch: the browser's own download handling is what puts the
+ * file in the downloads folder with the right name, and a `fetch` + blob would have to
+ * reconstruct `Content-Disposition` on the client to arrive at the same place. The route reads
+ * the session cookie as a first-party same-origin request, so the link needs no token of any kind
+ * in its query — which is also why no key material can leak into a URL, a history entry or a
+ * `Referer`.
+ */
+export function scaffoldDownloadUrl(id: string): string {
+  return `/api/v1/dev/sdks/scaffolds/${id}/download`;
+}
+
+/**
+ * Validate a manifest, with the runtime loader's own rules.
+ *
+ * The report carries a line per issue, and the screen renders them in order: a validator that
+ * only said "invalid" would leave the author guessing which of forty lines to look at.
+ */
+export function validateManifest(
+  kind: SdkKind,
+  manifest: string,
+): Promise<ManifestReport> {
+  return request<ManifestReport>("/api/v1/dev/manifests/validate", {
+    method: "POST",
+    body: JSON.stringify({ kind, manifest }),
+  });
+}
+
+/** Start a CLI device-code login from the signed-in browser session. */
+export function startDeviceCode(clientName: string): Promise<DeviceStart> {
+  return request<DeviceStart>("/api/v1/dev/cli/device-code", {
+    method: "POST",
+    body: JSON.stringify({ client_name: clientName }),
+  });
+}
+
+/**
+ * What a pending code wants, before anybody approves it.
+ *
+ * The screen calls this so a person sees the requesting client's name and the plain-language
+ * scopes rather than a bare code with a confirm button next to it.
+ */
+export function fetchDeviceCode(userCode: string): Promise<DeviceLookup> {
+  return request<DeviceLookup>(
+    `/api/v1/dev/cli/device-code/${encodeURIComponent(userCode)}`,
+  );
+}
+
+/** Approve a pending code. The scopes come from the stored row, never from this call. */
+export function approveDeviceCode(userCode: string): Promise<{ user_code: string }> {
+  return request<{ user_code: string }>("/api/v1/dev/cli/device-code/approve", {
+    method: "POST",
+    body: JSON.stringify({ user_code: userCode }),
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6098,599 +6026,6 @@ export function importSecurityReport(
   });
 }
 
-// -------------------------------------------------------------------------------------------
-// The agent runtime (REQ-099, slice 1).
-//
-// The screen is a queue's front end, so the client mirrors the store's own vocabulary rather
-// than inventing labels: a status a human reads is a status the loop wrote. Every call carries
-// the organization through `agentScopeParams`, because a platform-level account has to name one
-// and an organization account passing a different one is refused with `403 cross_organization`.
-// -------------------------------------------------------------------------------------------
-
-/** One agent as the table renders it. */
-export type AiAgent = {
-  id: string;
-  organization_id: string;
-  site_id: string | null;
-  key: string;
-  name: string;
-  description: string;
-  system_prompt: string;
-  model_id: string | null;
-  temperature: number;
-  max_steps: number;
-  deadline_seconds: number;
-  token_budget: number;
-  tools: string[];
-  /** How many of `tools` park the run for a person; the table shows it beside the count. */
-  approvals_count: number;
-  approvals: string[];
-  memory_scope: string;
-  enabled: boolean;
-  created_at: string;
-  updated_at: string;
-  /**
-   * The 30-day roll-up, present on the list and absent on the detail.
-   *
-   * Optional on purpose: the list route fills it from one bulk query, the detail route does not
-   * compute it, and a type that demanded it would make the second one lie. The cell renders an
-   * em dash for `null` rather than a zero, because "no runs yet" and "zero percent" are
-   * different facts.
-   */
-  telemetry?: AiAgentTelemetry | null;
-};
-
-/**
- * One agent's 30-day roll-up.
- *
- * The denominator is **finished** runs, and `cancelled` is published beside it rather than
- * folded in: a person pressing stop stopped the run, and counting that against the agent's
- * reliability is the definition of a metric that gets gamed by impatience. A reader who wants
- * the other denominator subtracts `cancelled` from `runs`.
- */
-export type AiAgentTelemetry = {
-  /** Finished runs in the window. */
-  runs: number;
-  /** Of those, the ones that produced an answer. */
-  completed: number;
-  /** Of those, the ones a person stopped. */
-  cancelled: number;
-  /** Of those, the ones that failed. */
-  failed: number;
-  /** Total tokens in the window. */
-  total_tokens: number;
-  /** Cost in millionths in the window. */
-  cost_micros: number;
-  /** Steps in the window. */
-  steps: number;
-  /**
-   * Completed as a percentage of finished runs, or `null` when nothing has finished.
-   *
-   * `null` is the honest answer for a brand-new agent: `0%` is a claim about a division that
-   * never happened, and a cell reading "0%" on an agent nobody has run yet is a defect.
-   */
-  success_rate: number | null;
-  /** When the window starts, so the client does not have to guess its own. */
-  since: string;
-};
-
-/** How often each tool was called in the window, tenant-wide. */
-export type AiToolUsage = {
-  since: string;
-  /** Call counts by tool key. */
-  tools: Record<string, number>;
-};
-
-/** One run as the history list renders it. */
-export type AiRun = {
-  id: string;
-  agent_id: string | null;
-  user_id: string | null;
-  /** `chat`, `agent`, `workflow` or `schedule` — who started it, not just that it started. */
-  trigger: string;
-  goal: string;
-  status: string;
-  stop_reason: string | null;
-  model_id: string | null;
-  current_step: number;
-  resume_count: number;
-  prompt_tokens: number;
-  completion_tokens: number;
-  cost_micros: number;
-  started_at: string | null;
-  finished_at: string | null;
-  error: string | null;
-};
-
-/** One step of a run's trace. `arguments` is the **redacted** form the store wrote. */
-export type AiRunStep = {
-  step_no: number;
-  kind: string;
-  tool: string | null;
-  arguments: Record<string, unknown> | null;
-  result: unknown;
-  status: string;
-  prompt_tokens: number;
-  completion_tokens: number;
-  cost_micros: number;
-  duration_ms: number | null;
-  error: string | null;
-};
-
-/**
- * One workspace reference a run was told to read.
- *
- * `resolved: false` is the state that explains a failed run: the sheet named `q3.csv`, and the
- * file was deleted before the runner claimed the run. The reference survives the delete on
- * purpose, so the trace can name the path rather than showing a run that had no inputs.
- */
-export type AiRunInput = {
-  id: string;
-  path: string;
-  resolved: boolean;
-  size_bytes: number;
-};
-
-/** One run with its trace and its named inputs — the run detail screen's whole payload. */
-/**
- * One run's recomputed telemetry, as the run detail's header renders it.
- *
- * A separate block rather than more columns on `AiRun` because the run's own columns are the
- * *stored* totals and this is the *recomputed* one. Shipping both side by side turns "telemetry
- * equals the underlying rows" from a test into something an operator can check by eye: a drift
- * shows up as two different numbers in the same header instead of as one wrong number.
- */
-export type AiRunTelemetry = {
-  completed_steps: number;
-  failed_steps: number;
-  tool_calls: number;
-  prompt_tokens: number;
-  completion_tokens: number;
-  cost_micros: number;
-  duration_ms: number;
-  total_tokens: number;
-};
-
-export type AiRunDetail = AiRun & {
-  steps: AiRunStep[];
-  inputs: AiRunInput[];
-  telemetry: AiRunTelemetry;
-};
-
-/**
- * One agent's 30-day roll-up, on its own.
- *
- * The list already carries this number, so the call exists for the detail screen and for
- * anything that wants the roll-up without the whole agent list.
- */
-export function fetchAiAgentTelemetry(
-  agentId: string,
-  organizationId?: string | null,
-): Promise<AiAgentTelemetry> {
-  return request<AiAgentTelemetry>(
-    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/telemetry${agentScopeParams(organizationId)}`,
-  );
-}
-
-/**
- * How often each tool was called in the window, tenant-wide.
- *
- * **`/ai/agents/tool-usage`, NOT `/ai/telemetry/tools`.** Both are real reads and both are
- * mounted: this one is the raw call-count table (`ai.agents.read`), and REQ-107's
- * `/ai/telemetry/tools` is the success/denial/latency roll-up behind its own `ai.telemetry.read`
- * key. They were briefly registered on the same path, which axum rejects at router
- * *construction* — the API panicked at boot while `cargo build` stayed green.
- */
-export function fetchAiToolUsage(organizationId?: string | null): Promise<AiToolUsage> {
-  return request<AiToolUsage>(
-    `/api/v1/ai/agents/tool-usage${agentScopeParams(organizationId)}`,
-  );
-}
-
-/** The organization selector the agent and run routes accept. */
-function agentScopeParams(organizationId?: string | null): string {
-  if (!organizationId) return "";
-  return `?organization_id=${encodeURIComponent(organizationId)}`;
-}
-
-/** The agents table. */
-export function fetchAiAgents(organizationId?: string | null): Promise<AiAgent[]> {
-  return request<AiAgent[]>(`/api/v1/ai/agents${agentScopeParams(organizationId)}`);
-}
-
-/** The run history, narrowed by whichever filters the list sets. */
-export function fetchAiRuns(input: {
-  organizationId?: string | null;
-  agentId?: string;
-  status?: string;
-  stopReason?: string;
-  limit?: number;
-}): Promise<AiRun[]> {
-  const params = new URLSearchParams();
-  if (input.organizationId) params.set("organization_id", input.organizationId);
-  if (input.agentId) params.set("agent_id", input.agentId);
-  if (input.status) params.set("status", input.status);
-  if (input.stopReason) params.set("stop_reason", input.stopReason);
-  if (input.limit) params.set("limit", String(input.limit));
-  const query = params.toString();
-  return request<AiRun[]>(`/api/v1/ai/runs${query ? `?${query}` : ""}`);
-}
-
-/** One run with its trace. */
-export function fetchAiRun(id: string, organizationId?: string | null): Promise<AiRunDetail> {
-  return request<AiRunDetail>(
-    `/api/v1/ai/runs/${encodeURIComponent(id)}${agentScopeParams(organizationId)}`,
-  );
-}
-
-/** One agent in full — the config form's load. */
-export function fetchAiAgent(id: string, organizationId?: string | null): Promise<AiAgent> {
-  return request<AiAgent>(
-    `/api/v1/ai/agents/${encodeURIComponent(id)}${agentScopeParams(organizationId)}`,
-  );
-}
-
-/**
- * Create an agent.
- *
- * `tools` and `approvals` are the agent's own ordered lists rather than a catalogue pick, so a
- * form that drops an approval-gated tool is refused by the API with `agent.approval_not_allowed`
- * instead of silently losing the gate.
- */
-export function createAiAgent(input: {
-  organizationId?: string | null;
-  key: string;
-  name: string;
-  description?: string;
-  system_prompt?: string;
-  model_id?: string | null;
-  temperature?: number;
-  max_steps?: number;
-  deadline_seconds?: number;
-  token_budget?: number;
-  tools?: string[];
-  approvals?: string[];
-  memory_scope?: string;
-  enabled?: boolean;
-}): Promise<AiAgent> {
-  return request<AiAgent>(`/api/v1/ai/agents${agentScopeParams(input.organizationId)}`, {
-    method: "POST",
-    body: JSON.stringify({
-      key: input.key,
-      name: input.name,
-      description: input.description ?? "",
-      system_prompt: input.system_prompt ?? "",
-      model_id: input.model_id ?? null,
-      temperature: input.temperature,
-      max_steps: input.max_steps,
-      deadline_seconds: input.deadline_seconds,
-      token_budget: input.token_budget,
-      tools: input.tools ?? [],
-      approvals: input.approvals ?? [],
-      memory_scope: input.memory_scope,
-      enabled: input.enabled,
-    }),
-  });
-}
-
-/**
- * Change an agent.
- *
- * `model_id` is a double option on purpose: `null` un-pins the agent (let the router choose),
- * while omitting the key leaves the current pin alone. A single nullable field cannot express
- * the difference, and the difference is the difference between a pinned agent and a routed one.
- */
-export function updateAiAgent(
-  id: string,
-  input: {
-    organizationId?: string | null;
-    name?: string;
-    description?: string;
-    system_prompt?: string;
-    model_id?: string | null;
-    temperature?: number;
-    max_steps?: number;
-    deadline_seconds?: number;
-    token_budget?: number;
-    tools?: string[];
-    approvals?: string[];
-    memory_scope?: string;
-    enabled?: boolean;
-  },
-): Promise<AiAgent> {
-  return request<AiAgent>(
-    `/api/v1/ai/agents/${encodeURIComponent(id)}${agentScopeParams(input.organizationId)}`,
-    { method: "PATCH", body: JSON.stringify(input) },
-  );
-}
-
-/** Remove an agent. The API answers 409 while a run is still active for it. */
-export function deleteAiAgent(id: string, organizationId?: string | null): Promise<null> {
-  return request<null>(
-    `/api/v1/ai/agents/${encodeURIComponent(id)}${agentScopeParams(organizationId)}`,
-    { method: "DELETE" },
-  );
-}
-
-/** Ask a run to stop at its next step boundary. */
-export function cancelAiRun(id: string, organizationId?: string | null): Promise<AiRun> {
-  return request<AiRun>(
-    `/api/v1/ai/runs/${encodeURIComponent(id)}/cancel${agentScopeParams(organizationId)}`,
-    { method: "POST" },
-  );
-}
-
-/** Requeue an interrupted or approval-parked run. */
-export function resumeAiRun(id: string, organizationId?: string | null): Promise<AiRun> {
-  return request<AiRun>(
-    `/api/v1/ai/runs/${encodeURIComponent(id)}/resume${agentScopeParams(organizationId)}`,
-    { method: "POST" },
-  );
-}
-
-/** The run's agent, for the history table's link column. */
-export function fetchAiRunAgent(
-  id: string,
-  organizationId?: string | null,
-): Promise<AiAgent | null> {
-  return request<AiAgent | null>(
-    `/api/v1/ai/runs/${encodeURIComponent(id)}/agent${agentScopeParams(organizationId)}`,
-  );
-}
-
-/** One file in an agent's workspace (REQ-099 slice 2). */
-export type AiAgentFile = {
-  /** Row identity — what Download and Delete address. */
-  id: string;
-  /** The path inside the workspace, relative to the agent. */
-  path: string;
-  /** Size in bytes. */
-  size_bytes: number;
-  /** The declared content type. */
-  content_type: string;
-  /** Hex SHA-256 of the bytes, so two versions of a path are tellable apart. */
-  checksum: string;
-  /** The run that wrote it, when a run wrote it. */
-  run_id: string | null;
-  /** When it was added. */
-  created_at: string;
-  /** When a run last named it. */
-  last_used_at: string | null;
-};
-
-/**
- * How full a workspace is, as the usage bar reads it.
- *
- * `percent` is already clamped by the API rather than computed here: the bar's width is a
- * percentage of a number the server owns, and a client that recomputes it can disagree with the
- * quota that produced the refusal.
- */
-export type AiAgentFileUsage = {
-  /** Bytes stored across the agent's files. */
-  used_bytes: number;
-  /** The per-agent ceiling (100 MB). */
-  limit_bytes: number;
-  /** How many files count against it. */
-  file_count: number;
-  /** Whole percent, 0–100. */
-  percent: number;
-  /** The per-file ceiling (10 MB), so the upload hint names the same number. */
-  max_file_bytes: number;
-};
-
-/** The workspace listing and its quota, in one answer. */
-export type AiAgentWorkspace = {
-  /** The agent whose workspace this is. */
-  agent_id: string;
-  /** Its files, newest first. */
-  files: AiAgentFile[];
-  /** The quota, so the bar cannot disagree with the table above it. */
-  usage: AiAgentFileUsage;
-};
-
-/** The agent's workspace. */
-export function fetchAiAgentWorkspace(
-  agentId: string,
-  organizationId?: string | null,
-): Promise<AiAgentWorkspace> {
-  return request<AiAgentWorkspace>(
-    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/files${agentScopeParams(organizationId)}`,
-  );
-}
-
-/**
- * Add or replace one workspace file.
- *
- * The path is sent as its own form part rather than being taken from the picked file's name: a
- * filename is the browser's opinion about the user's disk, and the API deliberately refuses a
- * request that omits the path so a name it did not choose cannot reach a namespace it does not
- * validate.
- */
-export async function uploadAiAgentFile(input: {
-  agentId: string;
-  path: string;
-  file: File;
-  organizationId?: string | null;
-}): Promise<AiAgentFile> {
-  const form = new FormData();
-  form.append("path", input.path);
-  form.append("file", input.file);
-  return request<AiAgentFile>(
-    `/api/v1/ai/agents/${encodeURIComponent(input.agentId)}/files${agentScopeParams(input.organizationId)}`,
-    { method: "POST", body: form },
-  );
-}
-
-/** Remove one workspace file. */
-export function deleteAiAgentFile(input: {
-  agentId: string;
-  path: string;
-  organizationId?: string | null;
-}): Promise<null> {
-  return request<null>(
-    `/api/v1/ai/agents/${encodeURIComponent(input.agentId)}/files/${encodeWorkspacePath(input.path)}${agentScopeParams(input.organizationId)}`,
-    { method: "DELETE" },
-  );
-}
-
-/**
- * The download address for one workspace file.
- *
- * Built rather than fetched, because the route answers the bytes directly and a download that
- * had to round-trip a `blob` first would hold a copy of a 10 MB file in the tab's memory. The
- * path is encoded **once**, segment by segment: encoding the whole string turns the separators
- * into `%2F`, which is a file named `data%2Fq3.csv` rather than the file at `data/q3.csv`.
- */
-export function aiAgentFileHref(input: {
-  agentId: string;
-  path: string;
-  organizationId?: string | null;
-}): string {
-  return `/api/v1/ai/agents/${encodeURIComponent(input.agentId)}/files/${encodeWorkspacePath(input.path)}${agentScopeParams(input.organizationId)}`;
-}
-
-/** Percent-encode each segment of a workspace path and keep the separators. */
-function encodeWorkspacePath(path: string): string {
-  return path
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-}
-
-/** One frame of a run's event stream, as the Run sheet and the live trace read it. */
-export type AiRunFrame = {
-  /**
-   * `run`, `step_started`, `text`, `tool_call`, `tool_result`, `usage`, `awaiting_approval`,
-   * `loop_done`, `error` or `done`.
-   */
-  event: string;
-  data: Record<string, unknown>;
-};
-
-/** A consumer the stream calls as frames arrive. */
-export type AiRunStreamHandlers = {
-  onFrame?: (frame: AiRunFrame) => void;
-};
-
-/**
- * Read an SSE response the one way.
- *
- * The chat stream and the run stream are the same protocol in two places, so the frame parser
- * lives here once: a client that re-implemented it per screen is a client that will eventually
- * read a frame boundary differently from the writer. Split on the blank line, take the `event:`
- * and `data:` lines, hand the pair over — the caller branches on the *event name*, which is the
- * loop's own vocabulary rather than a transport word.
- */
-async function readEventStream(
-  response: Response,
-  handlers: AiRunStreamHandlers,
-): Promise<void> {
-  if (!response.body) {
-    return;
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const chunk = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      boundary = buffer.indexOf("\n\n");
-
-      let event = "message";
-      let data = "";
-      for (const line of chunk.split("\n")) {
-        if (line.startsWith("event: ")) event = line.slice(7).trim();
-        else if (line.startsWith("data: ")) data += line.slice(6);
-      }
-      if (!data) continue;
-
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = JSON.parse(data) as Record<string, unknown>;
-      } catch {
-        // A frame that is not JSON is a transport frame (a comment, a keep-alive), not a
-        // lifecycle event. Dropping it is correct; throwing would kill a live run over a
-        // keep-alive, which is the worst possible trade.
-        continue;
-      }
-      handlers.onFrame?.({ event, data: parsed });
-    }
-  }
-}
-
-/**
- * Start a run and stream its steps.
- *
- * Everything decidable before the first byte arrives as a normal HTTP status: a disabled agent,
- * an empty goal, a runner that is switched off (`503 runner_disabled`), or a run already in
- * progress (`409 run_in_progress`, whose details carry the existing run's id so the client
- * attaches to it rather than pressing Run again). After the stream opens the frames are the
- * run's own lifecycle.
- */
-export async function startAiRun(
-  agentId: string,
-  input: { goal: string; files?: string[]; organizationId?: string | null },
-  handlers: AiRunStreamHandlers = {},
-): Promise<void> {
-  const response = await fetch(
-    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/runs${agentScopeParams(input.organizationId)}`,
-    {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "content-type": "application/json", accept: "text/event-stream" },
-      body: JSON.stringify({ goal: input.goal, files: input.files ?? [] }),
-    },
-  );
-
-  if (!response.ok || !response.body) {
-    const payload = (await readJson(response)) as ErrorBody | null;
-    throw new ApiError(
-      response.status,
-      payload?.error?.code ?? "unknown_error",
-      payload?.error?.message ?? `The API answered with status ${response.status}.`,
-      payload?.error?.details ?? null,
-    );
-  }
-
-  await readEventStream(response, handlers);
-}
-
-/**
- * Re-attach to a run that is still going.
- *
- * A replay, not a subscription: the API has nothing to publish to on a request that is not the
- * one running the loop, so the frames come from the step rows. That is the property the spec's
- * "replay matches SSE" box asks for — the same rows produce both.
- */
-export async function attachAiRun(
-  runId: string,
-  handlers: AiRunStreamHandlers = {},
-  organizationId?: string | null,
-): Promise<void> {
-  const response = await fetch(
-    `/api/v1/ai/runs/${encodeURIComponent(runId)}/events${agentScopeParams(organizationId)}`,
-    { credentials: "same-origin", headers: { accept: "text/event-stream" } },
-  );
-  if (!response.ok || !response.body) {
-    const payload = (await readJson(response)) as ErrorBody | null;
-    throw new ApiError(
-      response.status,
-      payload?.error?.code ?? "unknown_error",
-      payload?.error?.message ?? `The API answered with status ${response.status}.`,
-      payload?.error?.details ?? null,
-    );
-  }
-  await readEventStream(response, handlers);
-}
-
-// ---------------------------------------------------------------------------------------------
 // Security centre (REQ-012, slice 2) — the header policy
 // ---------------------------------------------------------------------------------------------
 
@@ -6721,28 +6056,149 @@ export function saveHeaderPolicy(save: HeaderPolicySave): Promise<HeaderPolicySa
 }
 
 // ---------------------------------------------------------------------------------------------
-// Security centre (REQ-012, slice 3) — rate limiting and sign-in protection
+// Staging environments (REQ-017)
 // ---------------------------------------------------------------------------------------------
 
 /**
- * The five scopes, merged with the baseline.
+ * The list, with its filters.
  *
- * `no-store` for the same reason the overview and the header policy carry it: a stale limiter
- * table is a screen that says "600 per minute" while the platform enforces something else, and
- * the whole value of the screen is that the two agree.
+ * A filter value the API does not recognise is answered as *no filter* rather than as a `400` —
+ * that rule lives in the route, and the panel passes the chip through unchanged so the two can
+ * never disagree about what a value means.
  */
+export async function fetchEnvironments(
+  filters: EnvironmentFilters = {},
+): Promise<EnvironmentListResponse> {
+  const query = new URLSearchParams();
+  if (filters.type) query.set("type", filters.type);
+  if (filters.status) query.set("status", filters.status);
+  if (filters.search && filters.search.trim() !== "") query.set("search", filters.search.trim());
+  const suffix = query.toString();
+  return request<EnvironmentListResponse>(
+    `/api/v1/environments${suffix ? `?${suffix}` : ""}`,
+  );
+}
+
+/** One environment, with its job history and the estimate for the next clone. */
+export async function fetchEnvironment(id: string): Promise<EnvironmentDetailResponse> {
+  return request<EnvironmentDetailResponse>(`/api/v1/environments/${encodeURIComponent(id)}`);
+}
+
+/**
+ * Create a staging environment and start its first clone.
+ *
+ * The response is the environment with status `cloning`: the copy itself runs in the API's own
+ * worker, so the wizard returns the moment the row exists and the list screen polls from there.
+ */
+export async function createEnvironment(input: {
+  name: string;
+  key?: string;
+  staging_host?: string;
+  areas: string[];
+  exclude_archived: boolean;
+}): Promise<Environment> {
+  return request<Environment>("/api/v1/environments", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** The live progress of an environment's clone, polled while one is open. */
+export async function fetchCloneJobs(id: string): Promise<EnvironmentCloneJob[]> {
+  return request<EnvironmentCloneJob[]>(
+    `/api/v1/environments/${encodeURIComponent(id)}/clone-jobs`,
+  );
+}
+
+/**
+ * Re-clone from production.
+ *
+ * `discard_confirmed` is not advisory: the API refuses with `clone_discard_unconfirmed` and
+ * names how many staging rows would be lost, and that refusal is what the confirmation dialog is
+ * built from. The dialog therefore sends the second request *after* the operator has seen the
+ * count, not before.
+ */
+export async function startEnvironmentClone(
+  id: string,
+  input: { areas: string[]; exclude_archived: boolean; discard_confirmed: boolean },
+): Promise<EnvironmentCloneJob> {
+  return request<EnvironmentCloneJob>(`/api/v1/environments/${encodeURIComponent(id)}/clone`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Stop a running clone. */
+export async function cancelEnvironmentClone(
+  id: string,
+  jobId: string,
+): Promise<{ job: EnvironmentCloneJob; environment_status: string }> {
+  return request(`/api/v1/environments/${encodeURIComponent(id)}/clone-jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+  });
+}
+
+/** Archive a staging environment: its content is kept, its host is released. */
+export async function archiveEnvironment(id: string): Promise<Environment> {
+  return request<Environment>(`/api/v1/environments/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+/** What staging holds that production does not — the Changes tab, and what a promotion freezes. */
+export async function fetchEnvironmentChanges(id: string): Promise<ChangeSetResponse> {
+  return request<ChangeSetResponse>(
+    `/api/v1/environments/${encodeURIComponent(id)}/changes`,
+  );
+}
+
+/** An environment's promotion history, newest first. */
+export async function fetchEnvironmentPromotions(id: string): Promise<Promotion[]> {
+  return request<Promotion[]>(
+    `/api/v1/environments/${encodeURIComponent(id)}/promotions`,
+  );
+}
+
+/** One promotion with the change set it froze. */
+export async function fetchPromotion(id: string): Promise<PromotionDetail> {
+  return request<PromotionDetail>(`/api/v1/promotions/${encodeURIComponent(id)}`);
+}
+
+/**
+ * Request a promotion.
+ *
+ * `items` names the change-set rows to freeze; an **empty list means every change**, which is what
+ * the dialog's primary button sends. The answer carries both the record and the frozen items,
+ * because the dialog opens on it and a second request would describe a second instant.
+ */
+export async function requestPromotion(
+  environmentId: string,
+  items: string[] = [],
+): Promise<PromotionRequested> {
+  return request<PromotionRequested>(
+    `/api/v1/environments/${encodeURIComponent(environmentId)}/promotions`,
+    { method: "POST", body: JSON.stringify({ items }) },
+  );
+}
+
+/** Approve and apply the frozen change set to production (`deployment.deploy`). */
+export async function approvePromotion(id: string): Promise<Promotion> {
+  return request<Promotion>(`/api/v1/promotions/${encodeURIComponent(id)}/approve`, {
+    method: "POST",
+  });
+}
+
+/** Withdraw a promotion that has not started. Only its requester may. */
+export async function cancelPromotion(id: string): Promise<Promotion> {
+  return request<Promotion>(`/api/v1/promotions/${encodeURIComponent(id)}/cancel`, {
+    method: "POST",
+  });
+}
+
 export function fetchRateLimits(): Promise<RateLimitsDocument> {
   return request<RateLimitsDocument>("/api/v1/security/rate-limits", { cache: "no-store" });
 }
 
-/**
- * Save the limiter document.
- *
- * `expected_scopes` is the document the form was opened with and is the compare-and-swap key:
- * a form somebody else has since saved is **refused** rather than silently overwriting them. The
- * client validates nothing — the server owns every range, and a second rule that disagreed with
- * it would be a second place to be wrong about a limit that is refusing real traffic.
- */
 export function saveRateLimits(save: RateLimitsSave): Promise<RateLimitsSaved> {
   return request<RateLimitsSaved>("/api/v1/security/rate-limits", {
     method: "PUT",
@@ -6750,15 +6206,6 @@ export function saveRateLimits(save: RateLimitsSave): Promise<RateLimitsSaved> {
   });
 }
 
-/**
- * Dry-run one request through the limiter.
- *
- * This is a **server** call rather than a local computation on purpose, and the reason is the
- * acceptance criterion it satisfies: the tester's verdict must match the real middleware
- * decision. Only the server holds the same `decide` the middleware runs, so a client that
- * reimplemented the arithmetic would agree with it on the day it was written and drift the
- * first time somebody tunes a limit — which is the day somebody is relying on it.
- */
 export function testRateLimit(body: RateLimitTestRequest): Promise<RateLimitTestResponse> {
   return request<RateLimitTestResponse>("/api/v1/security/rate-limits/test", {
     method: "POST",
@@ -6766,14 +6213,12 @@ export function testRateLimit(body: RateLimitTestRequest): Promise<RateLimitTest
   });
 }
 
-/** The lockout document, its ranges, and how many accounts are locked right now. */
 export function fetchSignInProtection(): Promise<SignInProtectionDocument> {
   return request<SignInProtectionDocument>("/api/v1/security/sign-in-protection", {
     cache: "no-store",
   });
 }
 
-/** Save the lockout document. `expected_policy` is the compare-and-swap key. */
 export function saveSignInProtection(save: SignInProtectionSave): Promise<SignInProtectionSaved> {
   return request<SignInProtectionSaved>("/api/v1/security/sign-in-protection", {
     method: "PUT",
@@ -6781,7 +6226,6 @@ export function saveSignInProtection(save: SignInProtectionSave): Promise<SignIn
   });
 }
 
-/** Who is locked out right now, soonest to expire first. */
 export function fetchLockedAccounts(): Promise<LockedAccountsPage> {
   return request<LockedAccountsPage>("/api/v1/security/locked-accounts", { cache: "no-store" });
 }
@@ -6909,605 +6353,6 @@ export function unlockAccount(userId: string): Promise<LockedAccountsPage> {
   );
 }
 
-/**
- * The skills registry (REQ-099, slice 3).
- *
- * The client mirrors the server's distinction between *attached* and *injected* rather than
- * collapsing them: a row can be attached and still contribute nothing to a prompt, and a tab
- * that renders "3 skills" above a prompt that carries one is the exact failure this API shape
- * exists to make impossible.
- */
-
-/** One registry row, as the table renders it. */
-export type AiSkill = {
-  /** The stable identifier. */
-  key: string;
-  /** Display name. */
-  name: string;
-  /** One line about what it is for. */
-  description: string;
-  /** When the model should reach for it. */
-  when_to_use: string;
-  /** The instruction body — data, never code. */
-  instructions: string;
-  /** Tool keys this skill is relevant to. **Not** a grant. */
-  tools: string[];
-  /** The manual version. */
-  version: number;
-  /** The digest of the definition, shown in the drawer. */
-  checksum: string;
-  /** `built_in` or `custom` — which decides whether Delete is offered. */
-  source: string;
-  /** Whether the runtime will inject it. */
-  enabled: boolean;
-  /** How many agents hold it. */
-  used_by: number;
-  /** Whether the definition is read-only. */
-  built_in: boolean;
-  /** When it last changed. */
-  updated_at: string;
-};
-
-/** One attachment, with the runtime's verdict on it. */
-export type AiAgentSkill = {
-  /** The registry key. */
-  key: string;
-  /** Display name, or the bare key when the row is gone. */
-  name: string;
-  /** Description, empty when stale. */
-  description: string;
-  /** When to use it, empty when stale. */
-  when_to_use: string;
-  /** Version, 0 when stale. */
-  version: number;
-  /** The tools it names. */
-  tools: string[];
-  /** `built_in` / `custom`, empty when stale. */
-  source: string;
-  /** The attachment order. */
-  position: number;
-  /** Whether the runtime would inject it. */
-  injected: boolean;
-  /** Why not, when it would not. */
-  withheld_reason: string | null;
-  /** A stable code for the reason. */
-  withheld_code: string | null;
-  /** Whether the row's own checksum still describes its body. */
-  checksum_ok: boolean;
-};
-
-/**
- * The Skills tab payload.
- *
- * `prompt_block` is the *assembled* text the runtime would add, returned rather than
- * reconstructed: a panel that shows each skill separately can be right about all of them and
- * still display an order the runtime does not use.
- */
-export type AiAgentSkills = {
-  /** The agent. */
-  agent_id: string;
-  /** Every attachment, in runtime order. */
-  skills: AiAgentSkill[];
-  /** The prompt text, or null when nothing is injected. */
-  prompt_block: string | null;
-  /** Keys that are attached but withheld. */
-  withheld: string[];
-};
-
-/** The registry list. */
-export type AiSkillList = {
-  /** This organization's skills plus the built-ins. */
-  skills: AiSkill[];
-};
-
-/** What `POST /ai/skills/{key}/validate` answers. */
-export type AiSkillValidation = {
-  /** Whether the definition would be accepted. */
-  valid: boolean;
-  /** Every problem, in check order. */
-  problems: string[];
-  /** The digest the body currently has. */
-  checksum: string;
-  /** Whether it matched a supplied expectation. */
-  checksum_matched: boolean;
-};
-
-/** The scope query every skills route shares. */
-function skillScopeParams(organizationId?: string | null): string {
-  return organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
-}
-
-// ---- The AI tool registry (REQ-100) ------------------------------------------------------
-//
-// `ungated_high_risk` and `used_by_agents` are computed by the API on purpose. The stripe and the
-// disable confirmation are the two places this screen can quietly lie — a client that derived
-// "is this high risk and ungated" from `risk === "high" && !requires_approval` would have to
-// re-implement the disabled-wins rule to get the same answer, and one that derived the agent list
-// from its own copy of the agents table would name agents from another organization.
-
-/** One registry row. */
-export type AiTool = {
-  key: string;
-  class: string;
-  /** The single permission this tool needs. Never a list. */
-  permission: string;
-  risk: "low" | "medium" | "high";
-  description: string;
-  idempotent: boolean;
-  requires_approval: boolean;
-  enabled: boolean;
-  timeout_ms: number;
-  max_calls_per_run: number;
-  /** Set once the tool has left the compiled catalogue. */
-  retired_note: string | null;
-  /** Enabled, high risk, no approval gate — the row that gets a warning stripe. */
-  ungated_high_risk: boolean;
-  calls_30d: number;
-  /** `null` when the tool was never called, which is not the same as 0 %. */
-  error_rate_30d: number | null;
-  last_used: string | null;
-  used_by_agents: { id: string; name: string }[];
-};
-
-/** The list body. `seeded: false` renders the "seeding has not run" banner. */
-export type AiToolList = { tools: AiTool[]; seeded: boolean };
-
-/** One row of a tool's Recent calls. Arguments are never returned. */
-export type AiToolCall = {
-  id: number;
-  created_at: string;
-  agent_id: string | null;
-  agent_name: string | null;
-  run_id: string | null;
-  status: "ok" | "denied" | "failed" | "timeout" | "limited";
-  error_code: string | null;
-  duration_ms: number | null;
-  args_bytes: number | null;
-  result_bytes: number | null;
-};
-
-/** One tool with its schema, limits and recent calls. */
-export type AiToolDetail = AiTool & {
-  input_schema: unknown;
-  example: unknown;
-  /** `false` for a row whose tool has left the compiled catalogue. */
-  compiled: boolean;
-  recent_calls: AiToolCall[];
-};
-
-/** The class metadata the filters and grouping read. */
-export type AiToolClass = { key: string; label: string; order: number; default_risk: string };
-
-/** One tool's usage chart: totals plus the per-day series.
- *
- *  NOT `AiToolUsage` — REQ-099's agent telemetry already owns that name at line ~5507, and a
- *  second export under it would make the telemetry's `tools: Record<string, number>` shadow the
- *  registry's per-day series depending on import order. `AiToolUsageChart` says which of the two
- *  is meant at the call site. */
-export type AiToolUsageChart = {
-  key: string;
-  days: number;
-  calls: number;
-  errors: number;
-  error_rate: number | null;
-  avg_duration_ms: number | null;
-  series: { day: string; calls: number; errors: number; avg_duration_ms: number | null }[];
-};
-
-// ---- AI identities and the permission matrix (REQ-100 slice 2) ----------------------------
-//
-// The tri-state is a *string union*, not a boolean and not `boolean | null`. A cell that a
-// client cannot distinguish from "unset" is a cell a client will guess about, and the guess is
-// always "allow" — which for a permission matrix is the dangerous direction. The API sends
-// `"inherit"` explicitly so a toggle back to the default state is a value, not an omission.
-
-/** The three states one matrix cell can be in. Inherit writes no row. */
-export type AiGrantEffect = "allow" | "deny" | "inherit";
-
-/** One identity, as the list and the detail render it. */
-export type AiIdentity = {
-  id: string;
-  /** `null` is the platform-level identity, shared by every organization. */
-  organization_id: string | null;
-  key: string;
-  name: string;
-  description: string;
-  is_default: boolean;
-  platform_level: boolean;
-  /** Decided allow cells. Inherit is not counted: it is the absence of a decision. */
-  allowed: number;
-  denied: number;
-  agents_using: number;
-  updated_at: string;
-};
-
-/** The identity table's body. */
-export type AiIdentityList = { identities: AiIdentity[]; own: number };
-
-/** One row of the identity's grant editor — every tool, not only the decided ones. */
-export type AiIdentityToolCell = {
-  tool_key: string;
-  class: string;
-  risk: string;
-  /** The permission the tool itself needs, shown so a cell's sensitivity is legible. */
-  permission: string;
-  enabled: boolean;
-  requires_approval: boolean;
-  effect: AiGrantEffect;
-};
-
-/** One identity with its whole grant editor. */
-export type AiIdentityDetail = AiIdentity & { tools: AiIdentityToolCell[] };
-
-/** A grant map: `tool_key → effect`. Inherit is present in the map and writes no row. */
-export type AiIdentityGrants = { grants: Record<string, AiGrantEffect> };
-
-/** One row of the matrix. */
-export type AiMatrixTool = {
-  key: string;
-  class: string;
-  risk: string;
-  description: string;
-  permission: string;
-  enabled: boolean;
-  requires_approval: boolean;
-  ungated_high_risk: boolean;
-};
-
-/** One agent's column. A tool absent from `tools` is "not in the agent's list". */
-export type AiMatrixAgentColumn = {
-  id: string;
-  key: string;
-  name: string;
-  enabled: boolean;
-  tools: string[];
-  approvals: string[];
-};
-
-/** One identity's column — the cells that actually carry a real tri-state. */
-export type AiMatrixIdentityColumn = {
-  id: string;
-  key: string;
-  name: string;
-  is_default: boolean;
-  platform_level: boolean;
-  /** Decided cells only; anything else is inherit. */
-  grants: Record<string, AiGrantEffect>;
-};
-
-/** The whole grid, with the viewer's own permissions so disabled cells can be explained. */
-export type AiPermissionMatrix = {
-  tools: AiMatrixTool[];
-  agents: AiMatrixAgentColumn[];
-  identities: AiMatrixIdentityColumn[];
-  /** The tool permissions the caller holds. */
-  viewer_permissions: string[];
-  /** `tool_key → the permissions the caller is missing`, named so the cell can say which. */
-  viewer_missing: Record<string, string[]>;
-};
-
-/** The identities table. */
-export function fetchAiIdentities(
-  organizationId?: string | null,
-): Promise<AiIdentityList> {
-  return request<AiIdentityList>(
-    `/api/v1/ai/identities${toolScopeParams(organizationId)}`,
-  );
-}
-
-/** One identity with its whole grant editor. */
-export function fetchAiIdentity(
-  id: string,
-  organizationId?: string | null,
-): Promise<AiIdentityDetail> {
-  return request<AiIdentityDetail>(
-    `/api/v1/ai/identities/${encodeURIComponent(id)}${toolScopeParams(organizationId)}`,
-  );
-}
-
-/** Create an identity. */
-export function createAiIdentity(
-  body: { key: string; name: string; description?: string; is_default?: boolean },
-  organizationId?: string | null,
-): Promise<AiIdentity> {
-  return request<AiIdentity>(`/api/v1/ai/identities${toolScopeParams(organizationId)}`, {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
-}
-
-/** Rename, re-describe or promote an identity. An absent field is left as it is. */
-export function updateAiIdentity(
-  id: string,
-  changes: { name?: string; description?: string; is_default?: boolean },
-  organizationId?: string | null,
-): Promise<AiIdentity> {
-  return request<AiIdentity>(
-    `/api/v1/ai/identities/${encodeURIComponent(id)}${toolScopeParams(organizationId)}`,
-    { method: "PATCH", body: JSON.stringify(changes) },
-  );
-}
-
-/** Remove an identity and, with it, its grants. */
-export function deleteAiIdentity(
-  id: string,
-  organizationId?: string | null,
-): Promise<void> {
-  return request<void>(
-    `/api/v1/ai/identities/${encodeURIComponent(id)}${toolScopeParams(organizationId)}`,
-    { method: "DELETE" },
-  );
-}
-
-/** One identity's decided grants. */
-export function fetchAiIdentityGrants(
-  id: string,
-  organizationId?: string | null,
-): Promise<AiIdentityGrants> {
-  return request<AiIdentityGrants>(
-    `/api/v1/ai/identities/${encodeURIComponent(id)}/tools${toolScopeParams(organizationId)}`,
-  );
-}
-
-/** Replace one identity's whole grant map. Inherit in the map writes no row. */
-export function saveAiIdentityGrants(
-  id: string,
-  grants: Record<string, AiGrantEffect>,
-  organizationId?: string | null,
-): Promise<AiIdentityGrants> {
-  return request<AiIdentityGrants>(
-    `/api/v1/ai/identities/${encodeURIComponent(id)}/tools${toolScopeParams(organizationId)}`,
-    { method: "PUT", body: JSON.stringify({ grants }) },
-  );
-}
-
-/** The full tool × (agents, identities) grid. */
-export function fetchAiPermissionMatrix(
-  organizationId?: string | null,
-): Promise<AiPermissionMatrix> {
-  return request<AiPermissionMatrix>(
-    `/api/v1/ai/permissions/matrix${toolScopeParams(organizationId)}`,
-  );
-}
-
-
-function toolScopeParams(organizationId?: string | null): string {
-  return organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
-}
-
-/** The registry, with every filter the spec's table lists. */
-export function fetchAiTools(options?: {
-  organizationId?: string | null;
-  q?: string;
-  class?: string;
-  risk?: string;
-  gated?: boolean;
-  enabled?: boolean;
-}): Promise<AiToolList> {
-  const params = new URLSearchParams();
-  if (options?.organizationId) params.set("organization_id", options.organizationId);
-  if (options?.q) params.set("q", options.q);
-  if (options?.class) params.set("class", options.class);
-  if (options?.risk) params.set("risk", options.risk);
-  if (options?.gated !== undefined) params.set("gated", String(options.gated));
-  if (options?.enabled !== undefined) params.set("enabled", String(options.enabled));
-  const query = params.toString();
-  return request<AiToolList>(`/api/v1/ai/tools${query ? `?${query}` : ""}`);
-}
-
-/** One tool. */
-export function fetchAiTool(
-  key: string,
-  organizationId?: string | null,
-): Promise<AiToolDetail> {
-  return request<AiToolDetail>(
-    `/api/v1/ai/tools/${encodeURIComponent(key)}${toolScopeParams(organizationId)}`,
-  );
-}
-
-/** The class list, for the filter chips and the grouping order. */
-export function fetchAiToolClasses(organizationId?: string | null): Promise<AiToolClass[]> {
-  return request<AiToolClass[]>(
-    `/api/v1/ai/tools/classes${toolScopeParams(organizationId)}`,
-  );
-}
-
-/** The four operator-owned decisions. An absent field is left as it is. */
-export async function updateAiTool(
-  key: string,
-  changes: {
-    enabled?: boolean;
-    requires_approval?: boolean;
-    timeout_ms?: number;
-    max_calls_per_run?: number;
-  },
-  organizationId?: string | null,
-): Promise<AiTool> {
-  return request<AiTool>(`/api/v1/ai/tools/${encodeURIComponent(key)}${toolScopeParams(organizationId)}`, {
-    method: "PATCH",
-    body: JSON.stringify(changes),
-  });
-}
-
-/** One tool's usage chart over a window.
- *
- *  NOT `fetchAiToolUsage` — REQ-099's agent telemetry already exports that name for the
- *  tenant-wide `{ since, tools: Record<string, number> }` shape. Two exports under one name in a
- *  6700-line module is a duplicate-implementation error, and the *right* fix is the more specific
- *  name rather than renaming the one three other files already import. */
-export function fetchAiToolUsageChart(
-  key: string,
-  options?: { organizationId?: string | null; days?: number },
-): Promise<AiToolUsageChart> {
-  const params = new URLSearchParams();
-  if (options?.organizationId) params.set("organization_id", options.organizationId);
-  if (options?.days) params.set("days", String(options.days));
-  const query = params.toString();
-  return request<AiToolUsageChart>(
-    `/api/v1/ai/tools/${encodeURIComponent(key)}/usage${query ? `?${query}` : ""}`,
-  );
-}
-
-/** The registry, optionally filtered to the rows that are enabled. */
-export function fetchAiSkills(options?: {
-  organizationId?: string | null;
-  enabledOnly?: boolean;
-}): Promise<AiSkillList> {
-  const params = new URLSearchParams();
-  if (options?.organizationId) params.set("organization_id", options.organizationId);
-  if (options?.enabledOnly) params.set("enabled_only", "true");
-  const query = params.toString();
-  return request<AiSkillList>(`/api/v1/ai/skills${query ? `?${query}` : ""}`);
-}
-
-/** One definition. */
-export function fetchAiSkill(
-  key: string,
-  organizationId?: string | null,
-): Promise<AiSkill> {
-  return request<AiSkill>(
-    `/api/v1/ai/skills/${encodeURIComponent(key)}${skillScopeParams(organizationId)}`,
-  );
-}
-
-/** Register a custom definition. */
-export async function createAiSkill(input: {
-  key: string;
-  name: string;
-  description?: string;
-  when_to_use?: string;
-  instructions: string;
-  tools?: string[];
-  enabled?: boolean;
-  organizationId?: string | null;
-}): Promise<AiSkill> {
-  return request<AiSkill>("/api/v1/ai/skills", {
-    method: "POST",
-    body: JSON.stringify({
-      key: input.key,
-      name: input.name,
-      description: input.description ?? "",
-      when_to_use: input.when_to_use ?? "",
-      instructions: input.instructions,
-      tools: input.tools ?? [],
-      enabled: input.enabled ?? true,
-    }),
-  });
-}
-
-/** Change a definition, or enable/disable a built-in. */
-export async function updateAiSkill(
-  key: string,
-  changes: {
-    name?: string;
-    description?: string;
-    when_to_use?: string;
-    instructions?: string;
-    tools?: string[];
-    version?: number;
-    enabled?: boolean;
-  },
-  organizationId?: string | null,
-): Promise<AiSkill> {
-  return request<AiSkill>(`/api/v1/ai/skills/${encodeURIComponent(key)}${skillScopeParams(organizationId)}`, {
-    method: "PATCH",
-    body: JSON.stringify(changes),
-  });
-}
-
-/** Remove a custom skill. A built-in answers 403. */
-export async function deleteAiSkill(
-  key: string,
-  organizationId?: string | null,
-): Promise<void> {
-  await request<null>(
-    `/api/v1/ai/skills/${encodeURIComponent(key)}${skillScopeParams(organizationId)}`,
-    { method: "DELETE" },
-  );
-}
-
-/** "Would this definition be accepted?" — writes nothing. */
-export function validateAiSkill(
-  key: string,
-  draft: {
-    name?: string;
-    description?: string;
-    when_to_use?: string;
-    instructions?: string;
-    tools?: string[];
-    expected_checksum?: string | null;
-  },
-  organizationId?: string | null,
-): Promise<AiSkillValidation> {
-  return request<AiSkillValidation>(
-    `/api/v1/ai/skills/${encodeURIComponent(key)}/validate${skillScopeParams(organizationId)}`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        key,
-        name: draft.name ?? "",
-        description: draft.description ?? "",
-        when_to_use: draft.when_to_use ?? "",
-        instructions: draft.instructions ?? "",
-        tools: draft.tools ?? [],
-        expected_checksum: draft.expected_checksum ?? null,
-      }),
-    },
-  );
-}
-
-/** The Skills tab payload for one agent. */
-export function fetchAiAgentSkills(
-  agentId: string,
-  organizationId?: string | null,
-): Promise<AiAgentSkills> {
-  return request<AiAgentSkills>(
-    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills${skillScopeParams(organizationId)}`,
-  );
-}
-
-/**
- * Attach one skill.
- *
- * The response reports `tools_not_in_agent`: the skill names a tool this agent cannot call. That
- * is a *warning*, not a refusal — the operator may be about to grant it — but it has to be
- * sayable out loud, because the alternative is a run that mysteriously ignores half its
- * instructions.
- */
-export function attachAiAgentSkill(
-  agentId: string,
-  skillKey: string,
-  organizationId?: string | null,
-): Promise<{ skill: AiAgentSkill; tools_not_in_agent: string[] }> {
-  return request<{ skill: AiAgentSkill; tools_not_in_agent: string[] }>(
-    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills${skillScopeParams(organizationId)}`,
-    { method: "POST", body: JSON.stringify({ skill_key: skillKey }) },
-  );
-}
-
-/** Replace the whole order — a drag produces a list, so the whole list goes. */
-export function setAiAgentSkills(
-  agentId: string,
-  skills: string[],
-  organizationId?: string | null,
-): Promise<AiAgentSkills> {
-  return request<AiAgentSkills>(
-    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills${skillScopeParams(organizationId)}`,
-    { method: "PUT", body: JSON.stringify({ skills }) },
-  );
-}
-
-/** Detach one skill. */
-export async function detachAiAgentSkill(
-  agentId: string,
-  skillKey: string,
-  organizationId?: string | null,
-): Promise<void> {
-  await request<null>(
-    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/skills/${encodeURIComponent(skillKey)}${skillScopeParams(organizationId)}`,
-    { method: "DELETE" },
-  );
-}
 
 /* ---------------------------------------------------------------------------------------------
  * Backups (REQ-013)
@@ -8069,6 +6914,426 @@ export function deleteHealthMaintenanceWindow(id: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The deployment centre (REQ-024, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The build metadata, also read by the shell footer.
+ *
+ * Answers even when the release feed is down and the cache is empty, because a footer that
+ * fails when a publisher's CDN wobbles is worse than a footer that shows a version and says
+ * nothing about updates.
+ */
+export async function fetchDeploymentVersion(): Promise<{ version: DeploymentVersion }> {
+  return request<{ version: DeploymentVersion }>("/api/v1/deployment/version");
+}
+
+/** The environment cards, with the version block they were computed from. */
+export async function fetchDeploymentEnvironments(): Promise<DeploymentEnvironmentsResponse> {
+  return request<DeploymentEnvironmentsResponse>("/api/v1/deployment/environments");
+}
+
+/** One card with its recent history. */
+export async function fetchDeploymentEnvironment(
+  environment: string,
+): Promise<DeploymentEnvironmentDetail> {
+  return request<DeploymentEnvironmentDetail>(
+    `/api/v1/deployment/environments/${encodeURIComponent(environment)}`,
+  );
+}
+
+/** The release browser for a channel. */
+export async function fetchDeploymentReleases(filters: {
+  channel?: string;
+  limit?: number;
+} = {}): Promise<DeploymentReleasesResponse> {
+  const query = new URLSearchParams();
+  if (filters.channel) query.set("channel", filters.channel);
+  if (filters.limit) query.set("limit", String(filters.limit));
+  const suffix = query.toString();
+  return request<DeploymentReleasesResponse>(
+    `/api/v1/deployment/releases${suffix ? `?${suffix}` : ""}`,
+  );
+}
+
+/** `View Changes`: one release with the version block beside it. */
+export async function fetchDeploymentRelease(
+  version: string,
+  channel?: string,
+): Promise<DeploymentReleaseDetail> {
+  const query = channel ? `?channel=${encodeURIComponent(channel)}` : "";
+  return request<DeploymentReleaseDetail>(
+    `/api/v1/deployment/releases/${encodeURIComponent(version)}${query}`,
+  );
+}
+
+/** The deploy / rollback / restart history, with the applied filter echoed back. */
+export async function fetchDeploymentHistory(
+  filters: DeploymentHistoryFilters = {},
+): Promise<DeploymentHistoryResponse> {
+  const query = new URLSearchParams();
+  if (filters.environment) query.set("environment", filters.environment);
+  if (filters.kind) query.set("kind", filters.kind);
+  if (filters.status) query.set("status", filters.status);
+  if (filters.window) query.set("window", filters.window);
+  if (filters.limit) query.set("limit", String(filters.limit));
+  if (filters.offset) query.set("offset", String(filters.offset));
+  const suffix = query.toString();
+  return request<DeploymentHistoryResponse>(
+    `/api/v1/deployment/history${suffix ? `?${suffix}` : ""}`,
+  );
+}
+
+/** The update check's own state: last run, next run, what it announced. */
+export async function fetchDeploymentChecks(): Promise<DeploymentChecksResponse> {
+  return request<DeploymentChecksResponse>("/api/v1/deployment/checks");
+}
+
+/**
+ * Run an update check now, and wait for it.
+ *
+ * Synchronous on the wire on purpose: an operator presses this immediately before a deploy and
+ * needs the answer before the wizard's pre-flight, not a spinner and a re-poll. The response
+ * carries *this* run's result, never the previous run's.
+ */
+/* ── REQ-024 slice 2: the deploy wizard ───────────────────────────────────────────────────── */
+
+/** Run the pre-flight for a target version. Recomputed server-side on every call. */
+export async function runDeploymentPreflight(
+  environment: string,
+  toVersion: string,
+): Promise<DeploymentPreflight> {
+  return request<DeploymentPreflight>(
+    `/api/v1/deployment/environments/${encodeURIComponent(environment)}/preflight`,
+    { method: "POST", body: JSON.stringify({ to_version: toVersion }) },
+  );
+}
+
+/** Start a deploy. Production additionally requires the typed version. */
+export async function startDeployment(input: {
+  environment: string;
+  toVersion: string;
+  confirmVersion?: string;
+  backupFirst?: boolean;
+  preflightToken?: string;
+  acknowledged?: boolean;
+}): Promise<DeploymentJobResponse> {
+  return request<DeploymentJobResponse>(
+    `/api/v1/deployment/environments/${encodeURIComponent(input.environment)}/deploy`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        to_version: input.toVersion,
+        confirm_version: input.confirmVersion ?? null,
+        // The server defaults this to true; sending it explicitly means the panel's checkbox and
+        // the request cannot drift apart.
+        backup_first: input.backupFirst ?? true,
+        preflight_token: input.preflightToken ?? null,
+        acknowledged: input.acknowledged ?? false,
+      }),
+    },
+  );
+}
+
+/** One poll of a running job. */
+export async function fetchDeploymentJob(id: string): Promise<DeploymentJobResponse> {
+  return request<DeploymentJobResponse>(`/api/v1/deployment/jobs/${encodeURIComponent(id)}`);
+}
+
+/** The log since a cursor. The polling fallback for a browser that cannot hold an SSE open. */
+export async function fetchDeploymentLog(
+  id: string,
+  cursor: number,
+): Promise<DeploymentLogChunk> {
+  return request<DeploymentLogChunk>(
+    `/api/v1/deployment/jobs/${encodeURIComponent(id)}/log?cursor=${cursor}`,
+  );
+}
+
+/** Stop a job before its migrate step. */
+export async function cancelDeployment(id: string): Promise<DeploymentCancelResponse> {
+  return request<DeploymentCancelResponse>(
+    `/api/v1/deployment/jobs/${encodeURIComponent(id)}/cancel`,
+    { method: "POST" },
+  );
+}
+
+export async function runDeploymentCheck(): Promise<DeploymentCheckRunResponse> {
+  return request<DeploymentCheckRunResponse>("/api/v1/deployment/checks/run", { method: "POST" });
+}
+
+/**
+ * Start a rollback to a previous version (REQ-024, slice 3).
+ *
+ * `reason` is not optional in the type, and that is the point: the server refuses an empty one
+ * and the `0211` constraint refuses the row, so a form that lets an operator submit a blank
+ * reason has a button that always fails.
+ */
+export async function startDeploymentRollback(input: {
+  environment: string;
+  toVersion: string;
+  reason: string;
+  backupFirst?: boolean;
+}): Promise<DeploymentRollbackResponse> {
+  return request<DeploymentRollbackResponse>(
+    `/api/v1/deployment/environments/${encodeURIComponent(input.environment)}/rollback`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        to_version: input.toVersion,
+        reason: input.reason,
+        // Sent explicitly so the panel's checkbox and the request cannot drift; the server's own
+        // default is also `true`, because the dangerous default is the one with no way back.
+        backup_first: input.backupFirst ?? true,
+      }),
+    },
+  );
+}
+
+/** Every environment's maintenance window. Polled by the screen and by the shell banner. */
+export async function fetchDeploymentMaintenance(): Promise<DeploymentMaintenanceResponse> {
+  return request<DeploymentMaintenanceResponse>("/api/v1/deployment/maintenance");
+}
+
+/**
+ * Save one environment's window.
+ *
+ * `scope` and the timestamps are sent as `null` when unset rather than omitted: the server
+ * treats a missing scope as "keep the stored one", and a form that omitted it would silently
+ * keep an old value the operator thought they had changed.
+ */
+export async function saveDeploymentMaintenance(input: {
+  environment: string;
+  enabled: boolean;
+  message: string;
+  startsAt?: string | null;
+  endsAt?: string | null;
+  scope?: string | null;
+}): Promise<DeploymentMaintenanceWindow> {
+  return request<DeploymentMaintenanceWindow>(
+    `/api/v1/deployment/maintenance/${encodeURIComponent(input.environment)}`,
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        enabled: input.enabled,
+        message: input.message,
+        starts_at: input.startsAt ?? null,
+        ends_at: input.endsAt ?? null,
+        scope: input.scope ?? null,
+      }),
+    },
+  );
+}
+
+/** ---------------------------------------------------------------------------------------------
+ * The cluster panel (REQ-024, slice 4).
+ *
+ * The read refuses with a `404` carrying a payload on a single instance rather than answering an
+ * empty cluster, so the caller has to handle the refusal: `fetchDeploymentCluster` returns the
+ * discriminated union instead of throwing, because a 404 here is the normal answer for a single
+ * VPS and a screen that renders an error state for it is wrong on most installations.
+ * ------------------------------------------------------------------------------------------- */
+
+/** The cluster read, or the single-instance card. Never throws for "not a cluster". */
+export async function fetchDeploymentCluster(
+  environment: string,
+): Promise<DeploymentClusterResponse | DeploymentProcessCard> {
+  try {
+    return await request<DeploymentClusterResponse>("/api/v1/deployment/cluster");
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      // The server names which of the three cases it is; showing the operator a generic
+      // "not found" for a cluster whose token is missing sends them looking for the wrong thing.
+      return {
+        runtime: "single",
+        process: null,
+        reason: error.message,
+      };
+    }
+    throw error;
+  }
+}
+
+/** One workload's sample series, for the sparkline. */
+export async function fetchClusterSamples(
+  environment: string,
+  workload: string,
+): Promise<ClusterSamplesResponse> {
+  return request<ClusterSamplesResponse>(
+    `/api/v1/deployment/cluster/${encodeURIComponent(environment)}/samples/${encodeURIComponent(workload)}`,
+  );
+}
+
+/** Restart a workload. `confirm` is required in production and is the workload's name. */
+export async function restartClusterWorkload(input: {
+  environment: string;
+  workload: string;
+  confirm?: string;
+  reason?: string;
+}): Promise<ClusterRestartResponse> {
+  return request<ClusterRestartResponse>(
+    `/api/v1/deployment/cluster/${encodeURIComponent(input.environment)}/restart`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        workload: input.workload,
+        confirm: input.confirm ?? "",
+        reason: input.reason ?? null,
+      }),
+    },
+  );
+}
+
+/** Sample now and prune, so the "sample" button is not a dead control. */
+export async function runClusterSample(environment: string): Promise<ClusterSampleRunResponse> {
+  return request<ClusterSampleRunResponse>(
+    `/api/v1/deployment/cluster/${encodeURIComponent(environment)}/sample`,
+    { method: "POST" },
+  );
+}
+
+// The developer platform (REQ-033, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * List the organization's API keys.
+ *
+ * The return type is `ApiKeysResponse` rather than `ApiKey[]` because the API answers an object:
+ * a bare array is the shape you cannot add a summary to later without changing every client's
+ * type on the day you do.
+ */
+export async function fetchApiKeys(): Promise<ApiKeysResponse> {
+  return request("/api/v1/api-keys");
+}
+
+/**
+ * One key and its daily usage, in one round trip.
+ *
+ * `days` is bounded by the API (1–365) so a client cannot ask for a decade of bars and get a
+ * thousand-point chart nobody reads.
+ */
+export async function fetchApiKey(keyId: string, days = 30): Promise<ApiKeyDetail> {
+  return request(`/api/v1/api-keys/${encodeURIComponent(keyId)}?days=${days}`);
+}
+
+/** What `POST /api/v1/api-keys` accepts. */
+export type CreateApiKeyInput = {
+  name: string;
+  scopes: string[];
+  environment: "live" | "sandbox";
+  rate_tier?: "standard" | "high";
+  /** CIDR blocks. Omit the field entirely for "any source" — an empty array means the same. */
+  ip_allowlist?: string[];
+  /** 30, 90, 365, or omit for "never". */
+  expires_in_days?: number;
+};
+
+/**
+ * Mint a key. The response carries `secret` and this is the only time it will.
+ *
+ * The caller is responsible for showing it once and then discarding it — there is no endpoint
+ * to fetch it again, which is the point.
+ */
+export async function createApiKey(input: CreateApiKeyInput): Promise<MintedApiKey> {
+  return request("/api/v1/api-keys", { method: "POST", body: JSON.stringify(input) });
+}
+
+/**
+ * Rotate a key: a new secret, the old one dead immediately.
+ *
+ * No overlap window, and the panel says so — see the REQ-033 slice-1 note on why rotation and
+ * the OAuth client-secret rotation (slice 3, which *does* overlap) are different operations.
+ */
+export async function rotateApiKey(keyId: string): Promise<MintedApiKey> {
+  return request(`/api/v1/api-keys/${encodeURIComponent(keyId)}/rotate`, { method: "POST" });
+}
+
+/** Revoke a key. The row and its history stay; the credential stops working. */
+export async function revokeApiKey(keyId: string): Promise<void> {
+  await request(`/api/v1/api-keys/${encodeURIComponent(keyId)}`, { method: "DELETE" });
+}
+
+/** The filters `GET /api/v1/request-logs` accepts. Every one is optional. */
+export type RequestLogFilters = {
+  api_key_id?: string;
+  /** By public prefix — what a key row's "View logs" link uses. */
+  key_prefix?: string;
+  status?: number;
+  status_class?: "2xx" | "3xx" | "4xx" | "5xx";
+  path_prefix?: string;
+  method?: string;
+  /** How far back. The API defaults to 24 hours when this is omitted. */
+  since_hours?: number;
+  min_duration_ms?: number;
+  limit?: number;
+  offset?: number;
+};
+
+/**
+ * Build the log query string.
+ *
+ * Empty values are *omitted* rather than sent blank: `?status_class=` would arrive as an empty
+ * string, fail the API's closed-list validation with a 400, and read as "the filter is broken"
+ * rather than "the filter is not set".
+ */
+export function requestLogQuery(filters: RequestLogFilters): string {
+  const params = new URLSearchParams();
+  for (const [name, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+    params.set(name, String(value));
+  }
+  const query = params.toString();
+  return query.length > 0 ? `?${query}` : "";
+}
+
+/**
+ * A filtered page of the request log.
+ *
+ * Metadata only. There is no body to return, so the absence of payload data is the schema
+ * rather than a redaction somebody has to remember to apply.
+ */
+export async function fetchRequestLogs(
+  filters: RequestLogFilters = {},
+): Promise<ApiRequestLogPage> {
+  return request(`/api/v1/request-logs${requestLogQuery(filters)}`);
+}
+
+/** One request's metadata — what the log row's drawer opens. */
+export async function fetchRequestLog(id: number): Promise<ApiRequestLog> {
+  return request(`/api/v1/request-logs/${encodeURIComponent(String(id))}`);
+}
+
+
+// The API Explorer (REQ-033, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The operations this caller may see, for the browser's left column.
+ *
+ * A separate call from the OpenAPI document rather than a query flag on it: the document is a
+ * standard that a code generator consumes, and an extension to its top level would break one.
+ * The filtered list is the platform's own shape for its own UI.
+ */
+export async function fetchExplorerOperations(): Promise<ExplorerOperations> {
+  return request("/api/v1/dev/operations");
+}
+
+/**
+ * Send one call as the signed-in caller.
+ *
+ * The API refuses this route when the caller's own permissions would refuse the call it is
+ * asked to make, so a `403` here is the same `403` the same person would get from their
+ * terminal — which is the whole reason the Explorer is useful rather than dangerous.
+ */
+export async function runExplorerRequest(input: ExplorerRunInput): Promise<ExplorerRun> {
+  return request("/api/v1/dev/explorer/requests", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 // Developer portal (REQ-022, slice 2)
 // ---------------------------------------------------------------------------------------------
 //
@@ -8113,6 +7378,176 @@ export function createDeveloperKey(
   return request<IssuedDeveloperKey>("/api/v1/developer/api-keys", {
     method: "POST",
     body: JSON.stringify(input),
+  });
+}
+
+/**
+ * The served OpenAPI document, for a developer who wants to point a generator at it.
+ *
+ * Nothing in the panel calls this — the panel's browser uses {@link fetchExplorerOperations},
+ * which is permission-filtered. It is here because "download the OpenAPI document" is a thing
+ * somebody will want to do, and a reference that can only be seen through a UI is a reference
+ * that cannot be scripted against.
+ */
+export async function fetchOpenApiDocument(): Promise<Record<string, unknown>> {
+  return request("/api/v1/dev/openapi.json");
+}
+
+/**
+ * OAuth applications (REQ-033, slice 3). The panel's side of the OAuth story.
+ *
+ * These six functions wrap the six panel routes in `apps/api/src/routes/developer_oauth.rs`.
+ * The four *sessionless* endpoints — authorize, consent POST, token and introspect — are
+ * deliberately absent here: they take no session and are reached by a third-party client, so
+ * putting them in the panel's `request()` helper would put them behind the caller's cookie and
+ * make them look like panel routes.
+ */
+
+/** `GET /api/v1/oauth-apps`. */
+export async function fetchOAuthApps(): Promise<OAuthAppsResponse> {
+  return request("/api/v1/oauth-apps");
+}
+
+/**
+ * `GET /api/v1/oauth-apps/{id}` — one app and its live authorization-code count.
+ *
+ * The id is encoded: it is a UUID the panel read from the list, but the helper does not assume
+ * a caller passed something it produced.
+ */
+export async function fetchOAuthApp(appId: string): Promise<OAuthAppDetailResponse> {
+  return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}`);
+}
+
+/** Body of `POST /api/v1/oauth-apps`. `grant_types` omitted means the browser flow alone. */
+export type CreateOAuthAppInput = {
+  name: string;
+  description?: string;
+  logo_object_key?: string;
+  redirect_uris: string[];
+  scopes: string[];
+  grant_types?: OAuthGrant[];
+};
+
+/** Register an app. The secret is in this response and nowhere else, ever. */
+export async function createOAuthApp(input: CreateOAuthAppInput): Promise<MintedOAuthApp> {
+  return request("/api/v1/oauth-apps", { method: "POST", body: JSON.stringify(input) });
+}
+
+/**
+ * `PATCH /api/v1/oauth-apps/{id}` — a partial edit.
+ *
+ * A `PATCH` rather than a `PUT` because the panel's form submits the record it read, and a `PUT`
+ * means "this is now the whole resource" — so editing one description would blank the redirect
+ * URIs. `description` and `logo_object_key` take `null` to *clear*, which is why they are
+ * `string | null` rather than absent.
+ */
+export async function editOAuthApp(
+  appId: string,
+  input: {
+    name?: string;
+    description?: string | null;
+    logo_object_key?: string | null;
+    redirect_uris?: string[];
+    scopes?: string[];
+    grant_types?: OAuthGrant[];
+  },
+): Promise<OAuthAppDetailResponse> {
+  return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * `POST /api/v1/oauth-apps/{id}/rotate` — a new client secret, and a 7-day overlap for the old
+ * one.
+ *
+ * The overlap is the difference from an API key rotation, which has none: a client secret is
+ * usually deployed to more machines than anybody is tracking, so the panel says how long the old
+ * one keeps working rather than pretending the switch is instantaneous.
+ */
+export async function rotateOAuthAppSecret(appId: string): Promise<MintedOAuthApp> {
+  return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}/rotate`, { method: "POST" });
+}
+
+/**
+ * `DELETE /api/v1/oauth-apps/{id}` — withdraw.
+ *
+ * Idempotent, and it does not delete the row: its codes and its audit trail reference it, and
+ * "show me what this integration did last March" has to keep working.
+ */
+export async function withdrawOAuthApp(appId: string): Promise<void> {
+  await request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}`, { method: "DELETE" });
+}
+
+/**
+ * `POST /api/v1/oauth-apps/{id}/suspend` — switch an app off and back on without withdrawing it.
+ *
+ * Two verbs rather than a `PATCH` with a status, because the two are not symmetric: suspending is
+ * reversible and safe, withdrawing is neither.
+ */
+export async function setOAuthAppSuspended(
+  appId: string,
+  suspended: boolean,
+): Promise<OAuthAppDetailResponse> {
+  return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}/suspend`, {
+    method: "POST",
+    body: JSON.stringify({ suspended }),
+  });
+}
+
+// The edge region registry (REQ-035, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The registry, the health matrix and the latency matrix, in one read.
+ *
+ * One request rather than three, and the reason is specific rather than tidy: the list screen
+ * renders all three, so three fetches mean three independent paint states AND three moments
+ * in time. On a deployment that is actively changing, the region table and the health badges
+ * disagree for as long as the slowest request takes -- and the disagreement looks like a bug in
+ * the panel rather than a race between two reads of the same instant.
+ */
+export async function fetchRegions(): Promise<RegionOverview> {
+  return request<RegionOverview>("/api/v1/regions");
+}
+
+/**
+ * One region, for the detail screen.
+ *
+ * A separate call rather than a filter of the overview, because the detail screen shows the
+ * region's own row and column of the latency matrix — which the overview carries anyway, but a
+ * deep link from a search result should not have to load every region to render one.
+ */
+export async function fetchRegion(code: string): Promise<RegionDetail> {
+  return request<RegionDetail>(`/api/v1/regions/${encodeURIComponent(code)}`);
+}
+
+/** The health matrix on its own, for the health checker's own polling. */
+export async function fetchRegionHealth(): Promise<RegionHealthMatrix> {
+  return request<RegionHealthMatrix>("/api/v1/regions/health");
+}
+
+/** The region-to-region latency matrix on its own. */
+export async function fetchRegionLatency(): Promise<RegionLatencyMatrix> {
+  return request<RegionLatencyMatrix>("/api/v1/regions/latency-matrix");
+}
+
+/**
+ * Rename a region, set its status, activate it, or move the routing default.
+ *
+ * `PATCH` rather than `PUT` and never a form-encoded body: the two endpoints are nullable, and
+ * a `PUT` that means "replace the whole document" cannot express "clear the admin host, leave
+ * the web host alone" without also resending every other field — which is how a concurrent
+ * editor loses a change.
+ */
+export async function patchRegion(
+  code: string,
+  patch: RegionPatchInput,
+): Promise<RegionPatchResponse> {
+  return request<RegionPatchResponse>(`/api/v1/regions/${encodeURIComponent(code)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
   });
 }
 

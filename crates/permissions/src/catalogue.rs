@@ -6,7 +6,7 @@
 //! outside the catalogue is a bug, and the store rejects it.
 //!
 //! Categories group the keys for the admin UI (`content`, `media`, `users`, `plugins`,
-//! `deployment`, `iam`, `audit`, `tenancy`, `webhooks`, `events`).
+//! `deployment`, `developer`, `iam`, `audit`, `tenancy`, `webhooks`, `events`).
 
 /// A single permission the platform understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,231 +120,10 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "ai",
         description: "Connect and configure AI providers",
     },
-    // REQ-098: reading the registry and rewriting the task map are *different* powers. An
-    // operator who may look at what a request cost may not get to decide which model serves it,
-    // and one who may decide may not read the bill. Splitting them is what makes the audit trail
-    // for a routing change attributable to somebody.
-    PermissionDef {
-        key: "ai.settings.manage",
-        category: "ai",
-        description: "Rewrite task routes and per-feature model overrides",
-    },
-    // REQ-104 will own the cost screens; the key lands here because the catalog's own usage
-    // counts and the price columns read the same store, and a permission added in whichever
-    // request ships second is a migration that has to be backdated.
-    PermissionDef {
-        key: "ai.usage.read",
-        category: "ai",
-        description: "Read AI usage, cost and routing decision logs",
-    },
     PermissionDef {
         key: "ai.chat",
         category: "ai",
         description: "Use the platform's AI chat",
-    },
-    // The agent runtime (REQ-099). Three keys, and the split is the point: reading an agent is
-    // knowing how the installation's AI is configured, changing one is a write, and *running* one
-    // spends the installation's money and acts on its behalf through tools. An operator who can
-    // see a system prompt is not automatically somebody who should be able to press Run.
-    PermissionDef {
-        key: "ai.agents.read",
-        category: "ai",
-        description: "Read agents and their run history",
-    },
-    PermissionDef {
-        key: "ai.agents.manage",
-        category: "ai",
-        description: "Create, change and remove agents",
-    },
-    PermissionDef {
-        key: "ai.agents.run",
-        category: "ai",
-        description: "Start, cancel and resume agent runs",
-    },
-    // The skills registry (REQ-099, slice 3). The same read/write split as agents, and the
-    // reason is sharper here: a skill is *text that lands in a prompt*. Reading the registry
-    // shows an operator what guidance exists; writing one changes what every run of every
-    // attached agent is told. `ai.skills.manage` is therefore the key to review when an
-    // installation asks "who can change what the models are told".
-    PermissionDef {
-        key: "ai.skills.read",
-        category: "ai",
-        description: "Read the skills registry and agent attachments",
-    },
-    PermissionDef {
-        key: "ai.skills.manage",
-        category: "ai",
-        description: "Create, edit, enable and attach skills",
-    },
-    // The tool registry (REQ-100 slice 1). The read/write split is sharper than it looks: reading
-    // the registry shows *what the installation's AI is able to do and under which permission*,
-    // which is already a map of the platform's own capabilities, while `ai.tools.manage` is the
-    // power to change what a model will be permitted to do — the switch that un-gates
-    // `deployment.deploy` or raises a timeout. `ai.tools.manage` is therefore the key an
-    // installation reviews when it asks "who can widen what the agents may touch".
-    // Local endpoints (REQ-106 slice 1). Two keys and one sharp edge: `ai.local.read` shows
-    // which providers are local, how they were classified and what they serve — the same
-    // knowledge as the provider list, and the badge a screen needs to answer "does anything leave
-    // this machine?". `ai.local.manage` is the power to *point the platform's AI at a host on an
-    // operator's own network*, which changes where a tenant's prompts physically go; that is a
-    // different act from reading, so it is a different key.
-    //
-    // `ai.airgap.manage` (slice 2) is deliberately NOT a third name in this family: turning the
-    // air gap on strands every remote feature at once, and it is the switch an auditor looks for
-    // by name. It is added with that slice rather than declared empty here, because a catalogue
-    // entry with no route behind it is a promise the platform cannot keep.
-    PermissionDef {
-        key: "ai.local.read",
-        category: "ai",
-        description: "Read local AI endpoints, their locality and the models they serve",
-    },
-    PermissionDef {
-        key: "ai.local.manage",
-        category: "ai",
-        description: "Register local AI endpoints and manage the models they serve",
-    },
-    // REQ-106 slice 2's own key, kept out of the `ai.local.*` family on purpose. Reading the
-    // switch is `ai.local.read`, because the question it answers ("does anything leave this
-    // machine?") is the same one the locality badges answer. FLIPPING it is a different act by
-    // any measure: turning the gap on strands every remote feature at once, and an installation
-    // that lets a support lead see the switch while only an owner moves it is the common and
-    // correct shape. It is also the name an auditor looks up, which is why it exists as its own
-    // key rather than as a flag on `ai.local.manage` — the allow-list editor is on this key too,
-    // because widening what counts as internal decides exactly what the switch permits.
-    PermissionDef {
-        key: "ai.airgap.manage",
-        category: "ai",
-        description: "Turn the air gap on or off, and edit the internal-host allow-list",
-    },
-    PermissionDef {
-        key: "ai.tools.read",
-        category: "ai",
-        description: "Read the AI tool registry, its limits and its usage",
-    },
-    PermissionDef {
-        key: "ai.tools.manage",
-        category: "ai",
-        description: "Enable, gate, limit and time out AI tools",
-    },
-    // The AI identity registry (REQ-100 slice 2). An identity is a *named set of tool grants* a
-    // run borrows, so managing identities is a strictly stronger act than managing tools: the
-    // registry says what a tool costs, an identity says what a particular borrower may reach.
-    // Keeping them apart means the installations that want "anyone may inspect the catalogue,
-    // nobody may hand out grants" can say exactly that.
-    PermissionDef {
-        key: "ai.identities.read",
-        category: "ai",
-        description: "Read AI identities and their tool grants",
-    },
-    PermissionDef {
-        key: "ai.identities.manage",
-        category: "ai",
-        description: "Create, edit and remove AI identities and their grants",
-    },
-    // The approval gate (REQ-101). Read and act are separate keys because the whole point of the
-    // inbox is that *seeing* a dangerous operation is a much weaker power than *releasing* it:
-    // an installation that lets a support lead read the queue while only a manager decides is
-    // the common shape, and a single key cannot express it. The third key is separate again
-    // because un-gating a class (`content_publish` → `allow`) is a durable edit to what the
-    // installation's own agents may do without asking — a policy change, not a decision about
-    // one request, and REQ-101 requires both the permission *and* a typed phrase for it.
-    PermissionDef {
-        key: "ai.approvals.read",
-        category: "ai",
-        description: "Read the AI approval inbox, its diffs and its audit trail",
-    },
-    PermissionDef {
-        key: "ai.approvals.act",
-        category: "ai",
-        description: "Approve, reject and expire AI approval requests",
-    },
-    // The MCP client registry (REQ-108). Read and manage are separate for the reason the
-    // approval gate splits read from act: seeing which machine tokens exist and what they may
-    // reach is an audit question a security reader can answer, while minting, rotating and
-    // revoking a token is handing out a credential for the whole installation to act through.
-    // One key would make those two the same decision, and the failure would be silent: a reader
-    // who could rotate would never notice, because rotation looks like maintenance.
-    PermissionDef {
-        key: "mcp.clients.read",
-        category: "mcp",
-        description: "Read MCP clients, their grants and their invocation history",
-    },
-    PermissionDef {
-        key: "mcp.clients.manage",
-        category: "mcp",
-        description: "Create, rotate, revoke and delete MCP clients and change their grants",
-    },
-    PermissionDef {
-        key: "ai.policies.manage",
-        category: "ai",
-        description: "Change which AI tool classes require approval",
-    },
-    // The data guard (REQ-105). Read and manage are separate keys for the same reason the
-    // approval gate splits read from act: the *events* screen is an audit trail an
-    // organization may reasonably hand to a compliance reader, while raising a label to
-    // `block` is a change to what leaves the installation and to what the platform is willing
-    // to answer. A single key would make those two the same decision.
-    //
-    // The tester's read power is the *manage* key rather than the read one, and that is
-    // deliberate: `POST /ai/guard/test` takes a payload an operator pastes and returns the
-    // masked form of it. Handing a read-only auditor the ability to submit arbitrary text to
-    // the detector is a small oracle — it says whether a string of their choosing matches
-    // this installation's detection rules, which is a map of what the tenants' data looks
-    // like. The events screen shows the same information without accepting input.
-    PermissionDef {
-        key: "ai.guard.read",
-        category: "ai",
-        description: "Read the AI data guard's policy, rules and event log",
-    },
-    PermissionDef {
-        key: "ai.guard.manage",
-        category: "ai",
-        description: "Change guard rules, the policy and exemptions, and run the tester",
-    },
-    // The eval suites (REQ-107). FOUR keys rather than two, and the split is the request's own
-    // shape rather than a habit: a suite is a *measurement* of the platform, and the three acts
-    // it supports are genuinely different in what they cost when done by the wrong person.
-    //
-    // `ai.evals.read` sees suites, cases and past results. That is a QA audience, and the data
-    // is the installation's own prompts and outputs — sensitive enough that "everyone who uses
-    // the AI" is not a reasonable default.
-    //
-    // `ai.evals.manage` authors cases. A case is an *assertion about correctness*, so writing
-    // one is a claim about how the platform should behave, and deleting a case removes a
-    // measurement — which is the cheapest way to make a regression gate agree with you. It is
-    // kept away from `run` for exactly that reason: the person who may weaken the ruler should
-    // not also be the person who presses it.
-    //
-    // `ai.evals.run` starts a run. Running is not free — every case is a real inference call
-    // against a real provider, and a suite is trivially large — so it is separated from
-    // authoring. An installation that wants a release engineer to be able to press the gate
-    // without being able to edit what the gate measures grants this one key, and the panel says
-    // so by name on the disabled button rather than hiding it.
-    //
-    // `ai.telemetry.read` is separate from `ai.evals.read` on purpose: the eval screens answer
-    // "is this suite healthy", telemetry answers "is the tool estate healthy" across every
-    // agent and copilot in the installation, including runs that have nothing to do with evals.
-    // A tenant that runs no evals still has agents whose tools are failing, and folding the
-    // two would force that tenant to grant eval access to see its own tool stats.
-    PermissionDef {
-        key: "ai.evals.read",
-        category: "ai",
-        description: "Read AI eval suites, their cases and past results",
-    },
-    PermissionDef {
-        key: "ai.evals.manage",
-        category: "ai",
-        description: "Create, edit and remove eval suites and cases",
-    },
-    PermissionDef {
-        key: "ai.evals.run",
-        category: "ai",
-        description: "Start and cancel eval suite runs",
-    },
-    PermissionDef {
-        key: "ai.telemetry.read",
-        category: "ai",
-        description: "Read agent telemetry: per-tool success, denial and latency statistics",
     },
     // Workflows (docs/requests/REQ-003): the automation surface — definitions, their runs and
     // the steps a run left behind.
@@ -435,6 +214,49 @@ pub const CATALOGUE: &[PermissionDef] = &[
         key: "deployment.rollback",
         category: "deployment",
         description: "Roll a deployment back",
+    },
+    // `deployment.manage`, distinct from `deployment.deploy` on purpose. "Manage" is the
+    // operator's own instruments on the centre: run an update check, configure a maintenance
+    // window, restart a workload. "Deploy" is the thing that changes what a tenant runs. They
+    // are different amounts of trust and an account that may prepare a deployment — a release
+    // engineer checking whether a version exists before the window opens — must not thereby be
+    // able to put it in production.
+    PermissionDef {
+        key: "deployment.manage",
+        category: "deployment",
+        description: "Run update checks, configure maintenance windows and restart workloads",
+    },
+    // Cluster visibility is its own key, and not a fourth degree of the same axis: reading
+    // replica counts and CPU limits is a fact about infrastructure that an operator investigating
+    // an incident needs without the ability to restart anything, and merging it into
+    // `deployment.manage` would mean the read arrives with the write.
+    PermissionDef {
+        key: "deployment.cluster.read",
+        category: "deployment",
+        description: "Read cluster replicas, resource usage and rollout status",
+    },
+    // Maintenance windows change whether every write route on the platform answers 503, so they
+    // are separated from both: an account that may deploy a version must not thereby be able to
+    // freeze the panel for everybody else.
+    PermissionDef {
+        key: "deployment.maintenance",
+        category: "deployment",
+        description: "Configure maintenance windows",
+    },
+    // Edge regions (REQ-035 slice 1). Read and manage are separate keys for the same
+    // reason `deployment.cluster.read` is separate from `deployment.manage`: "which regions
+    // exist and how are they doing" is a fact an operator needs during an incident, and
+    // "rename one, move the routing default, drain one" is a control-plane action. Merged,
+    // every person reading a health matrix could also redirect traffic.
+    PermissionDef {
+        key: "platform.regions.read",
+        category: "platform",
+        description: "Read the edge region registry, its health matrix and region latency",
+    },
+    PermissionDef {
+        key: "platform.regions.manage",
+        category: "platform",
+        description: "Rename a region, set its status, activate it or move the routing default",
     },
     // Identity and access management.
     PermissionDef {
@@ -616,6 +438,109 @@ pub const CATALOGUE: &[PermissionDef] = &[
         key: "events.read",
         category: "events",
         description: "Read the platform's event feed",
+    },
+    // CDN / edge (docs/requests/REQ-011). Reading rules and the provider state is one
+    // power; changing a rule is another, because a rule decides what a shared cache is
+    // allowed to keep. `cdn.purge` is separate from `cdn.manage` on purpose: invalidating
+    // a zone is a blunt operational act that an operator may want to allow without
+    // letting the same account rewrite the policy.
+    PermissionDef {
+        key: "cdn.read",
+        category: "cdn",
+        description: "Read CDN settings, cache rules and purge history",
+    },
+    PermissionDef {
+        key: "cdn.manage",
+        category: "cdn",
+        description: "Create, change, reorder and remove cache rules and provider settings",
+    },
+    PermissionDef {
+        key: "cdn.purge",
+        category: "cdn",
+        description: "Invalidate cached URLs, tags or a whole zone",
+    },
+    // The developer platform (docs/requests/REQ-033, slice 1). Two keys, and the split is the
+    // one the request itself names: **reading** a key's metadata and **minting** one are
+    // different amounts of trust. An account that can see which integrations exist and how much
+    // they call is an auditor's need; an account that can mint a key that authenticates as
+    // this organization is a much larger power, and a read-only developer role must not be able
+    // to grant itself the write by virtue of holding the read. The request log rides the read
+    // key because it is the same question ("what has this organization called, and did it
+    // work") answered one row at a time rather than one day at a time.
+    PermissionDef {
+        key: "developer.keys.read",
+        category: "developer",
+        description: "Read API key metadata, usage and the request log",
+    },
+    PermissionDef {
+        key: "developer.keys.manage",
+        category: "developer",
+        description: "Create, rotate and revoke API keys",
+    },
+    // The API Explorer (REQ-033, slice 2). Two keys and the split is the one that makes the
+    // Explorer safe rather than interesting: **browsing** the document is reading the platform's
+    // own shape, which is the same question as reading a key's metadata, so it rides
+    // `developer.read` — a manager holds it. **Running** a call is a much larger power even
+    // though it carries no key material, because the caller's *session* is what authorises it:
+    // a developer who can send `DELETE /pages/{id}` from the Explorer is doing that with the
+    // permissions of the person sitting at the screen, and the request file is explicit that a
+    // call the caller could not make from the UI must answer the same `403`. Collapsing both
+    // into one key would have made a read-only role's Explorer a write capability.
+    PermissionDef {
+        key: "developer.read",
+        category: "developer",
+        description: "Browse the API reference and the served OpenAPI document",
+    },
+    PermissionDef {
+        key: "developer.explorer.run",
+        category: "developer",
+        description: "Send API requests from the Explorer as the signed-in caller",
+    },
+    // OAuth applications (docs/requests/REQ-033, slice 3). Two keys, and the split is the one
+    // that keeps the token endpoint honest.
+    //
+    // * `developer.oauth.read` is the app's own metadata: which redirect URIs it registered,
+    //   what it may be granted, whether its secret rotation is still inside an overlap. That is
+    //   a support question ("our integration started failing on Tuesday") and it is the same
+    //   kind of question as reading a key's metadata, so it rides with the rest of the
+    //   developer read surface.
+    // * `developer.oauth.manage` mints and rotates a **client secret**. A client secret is a
+    //   credential that authenticates as this organization at an endpoint no panel session ever
+    //   passes through, and rotating one starts an overlap in which two secrets are valid. An
+    //   account that can read the list must not thereby be able to add one — the same argument
+    //   as `developer.keys.read` / `developer.keys.manage`, kept separate for the same reason.
+    //
+    // Neither key grants anything about a *user's* OAuth session: those are scoped by the
+    // consent the user gave, not by a permission in this table.
+    PermissionDef {
+        key: "developer.oauth.read",
+        category: "developer",
+        description: "Read OAuth application metadata and registered redirect URIs",
+    },
+    PermissionDef {
+        key: "developer.oauth.manage",
+        category: "developer",
+        description: "Register OAuth applications and rotate client secrets",
+    },
+    // SDK scaffolds and the CLI (docs/requests/REQ-033, slice 4). One key, and the split is
+    // against adding a second.
+    //
+    // * Generating a starter writes an archive into a bucket. That is a *write* with a cost and
+    //   a quota, so it is its own power rather than riding `developer.read`.
+    // * Validating a manifest and listing the templates are pure reads and ride `developer.read`
+    //   with the rest of the "what can I build here" surface -- the API Explorer's document
+    //   browsing included.
+    //
+    // The CLI device-code flow deliberately adds **no key of its own**. `start` is a read of the
+    // tenant's CLI state, so `developer.read`; `approve` is `developer.keys.manage`, because
+    // the token it authorises is a credential for the same tenant and an account that cannot mint
+    // a key must not be able to mint a CLI token by approving somebody else's login. A fourth
+    // key here would have been one more place for the two halves to disagree about who may log
+    // a machine in.
+    PermissionDef {
+        key: "developer.sdks.scaffold",
+        category: "developer",
+        description: "Generate plugin, theme and workflow starter archives",
     },
     // Notifications (docs/requests/REQ-021). Four powers, split by *who is affected* rather
     // than by what the button does:
@@ -985,9 +910,42 @@ mod tests {
             "deployment.preview",
             "deployment.deploy",
             "deployment.rollback",
+            // The three the deployment centre adds. Named here explicitly because an
+            // uncatalogued key is the worst failure this catalogue has: `guards::require`
+            // resolves a key against it, so a route guarded by a name the catalogue does not
+            // know answers 403 for *everybody*, the owner included, and the screen looks like a
+            // permissions bug rather than a typo.
+            "deployment.manage",
+            "deployment.cluster.read",
+            "deployment.maintenance",
         ] {
             assert!(is_known(family), "{family} must be in the catalogue");
         }
+    }
+
+    #[test]
+    fn the_platform_region_family_is_catalogued() {
+        // REQ-035 slice 1. An uncatalogued key is the worst failure this catalogue has:
+        // `guards::require` resolves a key against it, so a route guarded by a name the
+        // catalogue does not know answers 403 for *everybody* — the owner included — and the
+        // screen reads as a permissions bug rather than a typo.
+        for key in ["platform.regions.read", "platform.regions.manage"] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+            // The category is asserted too, because the role editor groups by it and a key
+            // in the wrong category is invisible where the editor looks.
+            assert_eq!(
+                CATALOGUE
+                    .iter()
+                    .find(|d| d.key == key)
+                    .map(|d| d.category),
+                Some("platform"),
+                "{key} must be in the platform category"
+            );
+        }
+        // The two must stay *different* keys. A later edit that folds the read into the
+        // manage key would keep this test green while removing the whole point of the
+        // split, so the distinction is asserted rather than documented.
+        assert_ne!("platform.regions.read", "platform.regions.manage");
     }
 
     #[test]
@@ -1019,18 +977,27 @@ mod tests {
 
     #[test]
     fn the_developer_family_is_catalogued() {
-        // REQ-022: issuing a credential, reading a credential and reading the traffic record
-        // are three different blast radii, so three different keys. The test asserts the
-        // separation rather than the mere existence — a catalogue that collapsed
-        // `developer.keys.manage` into `developer.keys.read` would still pass a presence check
-        // and would ship the escalation.
+        // REQ-033 slice 1, and REQ-022's slice on top. The keys are guarded separately and a
+        // route guarded by a name the catalogue does not know answers 403 for *everybody* —
+        // including the owner — so a typo here would read as "permissions are broken" rather
+        // than as "a key is missing".
+        //
+        // The assertion is on the category as well as the key because the panel's role editor
+        // groups by it and a key in the wrong category is invisible where the editor looks.
+        //
+        // `developer.logs.read` is main's key for the traffic record, kept in the catalogue
+        // because the role editor offers it and an operator who granted it must not find the
+        // grant silently unrecognised. It is *not* what guards `/developer/logs` on this
+        // branch — that read rides `developer.keys.read`, argued at the route.
         for key in [
-            "developer.read",
             "developer.keys.read",
             "developer.keys.manage",
+            "developer.read",
+            "developer.logs.read",
+            "developer.explorer.run",
             "developer.oauth.read",
             "developer.oauth.manage",
-            "developer.logs.read",
+            "developer.sdks.scaffold",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),
@@ -1038,6 +1005,9 @@ mod tests {
                 "{key} belongs to the developer category"
             );
         }
+        // REQ-022's stronger form, kept because it is the one that fails loudly: a catalogue
+        // that collapsed `developer.keys.manage` into `developer.keys.read` would still pass a
+        // presence check and would ship the escalation.
         assert_ne!(
             get("developer.keys.read").map(|entry| entry.description),
             get("developer.keys.manage").map(|entry| entry.description),

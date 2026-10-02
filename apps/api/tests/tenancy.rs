@@ -50,11 +50,22 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .expect("router must answer");
 
     let status = response.status();
-    let set_cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+    // ALL of the `Set-Cookie` headers, joined. `Headers::get` returns only the first, and
+    // sign-in sends TWO — the session and the CSRF token — so reading one made the platform
+    // look like it had issued no CSRF cookie, and every mutation this suite sent was then
+    // refused at the security layer before reaching the handler under test. `auth.rs` carries
+    // the same note; the two suites disagree about how to read a response, and only one was
+    // right.
+    let set_cookie = {
+        let values: Vec<String> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .collect();
+        (!values.is_empty()).then(|| values.join("; "))
+    };
     let bytes = response
         .into_body()
         .collect()
@@ -75,11 +86,35 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
 }
 
 /// Build a request; `token` becomes the session cookie and `body` the JSON payload.
+///
+/// A mutation additionally needs the CSRF token the sign-in response issued alongside the
+/// session cookie — the session cookie is ambient authority, so the layer that guards every
+/// write refuses a request carrying the cookie without a matching `x-omnion-csrf`. Passing the
+/// token as its own argument keeps this helper a pure function of its inputs: a test that cannot
+/// name a token sends none, and the write it attempts is refused for the reason it was written
+/// to prove.
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
+    request_with_csrf(method, uri, token, None, body)
+}
+
+/// `request`, plus the CSRF token for a cookie-authenticated write.
+fn request_with_csrf(
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+    csrf: Option<&str>,
+    body: Option<Value>,
+) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
-    let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
-        None => builder,
+    let builder = match (token, csrf) {
+        (Some(token), Some(csrf)) => builder
+            .header(
+                header::COOKIE,
+                format!("omnion_session={token}; omnion_csrf={csrf}"),
+            )
+            .header("x-omnion-csrf", csrf),
+        (Some(token), None) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        (None, _) => builder,
     };
 
     match body {
@@ -228,17 +263,17 @@ impl Fixture {
     }
 
     /// The platform Owner, signed in.
-    async fn platform_token(&self) -> String {
+    async fn platform_token(&self) -> (String, String) {
         login(&self.state, &self.platform_email).await
     }
 
     /// The organization administrator, signed in.
-    async fn admin_token(&self) -> String {
+    async fn admin_token(&self) -> (String, String) {
         login(&self.state, &self.admin_email).await
     }
 
     /// The plain member of the first organization, signed in.
-    async fn member_token(&self) -> String {
+    async fn member_token(&self) -> (String, String) {
         login(&self.state, &self.member_email).await
     }
 
@@ -291,8 +326,17 @@ async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String
     (user.id, email)
 }
 
-/// Sign an account in and return the raw session token.
-async fn login(state: &AppState, email: &str) -> String {
+/// Sign an account in and return the session token together with the CSRF token the sign-in
+/// issued alongside it.
+///
+/// Both cookies come from one `Set-Cookie` header, and the previous version took `.split(';')
+/// .next()` — the *session* — and dropped the second. The CSRF layer refuses a cookie-
+/// authenticated write that carries no `x-omnion-csrf`, so every mutation this suite sent was
+/// refused at the security layer before it reached the handler it was written to exercise: the
+/// walks read as "the API is broken" when the harness had simply never sent the token. Reading
+/// the whole header and naming each cookie is also what makes a *missing* cookie visible —
+/// `expect` names which one, instead of the failure surfacing three layers away as a 403.
+async fn login(state: &AppState, email: &str) -> (String, String) {
     let response = call(
         state,
         request(
@@ -310,17 +354,21 @@ async fn login(state: &AppState, email: &str) -> String {
         "login body: {}",
         response.body
     );
-    response
+    let set_cookie = response
         .set_cookie
         .clone()
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("cookie has a value")
-        .split_once('=')
-        .expect("cookie is name=value")
-        .1
-        .to_owned()
+        .expect("login must set the session cookie");
+
+    let cookie_value = |name: &str| -> String {
+        set_cookie
+            .split(';')
+            .filter_map(|pair| pair.trim().split_once('='))
+            .find(|(cookie, _)| *cookie == name)
+            .map(|(_, value)| value.to_owned())
+            .unwrap_or_else(|| panic!("login must set the {name} cookie; sent: {set_cookie}"))
+    };
+
+    (cookie_value("omnion_session"), cookie_value("omnion_csrf"))
 }
 
 /// The `id` field of a response body, as text.
@@ -346,8 +394,8 @@ async fn the_tenancy_surface_is_permission_gated() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let member = fixture.member_token().await;
-    let admin = fixture.admin_token().await;
+    let (member_session, member_csrf) = fixture.member_token().await;
+    let (admin_session, admin_csrf) = fixture.admin_token().await;
 
     // Without a session nothing answers.
     for route in ["/api/v1/organizations", "/api/v1/sites"] {
@@ -358,7 +406,13 @@ async fn the_tenancy_surface_is_permission_gated() {
     // A member of the organization holds no tenancy permission.
     let denied = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/sites", Some(&member), None),
+        request_with_csrf(
+            Method::GET,
+            "/api/v1/sites",
+            Some(&member_session),
+            Some(&member_csrf),
+            None,
+        ),
     )
     .await;
     assert_eq!(denied.status, StatusCode::FORBIDDEN);
@@ -367,14 +421,26 @@ async fn the_tenancy_surface_is_permission_gated() {
     // The administrator holds them at organization scope.
     let allowed = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/sites", Some(&admin), None),
+        request_with_csrf(
+            Method::GET,
+            "/api/v1/sites",
+            Some(&admin_session),
+            Some(&admin_csrf),
+            None,
+        ),
     )
     .await;
     assert_eq!(allowed.status, StatusCode::OK, "sites: {}", allowed.body);
 
     let organizations = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/organizations", Some(&admin), None),
+        request_with_csrf(
+            Method::GET,
+            "/api/v1/organizations",
+            Some(&admin_session),
+            Some(&admin_csrf),
+            None,
+        ),
     )
     .await;
     assert_eq!(organizations.status, StatusCode::OK);
@@ -393,18 +459,19 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
     let Some(mut fixture) = Fixture::new().await else {
         return;
     };
-    let platform = fixture.platform_token().await;
-    let admin = fixture.admin_token().await;
+    let (platform_session, platform_csrf) = fixture.platform_token().await;
+    let (admin_session, admin_csrf) = fixture.admin_token().await;
     let org_b = fixture.org_b;
 
     // The platform Owner opens a tenant.
     let slug = format!("tenancy-{}", Uuid::new_v4().simple());
     let created = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/organizations",
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             Some(json!({ "name": "Tenancy Created", "slug": slug })),
         ),
     )
@@ -423,10 +490,11 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
     // The same slug is refused.
     let duplicate = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/organizations",
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             Some(json!({ "name": "Tenancy Created Again", "slug": slug })),
         ),
     )
@@ -438,10 +506,7 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
     // permissions: opening tenants is a platform action.
     let refused = call(
         &fixture.state,
-        request(
-            Method::POST,
-            "/api/v1/organizations",
-            Some(&admin),
+        request_with_csrf(Method::POST, "/api/v1/organizations", Some(&admin_session), Some(&admin_csrf),
             Some(json!({ "name": "Tenancy Refused", "slug": format!("tenancy-no-{}", Uuid::new_v4().simple()) })),
         ),
     )
@@ -452,7 +517,13 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
     // The platform sees every tenant; the organization account is refused the other one.
     let all = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/organizations", Some(&platform), None),
+        request_with_csrf(
+            Method::GET,
+            "/api/v1/organizations",
+            Some(&platform_session),
+            Some(&platform_csrf),
+            None,
+        ),
     )
     .await;
     assert_eq!(all.status, StatusCode::OK);
@@ -465,10 +536,11 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
 
     let foreign = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::GET,
             &format!("/api/v1/organizations/{org_b}"),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             None,
         ),
     )
@@ -479,10 +551,11 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
     // … while its own organization answers.
     let own = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::GET,
             &format!("/api/v1/organizations/{}", fixture.org_a),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             None,
         ),
     )
@@ -492,25 +565,27 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
     // The platform renames the new tenant.
     let updated = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::PATCH,
             &format!("/api/v1/organizations/{created_id}"),
-            Some(&platform),
-            Some(json!({ "name": "Tenancy Renamed", "status": "suspended" })),
+            Some(&platform_session),
+            Some(&platform_csrf),
+            Some(json!({ "name": "Tenancy Renamed" })),
         ),
     )
     .await;
     assert_eq!(updated.status, StatusCode::OK, "update: {}", updated.body);
     assert_eq!(updated.body["name"], "Tenancy Renamed");
-    assert_eq!(updated.body["status"], "suspended");
+    assert_eq!(updated.body["status"], "active");
 
     // … and the change is in the audit trail of that tenant.
     let audit = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::GET,
             &format!("/api/v1/iam/audit?organization_id={created_id}"),
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             None,
         ),
     )
@@ -523,16 +598,111 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
     );
     assert!(
         actions.contains(&"organization.updated".to_owned()),
-        "{actions:?}"
+        "a plain rename is filed as organization.updated: {actions:?}"
     );
+
+    // A status move bundled into the same PATCH is not a rename — it is the lifecycle action, and
+    // that is the property that makes the trail answer "who suspended this tenant and when".
+    // This walk used to send the rename and the status together and then assert
+    // `organization.updated` was present, which was only ever true before slice 3 made a status
+    // move its own action; the assertion outlived the behaviour it described. `tenancy_limits`
+    // proves the same rule from the other side (`a_status_move_is_audited_and_announced_as_its_
+    // own_event`), so this walk states it here for the *combined* payload, which is the case
+    // neither of them covers: a rename that arrives together with a freeze.
+    let frozen = call(
+        &fixture.state,
+        request_with_csrf(
+            Method::PATCH,
+            &format!("/api/v1/organizations/{created_id}"),
+            Some(&platform_session),
+            Some(&platform_csrf),
+            Some(json!({ "name": "Tenancy Renamed And Suspended", "status": "suspended" })),
+        ),
+    )
+    .await;
+    assert_eq!(frozen.status, StatusCode::OK, "freeze: {}", frozen.body);
+    assert_eq!(frozen.body["name"], "Tenancy Renamed And Suspended");
+    assert_eq!(frozen.body["status"], "suspended");
+
+    let after_freeze = call(
+        &fixture.state,
+        request_with_csrf(
+            Method::GET,
+            &format!("/api/v1/iam/audit?organization_id={created_id}"),
+            Some(&platform_session),
+            Some(&platform_csrf),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        after_freeze.status,
+        StatusCode::OK,
+        "audit after the freeze: {}",
+        after_freeze.body
+    );
+    let frozen_actions = field_of_all(&after_freeze.body, "entries", "action");
+    assert!(
+        frozen_actions.contains(&"organization.suspended".to_owned()),
+        "a payload that moves the status is audited as the lifecycle action it is, even when it \
+         also renames the tenant: {frozen_actions:?}"
+    );
+
+    // … and the freeze is a real one, not a label: the tenant the walk is about to write to has
+    // to refuse the write. Leaving the tenant suspended here made the *next* step of this walk
+    // fail with `organization_not_writable` a few lines later, which reads like a site-creation
+    // defect and is really the freeze doing its job. The walk states the property where it is
+    // made true, and then thaws, because the rest of the walk needs a writable tenant.
+    let refused_while_frozen = call(
+        &fixture.state,
+        request_with_csrf(
+            Method::PATCH,
+            &format!("/api/v1/organizations/{created_id}"),
+            Some(&platform_session),
+            Some(&platform_csrf),
+            Some(json!({ "name": "Tenancy Renamed While Frozen" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused_while_frozen.status,
+        StatusCode::CONFLICT,
+        "a rename of a frozen tenant is refused, and it names the reason: {}",
+        refused_while_frozen.body
+    );
+    assert_eq!(
+        refused_while_frozen.body["error"]["code"],
+        "organization_not_writable"
+    );
+    assert_eq!(
+        refused_while_frozen.body["error"]["details"]["status"],
+        "suspended"
+    );
+
+    // Thawing is a status change, so it is the one write the freeze cannot block — otherwise a
+    // tenant that could not be reactivated would be permanently frozen with no way out.
+    let thawed = call(
+        &fixture.state,
+        request_with_csrf(
+            Method::PATCH,
+            &format!("/api/v1/organizations/{created_id}"),
+            Some(&platform_session),
+            Some(&platform_csrf),
+            Some(json!({ "status": "active" })),
+        ),
+    )
+    .await;
+    assert_eq!(thawed.status, StatusCode::OK, "thaw: {}", thawed.body);
+    assert_eq!(thawed.body["status"], "active");
 
     // A tenant that still owns a site is not deleted in one step.
     let site = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/sites",
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             Some(json!({ "organization_id": created_id, "key": "main", "name": "Main Site" })),
         ),
     )
@@ -542,10 +712,11 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
 
     let blocked = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::DELETE,
             &format!("/api/v1/organizations/{created_id}"),
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             None,
         ),
     )
@@ -561,10 +732,11 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
     // An organization account may not remove a tenant at all.
     let refused_delete = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::DELETE,
             &format!("/api/v1/organizations/{}", fixture.org_a),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             None,
         ),
     )
@@ -575,10 +747,11 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
     // Emptied, the tenant goes — the site first, then the organization itself.
     let removed_site = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::DELETE,
             &format!("/api/v1/sites/{site_id}"),
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             None,
         ),
     )
@@ -587,10 +760,11 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
 
     let removed = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::DELETE,
             &format!("/api/v1/organizations/{created_id}"),
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             None,
         ),
     )
@@ -604,10 +778,11 @@ async fn only_the_platform_opens_tenants_and_reads_across_them() {
 
     let gone = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::GET,
             &format!("/api/v1/organizations/{created_id}"),
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             None,
         ),
     )
@@ -623,17 +798,18 @@ async fn sites_stay_inside_their_organization() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let platform = fixture.platform_token().await;
-    let admin = fixture.admin_token().await;
+    let (platform_session, platform_csrf) = fixture.platform_token().await;
+    let (admin_session, admin_csrf) = fixture.admin_token().await;
     let org_b = fixture.org_b;
 
     // A site of the second organization, created by the platform.
     let foreign_site = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/sites",
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             Some(json!({ "organization_id": org_b, "key": "main", "name": "Company B" })),
         ),
     )
@@ -649,10 +825,11 @@ async fn sites_stay_inside_their_organization() {
     // The organization administrator creates a site of its own.
     let created = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/sites",
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             Some(json!({ "key": "  Main  ", "name": "Main Site" })),
         ),
     )
@@ -670,10 +847,11 @@ async fn sites_stay_inside_their_organization() {
     // A second site with the same key is refused inside the organization.
     let duplicate = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/sites",
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             Some(json!({ "key": "main", "name": "Main Site Again" })),
         ),
     )
@@ -684,10 +862,11 @@ async fn sites_stay_inside_their_organization() {
     // An unusable key is a bad request.
     let invalid = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/sites",
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             Some(json!({ "key": "not a key", "name": "Bad" })),
         ),
     )
@@ -698,10 +877,11 @@ async fn sites_stay_inside_their_organization() {
     // Naming another tenant is refused; an unknown tenant is a 404.
     let cross = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/sites",
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             Some(json!({ "organization_id": org_b, "key": "sneak", "name": "Sneak" })),
         ),
     )
@@ -711,10 +891,11 @@ async fn sites_stay_inside_their_organization() {
 
     let unknown = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/sites",
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             Some(json!({ "organization_id": Uuid::new_v4(), "key": "ghost", "name": "Ghost" })),
         ),
     )
@@ -725,7 +906,13 @@ async fn sites_stay_inside_their_organization() {
     // The list is scoped: the organization sees its own sites only.
     let listed = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/sites", Some(&admin), None),
+        request_with_csrf(
+            Method::GET,
+            "/api/v1/sites",
+            Some(&admin_session),
+            Some(&admin_csrf),
+            None,
+        ),
     )
     .await;
     assert_eq!(listed.status, StatusCode::OK);
@@ -740,10 +927,11 @@ async fn sites_stay_inside_their_organization() {
     // Naming the other organization as a filter is refused too.
     let filtered = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::GET,
             &format!("/api/v1/sites?organization_id={org_b}"),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             None,
         ),
     )
@@ -763,10 +951,11 @@ async fn sites_stay_inside_their_organization() {
     ] {
         let denied = call(
             &fixture.state,
-            request(
+            request_with_csrf(
                 method.clone(),
                 &uri,
-                Some(&admin),
+                Some(&admin_session),
+                Some(&admin_csrf),
                 Some(json!({ "name": "Nope" })),
             ),
         )
@@ -783,10 +972,11 @@ async fn sites_stay_inside_their_organization() {
     // … while the platform edits it, and the organization edits its own.
     let renamed = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::PATCH,
             &format!("/api/v1/sites/{foreign_site_id}"),
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             Some(json!({ "name": "Company B Renamed" })),
         ),
     )
@@ -801,10 +991,11 @@ async fn sites_stay_inside_their_organization() {
 
     let archived = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::PATCH,
             &format!("/api/v1/sites/{site_id}"),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             Some(json!({ "status": "archived" })),
         ),
     )
@@ -821,10 +1012,11 @@ async fn sites_stay_inside_their_organization() {
     // The change is audited inside the organization.
     let audit = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::GET,
             &format!("/api/v1/iam/audit?organization_id={}", fixture.org_a),
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             None,
         ),
     )
@@ -836,10 +1028,11 @@ async fn sites_stay_inside_their_organization() {
     // Deleting the own site is allowed; the foreign one stays.
     let deleted = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::DELETE,
             &format!("/api/v1/sites/{site_id}"),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             None,
         ),
     )
@@ -848,10 +1041,11 @@ async fn sites_stay_inside_their_organization() {
 
     let gone = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::GET,
             &format!("/api/v1/sites/{site_id}"),
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             None,
         ),
     )
@@ -867,16 +1061,17 @@ async fn domains_are_platform_wide_unique_and_keep_one_primary() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let platform = fixture.platform_token().await;
-    let admin = fixture.admin_token().await;
+    let (platform_session, platform_csrf) = fixture.platform_token().await;
+    let (admin_session, admin_csrf) = fixture.admin_token().await;
     let org_b = fixture.org_b;
 
     let site = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/sites",
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             Some(json!({ "key": "shop", "name": "Shop" })),
         ),
     )
@@ -890,10 +1085,11 @@ async fn domains_are_platform_wide_unique_and_keep_one_primary() {
 
     let first = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             &format!("/api/v1/sites/{site_id}/domains"),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             Some(json!({ "host": format!("WWW-{}.TENANCY.TEST", Uuid::new_v4().simple()) })),
         ),
     )
@@ -918,10 +1114,11 @@ async fn domains_are_platform_wide_unique_and_keep_one_primary() {
 
     let second = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             &format!("/api/v1/sites/{site_id}/domains"),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             Some(json!({ "host": second_host })),
         ),
     )
@@ -938,10 +1135,11 @@ async fn domains_are_platform_wide_unique_and_keep_one_primary() {
     // The list is primary first.
     let listed = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::GET,
             &format!("/api/v1/sites/{site_id}/domains"),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             None,
         ),
     )
@@ -953,10 +1151,11 @@ async fn domains_are_platform_wide_unique_and_keep_one_primary() {
     // Promotion moves the flag.
     let promoted = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             &format!("/api/v1/sites/{site_id}/domains/{second_id}/primary"),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             None,
         ),
     )
@@ -971,10 +1170,11 @@ async fn domains_are_platform_wide_unique_and_keep_one_primary() {
 
     let listed = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::GET,
             &format!("/api/v1/sites/{site_id}/domains"),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             None,
         ),
     )
@@ -992,10 +1192,11 @@ async fn domains_are_platform_wide_unique_and_keep_one_primary() {
     // The host is unique platform-wide: the other tenant cannot take it.
     let foreign_site = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/sites",
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             Some(json!({ "organization_id": org_b, "key": "company", "name": "Company B" })),
         ),
     )
@@ -1004,10 +1205,11 @@ async fn domains_are_platform_wide_unique_and_keep_one_primary() {
 
     let stolen = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             &format!("/api/v1/sites/{foreign_site_id}/domains"),
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             Some(json!({ "host": second_host })),
         ),
     )
@@ -1018,10 +1220,11 @@ async fn domains_are_platform_wide_unique_and_keep_one_primary() {
     // A host the site does not carry cannot be promoted or removed.
     let not_there = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             &format!("/api/v1/sites/{site_id}/domains/{}/primary", Uuid::new_v4()),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             None,
         ),
     )
@@ -1032,10 +1235,11 @@ async fn domains_are_platform_wide_unique_and_keep_one_primary() {
     // Removing the primary host promotes the remaining one.
     let removed = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::DELETE,
             &format!("/api/v1/sites/{site_id}/domains/{second_id}"),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             None,
         ),
     )
@@ -1044,10 +1248,11 @@ async fn domains_are_platform_wide_unique_and_keep_one_primary() {
 
     let listed = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::GET,
             &format!("/api/v1/sites/{site_id}/domains"),
-            Some(&admin),
+            Some(&admin_session),
+            Some(&admin_csrf),
             None,
         ),
     )
@@ -1078,16 +1283,17 @@ async fn site_scoped_bindings_must_name_a_real_site_of_the_same_organization() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let platform = fixture.platform_token().await;
+    let (platform_session, platform_csrf) = fixture.platform_token().await;
     let org_b = fixture.org_b;
 
     // A site of the second organization.
     let foreign_site = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/sites",
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             Some(json!({ "organization_id": org_b, "key": "main", "name": "Company B" })),
         ),
     )
@@ -1102,10 +1308,11 @@ async fn site_scoped_bindings_must_name_a_real_site_of_the_same_organization() {
 
     let mismatch = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/iam/bindings",
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             Some(json!({
                 "user_id": fixture.admin_id,
                 "role_id": member_role.id,
@@ -1126,10 +1333,11 @@ async fn site_scoped_bindings_must_name_a_real_site_of_the_same_organization() {
 
     let unknown = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/iam/bindings",
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             Some(json!({
                 "user_id": fixture.admin_id,
                 "role_id": member_role.id,
@@ -1146,10 +1354,11 @@ async fn site_scoped_bindings_must_name_a_real_site_of_the_same_organization() {
     // The matching case still works and lands on the account.
     let granted = call(
         &fixture.state,
-        request(
+        request_with_csrf(
             Method::POST,
             "/api/v1/iam/bindings",
-            Some(&platform),
+            Some(&platform_session),
+            Some(&platform_csrf),
             Some(json!({
                 "user_id": fixture.admin_id,
                 "role_id": member_role.id,

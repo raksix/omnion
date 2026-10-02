@@ -20,6 +20,7 @@
 //! Media rows belong to sites, so the tenancy scope rule applies on top of the permission guard
 //! (`crate::scope`): an account with a primary organization touches only its own tenants.
 
+use crate::routes::cdn_cache;
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Multipart, Path, Query, State};
@@ -429,7 +430,11 @@ pub async fn raw_file(
     let file = crate::routes::media_files::file_in_scope(&state, &current, media_id).await?;
     ensure_servable(&state, &current, &file).await?;
     let range = range_header(&headers);
-    let conditional = conditional_headers(&headers, &file.checksum, file.updated_at.or(Some(file.created_at)));
+    let conditional = conditional_headers(
+        &headers,
+        &file.checksum,
+        file.updated_at.or(Some(file.created_at)),
+    );
     serve_file(&state, &file, "private, max-age=300", range, conditional).await
 }
 
@@ -503,9 +508,34 @@ pub async fn public_media(
     // unauthenticated reader must not reach. The two halves are separate functions for this
     // reason, and conflating them is the mistake this comment is here to stop.
     ensure_scan_allows(&state, &file).await?;
+    // The conditional answer is decided *before* the body moves (a revalidation that reads the
+    // object store and then sends nothing costs exactly what a `200` would), and the range
+    // window is what a player's seek actually asks for.
     let range = range_header(&headers);
-    let conditional = conditional_headers(&headers, &file.checksum, file.updated_at.or(Some(file.created_at)));
-    serve_file(&state, &file, "public, max-age=3600", range, conditional).await
+    let conditional = conditional_headers(
+        &headers,
+        &file.checksum,
+        file.updated_at.or(Some(file.created_at)),
+    );
+    let response = serve_file(&state, &file, "no-store", range, conditional).await?;
+
+    // The site's cache rules decide what the visitor's browser and the edge do with those bytes
+    // (REQ-011) — a range-aware body underneath a CDN policy, because the two answer different
+    // questions: seeking picks *which* bytes travel, the policy decides what a cache does with
+    // them. Reverse them and the cache headers report a length for a window nobody sent.
+    //
+    // The cache-control literal above is therefore a fallback that is never read: the layer
+    // always writes `Cache-Control` from the decision, and a decision of "nobody matched" is
+    // `private, no-store`, which is the safe answer for an asset nobody has declared shareable.
+    let request_path = format!("/api/v1/public/media/{media_id}");
+    let shape = cdn_cache::request_shape(&request_path, None, &headers);
+    let policy = cdn_cache::policy_for(state.db().pool(), file.site_id, &shape).await;
+    Ok(cdn_cache::apply(
+        response,
+        &policy,
+        cdn_cache::Validator::Preserved,
+        &headers,
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -810,7 +840,11 @@ pub(crate) fn conditional_headers(
         &etag,
         rendered.as_deref(),
     );
-    ConditionalAnswer { verdict, etag, rendered }
+    ConditionalAnswer {
+        verdict,
+        etag,
+        rendered,
+    }
 }
 
 /// What a conditional answer decided, carried with the values a `304` still has to report.

@@ -1266,13 +1266,37 @@ mod tests {
             json!({"findings": [{"title": "x", "api_key": "abc"}]}),
             json!({"findings": [{"title": "x", "nested": {"password": "hunter2"}}]}),
             json!({"findings": [{"title": "x", "evidence": "Bearer abcdefghijklmnopqrstuvwx"}]}),
-            json!({"findings": [{"title": "x", "leak": "sk-live0000000000000000000000000000"}]}),
+            json!({"findings": [{"title": "x", "leak": "sk-abcdefghijklmnopqrstuvwxyz"}]}),
         ] {
             assert!(
                 looks_like_a_credential(&leaky),
                 "this report carries something that should never be imported: {leaky}"
             );
             assert!(read_report(&leaky, "dependency").is_err());
+        }
+
+        // A marker that says a secret was *removed* is not a secret, and refusing an import
+        // because of one would reject the reports this check exists to let through: a scanner
+        // that redacts before it uploads is doing the right thing. This case used to sit in
+        // the list above as `«redacted:sk-…»` and asserted the opposite — that a redaction
+        // marker *is* a leak — which is why it failed: the value is 15 characters and does not
+        // begin with a token prefix, so the matcher is right and the fixture was wrong.
+        for redacted in [
+            json!({"findings": [{"title": "x", "leak": "«redacted:sk-…»"}]}),
+            json!({"findings": [{"title": "x", "leak": "[REDACTED]"}]}),
+            json!({"findings": [{"title": "x", "leak": "sk-…"}]}),
+        ] {
+            assert!(
+                !looks_like_a_credential(&redacted),
+                "an already-redacted marker must not be treated as a secret: {redacted}"
+            );
+            assert!(
+                read_report(&redacted, "dependency")
+                    .expect("a redacted report still parses")
+                    .len()
+                    == 1,
+                "redaction markers are not a reason to refuse the import"
+            );
         }
     }
 

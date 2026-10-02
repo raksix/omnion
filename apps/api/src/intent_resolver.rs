@@ -23,7 +23,7 @@
 
 use std::time::Duration;
 
-use omnion_ai_hub::{ChatMessage, ChatRequest, ProviderTarget, resolve as resolve_model};
+use omnion_ai_hub::{ChatMessage, ChatRequest, ChatRole, ProviderTarget, resolve as resolve_model};
 use omnion_permissions::EffectivePermissions;
 use omnion_search::commands;
 use omnion_search::intent::{self, Alternative, Intent, IntentKind};
@@ -201,13 +201,18 @@ async fn read_with_a_model(
     let request = ChatRequest {
         model: resolved.model.model_key.clone(),
         messages: vec![
-            ChatMessage::system(system_prompt(&|key| permissions.allows(key))),
-            ChatMessage::user(query.trim()),
+            ChatMessage {
+                role: ChatRole::System,
+                content: system_prompt(&|key| permissions.allows(key)),
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: query.trim().to_owned(),
+            },
         ],
         // A reading is not a creative act: the same phrase should read the same way twice.
         temperature: Some(0.0),
         max_tokens: Some(MAX_TOKENS),
-        tools: Vec::new(),
     };
 
     let target = ProviderTarget::from_provider(&resolved.provider);

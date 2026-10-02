@@ -52,6 +52,32 @@ impl Organization {
     pub fn is_active(&self) -> bool {
         self.status == "active"
     }
+
+    /// `true` when this organization accepts writes.
+    ///
+    /// Reads stay available in every status: an operator has to be able to look at a tenant it
+    /// has just suspended, and so does the tenant's own administrator. Writes do not — a
+    /// suspended tenant is frozen in place, and an archived one is a record rather than a
+    /// working installation. The single exception is the status change itself, which is the
+    /// control that undoes the freeze and therefore cannot be subject to it.
+    #[must_use]
+    pub fn accepts_writes(&self) -> bool {
+        self.is_active()
+    }
+}
+
+/// The status that refuses writes, and the sentence that says so.
+///
+/// Kept next to the rule so the API and the panel read the same words: a refusal that names the
+/// tenant *and* its status is answerable by a person reading a log line, while "operation not
+/// permitted" is not.
+#[must_use]
+pub fn write_refusal(organization: &Organization) -> String {
+    format!(
+        "{} is {} — its owner has to reactivate it before this organization can be written to \
+         again",
+        organization.name, organization.status
+    )
 }
 
 /// An organization to create.

@@ -1,64 +1,6 @@
 # REQ-105 — AI Data Guard (PII protection)
 
-> **Status:** in-progress (slice 1 detector/policy/budget: `602531b0`; the migration, the store
-> and the API: `94fde861`, `26f09f3a`; the **outbound checkpoint every provider call passes
-> through** — `d96d7f37`, which is the half that makes this a control rather than a screen: a
-> blocked payload is refused with `403 ai_guard_blocked` before any provider is dialled; the
-> **stub-provider walk that proves it on the wire** — `96232f63`, which replaces the detector-in-
-> the-test proof with a real provider at the other end of `POST /ai/chat`, so a masked turn is
-> observed leaving as `[EMAIL_1]` and a blocked turn is observed never being dialled; the **four
-> screens** — `/ai/guard` policy, `/ai/guard/rules`, `/ai/guard/events`, `/ai/guard/tester` —
-> `a79cf3f2`, with `lib/guard-api.ts`, the nav entries and the walkthrough depth pass. **The
-> browser pass over those four screens has NOT run**: `omnion-postgres` (the shared QA database
-> on 5433) has been in crash recovery since the disk hit 100%, with its startup process in
-> uninterruptible `D` state, so the pass cannot start a server. `D` ignores SIGKILL, and the
-> instance is shared infrastructure belonging to no single writer, so it is reported rather than
-> restarted. **No screen of this REQ is claimed as verified in a browser until it has been.**
-> The three outbound walks last tick flagged as needing a re-run are still blocked on the same
-> outage. ·
-> slice 2 the **re-map** — `guard_remap.rs`, built inside `checkpoint()` where the original
-> text and the detector's spans are both in hand, `substitute` for the requester and `redact`
-> for everyone else, plus the `mask_text`/`placeholder()` deterministic-token drift this found
-> and closed (`ad445d11`) ·
-> slice 3 — **the re-map is wired** and proved on the wire: `merged_map` builds one answer map from
-> every message's own map, the `done` frame carries the requester's `substitute`d text and the
-> withheld tokens, the `audit_log` metadata and the filed change set carry `redact`ed text, and the
-> chat screen swaps the streamed placeholders for the finished answer. `merge` drops a token two
-> different values claim rather than guessing. ·
-> slice 4 — **the audit trail, which had never written a row**. `checkpoint` filed
-> `finding.action.as_wire()` (the per-rule vocabulary: `allow`/`flag`/`mask`/`block`) into a column
-> whose check has always required the verdict vocabulary (`allowed`/`masked`/`blocked`). The two sets
-> are disjoint, so **every insert the guard ever attempted was rejected** — a masked turn and a
-> refusal alike. It was invisible because a failed audit is deliberately non-fatal: the checkpoint
-> returns its verdict and surfaces the write failure as `audit_error`, which the chat route logs at
-> `warn`. Correct in isolation, and the reason the whole trail could stay empty for three slices; the
-> only symptom a human would see is `/ai/guard/events` reporting "no events" for an installation whose
-> rules were demonstrably rewriting turns. An audit screen that shows nothing is worse than no audit
-> screen, because it is an affirmative statement that nothing happened. `9054abff` files the verdict,
-> makes `GuardVerdict::recordable_names()` the single list the store validates and derives `blocked`
-> from, narrows the check in `0215` and drops the two names the database accepted that nothing in the
-> build could produce (`flagged`, `remapped`), validates `?action=` so a stale filter is a `400` rather
-> than an empty table, and removes the two filter options that could only ever return nothing. The
-> pre-existing red walk (`a_blocked_turn…`) is now green: 8/8 outbound walks pass. ·
-> slice 5 — the **lapse announcement and the disclosure**. `lapsed_exemptions` filtered
-> `expires_at > $2`, a plain future filter: the function named for lapsed rows returned the exact
-> inverse of its name and of the event it exists to announce, so a caller announcing "an exemption
-> expired" would have announced every exemption *still running* and never the one that lapsed —
-> fixed at `87038885`, and the walk written to catch it found it. De-duplication is a **claim**
-> (`16615bac`), not a check-then-write, so two processes racing emit one event. The sweep runs off
-> traffic rather than a scheduler (`fb52edb1`), because a control whose reporting depends on a
-> background process is a control that silently stops reporting when that process dies; the cost is
-> named rather than hidden (the announcement is late by up to one request, and nothing about the
-> request's outcome depends on it). `GET /ai/guard/about` serves **the same `LABELS` constants the
-> detector is built from** rather than a second copy (`c63e9db0`) — a hand-written about page
-> drifts the moment a rule changes, and a screen that under-reports risk documents it as covered.
-> The panels disable their write controls with the missing key **named**, from the API's
-> `viewer_missing`, so the promise is one the write paths keep with a 403. The screen and its
-> nav link ship in `7a85d2ba`, the walkthrough assertions in `a4c93d99`. **Still open and NOT
-> claimed:** the browser pass (the QA slot is held by a *live* w3 walkthrough — verified by the
-> holder's `/proc/<pid>/cwd`, not by the place file, which is stale), and the final
-> `cargo test --workspace` + `pnpm build` box. ·
-> **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -193,36 +135,17 @@ refuses to start in the guard (the API answers a configuration error) rather tha
 
 ### Acceptance criteria
 
-- [x] A prompt containing an email address is masked to `[EMAIL_1]` before the provider call (proven with a stub provider that records the exact body it received) and the same value keeps the same placeholder across two calls in one request. — **proved in `apps/api/tests/ai_guard_outbound.rs`**: a stub provider records every body the router sends; the walk asserts `[EMAIL_1]` arrives *and* the original address does not, and that two mentions in two messages produce one placeholder and no `[EMAIL_2]`. The "no provider call" half of this criterion is the third walk, where the recorded call count does not move across the refused request.
-- [x] The answer is re-mapped on completion: a stub provider that echoes `[EMAIL_1]` produces the original address in the stored message for the requester. — **proved in `apps/api/tests/ai_guard_outbound.rs`** (`the_requester_reads_the_original_back_and_the_audit_row_does_not`): a stub that answers in **SSE framing** and echoes the last user turn back makes the re-map observable on the wire. The walk reads the `done` frame and asserts the requester's `answer` contains the address the user typed and **no leftover `[EMAIL_1]`**, then reads the `audit_log` row the *same request* wrote and asserts it holds the placeholder and not the address. Both halves, because asserting only the first would pass against a route that substituted everywhere — which is the leak this control exists to stop.
-- [x] While streaming, deltas show the placeholder and the completed message shows the original — `the_deltas_carry_the_placeholder_and_the_finished_answer_the_original` concatenates the `delta` frames and asserts `[EMAIL_1]` is present and the address is **absent**, then asserts the `done` frame's `answer` carries the original. Two separate claims: not leaking mid-stream, and being coherent afterwards.
-- [x] A second reader (shared conversation, admin) sees the placeholder, not the original (asserted with two readers on the same message). — the `audit_log` row is the second reader, read straight out of the database rather than through an endpoint (an endpoint would only prove the endpoint redacts). The filed **change set** also takes the redacted copy: a reviewer is a second reader, so `file_from_chat` is given `audited_answer`, never the requester's text.
-- [x] An ambiguous placeholder is withheld rather than guessed — `an_ambiguous_placeholder_is_withheld_rather_than_guessed`. Two different addresses in two turns each number their own `[EMAIL_1]`, so the token stops identifying anything; a naive merge would hand the reader one of the two and which one is a coin toss. The walk asserts **neither** address comes back and that `guard_withheld` names the token, so the screen can say so out loud.
-- [x] *(duplicate of the proved box above — kept rather than deleted, because removing an
-  acceptance criterion is not a writer's call to make silently.)* While streaming, deltas show the
-  placeholder and the completed message shows the original — asserted by capturing the SSE frames and
-  then reading the stored message.
-- [x] *(duplicate of the proved box above — kept rather than deleted, same reason.)* A second reader
-  (shared conversation, admin) sees the placeholder, not the original (asserted with two readers on
-  the same message).
-- [x] An exemption for one label and one feature allows that label through for that feature only; another feature with the same label stays masked.
-- [x] An expired exemption stops applying on the next request and emits `ai.guard.exemption.expired`. — **proved in `apps/api/tests/ai_guard.rs`** (`an_expired_exemption_stops_applying_and_is_announced_exactly_once`). Liveness is asserted by *moving the clock on the row* rather than by sleeping: a test that waited for a real expiry would be slow, non-deterministic, and blind to a predicate that is right about "now" and wrong about "later". The announcement is asserted **at the `events` table**, not against the sweep's return value — checking only the list passes against a sweep that computes the right rows and emits nothing, which is the defect this criterion exists to catch. The sweep runs twice and the count must stay at 1, because a lapse is a permanent fact and any caller that re-reads it re-announces it. **This walk found a real bug on the way in**: `lapsed_exemptions` filtered `expires_at > $2`, i.e. a plain future filter, so the function returned the inverse of its own name and would have announced every exemption *still running* and never the one that lapsed.
-- [x] Saving an invalid regex is refused with a field error and stores nothing; the validate endpoint returns the same message.
-- [x] The tester returns matches with labels and spans, the masked text and the verdict, and performs no provider call (stub provider records zero calls). — **proved in `apps/api/tests/ai_guard_outbound.rs`**: the walk runs a payload carrying an e-mail *and* a Luhn-valid card through `POST /ai/guard/test`, reads the `blocked` verdict, the `card` label, the eight running rules and the matches, and asserts the stub recorded **zero** calls. It also asserts two things the criterion does not name and the screen depends on: a blocked verdict carries **no** outbound text (so no caller can mistake a half-masked body for something that was sent), and no match carries the value — only its salted hash.
-- [x] The payload never appears in `ai_guard_events`, in the audit log or in the API response of the events endpoints — asserted by a test that greps the stored row text for the original value.
-- [x] **Every verdict the guard reaches becomes a row, and no other name does.** —
-  `every_verdict_the_guard_reaches_becomes_a_row_and_no_other_name_does` (slice 4). This box is the
-  one the previous three slices were missing: every other walk in `ai_guard.rs` hand-wrote its own
-  `NewEvent` with a literal it chose, so the suite was green against a writer whose output the
-  database rejected — it proved the store could *hold* a row, never that the guard's own string could
-  get there. This walk starts from the **verdict**, the way `checkpoint` does, and requires the row
-  to survive to storage for all three producible names; then it files the four per-rule action names,
-  `clear`, and the two phantom names `0210` accepted, and requires each to be **refused before the
-  insert** with a message naming the vocabulary it wanted. A walk that passed a `flagged` expectation
-  is what forced the finding that **there is no `flagged` verdict**: `Action::Flag` yields `Allowed`,
-  so two of the five names `0210` allowed were producible by nothing.
-- [ ] A caller without `ai.guard.manage` sees Rule actions and the tester disabled with the missing permission named; the API answers 403. — **half proved, half not, so not ticked.** Proved (`a_guard_reader_is_told_the_key_it_is_missing`): `missing_guard_keys` is computed from the **real** `effective_permissions`, not from a hand-built "missing" array, and all three states are checked — a reader is missing `manage`, a manager is missing nothing, and `read` is never reported missing (a screen that renders itself read-only to everybody looks broken). The `403`s are enforced by the existing `guards::require` write paths. **Not proved:** that the buttons are visibly disabled and the key visibly named, which needs the browser pass.
-- [ ] `/ai/guard/about` states the residual risk, and no other guard screen claims detection is complete. — **half proved, half not, so not ticked.** Proved: the endpoint serves the detector's own `LABELS` constants with a measured `labels_disabled`, `apps/admin/features/ai/guard-about.tsx` leads each row with `misses`, and the walkthrough asserts the misses text exists and that every served label carries a non-empty `misses` (a screen rendering an empty column would satisfy every other check). **Not proved:** the second half — that no *other* guard screen overstates detection — is a statement about four screens at once and only the browser pass can make it.
+- [ ] A prompt containing an email address is masked to `[EMAIL_1]` before the provider call (proven with a stub provider that records the exact body it received) and the same value keeps the same placeholder across two calls in one request.
+- [ ] The answer is re-mapped on completion: a stub provider that echoes `[EMAIL_1]` produces the original address in the stored message for the requester.
+- [ ] While streaming, deltas show the placeholder and the completed message shows the original — asserted by capturing the SSE frames and then reading the stored message.
+- [ ] A second reader (shared conversation, admin) sees the placeholder, not the original (asserted with two readers on the same message).
+- [ ] An exemption for one label and one feature allows that label through for that feature only; another feature with the same label stays masked.
+- [ ] An expired exemption stops applying on the next request and emits `ai.guard.exemption.expired`.
+- [ ] Saving an invalid regex is refused with a field error and stores nothing; the validate endpoint returns the same message.
+- [ ] The tester returns matches with labels and spans, the masked text and the verdict, and performs no provider call (stub provider records zero calls).
+- [ ] The payload never appears in `ai_guard_events`, in the audit log or in the API response of the events endpoints — asserted by a test that greps the stored row text for the original value.
+- [ ] A caller without `ai.guard.manage` sees Rule actions and the tester disabled with the missing permission named; the API answers 403.
+- [ ] `/ai/guard/about` states the residual risk, and no other guard screen claims detection is complete.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
 
 ### QA plan
