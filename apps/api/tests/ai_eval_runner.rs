@@ -417,14 +417,38 @@ impl Runner {
         .expect("the run must be created")
     }
 
+    /// Point one case's `input.prompt` at a real question.
+    ///
+    /// Written as an UPDATE rather than folded into `suite_with` because a case's prompt is the
+    /// **question**, and a fixture that had to supply it per case at creation time would put the
+    /// provider's answer-selection in the same call as the expectation — two variables in one
+    /// line, which is how a walk ends up asserting the stub rather than the runner.
+    ///
+    /// `case_messages` pushes the prompt unconditionally, so an empty one is not a blank question:
+    /// `validate_request` refuses it and the case settles `error` before a provider is reached.
+    async fn input_prompt(&self, organization_id: Uuid, suite_id: Uuid, name: &str, prompt: &str) {
+        sqlx::query(
+            "update ai_eval_cases set input = jsonb_build_object('prompt', $4::text) \
+             where suite_id = $1 and organization_id = $2 and name = $3",
+        )
+        .bind(suite_id)
+        .bind(organization_id)
+        .bind(name)
+        .bind(prompt)
+        .execute(&self.pool)
+        .await
+        .expect("the case prompt must be settable");
+    }
+
     /// The suite's own `last_*` columns, read the way the suite list reads them.
     async fn suite_state(&self, suite_id: Uuid) -> (Option<f64>, Option<String>) {
-        let row: (Option<f64>, Option<String>) =
-            sqlx::query_as("select last_pass_rate::float8, last_gate from ai_eval_suites where id = $1")
-                .bind(suite_id)
-                .fetch_one(&self.pool)
-                .await
-                .expect("the suite must be readable");
+        let row: (Option<f64>, Option<String>) = sqlx::query_as(
+            "select last_pass_rate::float8, last_gate from ai_eval_suites where id = $1",
+        )
+        .bind(suite_id)
+        .fetch_one(&self.pool)
+        .await
+        .expect("the suite must be readable");
         row
     }
 
@@ -1716,6 +1740,257 @@ async fn a_run_with_no_judge_records_no_judge_spend() {
     );
 
     model_stub.abort();
+    fx.dispose().await;
+}
+
+/// **A stub that answers each case's own prompt.** The two answers below are the fixture's, and
+/// they are keyed on the *question*, not on the case row.
+///
+/// The first version used the single-reply `stub_provider` above, on the reasoning that "the same
+/// bytes for every case" isolates the expectation. It isolates it in the wrong direction: with one
+/// fixed reply both cases get the leaky answer, so the clean case fails too and the walk asserts
+/// `failed == 2` — it measures the stub, not the guard. The honest shape is the one a real
+/// provider has: the model reads the case's prompt and answers *that* question, so the run's two
+/// rows differ because the model behaved differently, which is exactly what an eval measures.
+///
+/// The prompt is matched on its content, so the answer follows the case that was asked rather than
+/// its position in the queue — a runner that executed the cases in a different order would get the
+/// same rows.
+async fn stub_provider_answering_two() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::routing::post as route_post;
+    use axum::{Json, Router};
+
+    const LEAKY: &str = "Reach me at ada@example.com or +90 532 111 22 33.";
+    const CLEAN: &str = "The order shipped on Tuesday.";
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the stub must bind a port");
+    let address = listener.local_addr().expect("the stub has an address");
+    let app = Router::new().route(
+        "/chat/completions",
+        route_post(move |body: String| async move {
+            // The whole request body, not the parsed messages: the claim is which question the
+            // model was asked, and a walk that parsed and re-serialized it would be asserting on
+            // its own serialization. A stub that answered by *order* would pass a runner that
+            // scored every case against the previous case's output.
+            let reply = if body.contains("contact") { LEAKY } else { CLEAN };
+            Json(serde_json::json!({
+                "choices": [{
+                    "message": { "role": "assistant", "content": reply },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 1200, "completion_tokens": 300, "total_tokens": 1500 }
+            }))
+        }),
+    );
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), task)
+}
+
+/// **`no_pii` is decided by the installation's guard, at the run level, and it is the guard that
+/// decides — not a regex this file wrote.**
+///
+/// The acceptance row's wording is "a value REQ-105's detector would mask". That phrase is the
+/// whole test: an eval suite that grew its own e-mail/phone pattern would drift from the guard the
+/// product actually applies to outbound text, so a suite could pass while production masked the
+/// same output. The runner already loads `guard_store::load_guard` once per run — this walks that
+/// seam with the **seeded** platform rules, which is the only rule set a real installation has.
+///
+/// The two cases are the shape of the property: a leaky answer fails it, a clean one passes it,
+/// and the clean case names a second property too — a runner that short-circuited on the first
+/// satisfied property, or that never ran the guard at all and answered `pass` by default, would
+/// read the leaky row green.
+#[tokio::test]
+async fn a_no_pii_case_fails_on_what_the_data_guard_would_mask_and_passes_a_clean_one() {
+    let fx = runner!();
+    let org = fx.organization().await;
+
+    // The live seam again, so the output that reaches `score_case` is a provider's answer and the
+    // guard's verdict is computed over exactly the bytes the panel would show.
+    let (model_base, model_stub) = stub_provider_answering_two().await;
+    let model = fx.model_at(model_base, "pii-model").await;
+    let model_key = fx.key_of(model).await;
+
+    // Assert the fixture is a guard fixture at all: on a database whose seed lost the platform
+    // rules every row below would read "clean" and the walk would pass while measuring nothing.
+    let guard = omnion_ai_hub::guard_store::load_guard(&fx.pool, org)
+        .await
+        .expect("the guard must load");
+    let findings = omnion_ai_hub::eval_case::pii_findings(&guard, "write to ada@example.com");
+    assert!(
+        !findings.clean,
+        "the seeded guard must mask an e-mail address, or this walk measures nothing: {findings:?}"
+    );
+    assert!(
+        omnion_ai_hub::eval_case::pii_findings(&guard, "The order shipped on Tuesday.").clean,
+        "and the control output must be clean"
+    );
+
+    let suite = fx
+        .suite_with(
+            org,
+            "pii",
+            model,
+            &[
+                // The word `contact` is what the stub keys on to pick the leaky answer, so the two
+                // cases are asked two genuinely different questions rather than being told the same
+                // one and then expecting two different verdicts from identical bytes.
+                ("masked", serde_json::json!({ "no_pii": true, "contains": ["ada"] }), 1.0),
+                ("clean", serde_json::json!({ "no_pii": true, "contains": ["Tuesday"] }), 1.0),
+            ],
+            90,
+            5.0,
+            None,
+        )
+        .await;
+    // The prompts carry the questions the stub reads. `NewCase` writes `input` verbatim, so this is
+    // the whole wire the model sees.
+    for (name, prompt) in [
+        ("masked", "give me the contact address for the account"),
+        ("clean", "when did the order ship?"),
+    ] {
+        fx.input_prompt(org, suite, name, prompt).await;
+    }
+    fx.queue_with(
+        org,
+        suite,
+        model,
+        serde_json::json!({ "model": model_key, "temperature": 0.0, "prompt": "" }),
+    )
+    .await;
+
+    let queued = eval_run::claim_next_run(&fx.pool)
+        .await
+        .expect("the queue must read")
+        .expect("the run must be claimable");
+    let turn = ai_eval_runner::live_turn_for(&fx.pool, &queued)
+        .await
+        .expect("the run's pinned model must resolve to a dialable target");
+    let verdict = ai_eval_runner::execute(&fx.pool, &queued, &turn)
+        .await
+        .expect("the live run must not fail");
+
+    assert_eq!(verdict.failed, 1, "exactly the masked case fails: {verdict:?}");
+    let results = eval_run::list_case_results(&fx.pool, org, queued.id)
+        .await
+        .expect("the results must be readable");
+    let by_name = |name: &str| {
+        results
+            .iter()
+            .find(|row| row.case_name == name)
+            .unwrap_or_else(|| panic!("{name} must have a result: {results:?}"))
+    };
+
+    // The masked case fails on the guard, and the detail names the label — an operator reading an
+    // expanded row has to be able to tell *which* control fired without opening the guard screen.
+    let masked = by_name("masked");
+    assert_eq!(masked.status, "fail", "checks: {:?}", masked.checks);
+    let masked_checks: Vec<serde_json::Value> = serde_json::from_value(masked.checks.clone())
+        .unwrap_or_else(|_| panic!("checks must be a list: {:?}", masked.checks));
+    let pii = masked_checks
+        .iter()
+        .find(|check| check["property"] == "no_pii")
+        .unwrap_or_else(|| panic!("the no_pii check must be recorded: {masked_checks:?}"));
+    assert_eq!(pii["passed"], serde_json::json!(false));
+    let detail = pii["detail"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        detail.contains("email"),
+        "the detail must name the label the guard fired on, got {detail:?}"
+    );
+    // The output itself is stored unmasked: this is the panel's own copy of an answer that leaked
+    // an address, and an eval store that masked it would hide the very finding the case exists to
+    // surface. Asserted so a later "let's be careful with eval output" change cannot quietly do it.
+    assert!(
+        masked.output.as_deref().unwrap_or_default().contains("@example.com"),
+        "the output row keeps what the model said, so the finding is readable"
+    );
+
+    // The clean case passes on BOTH of its properties. A runner that decided `no_pii` from the
+    // case's own regex rather than the guard would also pass this — which is exactly why the
+    // masked row above carries the real label in its detail.
+    let clean = by_name("clean");
+    assert_eq!(clean.status, "pass", "checks: {:?}", clean.checks);
+    let clean_checks: Vec<serde_json::Value> = serde_json::from_value(clean.checks.clone())
+        .unwrap_or_else(|_| panic!("checks must be a list: {:?}", clean.checks));
+    assert!(
+        clean_checks.iter().any(|c| c["property"] == "no_pii" && c["passed"] == serde_json::json!(true)),
+        "the clean case records a passing no_pii: {clean_checks:?}"
+    );
+
+    model_stub.abort();
+    fx.dispose().await;
+}
+
+/// **A case whose `no_pii` was never evaluated is `error`, not `pass`.**
+///
+/// The control for the walk above, and the reason the row above needed a live seam at all. The
+/// runner hands `score_case` an `Option<&LoadedGuard>`; a runner that passed `None` — because the
+/// load failed, or because it never tried — still produces two plausible rows, except that the
+/// `no_pii` check is recorded `unevaluated` and the case settles `error`. A property that could
+/// not be measured must never read as a satisfied bar in a promotion gate.
+///
+/// It is walked here rather than in `eval_case.rs` because the unit module can only be handed a
+/// `GuardOutcome` by its own caller; proving that the *runner* supplies one needs the runner.
+#[tokio::test]
+async fn a_no_pii_case_the_guard_never_ran_is_an_error_and_not_a_pass() {
+    let fx = runner!();
+    let org = fx.organization().await;
+
+    // Break the guard the way production does: the rule budget refuses to compile. `load_guard`
+    // is what the runner swallows into `None`, so this is the honest way to reach that arm — and
+    // it is why the failure has to settle as `error`, not silently as a pass.
+    sqlx::query("update ai_guard_rules set enabled = false")
+        .execute(&fx.pool)
+        .await
+        .expect("the guard rules must be disableable");
+    // Zero rules is not a budget refusal, so the load still succeeds with an empty detector and
+    // the row below would read clean. Force the arm under test instead: a rule whose pattern the
+    // compiler rejects makes `Detector::new` fail and `load_guard` return Err.
+    sqlx::query(
+        "update ai_guard_rules set enabled = true, pattern = '(?<invalid' \
+         where key = 'email.builtin'",
+    )
+    .execute(&fx.pool)
+    .await
+    .expect("the platform email rule must be reachable");
+    assert!(
+        omnion_ai_hub::guard_store::load_guard(&fx.pool, org).await.is_err(),
+        "an uncompilable rule set must fail the load, or the walk is not reaching the None arm"
+    );
+
+    let model = fx.model().await;
+    let suite = fx
+        .suite_with(
+            org,
+            "no-guard",
+            model,
+            &[("pii", serde_json::json!({ "no_pii": true }), 1.0)],
+            90,
+            5.0,
+            None,
+        )
+        .await;
+    fx.queue(org, suite, model).await;
+
+    let turn = ScriptedTurn::new(&[("pii", "write to ada@example.com")]);
+    let report = ai_eval_runner::tick(&fx.pool, 1, &turn)
+        .await
+        .expect("the tick must not fail");
+    assert_eq!(report.claimed, 1, "the run must still be claimed and scored");
+
+    let results = eval_run::list_case_results(&fx.pool, org, first_run(&fx, suite).await)
+        .await
+        .expect("the results must be readable");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].status, "error",
+        "a case whose guard never ran must settle error, not pass: {:?}",
+        results[0].checks
+    );
+
     fx.dispose().await;
 }
 
