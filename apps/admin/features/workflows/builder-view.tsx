@@ -2609,6 +2609,17 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                       y={(from.position.y + to.position.y) / 2 + CARD_H / 2 - 6}
                       textAnchor="middle"
                       className="fill-[var(--color-muted)] text-[10px]"
+                      // **The label was the reason an edge could not be selected.** It is drawn
+                      // at the curve's own midpoint — the one point a probe and a user both
+                      // aim at — and with SVG's default `pointer-events: auto` a `<text>`
+                      // node wins the hit test against the 14px transparent stroke beneath it
+                      // and the stroke's own `onPointerDown` never runs. The result was an
+                      // edge that drew, could be walked to, and could not be clicked: the
+                      // criterion "Del on a selected edge removes it" had no reachable way
+                      // in, for anyone. `none` gives the stroke the point back without
+                      // moving the label a pixel, and the label stays readable because it was
+                      // never interactive to begin with.
+                      style={{ pointerEvents: "none" }}
                     >
                       {edge.source_port}
                     </text>
