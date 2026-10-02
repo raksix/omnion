@@ -11811,3 +11811,64 @@ sibling's pass, not on a saturated machine. The pass was queued, not forced.
 `narrow-lock.tableMode.editControls` that can be anything but 0. The two constants fixed this tick
 change what `analytics.empty` and the push-disabled readings mean, so their next live values are
 evidence rather than a repeat of the previous run's.
+
+---
+
+## Tick 88 — 2026-10-02 · REQ-004 slice 3 · `settleRun` was re-creating the race it was written to kill
+
+**What.** The run-from-here note reads the run through `settleRun` before asserting anything about
+it. That helper's own doc described a stop condition the code did not have — *"waits for the run to
+stop MOVING **after having observed it start**"* — while the implementation asked only for two
+identical readings. **A run waiting to be claimed has not moved either**, so two polls 500 ms apart on
+a freshly accepted run are byte-identical and the helper returned `settled: true` on a run that had
+executed nothing. That is tick 61's reading verbatim (`statuses: ["pending"]`, `pillsPainted: 0`,
+`inRunButNotPainted: [wait-3, act-3, end-3]`): the helper was written to kill that race and re-created
+it, and all five downstream readings say "the product is missing this" with no way to say why.
+
+**Second hole, found by the test rather than by reading.** A *hung* run also satisfies "stopped moving"
+(`running|1:running,2:pending` on every poll), so `settled` cannot distinguish a wedged engine from a
+finished one — and a run that moved once and stopped is the more common kind of hang. `settled` keeps
+its documented contract; `finished` names the stronger fact beside it, and the note emits three answers
+where it emitted one:
+
+| what happened | before | now |
+|---|---|---|
+| never claimed | `settled: true` (wrong) | `settled: false, started: false` |
+| claimed, then wedged | `settled: true` (unreadable) | `settled: true, started: true, finished: false` |
+| finished | `settled: true` | `settled: true, started: true, finished: true` |
+
+`settleGraph`, the graph-side twin thirty lines below, already required stability **and** movement and
+says why in its own comment (*a graph that has not been written yet is stable*). Two helpers with one
+job, one requiring the witness and one not, is the tick-87 shape one level down.
+
+**Proof.** `node --test 'apps/admin/features/workflows/*.test.ts'` → **389/389** (381 before, +8) ·
+`pnpm typecheck` → **2/2** clean · `cargo test -p omnion-workflows --lib` → **163 passed**, unchanged (a
+harness defect, not an engine one) · `mutate-settle-run-row.sh` → **7/7 red**, each naming its assertion ·
+`run-from-here-row.mutation.mjs` → **14/14 red** (M11/M13 anchors were stale after this change and were
+retargeted; that harness's own `includes` check would have thrown rather than reporting a strawman) ·
+walkthrough restored byte-identical after every mutation run. **No criterion is ticked by this** — it
+makes the next reading legible, not available.
+
+**The gate runs the helper rather than reading it.** Every other instrument test here asserts on source
+text, and this REQ has a run of those being satisfied by a *mention* of a construct rather than a use of
+it — a source check passes on a helper whose condition is commented out. `settle-run-row.test.ts`
+extracts the function by brace matching and evaluates it, so every assertion is about what it RETURNS.
+**The extractor was wrong twice before it was right**, both in this directory's own family:
+`{ attempts = 40, interval = 500 } = {}` is a brace pair inside the *signature* (a matcher counting from
+the paren hands `new Function` a bodyless function — caught by the length assertion, which is why that
+non-load-bearing assertion is kept), and the `)` is followed by a space, so "the next character is `{`"
+is a claim about formatting. **One mutation is a declared survivor and says so out loud** (tick 57's
+rule): relaxing the length assertion leaves the suite green because M7 and the behaviour tests already
+catch truncation — kept as documentation, which is a different statement from "removed".
+
+**Slot.** Checked first and held throughout. w4's pass (holder 2327603, `/proc/2327603/cwd` =
+`/mnt/apopic/omnion-w4`, live) finished and the place went to w8 (holder 2878882, cwd
+`/mnt/apopic/omnion-w8`, live) — 384 Chrome, 0 free RAM, load 26. The pass was queued, not forced; a
+forced pass on a box with 0 free RAM measures the machine.
+
+**Commits:** `d1a09c17`, pushed.
+
+**Next:** `--only=workflow-table,workflow-builder` the moment the slot frees, and the run-from-here note
+must be read with `runStarted` / `runFinished` beside `runSettled` — `settled: true, finished: false` is a
+wedged engine and not a rule whose nodes fail to paint pills. That single distinction is what four
+unticked rows have been reading as a product defect since tick 61.
