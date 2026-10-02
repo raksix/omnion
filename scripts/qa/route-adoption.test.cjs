@@ -106,6 +106,34 @@ const CASES = [
     methods: [['GET', null], ['POST', 'c.d']],
   },
   {
+    name: 'three merged verbs under one trailing layer all carry it',
+    // The real shape from `command_recent`: every merge is closed before the layer, so the
+    // layer chains onto the merged router and guards all three. Reading the layer as belonging
+    // only to the last verb -- which the depth rule here prevents -- documents two of them as
+    // unguarded when they are guarded.
+    expr:
+      'get(c::recent)\n.merge(post(c::record))\n.merge(delete(c::clear))\n.layer(guards::require(&state, "search.read"))',
+    parts: 3,
+    methods: [
+      ['GET', 'search.read'],
+      ['POST', 'search.read'],
+      ['DELETE', 'search.read'],
+    ],
+  },
+  {
+    name: 'a multi-line merge with a trailing comma closes cleanly',
+    // The real shape from `/health/incidents/{id}`: the merge argument spans lines and ends
+    // with a comma. The `)` that closes merge sits after that comma, so a stripper that only
+    // looks for `))` leaves it behind and emits `{ patch(..) ), }` -- which does not parse.
+    expr:
+      'get(h::incident).layer(guards::require(&state, "health.read")).merge(\n                    patch(h::patch_incident)\n                        .layer(guards::require(&state, "health.manage")),\n                )',
+    parts: 2,
+    methods: [
+      ['GET', 'health.read'],
+      ['PATCH', 'health.manage'],
+    ],
+  },
+  {
     name: 'a body limit layer is not mistaken for a permission',
     expr: 'post(media::upload_media).layer(DefaultBodyLimit::max(25))',
     parts: 1,

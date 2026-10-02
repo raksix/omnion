@@ -218,32 +218,84 @@ def split_routers(expr):
     # not parse -- which is the good kind of failure, and the reason the round-trip assertion in
     # `route-adoption.test.cjs` is checked before anything is written.
     parts, prev = [], 0
-    for idx, c in enumerate(cuts):
+    for c in cuts:
         chunk = expr[prev:c]
-        stripped = re.sub(r'\.merge\(\s*$', '', chunk).rstrip()
-        # `post(h).merge(` opens a bracket that belongs to the verb AFTER the merge. The two
-        # halves therefore have to be closed from BOTH sides: the verb before the merge gives back
-        # the `)` it borrowed, and the verb after it gives up the `)` that closed merge's
-        # argument. Fixing only one side is what produced the two asymmetric failures before
-        # this assertion existed -- parts one `)` too heavy, in one direction and then the other.
-        if _parens(stripped) > 0:
-            stripped += ')' * _parens(stripped)
-        parts.append(stripped)
+        # The `.merge(` operator belongs to the chain, not to a verb: drop it, and drop the single
+        # `)` that closed merge -- which lands immediately after the verb call it wrapped. That
+        # paren is what produced `{ post(commands::record)) }` and a file that does not parse.
+        parts.append(_strip_merge(chunk))
         prev = c
-    last = expr[prev:]
-    # The verb after a merge carries merge's closing paren. Drop exactly that many TRAILING
-    # parens -- `rstrip(')')` blindly would also eat the `)` that closes `guards::require(..)`
-    # and then the guard stops parsing, which is how the last verb lost its permission.
-    surplus = -_parens(last)
-    if surplus > 0:
-        stripped = last.rstrip()
-        for _ in range(surplus):
-            if not stripped.endswith(')'):
-                break
-            stripped = stripped[:-1].rstrip()
-        last = stripped
-    parts.append(last)
+    parts.append(_strip_merge(expr[prev:]))
     return [p for p in parts if p.strip(', ')]
+
+def _strip_merge(chunk):
+    """Remove a trailing `.merge(` and the `)` that closed it, leaving a standalone router.
+
+    The trailing DOT is dropped too. A chain element that follows another one begins where its
+    method name begins -- `.delete(h)` contributes from `delete`, not from the dot -- so the dot
+    belongs to nothing once the two verbs are in separate parts. Left in, it is what produced
+    `{ axum::routing::patch(..)\n . }` and *unexpected token: `}`*.
+    """
+    out = re.sub(r'\.merge\(\s*$', '', chunk).rstrip()
+    # a `)` sitting directly after a completed top-level verb call is merge's, not ours
+    while True:
+        cut = _merge_close_at(out)
+        if cut is None:
+            break
+        out = out[:cut] + out[cut + 1:]
+    return out.strip().rstrip('.').strip()
+
+def _merge_close_at(chunk):
+    """Index of the `)` that closes an enclosing `.merge(`, or None.
+
+    Three spellings occur in this router and the first version only handled one:
+
+    * `get(h).merge(post(x))`      -- merge's `)` directly follows the verb's
+    * `.merge(\n  post(x),\n)`     -- a trailing comma and newlines before the `)`
+    * `.merge(post(x).layer(g),)`  -- a trailing comma with no newline
+
+    All three are the same thing: one extra closing paren after a completed verb expression.
+    """
+    depth, i, in_str, after_verb = 0, 0, False, False
+    while i < len(chunk):
+        c = chunk[i]
+        if in_str:
+            if c == '\\':
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c in '([{':
+            if depth == 0 and VERB_HIT(chunk, i):
+                after_verb = True
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+            if depth == 0:
+                after_verb = True
+            # a completed verb expression followed by `,?` and then `)` is merge's paren
+            if depth == 0 and after_verb and c == ')':
+                j = i + 1
+                while j < len(chunk) and chunk[j] in ' \t\n':
+                    j += 1
+                if j < len(chunk) and chunk[j] in '),':
+                    return i + 1
+                after_verb = False
+        i += 1
+    return None
+
+def VERB_HIT(chunk, at):
+    """Whether an opening bracket at `at` opens a routing verb call."""
+    e = at - 1
+    while e >= 0 and chunk[e] in ' \t\n':
+        e -= 1
+    f = e
+    while f >= 0 and (chunk[f].isalnum() or chunk[f] in '_:'):
+        f -= 1
+    name = chunk[f + 1:e + 1].split('::')[-1]
+    return name in ('get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'trace')
 
 def _parens(s):
     """Net parenthesis depth of `s`, string-aware."""
@@ -322,23 +374,23 @@ def guard_covers_all(expr):
     """Whether a `guards::` call guards the WHOLE router or only the leg it is written on.
 
     `owner == 'layer'` is true in BOTH shapes, so it cannot be the discriminator -- that was the
-    first version, and it documented `get(h).merge(delete(h2).layer(g))`'s GET with the DELETE's
-    permission. What separates them is WHERE the layer sits relative to the verbs:
+    first version, and it documented the GET leg of `get(h).merge(delete(h2).layer(g))` with the
+    DELETE's permission. The discriminator is DEPTH:
 
-    * `post(h).get(h2).layer(g)` -- the layer comes AFTER every verb it guards, chained onto the
-      router they are all part of. Both verbs are covered.
-    * `get(h).merge(delete(h2).layer(g))` -- the layer guards the last verb, and a `merge` argument
-      is a router in its own right; a verb BEFORE the merge is not covered by a layer written
-      inside it.
+    * `get(recent).merge(post(record)).merge(delete(clear)).layer(g)` -- every merge is closed
+      before the layer, so the layer sits at depth 1 and chains onto the merged router: `g` guards
+      all three verbs.
+    * `get(h).merge(delete(h2).layer(g))` -- the layer is inside merge's parentheses, at depth 2,
+      and guards the DELETE leg alone.
 
-    So: a whole-router layer applies only when no `.merge(` precedes it in the expression.
+    Both are real shapes in this repository, and reading the second as the first (or the reverse)
+    misstates a permission the guard does not enforce.
     """
     for m in re.finditer(r'guards::[a-z_]+\s*', expr):
         if enclosing_call(expr, m.start()) != 'layer':
             continue
-        if '.merge(' in expr[:m.start()]:
-            return False
-        return True
+        if _paren_depth(expr, m.start()) == 1:
+            return True
     return False
 
 def enclosing_call(expr, at):
@@ -501,6 +553,65 @@ def router_chains(src):
         out.append((m.end(), j, layer))
     return out
 
+def annotate_bindings(src):
+    """Give every handler binding an explicit `MethodRouter<AppState, Infallible>` type.
+
+    ## Why this exists at all
+
+    A `MethodRouter`'s second type parameter is the handler's error type, and axum's builders
+    leave it to inference at the point where the router is USED. Before `documented!`, that point
+    was the `.route(..)` call, which passed the router into a typed `Router<AppState>` and settled
+    the parameter. Inside the macro there is no such use -- the macro's body constrains nothing --
+    so the inference vanished and 161 bindings failed with
+
+        E0283: type annotations needed for `MethodRouter<AppState, _>`
+
+    **reported at `let roles = get(..)` -- a line this pass does not touch.** That is what made it
+    hard to read: the error is in the binding, the cause is in the call site, and there are 161 of
+    them.
+
+    Annotating is not a workaround; it restates the type the use site used to infer, and it makes
+    the binding's contract visible where the binding is declared. 57 bindings already carry it.
+    """
+    masked = mask_comments(src)
+    verb_start = re.compile(
+        r'^\s*(?:axum::routing::)?(?:get|post|put|patch|delete|head|options|trace)\s*\('
+    )
+    out = src
+    edits = []
+    for mm in re.finditer(r'\blet\s+([a-z_][a-z0-9_]*)\s*(:\s*[^=]+?)?=\s*', masked):
+        name, ann = mm.group(1), mm.group(2)
+        if ann:
+            continue
+        j, depth, in_str = mm.end(), 0, False
+        while j < len(masked):
+            c = masked[j]
+            if in_str:
+                if c == '\\':
+                    j += 2
+                    continue
+                if c == '"':
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c in '([{':
+                depth += 1
+            elif c in ')]}':
+                depth -= 1
+            elif c == ';' and depth == 0:
+                break
+            j += 1
+        if verb_start.match(masked[mm.end():j]):
+            # The annotation goes after the NAME and before whatever the regex matched next --
+            # which may be a type, or ` = `. Using `mm.end(1) + len(name)` was right for the
+            # untyped case and wrong for `let roles: MethodRouter = ..`, where it landed the
+            # annotation after the first character of the type: `let roles: M` became
+            # `let roles: M` with a second `: ...` spliced into `get(..)` as `ge: T)t(..)`.
+            edits.append((mm.end(1), mm.end(1)))
+    for name_end in sorted({e[0] for e in edits}, reverse=True):
+        out = out[:name_end] + ': MethodRouter<AppState, Infallible>' + out[name_end:]
+    return out, len(edits)
+
 def main():
     src = open(PATH).read()
     original = src
@@ -574,17 +685,39 @@ def main():
             counts['unguarded'] += 1
 
         # one documented! per (path, verb), each wrapping its ORIGINAL sub-expression unchanged
+        #
+        # The handler goes inside BRACES. `documented!` takes it as a `block` because a guard
+        # carries a top-level comma -- `guards::require(&state, "media.read")` -- and an `expr`
+        # fragment ends at that comma, shifting every later argument one position left. That
+        # failure is late and unreadable: *missing tokens in macro arguments*, on a line that
+        # looks right. Wrapping is not optional formatting.
+        #
+        # The TYPE is not annotated here: a macro `block` fragment matches one `{ expression }`,
+        # so a `let` inside the braces does not parse. `documented!` settles the handler's type
+        # itself, which is also the only place it can -- see the macro's own comment.
         parts = []
         for verb, perm, handler in methods:
             key = perm or inherited or ''
             parts.append(
-                'documented!(\n                Method::%s,\n                "%s",\n                %s,\n                "%s",\n                "%s"\n            )'
+                'documented!(\n                Method::%s,\n                "%s",\n'
+                '                { %s },\n'
+                '                "%s",\n                "%s"\n            )'
                 % (verb, path, handler, key, summary_for(path, verb))
             )
         if len(parts) == 1:
             replacement = parts[0]
         else:
-            replacement = parts[0] + '\n            .merge(\n                ' + '\n                .merge('.join(p.strip() for p in parts[1:]) + ',\n            )'
+            # CHAIN the merges: `a.merge(b).merge(c)`. The first attempt nested them as further
+            # arguments -- `.merge(a, b)` -- because the join put each next part inside the
+            # previous call's parentheses. `MethodRouter::merge` takes ONE router, so that is
+            # neither what axum accepts nor what the router served before, and the error it
+            # produced (`mismatched closing delimiter` at the whole `router()` fn) pointed at the
+            # function rather than at the call that was wrong.
+            head, tail = parts[0], parts[1:]
+            body = head
+            for p in tail:
+                body += '\n            .merge(' + p.strip() + ')'
+            replacement = body
         edits.append((h_start, h_end, replacement))
 
     print("resolved:", counts)
@@ -597,8 +730,12 @@ def main():
 
     for h_start, h_end, replacement in sorted(edits, reverse=True):
         src = src[:h_start] + replacement + src[h_end:]
+
+    # Second phase, AFTER the routes: the bindings must be annotated against the text the route
+    # rewrite produced, so an offset measured before it would land in the wrong place.
+    src, annotated = annotate_bindings(src)
     open(PATH, 'w').write(src)
-    print("wrote", PATH, "edits:", len(edits))
+    print("wrote", PATH, "route edits:", len(edits), "bindings annotated:", annotated)
     return 0
 
 def summary_for(path, verb):

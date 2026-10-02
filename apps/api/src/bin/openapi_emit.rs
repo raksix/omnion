@@ -83,14 +83,17 @@ async fn run(check_only: bool) -> Result<ExitCode, String> {
     // The floor is not a magic number: it is far below the smallest router this platform could
     // plausibly ship and far above an empty one, so it can only ever fire when the inventory is
     // not being filled — which is the only condition under which the check would be worth nothing.
-    const MINIMUM_PLAUSIBLE_ROUTES: usize = 100;
-    if verdict.total < MINIMUM_PLAUSIBLE_ROUTES {
+    //
+    // Quoted from the inventory rather than repeated here, so the gate and the test that guards
+    // this very condition cannot disagree about what an empty router is.
+    if verdict.total < omnion_api::routes::inventory::MINIMUM_ROUTES {
         eprintln!(
             "openapi-emit: INVENTORY FAILED — the router reported {} routes, below the floor of \
-             {MINIMUM_PLAUSIBLE_ROUTES}. Either no route has adopted documented! yet, or the \
+             {}. Either no route has adopted documented! yet, or the \
              inventory is being read before the router is assembled. An empty document passes \
              every check this binary makes, which is exactly why it must not be produced.",
-            verdict.total
+            verdict.total,
+            omnion_api::routes::inventory::MINIMUM_ROUTES
         );
         failed = true;
     }
