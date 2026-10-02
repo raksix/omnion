@@ -237,7 +237,40 @@ else
   OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_WEB" --name "$WEB_NAME" --cwd "$ROOT/apps/web" --time -- dev --port "$WEB_PORT" --hostname 127.0.0.1 >/dev/null
 fi
-wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
+# **The renderer is gated by what the pass MEASURES, not by existing.**
+#
+# `wait_http` here used to be a hard gate: if the public renderer did not answer, the pass exited
+# 1 before the walkthrough ran at all. That is right for a full acceptance run and wrong for a
+# focused one, and the cost was measured twice: a `QA_ONLY=workflow-builder` pass on a box with no
+# room for Turbopack's cache died on `public renderer did not answer`, and the two minutes after
+# that went into reading a *web* defect in a branch whose *web* app was merely out of disk. The
+# walkthrough itself does not treat the renderer as required — it wraps its public-renderer
+# section in a try/catch and records `report.web.error` (`walkthrough.cjs`, the `webBase` block).
+# **So the gate was stricter than the thing it guards**, and the pass measured less than its own
+# harness would have let it: every admin-side row in that run is unmeasured because of a component
+# none of those rows touch.
+#
+# The two options are now named rather than implied. `QA_REQUIRE_WEB=1` keeps the old behaviour
+# for a full acceptance run, where "the public site renders" is itself a criterion. The default
+# starts the renderer and RECORDS whether it answered; a focused admin pass that did not need it
+# runs to completion and says `public renderer: DOWN` in the log, and a full pass opts back into
+# refusing to start.
+#
+# A failed renderer is never silent: `WEB_ANSWERED=0` is exported so a caller can act on it, and
+# the line is printed either way. "The pass ran" and "the renderer booted" stay two claims.
+if ! wait_http "http://127.0.0.1:$WEB_PORT/" 150; then
+  if [ "${QA_REQUIRE_WEB:-0}" = "1" ]; then
+    echo "[qa] public renderer did not answer (QA_REQUIRE_WEB=1 — refusing to run a pass that measures it)"
+    pm2 logs "$WEB_NAME" --lines 20 --nostream || true
+    exit 1
+  fi
+  echo "[qa] public renderer did not answer; continuing — this pass does not measure it (QA_REQUIRE_WEB=1 to make it fatal)"
+  export WEB_ANSWERED=0
+  pm2 logs "$WEB_NAME" --lines 20 --nostream || true
+else
+  echo "[qa] public renderer answered on :$WEB_PORT"
+  export WEB_ANSWERED=1
+fi
 
 # `QA_ONLY` narrows the pass to named routes and depth passes. The default runs every one of
 # them, which is the right thing for a full acceptance run and the wrong thing for a loop that
@@ -299,11 +332,12 @@ step "vision review"
 node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
 
 step "summary"
-node -e '
+WEB_ANSWERED="${WEB_ANSWERED:-unknown}" node -e '
 const fs = require("fs");
 const path = require("path");
 const out = process.argv[1];
 const label = process.argv[2] || "main";
+const webAnswered = process.env.WEB_ANSWERED || "unknown";
 const summary = JSON.parse(fs.readFileSync(path.join(out, "summary.json"), "utf8"));
 const visionPath = path.join(out, "findings", "vision.json");
 const vision = fs.existsSync(visionPath) ? JSON.parse(fs.readFileSync(visionPath, "utf8")) : { skipped: "not run" };
@@ -311,6 +345,7 @@ const doc = [
   `# Omnion QA — latest pass (${label})`,
   "",
   `- When: ${summary.startedAt || "?"} · artifacts: \`${path.relative(process.cwd(), out)}\``,
+  `- Public renderer: ${webAnswered === "1" ? "answered" : webAnswered === "0" ? "**DID NOT ANSWER** — the public-renderer rows below are UNMEASURED, not green" : "unknown"}`,
   `- Interactions: ${summary.counts?.clicks ?? 0} clicks · ${summary.counts?.filled ?? 0} field fills · ${summary.counts?.forms ?? 0} form submissions · ${summary.counts?.screenshots ?? 0} screenshots`,
   `- Console errors: ${summary.counts?.consoleErrors ?? 0} · failed requests: ${summary.counts?.failedRequests ?? 0} · dialogs: ${summary.counts?.dialogs ?? 0}`,
   `- Programmatic findings: ${summary.findings?.length ?? 0} (high ${summary.bySeverity?.high ?? 0} · medium ${summary.bySeverity?.medium ?? 0} · low ${summary.bySeverity?.low ?? 0})`,
