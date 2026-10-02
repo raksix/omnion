@@ -12459,6 +12459,26 @@ async function main() {
     console.error(`[walk] artifacts kept at ${OUT} — re-run the pass before reading any finding above.`);
     process.exit(4);
   }
+
+  // **A pass that found defects exits non-zero.** Until tick 75 this file exited `0` whenever the
+  // run merely *produced evidence*, which made `QA_VERDICT=pass` mean "the pass ran", not "the
+  // screens are sound". The consequence is not cosmetic: a tick that trusted the verdict closed a
+  // REQ over a pass reporting **72 high findings**, and the BUILD-LOG line read `QA_VERDICT=pass`.
+  // Exit status is the one channel every reader already uses, so the number of high findings has
+  // to live there too — otherwise the honest report is the one nobody reads.
+  //
+  // `QA_HIGH_FAIL_ON` exists so a writer can keep a *known-red* area from blocking a focused pass
+  // (`QA_HIGH_FAIL_ON=0` is what the focused `--only=` runs use); the default is to fail, because
+  // the whole point of the gate is that "0 high findings" is a thing worth having to earn.
+  const failOn = process.env.QA_HIGH_FAIL_ON;
+  const highLimit = failOn === undefined || failOn === "" ? 0 : Number(failOn);
+  if (bySeverity.high > highLimit) {
+    console.error(
+      `[walk] ${bySeverity.high} high finding(s) — over the limit of ${highLimit}. ` +
+        `The run is a record, not a pass; artifacts are at ${OUT}.`,
+    );
+    process.exit(5);
+  }
 }
 
 main().catch(async (err) => {

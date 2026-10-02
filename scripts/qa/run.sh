@@ -266,7 +266,15 @@ step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
 # otherwise swallow all three, which is precisely how the tick-46 null reached a BUILD-LOG.
 WALK_EXIT=0
 node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}" || WALK_EXIT=$?
-if [ "$WALK_EXIT" != "0" ]; then
+# **Exit 4 and exit 5 are different failures and must not be reported as one.**
+# 4 means the run is *not a verdict* — it lost its evidence or the stack stopped serving, so the
+# findings below describe nothing trustworthy. 5 means the run *is* a verdict and the verdict is
+# red: high findings above the limit, against screens that were genuinely measured. Collapsing
+# them under one "not a verdict" line is what let a 72-high pass read as a broken run and a clean
+# run read as a pass, and it is why a writer could close a REQ on `QA_VERDICT=pass`.
+if [ "$WALK_EXIT" = "5" ]; then
+  printf '\n[qa] the walkthrough RAN and found high findings — the report below is a real verdict, and it is red.\n'
+elif [ "$WALK_EXIT" != "0" ]; then
   printf '\n[qa] the walkthrough exited %s — the report below is a record of the run, not a verdict.\n' "$WALK_EXIT"
 fi
 
@@ -344,7 +352,11 @@ grep -E "^QA_|^VISION_" "$OUT"/*.log 2>/dev/null || true
 # with the first. A pass that cannot be believed must fail the command that ran it, or "zero high
 # findings" keeps reading as a green result on a BUILD-LOG line.
 if [ "$WALK_EXIT" != "0" ]; then
-  echo "QA_VERDICT=void (walkthrough exit $WALK_EXIT)"
+  if [ "$WALK_EXIT" = "5" ]; then
+    echo "QA_VERDICT=fail (high findings above QA_HIGH_FAIL_ON)"
+  else
+    echo "QA_VERDICT=void (walkthrough exit $WALK_EXIT)"
+  fi
   exit "$WALK_EXIT"
 fi
 echo "QA_VERDICT=pass"
