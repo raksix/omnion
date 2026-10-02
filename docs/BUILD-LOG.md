@@ -13849,3 +13849,70 @@ behind the queue; it does not produce a pixel.
 
 **Next.** The browser pass when the slot frees **and** `/mnt/apopic` is off 100% — then the three
 boxes, then `done`. Reclaim before the pass, and expect `CARGO_TARGET_DIR` to point off this volume.
+
+## Tick 79 — 2026-10-02 · REQ-051 · the board's cursor followed `j` but not the mouse
+
+**Found, and it is the contradiction the last browser report could not resolve.** That report left
+three red steps with a precise tension: `theCursorIsVisible: true`, `theListHasRows: true`, and
+`jMovesTheVisibleCursor`/`kMovesBack`/`exactlyOneCursor` all `false` — "a cursor that exists, is
+drawn, and does not move under `j`", with the note that either the two disagree about which row is
+marked or `j` moves a selection the DOM never reflects. It could not be settled from the report, so
+this tick read the code.
+
+**The board had two cursors.** The frame's `selectedIndex` (a number `j`/`k` move, held in
+`CrmShell` via `useCrmKeyboard`) and the board's own `focusedCard` (the id the card draws its ring
+on). A one-way sync was meant to join them:
+
+```ts
+useEffect(() => {
+  const id = frame ? dealIds[frame.selectedIndex] : null;
+  if (id) setFocusedCard(id);
+}, [dealIds, frame]);
+```
+
+`frame` is **not a stable value**. `CrmShell` builds its context as a bare literal —
+`const value: CrmListState = { … }`, no `useMemo` — so the dependency is a new object on every
+render, the effect body re-ran after every render, and it rewrote `focusedCard` from a number that
+**only `j`/`k` ever moved**. Clicking a card called `setFocusedCard` and nothing else, so the ring
+drew on the clicked card for one frame and the next render of anything on the page — a hover, a
+notice clearing, a refetch — put it back on the first card. `Enter` then opened whichever deal the
+*index* named, not the one that was clicked.
+
+**Fixed** in `5feec809`: the sync depends on `frameIndex`, a **primitive**, so the body runs when
+the index genuinely changed and never otherwise; and the card's click now moves both cursors, so
+clicking and `j` leave the same state behind.
+
+**A gate, because the defect reads as reviewed code.** A non-empty dependency array still looks like
+a dependency array, and the comment above the effect described the sync as correct.
+`scripts/qa/probe-crm-cursor-sync.cjs` asserts no hook depends on the provider's non-memoized
+context object, that the board resolves through the primitive, and that a click moves both cursors.
+It also asserts the provider is *still* an unmemoized literal — if that ever changes the rule is
+stale, and a gate that keeps passing after its premise moved is worse than no gate.
+
+**proof**
+
+| gate | result |
+|---|---|
+| `cargo test -p omnion-module-crm --lib` (`CARGO_TARGET_DIR=/dev/shm/w4-target`) | **172 passed**, 0 failed |
+| `apps/admin` `tsc --noEmit` | exit **0** |
+| `probe-crm-screen-states.cjs` | **28/28** |
+| `probe-crm-sweep-selectors.cjs` | **11/11** |
+| `probe-crm-cursor-sync.cjs` | **6/6**, exit 0 |
+| the same gate on the **real pre-fix file** | **2/6, exit 1**, naming the object dependency, the click and the join |
+
+The gate's first draft printed a **false** reason for the join rule when run against the pre-fix
+file — it said no path joined the cursors, where the truth is that the pre-fix code *did* join them,
+just through the object. Corrected to distinguish the two, and re-proven red with the accurate
+reason.
+
+**NOT CLAIMED.** No acceptance box ticked. The three open boxes are still browser-only, and this fix
+is the thing the keyboard box's pass would have caught had it run — but a static gate is not a
+pixel, so the box stays open.
+
+**Why no browser pass again.** The slot is held live by **main** (`pid 315364`, `cwd=/mnt/apopic/omnion`,
+`kill -0` + `/proc/<pid>/cwd` verified), and the box is the real reason: **933 Chrome processes**,
+1.2 GB available of 32, **24 GB of swap in use**, `/mnt/apopic` at **97%**. A pass launched into that
+is an OOM kill whose output looks like a defect list.
+
+**Next.** The browser pass when the slot frees *and* the box has room — then the three boxes, then
+`done`. `CARGO_TARGET_DIR` off this volume, `${PIPESTATUS[0]}` not `$?` after a pipe.
