@@ -37,7 +37,7 @@ New crate `crates/cdn` (cache rules + purge queue + provider adapters), an admin
 - Adapters shipping in this request: `origin` (no external cache — rule engine and headers only), `generic_http` (POST a JSON purge payload to a configured endpoint), `cloudflare_style` (zone purge calls matching a hosted-CDN zone API). The catalogue endpoint lists only shipped adapters.
 - Cache policy output on the public API surface: `Cache-Control`, `CDN-Cache-Control`, `ETag`, `Vary`, `Surrogate-Key` on `/api/v1/public/*` and `/api/v1/media/*`; immutable caching for content-hashed theme assets.
 - Admin: CDN overview, purge console, cache-rule editor, provider settings, purge history.
-- Automatic purge triggers: `page.published`, `page.unpublished`, `page.deleted`, `media.replaced`, `theme.activated`, `site.domain.changed` — each mapped to URLs and tags by the rule set.
+- Automatic purge triggers: `page.published`, `page.unpublished`, `page.deleted`, `media.version_created`, `theme.activated`, `domain.added`, `domain.removed` — each mapped to URLs and tags by the rule set.
 - A purge worker (drain loop, exponential backoff, batch cap, per-provider concurrency limit).
 
 **Out**
@@ -91,7 +91,7 @@ Indexes: `cdn_purges (site_id, requested_at desc)`; `cdn_purge_items (purge_id, 
 
 ### Events
 
-**Emitted:** `cdn.purge.requested`, `cdn.purge.completed`, `cdn.purge.failed`, `cdn.rule.changed`, `cdn.settings.updated` — each with the identifiers a consumer needs (purge id, site id, kind, counts) and no rendered content. **Consumed:** `page.published`, `page.unpublished`, `page.deleted`, `media.replaced`, `theme.activated`, `site.domain.changed`; a consumed event maps to URLs and tags through the rule set, then enqueues one purge.
+**Emitted:** `cdn.purge.requested`, `cdn.purge.completed`, `cdn.purge.failed`, `cdn.rule.changed`, `cdn.settings.updated` — each with the identifiers a consumer needs (purge id, site id, kind, counts) and no rendered content. **Consumed:** `page.published`, `page.unpublished`, `page.deleted`, `media.version_created`, `theme.activated`, `domain.added`, `domain.removed`; a consumed event maps to URLs and tags through the rule set, then enqueues one purge.
 
 Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint can alert on cache drift; `cdn.purge.completed` is deliberately low-volume and also subscribable. Audit entries use the `cdn.*` namespace (`cdn.purge.requested`, `cdn.settings.updated`, `cdn.rule.changed`).
 
@@ -133,3 +133,6 @@ The walkthrough must visit `/cdn`, `/cdn/purges`, `/cdn/purge`, `/cdn/rules`, `/
 - Tag-based purging depends on the CDN supporting surrogate keys; `origin` and `generic_http` fall back to URL purges derived from the same tag map, and the UI says which strategy ran.
 - Purge storms: cap enqueued items per trigger and coalesce URLs that repeat within a short window.
 - Public cache headers must not leak private data: only published content routes are cacheable, and anything behind a session sends `Cache-Control: private, no-store` as today.
+
+
+**Correction (tick 103).** Two names in this request were ones the platform has never emitted and never will under those spellings, and a consumer built to this spec would have subscribed to nothing: `media.replaced` is emitted by the file manager as `media.version_created` (REQ-010 names it in its own Events list and in the comment on the emitter), and the tenancy layer emits `domain.added` / `domain.removed` rather than a single `site.domain.changed`. Both lines above — the scope list and the event contract — now say the way the emitters actually record them. The gate `every_consumed_name_in_a_live_area_is_deliverable` (`apps/api/tests/events.rs`) is what found them: it walks every `Consumed:` line in `docs/requests/` and fails when the name's area already emits other events, but this exact name is neither live nor `Reserved`. It is the third direction of the same seam the two existing drift gates close — those hold emitters against the catalogue, and this holds the **specs** against the catalogue.
