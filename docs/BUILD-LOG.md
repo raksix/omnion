@@ -16536,3 +16536,161 @@ defect in the code.
 
 **Next:** the browser pass with `--only=backups` on a free slot, then the status-card browser
 tick and the walkthrough criterion.
+
+## 2026-10-02 — slice 48 · REQ-117: a key that exists and a value that does not
+
+**Four functions asked jsonb whether a `delivered_at` KEY existed. Migration `0202` — the repair
+migration for this very table — writes that key with a `null` value, and `?` cannot see the
+difference.**
+
+The autoresponder store decides one question in four places, and it wrote it the same way in all
+four:
+
+```sql
+and detail ? 'sent' and not (detail ? 'delivered_at')
+```
+
+`?` is jsonb's key-**existence** operator and it is TRUE for a key whose value is JSON `null`.
+That is not a subtle corner — it is what `0202` writes, in the migration's own words:
+
+```sql
+jsonb_build_object('sent', true, 'delivered_at', null, 'delivery_unknown', true)
+-- "`delivered_at` is NULL for a row whose delivery was never observed, which is the truth"
+```
+
+Measured on the running server rather than argued, which is now leg 1 of the gate:
+
+```text
+{"sent":true,"delivered_at":null,"delivery_unknown":true} ? 'delivered_at'   ->  t
+not (that)                                                                   ->  f
+```
+
+So the predicate excluded **exactly the rows `0202` was written to rescue.**
+
+### The half that was unreachable, and the half that was accidentally right
+
+`mark_sent`'s doc comment, three lines above the predicate that contradicted it:
+
+> *"this predicate therefore also matches them: an installation upgrading mid-flight can complete
+> a claim the old code claimed but never recorded, rather than leaving it permanently
+> uncompletable."*
+
+It did not match them. A comment that specifies a behaviour, next to a predicate that excludes
+its subject, is the shape this branch keeps meeting — and this time the specification came from
+the migration, not from a wish.
+
+The other half is the reason this was not a one-line fix. `release_claim` is a **`delete`**, and
+it shared the broken predicate — so the bug was *also* a safety net: the key-existence test was
+accidentally shielding a `0202` row from deletion. That row is `sent: true`; `0202` sets it that
+way precisely so an answered lead is never re-opened. A release that could see it would delete
+the only record that the lead was answered, `prepare` would answer "not sent", and the second
+copy would go to a visitor who already has the first. **A duplicate is a permanent, invisible
+defect** — the bias this module has taken since `0058`.
+
+The uniform search-and-replace — the one four writers reach for — would have shipped that. So the
+repair is asymmetric, and the asymmetry is the rule:
+
+> **completion may proceed on an unknown row, a release may not.**
+
+`mark_sent` reads `detail->>'delivered_at' is null` alone. `release_claim` reads that **and**
+`coalesce(detail->>'delivery_unknown', 'false') <> 'true'`. `claim_delivery` and the
+`due_reservations` sweep take the value answer. `ClaimState::of` already read the column with
+`and_then(Value::as_str)`, so the SQL and the reader now agree on one spelling of the same fact
+instead of two that disagree only for `0202`'s rows.
+
+**The guard on the release is not load-bearing today** — a `0202` row is `sent: true`, so
+`prepare` answers `AlreadySent` first and the sweep requires `sent = 'false'`, and no path
+reaches it. It is written anyway, and the test says so in prose: *a predicate that happens to be
+safe is one refactor away from not being safe*, and "no caller can produce this" is a claim about
+the callers rather than about the predicate.
+
+### The gate
+
+```text
+bash scripts/qa/run-autoresponder-delivery-null.sh    9 passed, 0 failed   (×3, identical)
+```
+
+**PROVEN TO FAIL at 3/9** with the fix stashed — and the two legs that stay green are the ones
+that matter for that claim:
+
+```text
+PASS  a null-valued key answers 'present' to ? …                 <- the defect's own arithmetic
+FAIL  no function tests for the PRESENCE of delivered_at (3 + 1)
+FAIL  the value spelling is in all four places (found 0, expected 4)
+FAIL  the release carries an explicit delivery_unknown exemption
+PASS  the suite asserts a_0202_shaped_claim_can_still_be_completed <- the witness
+PASS  the suite asserts a_settled_0202_claim_is_never_released
+```
+
+A gate that went red on every leg would be measuring its own fixture. The jsonb leg is a
+*control*: it is true before and after the fix, which is what shows the remaining reds come from
+the predicates and not from a mis-stated premise.
+
+Behaviourally, `modules/crm-intake/tests/crm_autoresponder.rs` is **20 passed (was 18)**, and
+reverting only the four predicate strings — nothing else, the docs and the tests left in place —
+reds **exactly one** test:
+
+```text
+a_0202_shaped_claim_can_still_be_completed ... FAILED      <- the positive case
+test result: FAILED. 19 passed; 1 failed
+```
+
+**The negative control staying green is the honest result, and it is the most useful line in
+this entry.** `a_settled_0202_claim_is_never_released` passes against the *broken* code, because
+the broken predicate was accidentally safe there — which is precisely why the release needs an
+explicit exemption instead of the repaired predicate alone. Had I read that green as "the fix is
+over-corrected", or had I left the test out and shipped the uniform replacement, the duplicate
+would have shipped with a green suite and a passing gate.
+
+### The gate's first two runs failed for reasons that were not the defect
+
+Both were mine and both are in the file, because a gate whose header documents a trap and then
+walks into it teaches the reader nothing:
+
+1. **The subject appeared in the gate's own description.** Leg 2 counted the string
+   `not (detail ? 'delivered_at')` across the whole file — and found the one occurrence *in the
+   doc comment I had just written naming the defect*. A gate that greps prose counts its own
+   explanation as a regression. Code lines are now filtered (`grep -v -E '^[[:space:]]*//'`).
+2. **Leg 4 used the exact construct the header warns about.** This file's header documents the
+   `printf | grep -q` SIGPIPE race under `pipefail` (measured on an earlier gate: `0 141 141 0
+   141 141 0 141` over eight identical runs). Leg 4 then wrote the pipeline form anyway and
+   failed — for the race, not for the rule. The body is now matched with `case`.
+
+### Gate result
+
+```text
+cargo test -p omnion-module-crm-intake --test crm_autoresponder   20 passed; 0 failed
+cargo test -p omnion-module-crm-intake --lib                      207 passed; 0 failed
+cargo test -p omnion-api --lib                                    327 passed; 0 failed
+cargo clippy -p omnion-module-crm-intake --lib                    0 warnings
+tsc -p apps/admin/tsconfig.json --noEmit                          exit 0
+```
+
+**No browser pass, and none claimed.** No screen changed — this is four SQL predicate strings and
+the prose that governs them — and the QA slot is held by a live sibling (`omnion-qa-slot-holders`
+pid alive, cwd `/mnt/apopic/omnion-w3`) with `/mnt/apopic` at 95%. The rule on this branch is
+that a pass not executed is a hypothesis; nothing here is claimed to be walked.
+
+### Lessons
+
+* **`?` is a question about a key; `->>` is a question about a value, and they disagree exactly
+  where a migration writes `null` on purpose.** A predicate that negates a key-existence test is
+  not a conservative reading of "absent" — it is a *third* meaning that matches neither. Whenever
+  a column can hold JSON `null`, ask the value.
+* **The same broken predicate can be a defect in one function and a safety net in another.**
+  `mark_sent` adds a fact and `release_claim` deletes a row; the row `0202` writes is missing a
+  fact and is load-bearing evidence. "Fix the predicate everywhere" is a heuristic, and here it
+  would have shipped a duplicate email. When a predicate is shared, the *operations* have to be
+  compared before the predicate is.
+* **A test that stays green against the broken code is a finding, not a pass.** It told me the
+  old predicate was accidentally correct there — which is the fact that forced the explicit
+  exemption. The proof that matters is not "N tests red before the fix" but "exactly the ones
+  that name the defect, and the rest explain themselves".
+* **Ask the database, do not argue from memory.** The whole defect turned on one jsonb question;
+  the gate prints the server's answer, so the premise is re-checked on every run rather than
+  trusted from this entry.
+* **`printf | grep -q` under `pipefail` is a race, and I wrote it anyway** in a file whose header
+  documents the race. The rule is not "know the trap" — it is "use `case` or capture-then-test",
+  so the trap is unreachable by construction.
+* **A gate that greps a file must separate code from prose.** The first version counted its own
+  documentation as a violation, and would have failed for ever on correct code.
