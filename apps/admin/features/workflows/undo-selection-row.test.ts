@@ -214,15 +214,54 @@ test("every write gesture waits for the write instead of guessing its duration",
       NEXT_NOTE.lastIndex = index;
       const noteAt = NEXT_NOTE.exec(BUILDER_PASS)?.index ?? -1;
       const window = BUILDER_PASS.slice(index, noteAt === -1 ? BUILDER_PASS.length : noteAt);
-      // A window this wide is not a row, it is a region of the file. Assert the shape of the
-      // instrument as well as its verdict, so a future note format that the search misses fails
-      // loudly instead of silently widening every window in the suite.
-      assert.ok(
-        window.length < 4000,
-        `the window after a ${name} is ${window.length} chars: the next-note search missed a ` +
-          `note format and this is judging the whole rest of the pass`,
+      // **A row's size is not a defect, and no cap on the whole window can tell the two apart.**
+      //
+      // This was `window.length < 4000`, and it went red on the `narrow-lock` row at 4377
+      // chars — a row that is *correct*: it presses Delete, `c`, Enter, Escape and Control+z,
+      // each with its own settle helper, and then closes the loop by proving a locked builder is
+      // still readable. Every one of those is that row's own subject, so the window is exactly as
+      // wide as the row is long, and no amount of fixing the search would narrow it.
+      //
+      // The second attempt capped the number of *presses* in the window at 8. That is also wrong,
+      // and the measurements say so: the windows of the two gestures this guard actually scans
+      // hold 5 and 1 presses, while windows elsewhere in the same file legitimately hold 16. A cap
+      // set between those numbers is a number that will be raised the first time a row grows,
+      // which is a number that stops meaning anything. Worse, it guards a property of the
+      // *harness's own search patterns* rather than of the code under test: `WRITE_GESTURES`
+      // scans two keys, so no cap on gesture counts can notice that a note search broke for some
+      // third key. Three mutations in a row stayed green because of exactly that.
+      //
+      // What is left is the claim this guard can actually make, and it is the one that mattered:
+      // **the window must contain the gesture's own settle helper, and must not open with a fixed
+      // sleep.** A missed note widens the window and the helper check is what notices, because a
+      // gesture whose helper has fallen out of its own row is exactly the failure the next-note
+      // search exists to prevent. So the helper assertion is kept, promoted to a named check, and
+      // the two size proxies are dropped rather than re-tuned.
+      //
+      // **What this still does not catch, stated rather than papered over:** a note written in a
+      // shape this regex does not recognise but which still *terminates* the window. Inserting
+      // `note({ NOTEPROBESYNC: true })` before the row's real note keeps the window well-formed
+      // — it just stops one gesture early — and every assertion here stays green, because the
+      // helpers that follow the inserted note belong to the same row and are still inside it. A
+      // mutation did exactly that and passed. Catching it would mean parsing the note's fields,
+      // which is a second copy of the walkthrough's structure inside a test that exists to police
+      // *its* structure; the honest fix is a real parser, not another regex. The two defects this
+      // guard is FOR — a settle helper replaced by a fixed sleep, and every helper removed from
+      // the row — are both caught, and both were red on a named assertion under mutation.
+      assert.notEqual(
+        noteAt,
+        -1,
+        `a ${name} has no closing note: the window ran to the end of the file, so this guard ` +
+          `would police the rest of the pass instead of the row`,
       );
       const settled = SETTLE_HELPERS.some((helper) => window.includes(helper));
+      assert.ok(
+        settled,
+        `the window after a ${name} holds no settle helper, so the gesture's reading is not ` +
+          `waiting for anything: the next-note search missed a note format and this window is ` +
+          `no longer the row (${window.length} chars, ` +
+          `${window.match(/\.press\(/g)?.length ?? 0} presses)`,
+      );
       // A fixed sleep ANYWHERE in the window is the defect only when it stands in for the
       // gesture's OWN claim. A row may legitimately contain several gestures — the locked-builder
       // row presses `Delete`, `c`, `Enter`, `Escape` and `Control+z`, and each is measured by its
