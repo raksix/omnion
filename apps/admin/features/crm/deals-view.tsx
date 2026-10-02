@@ -506,11 +506,24 @@ export function DealsView() {
   // body in the deals depth pass, so the guard is real rather than theoretical. The throwing
   // `useCrmList` is the wrong hook here: this component is drawn **above** the `CrmShell` it is a
   // child of, so the throwing form took the whole route down on every load.
+  //
+  // The dependency is `frameIndex`, the **primitive**, not `frame`. `CrmShell` builds its context
+  // value as a plain object literal (`crm-parts.tsx`, `const value: CrmListState = {...}`, no
+  // `useMemo`), so a dependency on `frame` changed identity on *every* render and this effect body
+  // re-ran after every render — including renders it had nothing to do with. It then rewrote
+  // `focusedCard` from `dealIds[frame.selectedIndex]`, which is a number the **click** and the
+  // `?focus=` link had never moved. The operator's click on a card therefore set the ring, and the
+  // next render of anything on the page (a hover state, a notice clearing, a refetch) put the ring
+  // back on the first card: a cursor that follows `j` but not the mouse, and where `Enter` opens a
+  // deal the ring is not on. Depending on the index means the body runs when the index genuinely
+  // changed — that is, when `j`/`k` moved it — and never otherwise.
   const frame = useOptionalCrmList();
+  const frameIndex = frame ? frame.selectedIndex : -1;
   useEffect(() => {
-    const id = frame ? dealIds[frame.selectedIndex] : null;
+    if (frameIndex < 0) return;
+    const id = dealIds[frameIndex];
     if (id) setFocusedCard(id);
-  }, [dealIds, frame]);
+  }, [dealIds, frameIndex]);
 
   return (
     <CrmShell
@@ -751,7 +764,18 @@ export function DealsView() {
                           setDropStage(null);
                         }}
                         onFocus={() => setFocusedCard(deal.id)}
-                        onClick={() => setFocusedCard(deal.id)}
+                        // A click moves **both** cursors. `setFocusedCard` alone drew the ring on
+                        // this card while the frame's `selectedIndex` stayed where `j` last left
+                        // it, and the sync effect above writes the ring back from that index — so
+                        // the ring moved for a frame and then snapped away, and `Enter` opened
+                        // whichever deal the *index* named rather than the one that was clicked.
+                        // Pressing `j` and clicking are the same act, so they leave the same
+                        // state behind.
+                        onClick={() => {
+                          setFocusedCard(deal.id);
+                          const index = dealIds.indexOf(deal.id);
+                          if (index >= 0) frame?.setSelectedIndex(index);
+                        }}
                         onKeyDown={(event) => {
                           if (event.key === "Enter" || event.key === " ") {
                             event.preventDefault();
