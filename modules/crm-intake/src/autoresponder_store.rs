@@ -31,6 +31,7 @@
 //! file now carries two tests for — one per decline path, because the two are separate arms and
 //! fixing one while leaving the other is how a branch keeps the same bug in a new place.
 
+use serde::Serialize;
 use serde_json::Value;
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -77,6 +78,133 @@ impl Outcome {
     #[must_use]
     pub fn sendable(&self) -> Option<&Message> {
         self.verdict.sendable()
+    }
+}
+
+/// How long a *completed* claim is left alone before the sweep may consider it again.
+///
+/// Only ever applied to the recovery arm below, and it exists so that re-offering a lost send
+/// costs one tick rather than racing the caller that is presumably still sending it.
+pub const ABANDONED_CLAIM_AFTER: time::Duration = time::Duration::minutes(5);
+
+/// What a claim row currently is, as a *reader* needs it.
+///
+/// ## Why the state is computed here and not in the browser
+///
+/// A claim line is a jsonb blob and the detail screen used to read the raw keys and infer:
+/// `sent: true` means answered, no `delivered_at` means waiting, `due_at` in the future means
+/// held. Each of those is a *separate* inference, in the one consumer that has no way to be
+/// wrong loudly — so an abandoned claim rendered exactly like a claim the caller is still
+/// holding, on a lead whose reply was never sent. The row already carries the two facts; what
+/// was missing was the sentence that says which one this is, in the same place `verdict_name`
+/// was put in slice 45. **A state a reader has to infer from three keys is a state two readers
+/// will infer differently.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimState {
+    /// The message went to the mailer and a delivery instant was recorded.
+    Sent,
+    /// Reserved and waiting for its delay to elapse.
+    Reserved,
+    /// Undelayed, and the caller is still holding it.
+    Claimed,
+    /// Undelayed, past the window, and nothing has sent it — the recovery case.
+    Abandoned,
+    /// The claim was recorded before any delivery could be observed (migration `0202`).
+    Unknown,
+}
+
+impl ClaimState {
+    /// The state of one stored claim detail.
+    ///
+    /// `None` for anything that is not a claim at all — a skip note, which shares the `kind`
+    /// deliberately so the trail shows "autoresponder_sent: no address" as a fact about the
+    /// autoresponder rather than about a message.
+    ///
+    /// ## The order of the questions is the rule
+    ///
+    /// `delivered_at` first, because it is the only key written by [`mark_sent`] and therefore
+    /// the only evidence of a send. `due_at` second, because a due instant means the delay
+    /// still governs this row. `delivery_unknown` before the `created_at` arithmetic, because
+    /// migration `0202` stamped the rows it could not repair with a key that means exactly
+    /// "never claimed as delivered, and never will be".
+    #[must_use]
+    pub fn of(detail: &Value) -> Option<Self> {
+        if !detail.get("sent").is_some() {
+            return None;
+        }
+        if detail.get("delivered_at").and_then(Value::as_str).is_some() {
+            return Some(Self::Sent);
+        }
+        if detail.get("delivery_unknown").and_then(Value::as_bool) == Some(true) {
+            return Some(Self::Unknown);
+        }
+        let due = detail.get("due_at").and_then(Value::as_str).filter(|v| !v.is_empty());
+        match due {
+            // A delayed claim is the reservation case, and it is the sweep's own predicate.
+            Some(_) => Some(Self::Reserved),
+            // **No due instant means the delay does not govern this row**, so what governs it
+            // is whether the caller is still holding it. `created_at` is the claim instant,
+            // and the row carries no other timestamp for an immediate send.
+            None => Some(Self::Claimed),
+        }
+    }
+
+    /// The same state, decided against the clock: is an *undelayed* claim old enough that the
+    /// sweep may take it over?
+    ///
+    /// **This is the one place the answer changes with time**, and it is deliberately not
+    /// folded into [`ClaimState::of`] — that function is a pure reading of a stored row, which
+    /// is what the panel and the API want, and this one is a decision about *another*
+    /// process's liveness. The bound is [`ABANDONED_CLAIM_AFTER`], not the worker's send claim
+    /// window: a claim that has been standing that long with no `delivered_at` is not somebody
+    /// mid-send, and the bias the module has always taken holds — **a duplicate is a permanent,
+    /// invisible defect; a delayed send is a temporary, visible one.**
+    ///
+    /// The bound is five minutes against an SMTP timeout an operator can raise out to any
+    /// length (`OMNION_SMTP_TIMEOUT_MS`), so a send that outlives the window is possible and
+    /// the bias decides what happens then: the second copy goes out, rather than the lead never
+    /// being answered at all.
+    #[must_use]
+    pub fn is_abandoned(&self, claimed_at: OffsetDateTime, now: OffsetDateTime) -> bool {
+        match self {
+            Self::Claimed => now - claimed_at >= ABANDONED_CLAIM_AFTER,
+            Self::Reserved | Self::Sent | Self::Unknown | Self::Abandoned => false,
+        }
+    }
+
+    /// The full state of a stored row at an instant, `Abandoned` included.
+    ///
+    /// The reader's entry point, and the reason [`ClaimState::Abandoned`] is reachable at all:
+    /// [`ClaimState::of`] deliberately cannot produce it, because deciding that a claim is
+    /// abandoned is a statement about *another process's* liveness rather than a fact in the
+    /// row. Splitting the two is what lets the API answer "what does this line mean" without a
+    /// clock argument, and the sweep answer "is this one still owed" with one.
+    #[must_use]
+    pub fn at(detail: &Value, claimed_at: OffsetDateTime, now: OffsetDateTime) -> Option<Self> {
+        let state = Self::of(detail)?;
+        Some(if state.is_abandoned(claimed_at, now) {
+            Self::Abandoned
+        } else {
+            state
+        })
+    }
+
+    /// `true` when the recovery sweep may take this row over.
+    ///
+    /// **One state, and that is the point.** A `Reserved` row is *not* recoverable by age: the
+    /// delay governs it and the SQL decides it from the due instant, which is a different
+    /// question with a different answer. A `Sent` or `Unknown` row must never be sent again,
+    /// and a fresh `Claimed` one still belongs to whoever took it.
+    ///
+    /// There is deliberately no `is_owed()` here. It was written first, answered "yes" for
+    /// `Reserved` as well, and had **no caller** — which is the exact shape this file's
+    /// neighbours in this branch have been burned by three times: a method whose doc describes a
+    /// decision nobody makes. The sweep's own predicate is the SQL; a reader's is
+    /// [`ClaimState::at`].
+    #[must_use]
+    pub fn is_recoverable(&self) -> bool {
+        matches!(self, Self::Abandoned)
     }
 }
 
@@ -511,13 +639,27 @@ pub async fn due_reservations(
          from crm_lead_events e \
          where e.kind = $1 \
            and e.detail->>'sent' = 'false' \
-           and nullif(e.detail->>'due_at', '') is not null \
-           and e.detail->>'due_at' <= $2 \
-         order by e.detail->>'due_at' asc, e.id asc \
-         limit $3",
+           and not (e.detail ? 'delivered_at') \
+           and ( \
+             (nullif(e.detail->>'due_at', '') is not null and e.detail->>'due_at' <= $2) \
+             or (nullif(e.detail->>'due_at', '') is null and e.created_at <= $3) \
+           ) \
+         order by coalesce(nullif(e.detail->>'due_at', ''), e.created_at::text) asc, e.id asc \
+         limit $4",
     )
     .bind(SENT_KIND)
     .bind(crate::autoresponder::date_header(now))
+    // The recovery arm's bound. A delayed row's own `due_at` governs it; an *immediate* claim
+    // has no due instant at all, so what governs it is how long it has stood with no recorded
+    // delivery. That is the clause the previous version lacked, and it is the whole fix: without
+    // it this sweep could not see an abandoned immediate claim, so a send lost to a restart was
+    // owed by nobody for ever while `prepare` answered `AlreadySent`.
+    //
+    // `$3` is a real `timestamptz` and not the RFC 2822 string `due_at` uses, for the reason
+    // migration `0205` already wrote down for `delivery_claimed_at`: comparing an instant as
+    // text needs every writer to share one formatter in one zone, and the bias of getting that
+    // wrong here is toward *never* recovering a lead that is owed an answer.
+    .bind(now - ABANDONED_CLAIM_AFTER)
     .bind(limit.clamp(1, 500))
     .fetch_all(pool)
     .await?;
@@ -687,4 +829,171 @@ async fn source_of(pool: &PgPool, source_id: Option<Uuid>) -> Result<Option<Inta
     .bind(source_id)
     .fetch_optional(pool)
     .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use time::macros::datetime;
+
+    /// A fixed instant, so no test in this module reads the wall clock.
+    const NOON: OffsetDateTime = datetime!(2026-10-02 12:00 UTC);
+
+    /// The claim `claim` writes for an undelayed message: `sent: false`, no due instant.
+    fn immediate_claim() -> Value {
+        json!({
+            "to": "ada@example.com",
+            "subject": "We received your message",
+            "template": "acknowledgement",
+            "delayed": false,
+            "due_at": Value::Null,
+            "sent": false,
+        })
+    }
+
+    /// The claim `claim` writes for a delayed message.
+    fn reserved_claim() -> Value {
+        json!({
+            "to": "ada@example.com",
+            "subject": "We received your message",
+            "template": "acknowledgement",
+            "delayed": true,
+            "due_at": "Thu, 02 Oct 2026 12:30:00 +0000",
+            "sent": false,
+        })
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The state is one question with five answers, and each key decides exactly one of them.
+    //
+    // Every assertion here is a *negative* except the two that prove a state is reachable —
+    // a `ClaimState::of` that answered `None` for everything would satisfy the first three, so
+    // the "this row really is a claim" fixtures are asserted too.
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn a_skip_note_is_not_a_claim() {
+        // `record_skip` writes the SAME kind with no `sent` key, so "does this row claim the
+        // send" is the question — and answering it wrongly would render every silence in the
+        // trail as a message that is on its way.
+        assert_eq!(
+            ClaimState::of(&json!({ "reason": "no_address" })),
+            None,
+            "a note about why nothing went out is not a claim"
+        );
+    }
+
+    #[test]
+    fn an_immediate_claim_reads_as_claimed_and_not_as_a_reservation() {
+        // The defect this slice fixes, stated as a fact about one row: the *only* difference
+        // between "the caller is still sending" and "the caller is gone" is how long the row has
+        // stood, and `of` is the pure half that says nothing about time.
+        assert_eq!(
+            ClaimState::of(&immediate_claim()),
+            Some(ClaimState::Claimed),
+            "a claim with no due instant is the immediate path, whatever its age"
+        );
+    }
+
+    #[test]
+    fn a_delayed_claim_reads_as_reserved() {
+        assert_eq!(
+            ClaimState::of(&reserved_claim()),
+            Some(ClaimState::Reserved),
+            "a due instant means the delay still governs this row"
+        );
+        assert!(
+            !ClaimState::Reserved.is_recoverable(),
+            "a reservation is the delay working; age is not what governs it"
+        );
+    }
+
+    #[test]
+    fn a_completed_claim_reads_as_sent() {
+        // `delivered_at` is the ONLY key `mark_sent` writes, so it is the only evidence of a
+        // send — which is why it is the first question asked.
+        let mut detail = immediate_claim();
+        detail["delivered_at"] = json!("Thu, 02 Oct 2026 12:00:01 +0000");
+        assert_eq!(ClaimState::of(&detail), Some(ClaimState::Sent));
+        assert!(
+            !ClaimState::Sent.is_recoverable(),
+            "a delivered claim must never be offered again"
+        );
+    }
+
+    #[test]
+    fn a_pre_0202_row_reads_as_unknown_and_is_still_settled() {
+        // Migration 0202 marked the rows it could not repair with `delivery_unknown` and a null
+        // `delivered_at`. Those leads ARE answered — `prepare` must keep saying `AlreadySent` —
+        // so this state has to be distinct from `Abandoned`, or the recovery sweep would go and
+        // mail every lead answered before the fix.
+        let detail = json!({
+            "to": "ada@example.com", "delayed": false, "due_at": Value::Null,
+            "sent": true, "delivered_at": Value::Null, "delivery_unknown": true,
+        });
+        assert_eq!(
+            ClaimState::of(&detail),
+            Some(ClaimState::Unknown),
+            "an unrepairable row is answered, and saying so is the whole point of 0202"
+        );
+        assert!(
+            !ClaimState::Unknown.is_recoverable(),
+            "0202's rows are answered and settled; recovery must not re-mail every pre-fix lead"
+        );
+    }
+
+    #[test]
+    fn a_claim_only_becomes_abandoned_once_it_is_old_enough() {
+        let fresh = ClaimState::at(&immediate_claim(), NOON, NOON);
+        assert_eq!(
+            fresh,
+            Some(ClaimState::Claimed),
+            "a claim taken this instant is somebody's in-flight send, not a recovery case"
+        );
+        let stale = ClaimState::at(
+            &immediate_claim(),
+            NOON - ABANDONED_CLAIM_AFTER - time::Duration::seconds(1),
+            NOON,
+        );
+        assert_eq!(
+            stale,
+            Some(ClaimState::Abandoned),
+            "past the window with no recorded delivery, nobody is holding this reply"
+        );
+        assert!(
+            stale.is_some_and(|state| state.is_recoverable()),
+            "an abandoned claim is the one state the sweep may take over"
+        );
+    }
+
+    #[test]
+    fn a_reserved_claim_is_never_abandoned_however_old_it_is() {
+        // **The negative control for the test above, and the assertion that keeps the fix from
+        // over-correcting.** A delayed reservation is *supposed* to stand still for its delay —
+        // that is what a reservation is — so treating its age as abandonment would mail a
+        // message the operator deliberately asked to hold, during the very window they asked to
+        // hold it for.
+        let state = ClaimState::at(
+            &reserved_claim(),
+            NOON - ABANDONED_CLAIM_AFTER * 100,
+            NOON,
+        );
+        assert_eq!(
+            state,
+            Some(ClaimState::Reserved),
+            "age is not abandonment; only the absence of a delay is"
+        );
+    }
+
+    #[test]
+    fn at_is_the_only_way_to_reach_abandoned() {
+        // `of` deliberately cannot produce it. A reader that could get `Abandoned` without a
+        // clock would be calling a row abandoned at any age, which is the defect this whole
+        // split exists to prevent.
+        assert!(
+            !matches!(ClaimState::of(&immediate_claim()), Some(ClaimState::Abandoned)),
+            "a pure reading of the row has no opinion about how long it has stood"
+        );
+    }
 }

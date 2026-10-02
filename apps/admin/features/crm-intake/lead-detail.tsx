@@ -42,6 +42,7 @@ import {
 import { LoadingTable } from "@/components/loading-table";
 import { ApiError } from "@/lib/api";
 import {
+  AUTORESPONDER_STATE_LABEL,
   DECISION_LABEL,
   LEAD_EVENT_LABEL,
   LEAD_STATUSES,
@@ -919,6 +920,41 @@ export function LeadDetail() {
                     {typeof event.detail?.request_id === "string" ? (
                       <span className="text-[11.5px] text-muted" data-lead-trail-request-id>
                         request <code className="font-mono">{event.detail.request_id}</code>
+                      </span>
+                    ) : null}
+                    {/* The autoresponder's own state, and — for the two states where the
+                        message has not gone out — the INSTANT it goes out. The reason string on
+                        this line was the word "delayed" and the editor renders a minute count,
+                        so neither named the moment a lead that reads "answered" is not answered
+                        until. It is read from the stored row rather than recomputed from the
+                        source's configuration, because the configuration may have changed since
+                        the claim was taken and the row is what the send will actually honour. */}
+                    {event.autoresponder_state ? (
+                      <span
+                        className="text-[11.5px] text-muted"
+                        data-lead-trail-autoresponder
+                        data-autoresponder-state={event.autoresponder_state}
+                      >
+                        {AUTORESPONDER_STATE_LABEL[event.autoresponder_state]}
+                        {event.autoresponder_state === "reserved" &&
+                        typeof event.detail?.due_at === "string" ? (
+                          <span data-lead-trail-autoresponder-due>
+                            {` · goes out around ${absoluteInstant(event.detail.due_at)}`}
+                          </span>
+                        ) : null}
+                      </span>
+                    ) : null}
+                    {/* An abandoned claim is the one state that is a defect rather than a
+                        waiting room, so it is named in the operator's terms rather than as a
+                        state name: nothing is holding this reply and the worker will pick it up
+                        on its next pass. */}
+                    {event.autoresponder_state === "abandoned" ? (
+                      <span
+                        className="text-[11.5px] text-caution"
+                        data-lead-trail-autoresponder-abandoned
+                      >
+                        No delivery was recorded and nobody is holding it, so the worker will send
+                        this on its next pass. If it does not, this lead was never answered.
                       </span>
                     ) : null}
                   </li>

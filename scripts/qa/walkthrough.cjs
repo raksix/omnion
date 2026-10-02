@@ -6135,6 +6135,34 @@ async function runCrmIntakeDepth(page, report) {
   await page.waitForTimeout(2000);
   steps.convertResult = (await page.locator("[data-conversion-result]").innerText().catch(() => "")).trim();
   steps.convertTimeline = await page.locator("[data-event=converted]").count();
+
+  // The autoresponder's own state on the trail (REQ-117, the abandoned-claim slice). The QA
+  // source is created WITHOUT an autoresponder, so the honest answer here is that no claim line
+  // exists — and that is the assertion: a screen that invented a state for a lead that was never
+  // going to get a reply is exactly the failure this measures. The *state* itself is proved by
+  // the Rust walk against a real database (crm_autoresponder.rs), which is the only place a
+  // claim can actually exist in a QA database without a live SMTP conversation.
+  steps.autoresponderStateLines = await page.locator("[data-lead-trail-autoresponder]").count();
+  steps.noInventedAutoresponderState =
+    steps.autoresponderStateLines === 0 ||
+    (await page.evaluate(() =>
+      Array.from(document.querySelectorAll("[data-lead-trail-autoresponder]")).every((node) => {
+        const state = node.getAttribute("data-autoresponder-state");
+        // A closed list on both sides: a value the panel does not know is a raw state name
+        // rendered to the one person trying to find out whether a lead was answered.
+        return ["sent", "reserved", "claimed", "abandoned", "unknown"].includes(String(state));
+      }),
+    ));
+  // An abandoned claim is the one state that carries an operator-facing explanation, and it is
+  // the reason the slice exists: before it, a claim whose send was lost to a restart rendered
+  // exactly like one still in flight.
+  steps.abandonedExplained =
+    (await page.locator("[data-lead-trail-autoresponder-abandoned]").count()) === 0 ||
+    (await page
+      .locator("[data-lead-trail-autoresponder-abandoned]")
+      .first()
+      .innerText()
+      .catch(() => "")) .includes("next pass");
   const stepsAfter = await page.evaluate(() =>
     Array.from(document.querySelectorAll("[data-conversion-stepper] li")).map((li) => [
       li.getAttribute("data-step"),

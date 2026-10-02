@@ -670,16 +670,55 @@ pub struct EventBody {
     pub detail: serde_json::Value,
     /// When.
     pub created_at: String,
+    /// What an autoresponder line currently *means*, decided by the server.
+    ///
+    /// `None` for every other kind, and for an `autoresponder_sent` line that is a skip note
+    /// rather than a claim.
+    ///
+    /// ## Why the panel must not work this out from `detail`
+    ///
+    /// A claim is a jsonb row with three keys that a reader has to combine: `sent`, a
+    /// `delivered_at` that only the completion writes, and a `due_at` that is only present when
+    /// the send is delayed. The lead's timeline read all three in the browser, which is the one
+    /// consumer that cannot fail a build when the rule changes — so a claim that was *abandoned*
+    /// (the caller died between reserving and sending) rendered exactly like one the caller was
+    /// still holding, on a lead whose single reply was never sent. The state is the same kind of
+    /// named answer `Delivery::verdict_name` became in the previous slice: the arms of a match
+    /// are the part that goes stale when a variant is added.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autoresponder_state: Option<omnion_module_crm_intake::autoresponder_store::ClaimState>,
 }
 
 impl From<LeadEvent> for EventBody {
     fn from(value: LeadEvent) -> Self {
+        Self::from_event(value, time::OffsetDateTime::now_utc())
+    }
+}
+
+impl EventBody {
+    /// The body of one line, with the autoresponder's state read at an instant.
+    ///
+    /// The clock is an argument rather than read inside, because "abandoned" is a decision
+    /// about how long a row has stood and a caller that cannot say which `now` it meant cannot
+    /// test the difference between a claim the caller is still holding and one it abandoned.
+    #[must_use]
+    pub fn from_event(value: LeadEvent, now: time::OffsetDateTime) -> Self {
+        let autoresponder_state = if value.kind == autoresponder_store::SENT_KIND {
+            omnion_module_crm_intake::autoresponder_store::ClaimState::at(
+                &value.detail,
+                value.created_at,
+                now,
+            )
+        } else {
+            None
+        };
         Self {
             id: value.id,
             kind: value.kind,
             actor_user_id: value.actor_user_id,
             detail: value.detail,
             created_at: timestamp::rfc3339(value.created_at),
+            autoresponder_state,
         }
     }
 }
@@ -1210,11 +1249,16 @@ pub async fn get_lead(
         .map_err(map_store)?
         .ok_or_else(|| not_found("lead"))?;
 
+    // **One `now` for the whole timeline**, not one per line. "Abandoned" is a decision about
+    // how long a row has stood, so a reader that stamps each line with its own clock can render
+    // two lines of the same trail that disagree about which of them is abandoned — and a claim
+    // that crosses the bound between them mid-render is the one line an operator is looking at.
+    let read_at = time::OffsetDateTime::now_utc();
     let timeline = store::list_events(pool, organization_id, lead.id)
         .await
         .map_err(map_store)?
         .into_iter()
-        .map(EventBody::from)
+        .map(|event| EventBody::from_event(event, read_at))
         .collect();
 
     // The steps are computed here rather than in the view: the stepper's whole value is

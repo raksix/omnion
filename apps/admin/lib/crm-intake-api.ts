@@ -12,6 +12,11 @@
  * would be the bug.
  */
 import { request } from "./api";
+// Type-only, and one direction only: the vocabulary file owns the lists and this file owns the
+// wire shapes, so importing the *type* here (rather than declaring it here and importing it
+// there) keeps the panel's closed list the single definition a new state has to be added to.
+// `import type` also means the emitted module graph has no cycle between the two.
+import type { AutoresponderState } from "./crm-intake";
 
 /** The attribution split the lead detail's two panels read. */
 export type LeadAttribution = {
@@ -102,6 +107,8 @@ export type LeadEvent = {
   actor_user_id: string | null;
   detail: Record<string, unknown>;
   created_at: string;
+  /** Present only on `autoresponder_sent` lines that are a claim rather than a skip note. */
+  autoresponder_state?: AutoresponderState;
 };
 
 /**

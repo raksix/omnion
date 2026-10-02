@@ -65,6 +65,9 @@ pub use assignment_store::{
     list_rules, mark_escalated, policy_for_source, reorder_rules, stamp_assignment, update_policy,
     update_rule,
 };
+pub use autoresponder_store::{
+    ABANDONED_CLAIM_AFTER, ClaimState, DELIVERY_CLAIM_STALE_AFTER, SENT_KIND,
+};
 pub use convert::{
     Availability, Conversion, STEPS, Step, StepState, deal_title, initial_amount, step_plan,
 };

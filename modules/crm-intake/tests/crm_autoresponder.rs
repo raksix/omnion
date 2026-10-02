@@ -1133,3 +1133,154 @@ async fn two_workers_sending_one_due_reservation_produce_one_mail() {
 
     drop_org(&pool, org).await;
 }
+
+/// An *immediate* claim nobody completed is offered to the worker again.
+///
+/// The recovery half of the design, and the only one this file could not reach before. A
+/// delayed reservation keeps itself in the sweep because its `due_at` is in the past, so the
+/// worker's own predicate re-finds it; an immediate claim writes `due_at: null`, and the sweep's
+/// WHERE required a due instant, so a send lost to a restart was owed by nobody for ever. The
+/// observable consequence is the assertion at the end: `prepare` cannot answer `Ready` again
+/// (the claim exists, so the insert loses the unique index and `prepare` says `AlreadySent`),
+/// which means **the sweep is the only thing that can still answer this lead**.
+///
+/// The age is moved by *backdating the row*, not by waiting: the test must not take five
+/// minutes, and a row's `created_at` is exactly what the recovery arm reads.
+#[tokio::test]
+async fn an_abandoned_immediate_claim_is_offered_again() {
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder abandoned").await;
+    let source = source_with_autoresponder(&pool, org, 0).await;
+    let lead = accepted_lead(&pool, org, &source, "abandoned@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    // The claim is taken and then nobody sends it: no `mark_sent`, no release. This is what a
+    // deploy between `prepare` and the socket leaves behind.
+    let outcome = ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("prepare");
+    assert!(outcome.sent(), "an undelayed message is sendable at once");
+
+    assert!(
+        ar_store::due_reservations(&pool, now, 50)
+            .await
+            .expect("a sweep")
+            .is_empty(),
+        "a claim taken this instant is somebody's in-flight send - the recovery must not take it"
+    );
+
+    // Age the row past the window. `created_at` is what the recovery arm reads, so this is the
+    // honest way to move the clock for a test rather than sleeping.
+    sqlx::query(
+        "update crm_lead_events set created_at = created_at - $2::interval \
+         where lead_id = $1 and kind = $3 and detail ? 'sent'",
+    )
+    .bind(lead.id)
+    .bind(ar_store::ABANDONED_CLAIM_AFTER + time::Duration::minutes(1))
+    .bind(ar_store::SENT_KIND)
+    .execute(&pool)
+    .await
+    .expect("ageing the claim");
+
+    let offered = ar_store::due_reservations(&pool, now, 50)
+        .await
+        .expect("a sweep");
+    assert_eq!(
+        offered.len(),
+        1,
+        "an uncompleted immediate claim is the one row the sweep exists to re-offer"
+    );
+    assert_eq!(
+        offered[0].lead.id, lead.id,
+        "the sweep must offer THIS lead's message, not some other row"
+    );
+    assert_eq!(
+        offered[0].message.to, "abandoned@example.com",
+        "the recipient is read off the claim"
+    );
+
+    // And the lead is genuinely unanswerable by the other path, which is what makes the sweep
+    // load-bearing rather than a second opinion.
+    assert!(
+        !ar_store::prepare(&pool, &lead, &source, now)
+            .await
+            .expect("prepare")
+            .sent(),
+        "the claim still exists, so prepare cannot re-decide a send: the sweep is the only recovery"
+    );
+
+    drop_org(&pool, org).await;
+}
+
+/// The negative control for the walk above: a row the recovery must never offer.
+///
+/// **A walk that only proves the re-offer passes just as well on a sweep that re-offers
+/// everything**, and that sweep mails every lead twice — so the delivered row is asserted here
+/// rather than left to the unit test, because the unit test reads a struct and this reads the
+/// query.
+#[tokio::test]
+async fn a_delivered_claim_is_not_offered_again() {
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder recovered").await;
+    let source = source_with_autoresponder(&pool, org, 0).await;
+    let lead = accepted_lead(&pool, org, &source, "done@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("prepare");
+    assert!(
+        ar_store::mark_sent(&pool, lead.id, now)
+            .await
+            .expect("the send completed"),
+        "the mailer returned, so the completion wins the row"
+    );
+
+    // Age it past the window as well, so the ONLY thing keeping it out is the delivery.
+    sqlx::query(
+        "update crm_lead_events set created_at = created_at - $2::interval \
+         where lead_id = $1 and kind = $3 and detail ? 'sent'",
+    )
+    .bind(lead.id)
+    .bind(ar_store::ABANDONED_CLAIM_AFTER + time::Duration::minutes(1))
+    .bind(ar_store::SENT_KIND)
+    .execute(&pool)
+    .await
+    .expect("ageing the claim");
+
+    assert!(
+        ar_store::due_reservations(&pool, now, 50)
+            .await
+            .expect("a sweep")
+            .is_empty(),
+        "a delivered claim must never be offered again, however old it is"
+    );
+
+    // A row migration 0202 marked as never-observed is answered too, and it carries a NULL
+    // `delivered_at` — so it is the row most likely to slip through an exclusion that tests
+    // only for a present key.
+    sqlx::query(
+        "update crm_lead_events set detail = detail || $4::jsonb \
+         where lead_id = $1 and kind = $2 and detail ? 'sent'",
+    )
+    .bind(lead.id)
+    .bind(ar_store::SENT_KIND)
+    .bind(time::OffsetDateTime::now_utc() - time::Duration::days(30))
+    .bind(serde_json::json!({
+        "delivered_at": serde_json::Value::Null,
+        "delivery_unknown": true,
+    }))
+    .execute(&pool)
+    .await
+    .expect("marking the row unknown");
+
+    assert!(
+        ar_store::due_reservations(&pool, now, 50)
+            .await
+            .expect("a sweep")
+            .is_empty(),
+        "a pre-0202 row is answered and settled; recovery must not re-mail every old lead"
+    );
+
+    drop_org(&pool, org).await;
+}

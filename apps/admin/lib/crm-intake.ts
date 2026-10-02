@@ -320,6 +320,38 @@ export const LEAD_EVENT_LABEL: Record<string, string> = {
 };
 
 /**
+ * What an autoresponder claim *is*, in an operator's words.
+ *
+ * `abandoned` is the state the panel could not have worked out on its own: the claim was taken,
+ * the caller never recorded a delivery, and the row is old enough that the worker may take it
+ * over. Before this was a named state the timeline showed it as a plain reservation — the same
+ * rendering as a claim still in flight — on a lead whose only reply was never sent.
+ */
+export type AutoresponderState =
+  | "sent"
+  | "reserved"
+  | "claimed"
+  | "abandoned"
+  | "unknown";
+
+/**
+ * The words for each state, exhaustive over the type above.
+ *
+ * **Closed on purpose, with `satisfies` rather than `Record<string, string>`.** A state the
+ * server adds but this map does not carry is a type error here, rather than a lookup that
+ * answers `undefined` and renders nothing — which is the failure mode of `LEAD_EVENT_LABEL`
+ * above, and the reason the kinds map stays open (kinds are a growing vocabulary) while this one
+ * does not (a claim is in one of exactly these five states).
+ */
+export const AUTORESPONDER_STATE_LABEL = {
+  sent: "Reply sent",
+  reserved: "Reply reserved, waiting out the send delay",
+  claimed: "Claimed for sending",
+  abandoned: "Claimed, but no delivery was recorded",
+  unknown: "Answered before deliveries were recorded",
+} satisfies Record<AutoresponderState, string>;
+
+/**
  * How an owner reads in a row: their name when the roster knows them, and a short id when it
  * does not.
  *

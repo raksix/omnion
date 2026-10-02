@@ -104,6 +104,14 @@ SWEEP_SQL="$(sed -n '/pub async fn due_reservations(/,/fetch_all(pool)/p' "$STOR
 # and the fix is a helper that always prints one of the two words.
 yes() { if "$@"; then echo true; else echo false; fi; }
 
+# **A NEGATIVE assertion is `! yes`, not `yes && echo false || echo true`.** The chain reads as
+# "green when the grep fails", but `yes` returning false makes `&&` skip AND `||` fire — so it
+# printed `true`, the assertion reported PASS, and the negative control below went green against
+# a defect that was still in the file. **In a shell, `||` binds the whole chain: a failing `yes`
+# is exactly what makes the fallback run.** `no` is its own name so the polarity is visible at
+# the call site rather than in a chain that has to be re-derived.
+no() { if "$@"; then echo false; else echo true; fi; }
+
 # ------------------------------------------------------------------------------------------------
 # leg 1: an immediate claim is reachable by the recovery sweep
 # ------------------------------------------------------------------------------------------------
@@ -113,27 +121,51 @@ advance "an immediate claim is reachable by the recovery sweep"
 # reservation including the ones that are legitimately waiting, and one that kept only the
 # stale-claim arm would re-offer a claim the caller is still holding.
 #
-# **The negative control first.** Before the fix, the file contains
-# `and nullif(e.detail->>'due_at', '') is not null and` — so this greps for exactly that, and
-# the fix has to make it stop matching. A "the old clause is gone" assertion written against a
-# spelling the repository never had is the inverted one described in the header.
-check "the old due-instant requirement is gone (negative control)" \
-  "$(yes grep -qF "nullif(e.detail->>'due_at', '') is not null" <<<"$SWEEP_SQL" && echo false || echo true)" \
-  "the sweep still demands a due instant, so an immediate claim (due_at: null) is invisible to the query that exists to recover it"
+# **The negative control is the predicate, not a substring.** The first version grepped for
+# `nullif(e.detail->>'due_at', '') is not null` and passed on the fix — because the fixed query
+# *still contains* that clause, inside the `or` arm that is now one of two ways a row qualifies.
+# A substring assertion asks "is this text present", but the property is "is this clause
+# REQUIRED of every row", and only the second distinguishes a recovery arm from the defect it
+# replaced. So the check now asks whether the requirement sits at the top level of the WHERE
+# (a bare conjunction, before any `or (`) rather than inside a disjunction — which is the shape
+# the fix produced and the shape a regression back to the old query would lose.
+check "the due instant is no longer REQUIRED of every row (negative control)" \
+  "$(no python3 -c '
+import re, sys
+sql = sys.stdin.read()
+# The requirement, taken at the start of a line, as a bare conjunction rather than inside a
+# disjunction: a line that opens with "(" or "or (" belongs to a branch, not to the top level.
+top = [l.strip() for l in sql.splitlines() if l.strip().startswith("and")]
+required = [l for l in top if "is not null" in l and "due_at" in l]
+sys.exit(0 if required else 1)
+' <<<"$SWEEP_SQL")" \
+  "the sweep still demands a due instant of every row, so an immediate claim (due_at: null) is invisible to the query that exists to recover it"
 check "an undelivered claim with no due instant is still offered" \
   "$(yes grep -qF "detail->>'sent' = 'false'" <<<"$SWEEP_SQL")" \
   "the sweep no longer selects uncompleted claims at all, so a lost send is lost for ever"
+check "and the recovery arm is a disjunction, not a second requirement" \
+  "$(yes grep -qF 'or (nullif(e.detail' <<<"$SWEEP_SQL")" \
+  "the sweep has one way in, so the immediate arm was never added - this is the fix, measured"
 
 # ------------------------------------------------------------------------------------------------
 # leg 2: the arm that re-offers it is bounded, or it is a duplicate generator
 # ------------------------------------------------------------------------------------------------
-advance "the arm that re-offers it is bounded, or it is a duplicate generator"
-check "the re-offer arm is bounded by a staleness window" \
-  "$(yes grep -qE 'claimed_before|CLAIM_STALE|delivery_claimed_at' <<<"$SWEEP_SQL")" \
+advance "the re-offer arm is bounded by a staleness window"
+# **The bound is `created_at`, not the send-claim column.** The recovery arm answers "has nobody
+# come back for this?", and the instant that proves it is the moment the claim was written. It
+# must NOT be `delivery_claimed_at`: that column is only ever set by the *delayed* worker's
+# `claim_delivery`, and an immediate claim never passes through it — so keying recovery on it
+# would make the bound permanently "not stale" and the recovery would be dead code, which is
+# the same class of defect as the missing clause it replaced.
+check "the re-offer arm is bounded by the claim's own age" \
+  "$(yes grep -qF "is null and e.created_at <=" <<<"$SWEEP_SQL")" \
   "a claim with no due instant is offered on every tick while the caller is still holding it, which is two mailers"
-check "the sweep still orders by the due instant" \
-  "$(yes grep -qE 'order by.*due_at.*asc' <<<"$SWEEP_SQL")" \
-  "the oldest due reservation is no longer sent first, so a week-old reply can queue behind a fresh one"
+check "the bound is a real timestamptz comparison" \
+  "$(yes grep -qF 'e.created_at <= $3' <<<"$SWEEP_SQL")" \
+  "the recovery bound compares an RFC 2822 string, so a worker in another zone sorts to the wrong side and the lead is never recovered"
+check "the sweep still orders oldest-first" \
+  "$(yes grep -qE 'order by coalesce.*e.id asc' <<<"$SWEEP_SQL")" \
+  "the oldest owed reply is no longer sent first, so a week-old answer can queue behind a fresh one"
 notes "the bound is what makes this recovery rather than a second race"
 
 # ------------------------------------------------------------------------------------------------
@@ -162,16 +194,25 @@ check "and a re-rendered row is still re-rendered, not read from the claim" \
 # ------------------------------------------------------------------------------------------------
 # leg 5: the caller that loses the recovery is not *also* claiming
 # ------------------------------------------------------------------------------------------------
-advance "the caller that loses the recovery is not *also* claiming"
-# The re-offer arm and `claim_delivery` must not be the same lock with two names: a sweep that
-# marks the row claimed and a worker that marks it claimed are two arbiter writes on one column,
-# and the loser's silence has to be correct in both.
-check "the sweep records that it took the send" \
-  "$(yes grep -q 'claim_delivery' <<<"$SWEEP_BODY")" \
-  "the sweep offers a row without taking the send, so two workers both mail the re-offered reservation"
-check "and the worker's own take is still conditional" \
+advance "the send claim is taken once, for both arms of the sweep"
+# **The claim belongs in the runner, not in the sweep, and asserting it here would have been
+# wrong.** The first version of this leg required `due_reservations` to call `claim_delivery`,
+# on the reasoning that "the sweep offers a row, so the sweep must take it". That would have
+# moved the claim *earlier* than the socket and held the send-claim column for the length of a
+# render plus two reads — while `claim_delivery`'s own docs already say the take happens right
+# before the mailer, and it is the single arbiter for BOTH arms. **Two claims on one column, one
+# written by the sweeper and one by the worker, is two arbiter writes and a winner who does not
+# know it won.** The real property is that the runner arbitrates every row the sweep returns,
+# which is what these two assertions read.
+check "the runner arbitrates the send for every reservation it gets" \
+  "$(yes grep -q 'claim_delivery' "$RUNNER")" \
+  "the worker no longer takes the send claim, so the sweep's rows reach the mailer unarbitrated"
+check "and it stops when it loses" \
+  "$(yes grep -qE 'Ok\(false\) *=>' "$RUNNER")" \
+  "the loser keeps sending after losing the claim - the duplicate this whole design exists to prevent"
+check "the skip-locked guard is still on the claim" \
   "$(yes grep -qF 'for update skip locked' "$STORE")" \
-  "the send claim lost its skip-locked guard, so the recovery sweep reintroduces the two-worker duplicate"
+  "the recovery sweep reintroduces the two-worker duplicate if the claim no longer skips locked rows"
 
 # ------------------------------------------------------------------------------------------------
 # leg 6: the trail says what the state is, not what the code hoped
@@ -184,8 +225,11 @@ check "an abandoned claim is readable as abandoned" \
   "$(yes grep -qE 'fn claim_state|ClaimState' "$STORE" "$ROUTE")" \
   "nothing reads a claim's state for a reader, so the panel shows a reservation as a reservation for ever"
 check "the panel renders the state the server decided" \
-  "$(yes grep -qE 'autoresponder_state|claim_state' "$ROUTE" && yes grep -qE 'autoresponder_state|claim_state' apps/admin/lib/crm-intake.ts apps/admin/features/crm-intake/lead-detail.tsx)" \
+  "$(yes grep -qF 'AUTORESPONDER_STATE_LABEL[event.autoresponder_state]' apps/admin/features/crm-intake/lead-detail.tsx)" \
   "the timeline infers the state from raw keys in the browser, which is the second place the two can disagree"
+check "and a state the panel does not know is a type error, not a blank" \
+  "$(yes grep -qF 'satisfies Record<AutoresponderState, string>' apps/admin/lib/crm-intake.ts)" \
+  "an unmapped state renders as undefined - invisible rather than wrong, on the screen whose whole job is saying whether a lead was answered"
 
 # ------------------------------------------------------------------------------------------------
 # leg 7: the negative control — the recovery must not invent a second send
