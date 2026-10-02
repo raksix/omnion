@@ -33,6 +33,7 @@
 
 pub mod apply;
 pub mod cadence;
+pub mod crypto;
 pub mod destination;
 pub mod error;
 pub mod media;
@@ -50,6 +51,12 @@ pub use apply::{
     RestoreRequest, build_plan,
 };
 pub use cadence::Cadence;
+pub use crypto::{
+    CryptoError, MAGIC as ENCRYPTION_MAGIC, Mode as EncryptionMode,
+    NONCE_LEN as ENCRYPTION_NONCE_LEN, OVERHEAD as ENCRYPTION_OVERHEAD,
+    SALT_LEN as ENCRYPTION_SALT_LEN, is_sealed, open as open_archive, resolve_passphrase,
+    seal as seal_archive,
+};
 pub use destination::{
     DestinationReport, PROBE_FILENAME, local_path_for, local_root_for, probe_local, storage_key,
     storage_prefix,
