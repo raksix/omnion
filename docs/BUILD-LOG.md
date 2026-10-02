@@ -10470,3 +10470,54 @@ runs — and this is the fourth tick that has said so, which is why the *reason*
 rather than "the pass was slow".
 
 **Next:** the pass, then the state boxes and `done`.
+
+## Tick 74 — the merge with main, and the gate defect the merge exposed (not caused)
+
+**What.** `origin/main` moved 13 commits (REQ-022 slice 2: the request log on the request path,
+the developer portal's four screens, its typed client, its CSV export, two harness probes). Six
+files conflicted; all six resolutions are **unions**, not choices, and every one was verified
+rather than eyeballed. The tick's real finding was inside the gate that polices one of them.
+
+**Proof.**
+
+| Check | Result |
+|---|---|
+| `cargo check -p omnion-api` | green (1 m 57 s; 267 pre-existing warnings) |
+| `cargo test -p omnion-api --lib` | **409 passed, 0 failed** |
+| `cargo test -p omnion-graphql` | **139 passed, 0 failed** |
+| `pnpm typecheck` (`tsc --noEmit`) | exit 0 |
+| `node --check scripts/qa/walkthrough.cjs` | exit 0 |
+| `session-guard.test.cjs` | 9/9 checks · 5/5 mutations · 1/1 control |
+| other seven slot-free gates | deprecation-surface 43/43, wave5b-route-coverage 8/8 (6/6 mutations), graphql-surface 30 (9 proven-to-fail), route-adoption 11/11, exports-states 14, wizard-gate 5, only-filter-gate 19/19 |
+| merge completeness | every `function`/route/`{ path }` from **both** parents survives: 0 lost from ours, 0 lost from main |
+
+**The gate defect.** `session-guard.test.cjs` asserted
+
+```js
+/pushFindings\(\s*"high",\s*"depth-pass-failed"/.test(src)
+```
+
+— that the string exists **somewhere**. Its own mutation "the depth-pass roll-up is deleted"
+removes the `for (const failure of failedDepthPasses) { … }` loop and leaves that string sitting
+in the file, so the mutant stayed green: 4/5 mutations, exit 1, **MISSED**. The assertion proved
+a call existed and never that anything reached it. The check now requires the call INSIDE the
+roll-up:
+
+```js
+/for \(const failure of failedDepthPasses\) \{[\s\S]*?pushFindings\(\s*"high",\s*"depth-pass-failed"/
+```
+
+Proven load-bearing by running the gate against a copy of the real file with the loop deleted:
+**7/9 with the check FAILING**, where the unmodified file is 9/9. On the real file 9/9, 5/5, and
+the mutation is no longer a no-op.
+
+The merge is what made this visible: main's click-stream recovery added lines *inside*
+`runDepthPass`, so the file my wave had last gated is no longer byte-identical to the one the
+mutation was written against.
+
+**Not ticked:** REQ-130's close gate. The QA slot is held **live** by **w8** (holder pid
+2878882, `/proc/2878882/cwd` = `/mnt/apopic/omnion-w8`) and `/mnt/apopic` is at **96%** with
+2.9 G free — a pass needs a `.next` rebuild, so a pass started now dies on the box, which is what
+killed the last one (`/tmp/w6-qa/pass.log`: every depth pass after route 8 answered *"Target
+page, context or browser has been closed"*). **Next:** the pass, when a slot frees AND the disk
+has room; then tick the close box.
