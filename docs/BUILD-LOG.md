@@ -17800,3 +17800,104 @@ the walkthrough).
 **Next:** the browser pass on the private stack, then the unticked 390 px criterion, then the
 remaining `~`-boxed screens criteria — of which "All seven screens have empty, loading and error
 states" is the one no amount of store work can close.
+
+
+## 2026-10-02 · wave8 tick 88 · REQ-117 slice 52 — the inbox's two missing columns
+
+The inbox row in REQ-117's Screens table has read `Received, Contact, Source, Product
+interest, Owner, SLA, Status, Duplicate hint` since the request was written. The table
+shipped **six of the eight**, and the two that are absent are the two a triage answer needs —
+the fourth consecutive instance of the tick-87 signature (**read the REQ's own table against
+the routes, in order**), and the third instance of the rule that is now in the ledger: **the
+words on one table row are a checklist.**
+
+**`Source`.** The screen has carried a source *filter* since the same tick, so "which source"
+was answerable by filtering and not by reading a row. An operator who filtered to one source
+and then walked the table could not tell what a row in front of them was without going back to
+the filter. The column reads the roster the filter already holds, indexed by id — one read, one
+set of names, no join, and it **cannot disagree with the filter** because it is the filter's
+own data. A source the roster does not hold is named by its short id rather than a dash: a
+deleted source, or one another tab created after this page loaded, is a real row with a real
+cause, and a blank cell reads as "no source" and sends the operator to the form side instead of
+the settings side, which is where the answer is. A lead with no source at all — an imported
+lead — gets an **empty** cell, because the screen has no basis for the word "Imported".
+
+**`Duplicate hint`.** The matched key and the score have been rendered for a long time on
+`/crm/leads/duplicates`, one screen further along. The question "is this the same person who
+wrote to me last week?" is asked while standing on the inbox. The hint is deliberately **not a
+second copy of the status chip**: the chip prints the decision's *word*, the hint carries the
+**key it matched on and the confidence** — "duplicate of a contact" is a claim,
+"`ayse@company.com` at 0.95" is something an operator can check before merging somebody's
+record.
+
+**Two traps, and the gate is shaped around both rather than around the happy path.**
+
+1. **`decision = "linked"` is not a duplicate.** It is the dedupe pass's *good* outcome — the
+   lead now belongs to an existing contact — so a hint that fires on it tells an operator that
+   every ordinary lead in the inbox is suspicious. The predicate is checked for the word
+   `duplicate`, not for "any decision", and the negative arms are asserted **one per stored
+   status** rather than as a single "something else" case, because a permissive predicate hides
+   in exactly one of the eight vocabularies.
+2. **The two columns carrying the fact are not redundant.** `status = "duplicate"` is the row's
+   terminal state — the filter chip and every terminal-status gate read it. `decision =
+   "duplicate"` is the dedupe pass's verdict, which a `keep separate` in the queue can leave
+   behind on a row the status still calls duplicate. Reading only one produces a column that is
+   right for one policy and silent for the other, so the hint **records which column carried
+   it** (`from: "verdict" | "status"`) and the gate asserts both arms separately and then the
+   union.
+
+**The third trap, which is not a trap but a sentence that was wrong.** The same row asks for
+`Copy intake URL`, and both empty states promised *"its capture URL appears here"*. **It cannot
+appear here.** The endpoint's URL *contains its key*; the server stores only `endpoint_key_hash`
+and the clear value is issued once and shown once — which is the module's own credential
+boundary, and the REQ's own line is that the key is *"stored hashed and shown once"*. So the
+button is honoured **where it is true**, beside the one-time key copy, and both empty states
+were corrected to say *where* the URL is rather than promising one this screen cannot rebuild.
+An empty state that says "it appears here" and then never shows one teaches the operator that
+this screen has lost the value — a worse failure than the missing button, because it is a
+confident wrong statement instead of an absence.
+
+**The skeleton column count.** `LoadingTable columns={6}` was the count from before this slice
+and had never been revisited; it is now `8`, counted from the header with the reason written
+down. This is the **third** skeleton on the branch whose column count was written once and never
+revisited, and the walkthrough now measures the header count against the first row's cell count
+**from the DOM** rather than against a number in the test — a hard-coded eight is exactly the
+constant that goes stale the next time a column is added.
+
+| Gate | Command | Result |
+|---|---|---|
+| columns | `node --experimental-strip-types scripts/qa/crm-inbox-columns.ts .` | **17/17**, and **proven to fail at 9/17** |
+| crate | `cargo test -p omnion-module-crm-intake --lib --quiet` | **233 passed** |
+| build | `cargo build -p omnion-api` | exit 0 |
+| types | `tsc --noEmit` (apps/admin) | exit 0 |
+| harness | `node --check scripts/qa/walkthrough.cjs` | parses |
+
+**Proven to fail, and the shape of it.** The predicate `lead.decision === "duplicate"`
+neutralised to `if (lead.decision)` — the obvious version, the one that treats "this row has a
+decision" as "this row is a duplicate" — gives **9/17**: eight red spanning **both** negative
+families (the linked-verdict trap and all seven non-duplicate statuses), nine green. One
+neutralisation that kills two independent assertion families is worth more than two that each
+kill one.
+
+**The box, first and honestly.** `/mnt/apopic` opened this tick at **100%**, which the earlier
+disk-guard glob (`omnion*/target`, `/dev/shm/*-target`) cannot see: the real weight was
+`w8build` (1.8 GB, my own `CARGO_TARGET_DIR`) and my own `apps/admin/.next` (1.1 GB). Both were
+reclaimed after holder checks (`lsof`, `find -newermt '-20 minutes'`) and `df` came back to
+99 % → 95 % as siblings released theirs. Every build this tick went to `/dev/shm/w8-target`,
+which is where `one.sh` already puts it.
+
+**No browser pass and none claimed.** The QA slot is held by a live pass — holder pid 315364,
+`kill -0` alive, `cwd=/mnt/apopic/omnion` (verified, not read off the filename) — so the four new
+walkthrough observations (`inboxHasSourceColumn`, `inboxHasDuplicateColumn`,
+`inboxColumnCellsAligned`, `inboxHintNeverExceedsDuplicates`) are **written and not run**. The
+browser half of "All seven screens have empty, loading and error states" therefore stays unticked
+again, and the word on a table row being a checklist has produced a *walkthrough claim* this
+tick rather than a *proof* — which is the distinction this loop keeps having to write down.
+
+**Commit:** `e63beef5`.
+
+**Next:** the browser pass on the private stack once the slot frees; then the remaining filters
+the same row names and the store has never had — **`SLA state`, `date range`, `tag`** — where
+`sla_state` is computed by the route *after* the page query runs, so a SQL filter on it cannot
+exist without the state moving down into the query. That is a real design step, not a form field.
+
