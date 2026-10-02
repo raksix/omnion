@@ -20,6 +20,7 @@ import {
   Fingerprint,
   Gauge,
   Globe,
+  Globe2,
   HardDriveDownload,
   HeartPulse,
   Images,
@@ -136,6 +137,14 @@ const NAV: readonly NavItem[] = [
   // would be the same as putting a "create" button above the documentation of what it creates.
   { href: "/developer/sdks", label: "Developer · SDKs and CLI", icon: Package },
   { href: "/developer/logs", label: "Developer · Logs", icon: ScrollText },
+  // The edge region registry (REQ-035 slice 1). It sits directly after Deployment rather
+  // than under Settings, and the reason is the order of an operator's questions: "which
+  // version is running" (Deployment) and "where is it running, and is it answering" (Regions)
+  // are the same investigation, and splitting them across a nav section and a settings page
+  // is how the second one never gets opened. `Globe2` rather than `Globe` because `/sites`
+  // already owns the plain one and two identical icons in one nav is a labelling bug a user
+  // cannot report precisely.
+  { href: "/platform/regions", label: "Regions", icon: Globe2 },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/organizations", label: "Organizations", icon: Building2 },
   { href: "/ai", label: "AI Hub", icon: Sparkles, module: "ai-hub" },
