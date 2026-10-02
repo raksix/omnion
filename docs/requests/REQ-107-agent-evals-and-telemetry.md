@@ -4,7 +4,9 @@
 > validation the first acceptance row demands — `de3a1529` the pure scorer, `ddbd42a3` the store,
 > `c439548b` the twelve database walks and the two bugs they found; then the HTTP surface and the
 > four catalogue keys — `98e18319`; then the screens and the walkthrough pass that drives them —
-> `00755aee`. Slice 2: the routes mounted and the run permission split from the read one —
+> `00755aee`; slice 6a the announcements: `ai.eval.gate.blocked` is announced once with the settled
+> rate and `gate.passed` is not, and `regressed_cases` names the cases that regressed —
+> `843d3cc9`, falsified against the pre-fix body (`["alpha","beta","gamma"]` vs `["beta"]`). Slice 2: the routes mounted and the run permission split from the read one —
 > `e154d732`; the run history, the run detail, the mandatory baseline picker and a `Run now` that
 > works — `ed03200f`. Slice 3: the runner that claims, scores and settles — `718a73f9`, then the
 > model-under-test reader that makes a suite's pin mean something — `4a1c978a`. Slice 4 (store,
