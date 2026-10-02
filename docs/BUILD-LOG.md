@@ -7595,3 +7595,46 @@ tree. `/mnt/apopic` went 98 % → 91 %.
 written), which closes the `partial`-run criterion and the status-card boxes; then slice 4's
 status-depth half — the destination health card and the security/health cross-links — and the
 unencrypted-mode warning on the settings screen.
+
+### Tick 105 addendum — the browser pass was attempted three times and did not land
+
+`QA_ONLY=backups bash scripts/qa/run.sh` was run three times this tick. Every attempt booted the
+stack cleanly (API, admin, public renderer all answered; the media upload helper reported
+`{"ok":true,"uploaded":true,"file":"upload-sample.png","listed":2}`) and then **the browser died
+mid-walkthrough**:
+
+| Attempt | Load when it died | Error written to `summary.json` |
+|---|---|---|
+| 1 | 21.5 | `{"fatal": "Error: locator.count: Target crashed"}` |
+| 2 | ~9 | `{"fatal": "Error: page.waitForTimeout: Page crashed"}` |
+| 3 | 22.4 | `{"fatal": "Error: page.waitForTimeout: Target page, context or browser has been closed"}` |
+
+**What this is not:** a product defect. Nothing in the diff touches the browser, and the stack
+itself was healthy — three servers answered, the upload succeeded, thirty-odd routes rendered
+before the tab went.
+
+**What the artifact says:** nothing. All three wrote a `summary.json` containing **only** a
+`fatal` key — no `counts`, no `findings`, no `routes`. A report with no counters is not a red
+pass and not a green one; it is the *absence* of a measurement. Reading `summary.json`'s
+absence as "no high findings" would be exactly the failure this loop keeps finding in its own
+code, one layer up.
+
+**Why it keeps dying, measured rather than guessed:**
+
+* `uptime` at each crash: 21.5 / ~9 / 22.4. The box runs eight writers plus four QA stacks.
+* `/` is at **100 %** (562 M free). `/opt/omnion-w6-target` alone is **18 G** and is held open
+  right now by a sibling's live `cargo`+`rustc` (verified with `lsof +D`) — not this tick's to
+  delete.
+* `/mnt/apopic` was 98 % at the start of the tick and is 93 % now, after the reclaim below, so
+  the disk that mattered for the *stack* was fixed; the root filesystem was not, and it is the
+  one Chrome's own writes land on.
+* `chromium.launch` already passes `--disable-dev-shm-usage`, so the 79 %-full `/dev/shm` is
+  **not** the cause — that hypothesis was checked and discarded rather than repeated.
+
+**What would unblock it:** the root filesystem needs roughly 2–3 G, which means reclaiming build
+caches that belong to other writers while those writers are live. That is a decision above this
+tick, so the pass is reported as not-run rather than reported as green.
+
+**One harness note worth keeping:** `QA_ONLY=backups` still ran every `media-*` depth pass.
+`wants()` filters *routes and depth passes*, but the route list itself is walked first, so a
+focused pass is narrower than it looks — and on a box this loaded, the width is what killed it.
