@@ -154,6 +154,18 @@ fn string_array(value: serde_json::Value) -> Vec<String> {
 /// same scheme as an API key ([`secret::hash`]), so a dump of this table hands out nothing a
 /// waiting attacker can poll with — which matters here more than for keys, because a pending
 /// code is by definition *already* in someone's terminal waiting to be redeemed.
+/// The canonical form of a user code, as the column stores it.
+///
+/// One function, one decision. The insert binds this and every reader normalises with the same
+/// helper, so the writer and the readers cannot disagree about the spelling — which is precisely
+/// how they did, silently, before the browser pass: `start` returned the grouped `SPW5-SXDH`, the
+/// column stored it verbatim, and `find_for_approval`/`approve`/the poll all searched for
+/// `SPW5SXDH` and found nothing. Presentation (`ABCD-2345`) belongs to the view; the index and the
+/// lookups belong to this.
+pub fn stored_user_code_form(grouped: &str) -> String {
+    normalize_user_code(grouped)
+}
+
 pub async fn start(
     pool: &PgPool,
     organization_id: Uuid,
@@ -199,7 +211,23 @@ pub async fn start(
         )
         .bind(organization_id)
         .bind(&device_code_hash)
-        .bind(&user_code)
+        // The column stores the **normalised** form, and this is the only place that decision is
+        // made — so it is written down here rather than left to each reader.
+        //
+        // The bug this fixes is not subtle, and it was invisible to every test in the module:
+        // `draw_user_code` returns the *grouped* form (`SPW5-SXDH`) because that is what a person
+        // reads, and this insert stored that string as-is. Every reader — `find_for_approval`,
+        // `approve`, the poll's own lookup — normalises the input first and compares against this
+        // column, so all three compared `SPW5SXDH` against a stored `SPW5-SXDH` and matched
+        // nothing. The flow was broken end to end: `start` returned a code, and typing that same
+        // code into the approval screen answered "invalid device code".
+        //
+        // `on conflict (organization_id, user_code)` then dedupes on the same canonical form the
+        // readers use, so a collision is a collision on the value that is actually looked up.
+        // Storing the grouped form here would also have made the unique index mean something
+        // slightly different from what the code means, which is the same class of defect as
+        // comparing a *formatted* string: presentation belongs in the view, not the index.
+        .bind(stored_user_code_form(&user_code))
         .bind(client_name)
         .bind(client_uri)
         .bind(serde_json::json!(scopes))
@@ -526,4 +554,110 @@ pub async fn pending_count(
     .fetch_one(pool)
     .await?;
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The tests below use `stored_user_code_form` — the module-level helper, the very one the
+    // insert binds. The first version of them asserted the *format* of a normalised code and
+    // passed with the bug still in the tree, because it never touched the query: it proved
+    // `normalize_user_code` behaves, which is a claim about a function rather than about the
+    // store. The defect lived in one `.bind(...)`, and only a test that reaches the statement can
+    // see it.
+
+    /// The writer and the readers must agree on one spelling of a user code.
+    ///
+    /// `start` mints the **grouped** form (`SPW5-SXDH`) because that is what a person reads, and
+    /// every reader — `find_for_approval`, `approve`, the poll — normalises its input and compares
+    /// it against this column. Storing the grouped string made all three compare `SPW5SXDH` against
+    /// a stored `SPW5-SXDH` and match nothing: the browser pass reported `invalid device code` for
+    /// a code the platform had itself printed one line above.
+    ///
+    /// The claim is the **agreement**, not a format: whatever `start` hands the terminal, a reader
+    /// given that same string must compute the value that was stored. Asserting a pinned format
+    /// instead would go red on a rename that had kept the two in step.
+    #[test]
+    fn a_reader_finds_the_row_written_from_the_code_start_hands_out() {
+        let (_, _, user_code) = new_device_codes();
+
+        // The person reads a grouped code and types it back grouped; the terminal holds the same
+        // grouped string. Both must compute the stored value.
+        let from_the_terminal = stored_user_code_form(&user_code);
+        let from_a_person_typing_it = stored_user_code_form(&user_code.replace('-', " "));
+        assert_eq!(
+            from_the_terminal, from_a_person_typing_it,
+            "the grouped display form and the typed form disagree"
+        );
+
+        // The regression itself: what the reader computes must differ from the *displayed* string,
+        // because that is exactly why the two used to miss. If this ever asserts equal, the insert
+        // has gone back to binding the grouped value.
+        assert_ne!(
+            from_the_terminal, user_code,
+            "the stored form is the display string, so the lookup bug is back"
+        );
+        assert!(!from_the_terminal.contains('-'), "{from_the_terminal}");
+    }
+
+    /// The probe fixtures for this table were hand-written in the **grouped** form, so every one of
+    /// them described a row the store cannot produce — and the flow was broken end to end while the
+    /// probe stayed green. This asserts the canonical form so the next fixture cannot drift back.
+    #[test]
+    fn the_stored_form_is_eight_unpunctuated_alphabet_characters() {
+        for _ in 0..64 {
+            let (_, _, user_code) = new_device_codes();
+            let stored = stored_user_code_form(&user_code);
+            assert_eq!(
+                stored.chars().count(),
+                crate::cli::USER_CODE_LENGTH,
+                "{user_code} normalises to the wrong length"
+            );
+            assert!(
+                !stored.contains('-')
+                    && !stored.contains(' ')
+                    && stored.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+                "{user_code} normalises to {stored}, which is not a bare code"
+            );
+        }
+    }
+
+    /// The statement that binds the code must call the shared helper, not normalise inline.
+    ///
+    /// A source-level check, deliberately: the bug was never a wrong *value*, it was two places
+    /// each owning half of one decision. Grepping for the helper in the insert is the cheapest way
+    /// to keep the decision in one place, and it is what makes this module's tests above
+    /// meaningful — they test `stored_user_code_form`, and this asserts the production statement
+    /// uses it.
+    #[test]
+    fn the_insert_binds_the_shared_helper_rather_than_a_raw_value() {
+        // `env!("CARGO_MANIFEST_DIR")` rather than `include_str!`: the first version of this
+        // check read its own source, and because the test module sits BELOW the insert in the
+        // file it contains the very literal this test greps for — so it passed against the bug it
+        // exists to catch. A check that reads itself is a check that always agrees.
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store_cli.rs"),
+        )
+        .expect("this module's own source can be read");
+        // Cut at the test module, so the region inspected is the production statement and not the
+        // tests discussing it.
+        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+        let insert = production
+            .split("insert into cli_device_codes")
+            .nth(1)
+            .expect("the production half of this module contains the insert");
+        let bind = insert
+            .split(".bind(&device_code_hash)")
+            .nth(1)
+            .expect("the insert binds the device hash before the user code");
+        assert!(
+            bind.contains("stored_user_code_form(&user_code)"),
+            "the insert no longer binds the canonical form through the shared helper"
+        );
+        assert!(
+            !bind.contains(".bind(&user_code)"),
+            "the insert binds the grouped display value again"
+        );
+    }
 }

@@ -1,3 +1,99 @@
+## 2026-10-01 — the CLI hands a person a URL, and the tab strip was React state
+
+feat(developer): the scaffold archive as a file · feat(developer): the SDK and CLI screen ·
+fix(developer): honour the deep link the CLI hands out · fix(developer): the determinism test
+asserted a folder the archive does not have · test(qa): drive the SDK and CLI surface.
+
+**Slice 4 of REQ-033 is code-complete. Open on the browser pass alone.** Three defects, all in
+this tick's own work, and the second one is the interesting one.
+
+### 1. `object_key` was a promise nothing kept
+
+Slice 4 shipped `POST /dev/sdks/scaffold` returning a file tree, and a response field
+`object_key` that no code path ever filled in. The tree was previewable and the archive was not
+downloadable: a developer could read every generated file on screen and still have nothing to
+unpack. `8a7695c7` closes it, and the decision worth writing down is **not** to store the bytes.
+
+The download *rebuilds* the archive from the template rather than reading a stored copy. That is
+only safe because the zip's stamp comes from the row's `created_at` and not from the clock — so a
+download three weeks later is byte-identical to the download on the day it was generated. The
+argument against a stored copy is the one I would want a future editor to read before "optimising"
+this: a stored archive nobody revalidates is a copy of a template that has since changed, and a
+developer comparing two starters would be comparing them to themselves. The object *is* still
+written, on download, so it exists if and only if somebody actually received the bytes. And a
+store that refuses is logged, **not** returned — the developer already has the bytes, and failing
+over an audit copy they never see turns a working feature into an error page.
+
+The cross-tenant rule is an ordering rule: the row is read and scoped to the caller's
+organization **before** anything is generated. A lookup that generated first and checked second
+would be correct in every test and would run the generator on another tenant's slug.
+
+### 2. `verification_uri` is a URL the platform prints, and the screen ignored it
+
+`DeviceStart.verification_uri` is `/developer/sdks?tab=cli`. The CLI prints it; the person opens
+it. The tab strip was React state only, so the link landed on the plugin generator — a working
+page, so no route walk, no build and no `tsc` noticed. **Third instance of this exact class on
+this wave** (the first was `?event=` on the catalogue, the second `?event=` on the webhook form),
+which is why it is worth more than the fix:
+
+- The tab is read in the **`useState` initialiser**, not only in the effect that resynchronises
+  state with the URL. A view that corrects itself one frame later has already painted the wrong
+  screen to the person following a terminal's instructions.
+- The reading is a **named pure function** (`initialTab`), because my first probe asked "does the
+  view read `?tab=`?" — and that is *true of the dead version too*, since the resync effect reads
+  it. The probe reported green on the exact bug it existed to catch. A claim too general to fail
+  is the tick-98 gate in a different hat.
+- `useSearchParams` opts a client component out of the static prerender, so the route needs a
+  `Suspense` boundary or **`next build` fails at deploy time**. `tsc` is green in all three states,
+  which is exactly why the build ran this tick.
+
+### 3. The red test was mine, and the shape generalises
+
+`cargo test` failed `a_regenerated_archive_is_byte_identical_...` in the tick that committed it.
+It looked up `plugin-determinism/omnion.manifest.json`; the archive stores entries under the
+template's own paths with no enclosing folder. The archive was fine. "Look it up and see if it
+comes back" cannot distinguish a **missing entry** from a **wrong guess**, so a hardcoded path in
+a round-trip test is a second invisible claim about the format. The path now comes from the
+scaffold being archived, which keeps the assertion about determinism — the thing it is for.
+
+### Gates, and the probe that found what its sibling could not
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-api --lib` | **414** passed (was 412) |
+| `cargo test -p omnion-api --lib developer_scaffolds` | **6/6** |
+| `scripts/qa/probe-dev-sdk-screen.cjs` | **41/41** — proven to fail **5/41** |
+| `scripts/qa/probe-dev-sdk-tab-fallback.cjs` | **11/11** — proven to fail 5 and 6 ways |
+| `scripts/qa/probe-dev-event-screen.cjs` | **22/22** — the sibling screen is not broken |
+| `pnpm typecheck` | **2/2** |
+| `pnpm --filter @omnion/admin build` | compiles, `/developer/sdks` in `routes-manifest.json` |
+| `node --check scripts/qa/walkthrough.cjs` | clean |
+
+Five mutations for the screen probe: initial state hardcoded, a hook renamed on the pass side,
+`text-danger` reinstated, the `Suspense` boundary removed, and the server's `verification_uri`
+moved. All reverted; the view, the page, the walkthrough and `store_cli.rs` were each verified
+byte-identical afterwards.
+
+**The sixth mutation is the lesson.** Replacing `initialTab`'s body with
+`return (value as Tab) || "plugin"` left all 41 text checks **green** — while returning `"wat"`
+for an unknown tab, and `"wat"` flows straight into `ScaffoldTab kind={tab}` and on into a POST
+body. A text check cannot see behaviour. `probe-dev-sdk-tab-fallback.cjs` lifts the function's
+own source and *asks* it: 11 assertions over the four real tabs and seven refusals including
+`../secrets`, `plugin;drop` and `constructor`. It fails 5 ways on that mutation and 6 on a
+widened allowlist.
+
+It strips the TypeScript casts on purpose. Without that, the mutation fails by **refusing to
+parse** — `Unexpected identifier 'as'` — which would report "the function is broken" instead of
+the real claim, that the guard is gone. A probe that can only fail by not compiling is reporting
+the wrong failure.
+
+### Host note
+
+`/dev/shm` was at 95% with four writers building. `/dev/shm/w4-target` (1.3G) had **no holder** —
+no live `cargo`/`rustc` with that `CARGO_TARGET_DIR` in `/proc/<pid>/environ`, and no process with
+its cwd inside it. Reclaimed. The evidence standard is the one the disk-guard script already uses
+(`kill -0` on the holder pid plus `/proc/<pid>/cwd`); "the directory exists" was never it.
+
 ## 2026-10-01 — the event-bus suite had been dead for twenty ticks, and every one of its ten walks was proving the same refusal
 
 test(events): revive the whole suite. feat(events): catalogue four names the drift gate
