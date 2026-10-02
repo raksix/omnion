@@ -1704,12 +1704,25 @@ async fn resolve_under_test(
 }
 
 /// One model's `provider/model` string, the key the snapshot and the price table both use.
+///
+/// **The decode is a single `String`, not a tuple.** The query selects *one* expression —
+/// `p.name || '/' || m.model_key` — and the original decode asked for `(String, String)`, so
+/// `sqlx` answered `column index out of bounds: the len is 1, but the index is 1` on the very
+/// first row. That is a **500 on every model-targeted eval run**: the route reached this read on
+/// the path `POST /ai/evals/suites/{key}/run` takes after its readiness checks, so a perfectly
+/// valid suite could never be started at all.
+///
+/// It survived because no walk reached it — every run-surface walk either refused before this read
+/// (no suite, disabled, not ready, gate with no baseline) or drove the store directly, and the one
+/// walk that called the route for real was refused by a *permission* 403 a layer earlier. The
+/// counter-case in `ai_eval_run_permission.rs` found it by asserting the **accept** path: the same
+/// session, the same suite, the same body, with one more role_permission row.
 async fn model_key_of(pool: &sqlx::PgPool, model_id: Uuid) -> Result<Option<String>, ApiError> {
-    // `api.models.model_key` is the bare model name; the wire key the router and the price
+    // `ai_models.model_key` is the bare model name; the wire key the router and the price
     // table both use is `provider/model`, joined here so the snapshot records what a call would
     // actually be sent. Reading only `model_key` would make every snapshot ambiguous between
     // two providers offering a model of the same name.
-    let row: Option<(String, String)> = sqlx::query_as(
+    let row: Option<String> = sqlx::query_scalar(
         "select p.name || '/' || m.model_key from ai_models m \
          join ai_providers p on p.id = m.provider_id where m.id = $1",
     )
@@ -1723,7 +1736,7 @@ async fn model_key_of(pool: &sqlx::PgPool, model_id: Uuid) -> Result<Option<Stri
             format!("the model registry could not be read for this run: {error}"),
         )
     })?;
-    Ok(row.map(|(key, _)| key))
+    Ok(row)
 }
 
 /// The judge model's key, for the snapshot.
