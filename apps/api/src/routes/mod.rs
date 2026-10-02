@@ -1782,6 +1782,13 @@ pub fn router(state: AppState) -> Router {
             "/crm/leads/duplicates",
             get(crm_intake::duplicates).layer(guards::require(&state, "crm.leads.read")),
         )
+        // The counters on their own. Declared **before** `/crm/leads/{id}`: axum prefers the
+        // literal segment, and a uuid parse of the word "metrics" is a 400 a panel renders as a
+        // broken screen rather than as the route it is. The same reason `duplicates` sits above.
+        .route(
+            "/crm/leads/metrics",
+            get(crm_intake::metrics).layer(guards::require(&state, "crm.leads.read")),
+        )
         .route(
             "/crm/leads/{id}",
             get(crm_intake::get_lead)

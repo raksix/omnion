@@ -2078,6 +2078,75 @@ async fn count_unassigned(pool: &PgPool, organization_id: Uuid) -> Result<i64> {
         crate::vocabulary::open_statuses_sql("status")
     );
     let row: (i64,) = sqlx::query_as(&query)
+        .bind(organization_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The metrics endpoint
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The organization's inbox counters, with no filter applied.
+ *
+ * **A second read rather than a call to [`list_leads`] with an empty query, and the reason is
+ * the one that has bitten this module twice already.** `list_leads` returns one *page*, and
+ * its counters are deliberately built from that page's own filter list — which is right for
+ * the inbox, where "3 new leads" has to mean "3 of the leads you are looking at". A metrics
+ * endpoint has the opposite contract: it answers about every lead the organization holds, so
+ * borrowing the inbox's page limit would count fifty rows' worth and call the answer "all of
+ * them".
+ *
+ * The grouped read is shared with the inbox (`from_rows`) because that part is *not*
+ * page-scoped — it is a `group by status` over the whole table either way. Breached and the
+ * median are this function's own, for the same reason `list_leads` computes its own.
+ */
+pub async fn organization_metrics(pool: &PgPool, organization_id: Uuid) -> Result<LeadMetrics> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "select status, count(*) from crm_leads where organization_id = $1 group by status",
+    )
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+    let mut metrics = LeadMetrics::from_rows(&rows);
+    metrics.breached = count_breached(pool, organization_id).await?;
+    metrics.unassigned = count_unassigned(pool, organization_id).await?;
+    metrics.median_response_minutes = median_minutes_to_response(pool, organization_id).await?;
+    Ok(metrics)
+}
+
+/**
+ * The median minutes-to-first-response over answered leads, or `None` if there are none.
+ *
+ * **Only answered leads, and only ones whose interval is not negative.** A lead nobody has
+ * answered has no response time to report; counting it as zero makes a team that has answered
+ * nothing at all look like the fastest in the installation, which is the exact opposite
+ * reading and the one a dashboard is best at producing. A same-instant answer is kept —
+ * `>=` rather than `>` — because somebody who answered while the page was still loading did
+ * answer. The negative half is filtered rather than trusted on the argument that two
+ * `timestamptz` cannot produce one, because a median that quietly includes a zero row is the
+ * shape of defect this module has now written down six times.
+ *
+ * The arithmetic runs in SQL through `floor(percentile_cont(0.5) …)`: `percentile_cont` is
+ * the *continuous* percentile, so an even sample count averages the two middle rows — which
+ * is the definition [`LeadMetrics::median_of`] implements in Rust. That duplication is
+ * deliberate and is the point: the gate asserts the two agree on both an odd and an even
+ * fixture, so "the median" is a fact about the number rather than about one spelling of it.
+ * `floor` is what makes the SQL answer an integer like the Rust one, and it rounds *down* —
+ * a service that reports itself a minute faster than it was is the worse of the two ties.
+ */
+async fn median_minutes_to_response(
+    pool: &PgPool,
+    organization_id: Uuid,
+) -> Result<Option<i64>> {
+    let row: (Option<i64>,) = sqlx::query_as(
+        "select floor(percentile_cont(0.5) within group (order by \
+           extract(epoch from (first_response_at - received_at)) / 60.0))::bigint \
+         from crm_leads where organization_id = $1 and first_response_at is not null \
+         and first_response_at >= received_at",
+    )
     .bind(organization_id)
     .fetch_one(pool)
     .await?;

@@ -46,12 +46,14 @@ import {
   bulkAssignLeads,
   fetchIntakeSources,
   fetchLeads,
+  fetchLeadMetrics,
   fetchLeadOwners,
   type BulkAssignReport,
   type IntakeSource,
   type Lead,
   type LeadInbox,
   type LeadOwner,
+  type OrganizationMetrics,
 } from "@/lib/crm-intake-api";
 
 const PAGE = 25;
@@ -159,6 +161,38 @@ export function LeadInbox() {
     };
   }, []);
 
+  /**
+   * The organization-wide counters, read **beside** the page rather than out of it.
+   *
+   * The inbox's own metrics describe the rows on screen, which is the right answer for "how
+   * many of these are breached" and the wrong one for "how fast do we answer". A median taken
+   * from one filtered page moves every time somebody types in the search box and looks like a
+   * service-level number, so it has its own endpoint — and it is read once, not on every
+   * page turn, because no number on this screen is derived from the filter list.
+   *
+   * A failure here degrades the tile alone. The tile is a summary; the table underneath it is
+   * the work, and a metrics read must never be the reason the inbox does not draw.
+   */
+  const [orgMetrics, setOrgMetrics] = useState<OrganizationMetrics | null>(null);
+  const [orgMetricsFailed, setOrgMetricsFailed] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    fetchLeadMetrics()
+      .then((answer) => {
+        if (cancelled) return;
+        setOrgMetrics(answer);
+        setOrgMetricsFailed(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setOrgMetrics(null);
+        setOrgMetricsFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const toggleSelected = (id: string) => {
     setSelected((previous) =>
       previous.includes(id) ? previous.filter((row) => row !== id) : [...previous, id],
@@ -231,6 +265,58 @@ export function LeadInbox() {
           <Counter label="Duplicates" value={metrics.duplicates} test="duplicates" />
           <Counter label="Discarded" value={metrics.discarded} test="discarded" />
           <Counter label="Converted" value={metrics.converted} test="converted" />
+        </section>
+      ) : null}
+
+      {/*
+        The one tile that is NOT page-scoped, and it says so in its own words.
+
+        The six above follow the filter list — they describe the rows underneath. A median
+        response time that also followed the filters would be a service-level number that
+        changes when somebody types in the search box, which is the kind of metric that gets
+        quoted in a review and then turns out to have been one filtered page. This one is
+        read from `/crm/leads/metrics` over every lead the organization holds.
+
+        `null` is rendered as "no answered lead yet" and **not** as zero. The panel's own
+        SLA work has already been bitten by a counter that quietly reported the absence of a
+        fact as the presence of a number: zero minutes is the fastest team in the world, and
+        it is what a lead nobody replied to looks like.
+      */}
+      {orgMetrics ? (
+        <section
+          aria-label="Organization response time"
+          data-lead-metrics-org
+          className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-line bg-surface px-3 py-2"
+        >
+          <div className="flex items-baseline gap-2">
+            <span className="text-[11.5px] font-medium uppercase tracking-wide text-muted">
+              Median first response
+            </span>
+            <span
+              data-lead-metrics-median
+              data-lead-metrics-median-value={orgMetrics.median_response_minutes ?? ""}
+              className="text-[15px] font-semibold text-ink"
+            >
+              {orgMetrics.median_response_minutes === null
+                ? "no answered lead yet"
+                : `${orgMetrics.median_response_minutes} min`}
+            </span>
+          </div>
+          <span className="text-[11.5px] text-muted">
+            Across every lead, not this filter.
+          </span>
+        </section>
+      ) : orgMetricsFailed ? (
+        <section
+          aria-label="Organization response time"
+          data-lead-metrics-org
+          data-lead-metrics-org-error
+          className="rounded-xl border border-line bg-surface px-3 py-2"
+        >
+          <span className="text-[11.5px] text-muted">
+            The organization-wide response time could not be read. The inbox below is
+            unaffected.
+          </span>
         </section>
       ) : null}
 

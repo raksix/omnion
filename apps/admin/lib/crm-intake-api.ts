@@ -39,7 +39,32 @@ export type LeadMetrics = {
   duplicates: number;
   discarded: number;
   converted: number;
+  /**
+   * The median minutes to a first response, or `null` when nothing has been answered.
+   *
+   * Optional and nullable on purpose. The inbox's own counters are page-scoped and this one
+   * is not, so a `LeadMetrics` read off a *page* has no median to report — see
+   * {@link fetchLeadMetrics} for the endpoint that does.
+   */
+  median_response_minutes?: number | null;
 };
+
+/**
+ * The organization's counters with no filter applied.
+ *
+ * **A separate call, and not `fetchLeads({}).metrics`.** The inbox's counters deliberately
+ * describe the rows on screen, so reusing them here would answer "median over the leads you
+ * happen to be looking at" for a panel that says "median across the organization" — the same
+ * number under two names, which is the mistake this screen would then be impossible to
+ * debug. The endpoint exists because the request's own API table has promised it since the
+ * module shipped.
+ */
+export type OrganizationMetrics = LeadMetrics & { median_response_minutes: number | null };
+
+/** Read the organization's inbox counters, unfiltered, from `GET /crm/leads/metrics`. */
+export function fetchLeadMetrics(): Promise<OrganizationMetrics> {
+  return request<OrganizationMetrics>("/api/v1/crm/leads/metrics");
+}
 
 /** One row of the inbox. */
 export type Lead = {

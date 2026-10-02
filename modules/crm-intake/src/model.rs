@@ -588,10 +588,27 @@ pub struct LeadMetrics {
     pub discarded: i64,
     /// Leads converted.
     pub converted: i64,
+    /**
+     * The median of every answered lead's minutes-to-first-response, or `None` when nothing
+     * has been answered yet.
+     *
+     * **A median and not an average, and `None` rather than zero.** The mean of a handful of
+     * fast answers and one forgotten lead is a number nobody acted on; the REQ names a median
+     * for exactly that reason. And a module with no answered lead has *no* median — zero is
+     * the average of an empty set by a convention nobody chose, and printing it beside a real
+     * one puts "nobody has replied to anything" and "everybody replies in no time at all" on
+     * the same dashboard row.
+     */
+    pub median_response_minutes: Option<i64>,
 }
 
 impl LeadMetrics {
     /// The counters that come from one grouped read.
+    ///
+    /// `breached` and the median are **not** derived here: both need a read the grouped
+    /// `status, count(*)` cannot answer (one compares a row's deadline to `now()`, the other
+    /// orders instants the group discarded), and their zero/zero defaults are what makes
+    /// this constructor safe to call from the filtered inbox list.
     #[must_use]
     pub fn from_rows(rows: &[(String, i64)]) -> Self {
         let count = |wanted: &[&str]| -> i64 {
@@ -612,7 +629,32 @@ impl LeadMetrics {
             duplicates: count(&["duplicate"]),
             discarded: count(&["spam", "rejected"]),
             converted: count(&["converted"]),
+            median_response_minutes: None,
         }
+    }
+
+    /// The median of `samples`, or `None` when there are none.
+    ///
+    /// Exposed as a function rather than kept inside the SQL because it is the half of the
+    /// answer a unit test can measure: `percentile_cont(0.5)` is a one-line database call
+    /// nobody can check, while *an even number of samples averages the middle two* is a rule
+    /// with cases. The store uses it, and the gate asserts **both** arms — because a
+    /// "median" that reads the upper middle element turns a four-lead module into one that
+    /// reports itself a minute faster than it is.
+    #[must_use]
+    pub fn median_of(mut samples: Vec<i64>) -> Option<i64> {
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_unstable();
+        let middle = samples.len() / 2;
+        Some(if samples.len() % 2 == 1 {
+            samples[middle]
+        } else {
+            // Floor-divided: three minutes is a truthful median of 5 and 7, and a rounding
+            // direction that makes an operation look quicker than it was is the one to avoid.
+            (samples[middle - 1] + samples[middle]) / 2
+        })
     }
 }
 
@@ -804,6 +846,40 @@ mod tests {
         assert_eq!(metrics.converted, 1);
         assert_eq!(metrics.duplicates, 4);
         assert_eq!(metrics.discarded, 5);
+    }
+
+    /**
+     * The median has two cases and the *second* one is the one every implementation gets
+     * wrong. An odd count has one middle element; an even count has two and the definition is
+     * their average — which is what distinguishes a median from "the element at index n/2".
+     * That bug is invisible on a three-row fixture and appears only when a customer's inbox
+     * happens to hold an even number of answers, which is to say: in production.
+     */
+    #[test]
+    fn a_median_of_an_even_count_averages_the_two_middle_answers() {
+        assert_eq!(LeadMetrics::median_of(vec![10, 20, 30, 40]), Some(25));
+        assert_eq!(LeadMetrics::median_of(vec![1, 2, 3, 4, 5, 6]), Some(3));
+        assert_eq!(LeadMetrics::median_of(vec![7]), Some(7));
+        // Unsorted input, because the store's answer does not promise order and a definition
+        // that only holds for sorted input is a sort, not a median.
+        assert_eq!(LeadMetrics::median_of(vec![40, 10, 30, 20]), Some(25));
+    }
+
+    #[test]
+    fn a_median_of_no_answers_is_absence_and_not_zero() {
+        assert_eq!(LeadMetrics::median_of(vec![]), None);
+        // A single instant answer is kept — somebody who replied while the page was still
+        // loading did reply, and dropping it would turn one honest zero into "no data".
+        assert_eq!(LeadMetrics::median_of(vec![0]), Some(0));
+    }
+
+    #[test]
+    fn the_grouped_read_never_invents_a_median() {
+        // `from_rows` sees `status, count(*)` and has thrown away every instant, so any
+        // median it produced would be fiction. `None` is the only honest answer here.
+        let metrics =
+            LeadMetrics::from_rows(&[("new".to_string(), 9), ("contacted".to_string(), 9)]);
+        assert_eq!(metrics.median_response_minutes, None);
     }
 
     #[test]

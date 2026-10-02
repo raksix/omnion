@@ -1246,6 +1246,40 @@ pub async fn duplicates(
     Ok(Json(rows))
 }
 
+/// `GET /api/v1/crm/leads/metrics` — the organization's inbox counters, unfiltered.
+///
+/// **Declared before `/{id}` for the same reason `duplicates` is.** axum reads
+/// `/crm/leads/metrics` as a lead id first and answers a `400` on a uuid parse, which a panel
+/// shows as a broken screen rather than as the route it is. The route has been named in the
+/// request's own API table since the module shipped and had no handler at all: the inbox's
+/// counters were reachable only as a side effect of asking for a page of leads, so anything
+/// that wanted the numbers without the rows — a dashboard tile, a health check, a scheduled
+/// report — had to either page through leads or re-implement the counting. This is that
+/// handler, and it reads through [`store::organization_metrics`] rather than by calling the
+/// inbox list with an empty filter, because the inbox's counters are page-scoped by design.
+///
+/// The answer is the counters **and** the median, and `median_response_minutes` is `null`
+/// rather than zero when no lead has been answered: "nobody has replied to anything yet" and
+/// "everybody replies instantly" must not be the same row on a dashboard.
+pub async fn metrics(
+    State(state): State<AppState>,
+    session: CurrentSession,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let organization_id = organization_of(&session)?;
+    let counters = store::organization_metrics(state.db().pool(), organization_id)
+        .await
+        .map_err(map_store)?;
+    Ok(Json(serde_json::json!({
+        "open": counters.open,
+        "breached": counters.breached,
+        "unassigned": counters.unassigned,
+        "duplicates": counters.duplicates,
+        "discarded": counters.discarded,
+        "converted": counters.converted,
+        "median_response_minutes": counters.median_response_minutes,
+    })))
+}
+
 /// `GET /api/v1/crm/leads/{id}` — one lead with its payload and its trail.
 pub async fn get_lead(
     State(state): State<AppState>,
