@@ -1173,7 +1173,16 @@ async function interact(page, pageName, report) {
     // The two controls below (`Sign out`, `Sign in`) are excluded for the same reason they are
     // DEFERRED elsewhere in this file: they are the pass's own bookkeeping, driven deliberately by
     // the wizard and the re-login step, never incidentally by a round-robin click.
-    if (/\bsign in\b/i.test(meta.label) && /password/i.test(meta.type === "" ? meta.name : "")) {
+    // The submit control of that form. Matching on the LABEL alone is the fix: my first version
+    // also required `meta.name` to contain "password", reasoning that the button would carry the
+    // field's name — and a `<button type="submit">` has no name at all, so the guard never fired
+    // and the pass spent the budget again on its second attempt. The next run's `clicks.jsonl` is
+    // what showed it: the password field was correctly skipped, and the very next line was
+    // `label: "Sign in", outcome: <clicked>, net: ["429 …/auth/login"]`.
+    //
+    // So the label IS the discriminator, and it is checked here with the password field above so
+    // the two halves cannot drift: the field is never filled and the button is never pressed.
+    if (/\bsign in\b/i.test(meta.label) || /log ?in\b/i.test(meta.label)) {
       record({ page: pageName, i, ...meta, action: "skip", outcome: "deferred-signin" });
       continue;
     }
