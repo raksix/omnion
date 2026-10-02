@@ -225,6 +225,32 @@ pub enum AiHubError {
     /// different key rather than by rewriting the user's input.
     #[error("{0}")]
     IdentityConflict(String),
+    /// No MCP client carries that id in this organization (REQ-108).
+    ///
+    /// `NotFound` rather than a 403 for the tenancy reason `IdentityNotFound` gives: a client id
+    /// in a URL is a perfectly guessable UUID, and a status code that distinguishes "exists in
+    /// another tenant" turns the clients table into an existence oracle for every token prefix
+    /// in the installation.
+    #[error("no MCP client `{0}` in this organization")]
+    McpClientNotFound(Uuid),
+    /// A field of an MCP client is not acceptable (REQ-108).
+    ///
+    /// Its own code for the reason `InvalidIdentity` has one: the create dialog has a field per
+    /// attribute, and a caller that maps a bad rate limit onto a generic "invalid request" can
+    /// only print it above the whole form. The message names the field and the range, which are
+    /// the request's (1–600 per minute, 1–60 characters of name, 200 of description).
+    #[error("invalid MCP client: {0}")]
+    InvalidMcpClient(String),
+    /// An MCP client with that name already exists in this organization.
+    ///
+    /// A `409` rather than a `400`, for the reason `IdentityConflict` gives: the request is well
+    /// formed and the state is what refuses it. The panel resolves it by asking for another name
+    /// instead of silently rewriting what the operator typed.
+    #[error("{0}")]
+    McpClientConflict(String),
+    /// An MCP client already holds that tool grant (REQ-108).
+    #[error("{0}")]
+    McpClientToolConflict(String),
     /// The request needs a capability the model does not claim.
     ///
     /// The refusal happens before any call leaves the process, so a caller that asked for a
@@ -382,6 +408,10 @@ impl AiHubError {
             Self::AirgapHostNotFound(_) => "airgap_host_not_found",
             Self::ChangeSetNotFound(_) => "change_set_not_found",
             Self::IdentityNotFound(_) => "identity_not_found",
+            Self::McpClientNotFound(_) => "mcp_client_not_found",
+            Self::InvalidMcpClient(_) => "invalid_mcp_client",
+            Self::McpClientConflict(_) => "mcp_client_conflict",
+            Self::McpClientToolConflict(_) => "mcp_client_tool_conflict",
             Self::IdentityConflict(_) => "identity_conflict",
             // The guard codes (REQ-105). Four distinct shapes, not one, because the four answers
             // land on four different screens: a bad field is a `400` naming the field, a missing

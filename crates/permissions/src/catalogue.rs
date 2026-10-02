@@ -258,6 +258,22 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "ai",
         description: "Approve, reject and expire AI approval requests",
     },
+    // The MCP client registry (REQ-108). Read and manage are separate for the reason the
+    // approval gate splits read from act: seeing which machine tokens exist and what they may
+    // reach is an audit question a security reader can answer, while minting, rotating and
+    // revoking a token is handing out a credential for the whole installation to act through.
+    // One key would make those two the same decision, and the failure would be silent: a reader
+    // who could rotate would never notice, because rotation looks like maintenance.
+    PermissionDef {
+        key: "mcp.clients.read",
+        category: "mcp",
+        description: "Read MCP clients, their grants and their invocation history",
+    },
+    PermissionDef {
+        key: "mcp.clients.manage",
+        category: "mcp",
+        description: "Create, rotate, revoke and delete MCP clients and change their grants",
+    },
     PermissionDef {
         key: "ai.policies.manage",
         category: "ai",

@@ -16,6 +16,14 @@ time.workspace = true
 # key would be able to address another file's bytes. `omnion-storage` has the same dependency
 # for its own checksum column, so this is not a new edge in the tree.
 sha2 = "0.10"
+# MCP client tokens (REQ-108). `rand` mints the secret half from the OS entropy source and `hex`
+# encodes the SHA-256 the token's hash column stores — neither is new to the tree
+# (`crates/developer` hashes its keys the same pair of ways), but a token minted from anything
+# weaker than `OsRng` would make every other guarantee in `mcp_store` decoration.
+rand.workspace = true
+hex.workspace = true
+# base64url encodes the token's 32 random bytes into the 43 characters after the prefix.
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The data guard (REQ-105) compiles tenant-authored detection patterns, so it needs a real
