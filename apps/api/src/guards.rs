@@ -46,6 +46,13 @@ pub struct MachinePrincipal {
     pub organization_id: Uuid,
     /// The key that was presented.
     pub key_id: Uuid,
+    /// That key's displayable prefix — the lookup namespace, never a token.
+    ///
+    /// Carried here rather than read again by the request log (REQ-022 slice 2). It is not a
+    /// credential: the prefix is printed on the key list precisely so an operator can match a
+    /// log row to a key. Reading it a second time to decorate a log line would be a second
+    /// query whose answer could disagree with the one that authenticated the request.
+    pub key_prefix: Option<String>,
 }
 
 /// Whether a guard accepts only sessions, or also machine keys.
@@ -291,7 +298,7 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // An "any of" layer tries **every** name — the primary first, then the
+// An "any of" layer tries **every** name — the primary first, then the
             // alternatives — and keeps the first caller it gets.
             //
             // Both halves of that sentence are load-bearing, and the first version of this
@@ -303,34 +310,83 @@ where
             // caught it as a 403 naming both keys. The refusal held back until the last name has
             // been tried too, or a signed-in holder of the second key would be told they are not
             // signed in.
+            //
+            // The loop asks the **reporting** variant, not `check_kind`, so a refusal keeps the
+            // caller that produced it: an "any of" guard that denies every name still knows who
+            // was refused, and the request log can write that row with its organization rather
+            // than with `organization_id = null` — which is a row no log screen filters to.
             if !alternatives.is_empty() {
                 let mut last: Option<ApiError> = None;
+                let mut principal = crate::request_log_middleware::ResolvedPrincipal {
+                    permission: Some(permission.to_owned()),
+                    ..Default::default()
+                };
                 for name in std::iter::once(permission).chain(alternatives.iter().copied()) {
-                    match check_kind(&state, &headers, name, kind).await {
+                    let decision = check_kind_reporting(&state, &headers, name, kind).await;
+                    // Each attempt is logged under the name it was tried with, so the log says
+                    // which scope was being measured rather than only which set it belongs to.
+                    principal.permission = Some(name.to_owned());
+                    match decision {
                         Ok(caller) => {
+                            merge_principal(&mut principal, &principal_of_caller(&caller, name));
                             insert_caller(&mut request, caller);
-                            return inner.call(request).await;
+                            return finish(inner, request, principal).await;
                         }
-                        Err(error) => last = Some(error),
+                        Err((error, partial)) => {
+                            if let Some(partial) = partial {
+                                merge_principal(&mut principal, &partial);
+                            }
+                            last = Some(error);
+                        }
                     }
                 }
                 let Some(error) = last else {
-                    return inner.call(request).await;
+                    return finish(inner, request, principal).await;
                 };
                 // The refusal names the whole set, not the name that happened to be tried last.
-                return Ok(explain_any_denial(error, permission, alternatives).into_response());
+                let response = explain_any_denial(error, permission, alternatives).into_response();
+                return Ok(attach_principal(response, principal));
             }
-            match check_kind(&state, &headers, permission, kind).await {
+
+            // The reporting variant, so a **refusal** also carries a caller. This is the whole
+            // point of the split: a 403 that says "add the `content.pages.read` scope" and is
+            // stored with no organization is a row no log screen can ever show, because every
+            // screen filters on organization. The walk below caught exactly that.
+            let decision = check_kind_reporting(&state, &headers, permission, kind).await;
+            let principal = match &decision {
+                Ok(caller) => principal_of_caller(caller, permission),
+                // The refusal's own answer. `None` only when a presented key was not found at
+                // all, which genuinely has no caller to name.
+                Err((_, partial)) => partial.clone().unwrap_or_default(),
+            };
+
+            match decision {
                 Ok(Caller::Session(session)) => {
                     request.extensions_mut().insert(*session);
-                    inner.call(request).await
                 }
                 Ok(Caller::Machine(machine)) => {
                     request.extensions_mut().insert(machine);
-                    inner.call(request).await
                 }
-                Err(error) => Ok(error.into_response()),
+                Err((error, _)) => return Ok(attach_principal(error.into_response(), principal)),
             }
+
+            // **On the response, not the request, and not in a task-local.** The request log's
+            // layer sits *outside* this guard, so by the time it regains control the request has
+            // been consumed by the handler and any scope this guard opened has been popped. Two
+            // earlier attempts failed exactly here, and both failed *quietly*:
+            //
+            // * Reading the principal from the request extensions after `inner.call` — the
+            //   request is gone; the handler consumed it.
+            // * Publishing it in a task-local around the inner call — the scope closes when that
+            //   call returns, which is *before* the outer layer runs, so the log read `None`.
+            //
+            // The response is the one carrier that outlives the handler and travels back out to
+            // the layer that needs it, and it is per-response, so two concurrent requests cannot
+            // see each other's caller.
+            // `S::Error = Infallible`, so the error arm is matched rather than unwrapped: the
+            // bound says an observing guard can never be handed a failed service, and writing
+            // that as a `match` makes it a *checkable* statement rather than a comment.
+            finish(inner, request, principal).await
         })
     }
 }
@@ -366,6 +422,123 @@ fn explain_any_denial(
         "permission_denied",
         format!("this needs one of: {}", names.join(", ")),
     )
+}
+
+/// The name a log row shows for a signed-in account.
+///
+/// The same fallback the credential audit rows use: an account with no display name shows its
+/// email rather than a blank cell, and two different modules picking the same fallback is two
+/// places to change when a third field is added.
+fn display_name_of(session: &CurrentSession) -> String {
+    let display = session.user.display_name.trim();
+    if !display.is_empty() {
+        return display.to_owned();
+    }
+    let email = session.user.email.trim();
+    if email.is_empty() {
+        String::new()
+    } else {
+        email.to_owned()
+    }
+}
+
+/// The log's view of a machine or developer key.
+///
+/// The key's *prefix* travels in [`MachinePrincipal::key_prefix`] rather than being looked up
+/// again here: the guard is the only place that has already read the row, and a second read to
+/// decorate a log line is a second answer to "which key was that" that can disagree with the
+/// first. A `None` prefix (a key minted by a fixture, or a service-account row from before the
+/// column existed) is written as `None`, not as an empty string — a log cell that shows `""` for
+/// an unknown key looks like a formatting fault.
+fn machine_principal_of(
+    machine: &MachinePrincipal,
+    permission: &'static str,
+) -> crate::request_log_middleware::ResolvedPrincipal {
+    crate::request_log_middleware::ResolvedPrincipal {
+        user_id: None,
+        user_name: String::new(),
+        api_key_id: Some(machine.key_id),
+        api_key_prefix: machine.key_prefix.clone(),
+        organization_id: Some(machine.organization_id),
+        permission: Some(permission.to_owned()),
+    }
+}
+
+/// The log's view of a resolved caller, whichever kind it is.
+///
+/// One function for both paths so the "any of" loop and the single-permission guard cannot
+/// disagree about what a caller looks like in the log. They did, for one tick: the loop built a
+/// principal with a permission name and nothing else, so an "any of" refusal was the one row the
+/// request log stored with no user and no organization.
+fn principal_of_caller(
+    caller: &Caller,
+    permission: &'static str,
+) -> crate::request_log_middleware::ResolvedPrincipal {
+    match caller {
+        Caller::Session(session) => crate::request_log_middleware::ResolvedPrincipal {
+            user_id: Some(session.user.id),
+            user_name: display_name_of(session),
+            organization_id: session.user.organization_id,
+            permission: Some(permission.to_owned()),
+            ..Default::default()
+        },
+        Caller::Machine(machine) => machine_principal_of(machine, permission),
+    }
+}
+
+/// Fold a partial answer into the running one, keeping whichever half is populated.
+///
+/// The "any of" loop tries several names and keeps the last partial it saw, because each attempt
+/// names a different `permission` while user/organization stay the same. A field that is `None`
+/// in the newer answer must not erase one that was resolved: `None` here means "this attempt
+/// could not say", not "there is no user".
+fn merge_principal(
+    into: &mut crate::request_log_middleware::ResolvedPrincipal,
+    from: &crate::request_log_middleware::ResolvedPrincipal,
+) {
+    if into.user_id.is_none() {
+        into.user_id = from.user_id;
+    }
+    if into.user_name.is_empty() {
+        into.user_name = from.user_name.clone();
+    }
+    if into.api_key_id.is_none() {
+        into.api_key_id = from.api_key_id;
+    }
+    if into.api_key_prefix.is_none() {
+        into.api_key_prefix = from.api_key_prefix.clone();
+    }
+    if into.organization_id.is_none() {
+        into.organization_id = from.organization_id;
+    }
+}
+
+/// Put the principal on the response, which is the only carrier that outlives the handler.
+fn attach_principal(
+    mut response: Response<Body>,
+    principal: crate::request_log_middleware::ResolvedPrincipal,
+) -> Response<Body> {
+    response.extensions_mut().insert(principal);
+    response
+}
+
+/// Call the handler and return its response carrying `principal`.
+async fn finish<S>(
+    inner: S,
+    request: Request<Body>,
+    principal: crate::request_log_middleware::ResolvedPrincipal,
+) -> Result<Response<Body>, Infallible>
+where
+    S: Service<Request<Body>, Response = Response<Body>, Error = Infallible>,
+{
+    let mut inner = inner;
+    // `S::Error = Infallible`, so the error arm is matched rather than unwrapped: the bound says
+    // an observing guard can never be handed a failed service, and writing that as a `match`
+    // makes it a *checkable* statement rather than a comment.
+    match inner.call(request).await {
+        Ok(response) => Ok(attach_principal(response, principal)),
+        Err(unreachable) => match unreachable {},
+    }
 }
 
 /// Who called a guarded route.
@@ -408,12 +581,48 @@ pub async fn check_kind(
     permission: &str,
     kind: GuardKind,
 ) -> Result<Caller, ApiError> {
+    check_kind_reporting(state, headers, permission, kind)
+        .await
+        .map_err(|error| error.0)
+}
+
+/// [`check_kind`], and the half of the answer the request log needs on the **refusal** path.
+///
+/// A refusal is the row an integrator most often wants — "why is my integration being refused" —
+/// and it is the one row that has to carry a *caller*. The first version of this returned a bare
+/// `ApiError` on the error path, and the log layer, which reads the guard's answer, therefore
+/// published a principal with no user, no key and **no organization**. The row was written; it
+/// was written with `organization_id = null`, and every log screen filters on
+/// `organization_id = $1`. So the 403 that names the missing scope was stored where no operator
+/// could ever see it — a debugging table that silently drops exactly the rows it was built for.
+///
+/// Returning the partial answer alongside the error is what makes a refusal attributable. The
+/// caller is taken from the credential that was *presented*, not from a second resolution: the
+/// key was already read and hash-compared a line above, and re-reading it would be a second
+/// answer to a question that was just answered.
+pub async fn check_kind_reporting(
+    state: &AppState,
+    headers: &HeaderMap,
+    permission: &str,
+    kind: GuardKind,
+) -> Result<Caller, (ApiError, Option<crate::request_log_middleware::ResolvedPrincipal>)> {
     // A session cookie wins: a signed-in person is never mistaken for a machine.
     if crate::cookies::session_token(headers).is_some() {
-        let session = CurrentSession::resolve(state, headers).await?;
+        let session = match CurrentSession::resolve(state, headers).await {
+            Ok(session) => session,
+            Err(error) => {
+                return Err((
+                    error,
+                    Some(crate::request_log_middleware::ResolvedPrincipal {
+                        permission: Some(permission.to_owned()),
+                        ..Default::default()
+                    }),
+                ));
+            }
+        };
         let scope = scope_of(&session.user);
         let context = ResourceContext::from_scope(scope.clone());
-        // A department-scoped guard is the organization context **plus** one context per
+// A department-scoped guard is the organization context **plus** one context per
         // department the caller actually holds the permission on. The first decision that allows
         // the request wins, and the denial that is finally reported is the organization one, so
         // the explanation an operator reads is still the one about the whole tenant.
@@ -432,15 +641,26 @@ pub async fn check_kind(
                         department: Some(department),
                         ..ResourceContext::default()
                     };
-                    if let Decision::Allowed(_) =
-                        authorize_subject(state.db().pool(), Subject::User(session.user.id), &scoped, permission).await?
-                    {
+                    if let Decision::Allowed(_) = authorize_subject(
+                        state.db().pool(),
+                        Subject::User(session.user.id),
+                        &scoped,
+                        permission,
+                    )
+                    .await
+                    .map_err(|error| (ApiError::from(error), None))?
+                {
                         return Ok(Caller::Session(Box::new(session)));
                     }
                 }
             }
         }
-        return match authorize(state.db().pool(), session.user.id, scope, permission).await? {
+        // A store failure here is not a refusal and has no principal worth reporting, so it is
+        // the one `?` in this function that carries `None`.
+        let decision = authorize(state.db().pool(), session.user.id, scope, permission)
+            .await
+            .map_err(|error| (ApiError::from(error), None))?;
+        return match decision {
             Decision::Allowed(_) => Ok(Caller::Session(Box::new(session))),
             Decision::Denied { reason, source } => {
                 tracing::debug!(
@@ -450,10 +670,17 @@ pub async fn check_kind(
                     role = source.map(|grant| grant.role_key),
                     "permission denied"
                 );
-                Err(
+                Err((
                     explain_denial(state, Subject::User(session.user.id), &context, permission)
                         .await,
-                )
+                    Some(crate::request_log_middleware::ResolvedPrincipal {
+                        user_id: Some(session.user.id),
+                        user_name: display_name_of(&session),
+                        organization_id: session.user.organization_id,
+                        permission: Some(permission.to_owned()),
+                        ..Default::default()
+                    }),
+                ))
             }
         };
     }
@@ -468,12 +695,25 @@ pub async fn check_kind(
             if let Some(key) =
                 omnion_developer::keys_store::authenticate(state.db().pool(), &bearer, now)
                     .await
-                    .map_err(crate::routes::developer::map_store)?
+                    .map_err(|error| (crate::routes::developer::map_store(error), None))?
             {
                 // **The scope check is the authorization.** A key holds no role, so a
                 // permission the route asks for that the key does not carry is a plain refusal
                 // — and the refusal names the missing scope, so the integrator is told which
                 // scope to add rather than which route they hit.
+                // **The scope gap is a refusal that still knows who asked.** The key was read
+                // and hash-compared two lines above, so naming it here costs no query and makes
+                // the row visible: the organization is what the log screen filters on, and a
+                // refusal stored with a null organization is a refusal no operator can find.
+                let principal = crate::request_log_middleware::ResolvedPrincipal {
+                    user_id: None,
+                    user_name: String::new(),
+                    api_key_id: Some(key.id),
+                    api_key_prefix: Some(key.key_prefix.clone()),
+                    organization_id: Some(key.organization_id),
+                    permission: Some(permission.to_owned()),
+                };
+
                 if !key.scopes.iter().any(|scope| scope == permission) {
                     tracing::debug!(
                         permission,
@@ -481,12 +721,15 @@ pub async fn check_kind(
                         scopes = ?key.scopes,
                         "developer key does not carry the scope this route requires"
                     );
-                    return Err(ApiError::forbidden(
-                        "scope_missing",
-                        format!(
-                            "this key does not carry the \"{permission}\" scope — rotate it with \
-                             that scope added"
+                    return Err((
+                        ApiError::forbidden(
+                            "scope_missing",
+                            format!(
+                                "this key does not carry the \"{permission}\" scope — rotate it \
+                                 with that scope added"
+                            ),
                         ),
+                        Some(principal),
                     ));
                 }
 
@@ -501,6 +744,7 @@ pub async fn check_kind(
                     ),
                     organization_id: key.organization_id,
                     key_id: key.id,
+                    key_prefix: Some(key.key_prefix.clone()),
                 }));
             }
 
@@ -514,11 +758,17 @@ pub async fn check_kind(
         if let Some(bearer) = bearer_token(headers) {
             let Some(machine) =
                 omnion_permissions::service_accounts::authenticate(state.db().pool(), &bearer)
-                    .await?
+                    .await
+                    .map_err(|error| (ApiError::from(error), None))?
             else {
-                return Err(ApiError::unauthorized(
-                    "invalid_machine_key",
-                    "this machine key is unknown, revoked or does not match its secret",
+                // An unknown key is the one refusal with genuinely nothing to attribute it to,
+                // and it says so: `None` rather than a fabricated caller.
+                return Err((
+                    ApiError::unauthorized(
+                        "invalid_machine_key",
+                        "this machine key is unknown, revoked or does not match its secret",
+                    ),
+                    None,
                 ));
             };
 
@@ -527,15 +777,26 @@ pub async fn check_kind(
                 organization_id: Some(machine.account.organization_id),
                 ..omnion_permissions::model::ResourceContext::default()
             };
+            // Same reasoning as the developer key above: the key is in hand, so the refusal is
+            // attributable to it rather than to nobody.
+            let principal = crate::request_log_middleware::ResolvedPrincipal {
+                user_id: None,
+                user_name: String::new(),
+                api_key_id: Some(machine.key.id),
+                api_key_prefix: Some(machine.key.prefix.clone()),
+                organization_id: Some(machine.account.organization_id),
+                permission: Some(permission.to_owned()),
+            };
 
-            return match authorize_subject(state.db().pool(), subject, &context, permission).await?
+            return match authorize_subject(state.db().pool(), subject, &context, permission).await
             {
-                Decision::Allowed(_) => Ok(Caller::Machine(MachinePrincipal {
+                Ok(Decision::Allowed(_)) => Ok(Caller::Machine(MachinePrincipal {
                     account: subject,
                     organization_id: machine.account.organization_id,
                     key_id: machine.key.id,
+                    key_prefix: Some(machine.key.prefix.clone()),
                 })),
-                Decision::Denied { reason, source } => {
+                Ok(Decision::Denied { reason, source }) => {
                     tracing::debug!(
                         permission,
                         service_account = %machine.account.id,
@@ -543,15 +804,24 @@ pub async fn check_kind(
                         role = source.map(|grant| grant.role_key),
                         "machine permission denied"
                     );
-                    Err(explain_denial(state, subject, &context, permission).await)
+                    Err((
+                        explain_denial(state, subject, &context, permission).await,
+                        Some(principal),
+                    ))
                 }
+                Err(error) => Err((ApiError::from(error), Some(principal))),
             };
         }
     }
 
-    Err(ApiError::unauthorized(
-        "unauthenticated",
-        "sign in to continue",
+    // Nothing authenticated at all. A `401` row names the permission that was asked for and
+    // nothing else — there is no caller to attribute it to, and inventing one is the log lying.
+    Err((
+        ApiError::unauthorized("unauthenticated", "sign in to continue"),
+        Some(crate::request_log_middleware::ResolvedPrincipal {
+            permission: Some(permission.to_owned()),
+            ..Default::default()
+        }),
     ))
 }
 

@@ -25,6 +25,7 @@ pub mod lead_runner;
 pub mod notification_runner;
 pub mod rate_limit_middleware;
 pub mod request_id;
+pub mod request_log_middleware;
 pub mod restore_job_runner;
 pub mod retention_runner;
 pub mod routes;
