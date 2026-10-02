@@ -12575,3 +12575,64 @@ my own tree (1.0 G, `lsof` showed no holder) which took it to 1.8 G, and stopped
 unrelated functions — eight files, ~200 lines of churn that had nothing to do with this tick.
 Reverted with `git checkout --` and the export line re-applied by hand. Format the file you
 touched, not the crate.
+
+### Tick 71: the probe was reading the wrong thread, and the hang is arithmetic, not a deadlock (2026-10-01, w4 tick 71)
+
+Tick 70 shipped `scripts/qa/hung-test-probe.sh` to stop four ticks of hand-assembled
+diagnosis, then used it — and the tool that was supposed to settle the argument was itself
+wrong in the one way that matters.
+
+**The probe measured the main thread.** libtest runs each test on its own thread, so during a
+walk the main thread sits in `futex_do_wait` at zero CPU while the CPU actually burned is on
+the test thread. It therefore said "not working" about a suite that was halfway through a walk,
+and "moving" about a frozen one. Re-measured on one live suite, same binary, six seconds apart:
+
+| reading | value |
+|---|---|
+| `/proc/<pid>/stat` (main thread only) | `utime 546 → 573` — noise around a thread that is doing nothing |
+| sum over `/proc/<pid>/task/*` | `39 → 41 ticks` — the work |
+
+Fixed in `197625ad`, and proved back to back on a suite that was genuinely running (it now says
+"moving", the answer this script exists to distinguish). The same fix also removed a dead
+`awk -v a=... -v b=...` sub-expression that computed nothing and was discarded by a `;` before
+the real calculation.
+
+**With an honest probe, the hang stops being a deadlock.** The stall point moves between runs
+(35/57 last tick, 33/57 this tick, 17/57 on a second concurrent run), which is not what a
+deterministic deadlock looks like. Bisected on the same binary against the same database:
+
+| run | result |
+|---|---|
+| `reading_a_contact_does_not_grant_the_pipeline` alone | **1 passed, 5.91 s** |
+| 2 tests in sequence | pass, **21.7–30.2 s** |
+| 4 tests in sequence | pass, **68.26 s** |
+| 4 tests in sequence, first attempt | **RC=124 at 150 s**, stopped after the first dot |
+
+Four tests that cost about six seconds each took **68 s** together, and the same four in a fixed
+order then exceeded 150 s. The cost is not in any test — it is in the **repeating** part of the
+fixture, which every walk pays: `Fixture::new()` runs `live_state()` → `Db::connect` →
+`db.migrate()`, the full IAM `seed::ensure`, then six `create_account` calls, each an Argon2id
+hash at the crate's documented 19 MiB, and `crm_seed_default_pipeline` for two organizations.
+Connections were watched through the whole four-test run and plateaued at **7–12**, so this is
+**not** a connection leak either — `max_connections` is 100 and nothing approaches it.
+
+So the honest statement is: **the suite is not deadlocked, it is starved** — each walk pays a
+fixed setup bill, the walks serialise on `static CRM_WALK`, and on a box carrying load 14–20 with
+ten writers the per-test cost compounds until the tick budget arrives before the run does. That
+is a different claim from tick 69's and tick 70's, and it is the first one this suite's evidence
+actually supports.
+
+**What is not claimed:** that REQ-051's suite is green. It is **not** — the longest complete run
+in this tick is **4/4**, and no run has reached `test result:` for all 57. No acceptance box is
+ticked: the three open ones are browser-only and the QA slot was held all tick (holder pid
+3155581, cwd unreadable — a sibling's).
+
+**Gates:** `cargo test -p omnion-module-crm --lib` **172/172** · `pnpm typecheck` **2/2** ·
+`origin/main` merged (14 commits, BUILD-LOG spliced with `scripts/qa/merge-build-log.py` and
+verified by **multiset against both parents — 0 lines missing**, 182 `## ` entries) · both gates
+re-run green after the merge.
+
+**Next:** stop treating this as a hang and make the fixture cheap. The bill is per-walk, so the
+fix is one `OnceLock` around the `(AppState, Db)` that `live_state()` builds, with the per-walk
+`seed::ensure` and pipeline seeding kept inside the fixture — that turns 57 setups into 1 without
+weakening a single assertion. Then a full 57-test run, which this suite still has never produced.
