@@ -12885,3 +12885,74 @@ that is not being run, so it is written down rather than dismissed.
 
 **Next.** The browser pass (the members depth pass is the one that can finally answer the block and
 delete legs), then acceptance 18 and REQ-064's close. REQ-062 is next in wave order.
+
+## 2026-10-02 · wave2 tick 71 — the gate that proved the wrong thing, and a pass that ran out of disk mid-walk
+
+**What.** The QA slot was free for the first time in four ticks, so the pass that REQ-064's last
+criterion needs was actually started — and the tick found a gate that was **measuring the
+environment instead of the code** while the pass was still queued.
+
+`scripts/qa/test-reset-db-identity.sh` is the gate that proves `reset-db.sh` derives its database
+from `QA_STACK` and refuses anything else — the guard that exists so a writer debugging a pass by
+hand cannot drop the main writer's database. Every derivation case ran the script as
+`QA_STACK=w2 bash reset-db.sh`. But `reset-db.sh:24` is `DB="${QA_DB:-$DEFAULT_DB}"` (an explicit
+value wins, deliberately, because `run.sh` exports `QA_DB`), and `run.sh:40` exports it. So inside a
+pass the three derivation checks were reading `QA_DB=omnion_qa_w2` handed down by the harness, not
+the derivation — they passed **by coincidence**, and the one case that needs the derivation to
+produce a *different* name (`QA_STACK=main keeps omnion_qa`) **could not pass at all**. It reported
+`expected: omnion_qa, got: omnion_qa_w2`.
+
+It hid for two reasons worth writing down. `run.sh` prints the failure and continues (the right call
+for a broken auxiliary test, wrong for the one test standing between a writer and another writer's
+database), and the gate is **green standalone** — `bash scripts/qa/test-reset-db-identity.sh` passes
+13/13 in a plain shell. A gate that is green in one invocation and red in the harness it exists for
+is not proving the rule; it proves the shell it happened to run in.
+
+**The fix** runs each derivation case under `env -u QA_DB`, and adds a can-fail case that deletes
+the derivation line from a copy of `reset-db.sh` and asserts the main writer's database comes back —
+the direction the hazard actually points. The `sed` is applied to a temp copy, never to the real
+script.
+
+**Proof**
+
+| Gate | Command | Result |
+|---|---|---|
+| Old gate, the pass's own env | `QA_STACK=w2 QA_DB=omnion_qa_w2 bash <(git show HEAD:scripts/qa/test-reset-db-identity.sh)` | **5 checks red, exit 1** — the cascade an ambient value causes |
+| New gate, same env | same command against the working tree | **13/13, exit 0** |
+| New gate, standalone | `bash scripts/qa/test-reset-db-identity.sh` | **13/13, exit 0** |
+| …and it can fail | same gate with the derivation line removed from `reset-db.sh` | **3 red, exit 1**, naming `omnion_qa` — the main writer's database, exactly |
+| Rust (the crate this wave owns) | `cargo test -p omnion-content --lib --quiet` | **352 passed, 0 failed**, exit 0 |
+| Web types | `env -i … pnpm typecheck` | **2/2 packages, exit 0**, 5.6 s |
+| Selector contract | `node scripts/qa/probe-selector-contract.cjs` | **PASS**, exit 0 |
+| Screen inventories | `node scripts/qa/screen-coverage.cjs` | **PASS**, exit 0 |
+
+**The pass ran and died at `blocks`/`patterns`, and that is not a product result.** It took the slot,
+reset `omnion_qa_w2`, seeded analytics (`accepted:4 posted:4`), and walked `overview → pages → blocks
+→ patterns` before `/mnt/apopic` hit **0 bytes** and the run died with no `summary.json`. The
+walkthrough output root was `/dev/shm/w2-qa`, so the artifact is not the disk's doing directly: the
+volume went 100% → 1.2 GB → 0 while my own `CARGO_TARGET_DIR` grew 2.1 GB → 4.0 GB, and the
+`.next` trees run.sh rebuilds are ~1 GB. Per the disk rule the pass is **not** evidence in either
+direction, and acceptance 18 stays **unticked** — a killed pass is not a green pass.
+
+Two things this tick reclaimed, both mine and both verified before deletion: `CARGO_TARGET_DIR` held
+**five duplicate rlib/rmeta copies per crate** (10 for `libomnion_api`, `libomnion_security`,
+`libsqlx_postgres`), 5.64 GB from newest-per-crate, `debug/omnion-api` kept because the QA stack runs
+it — verified still starting afterwards. Then `.next` + two stale test binaries, 0.41 GB. Disk 100%
+→ 97%. Nothing belonging to a sibling was touched; `docker-data` (28 GB, shared) is not mine and was
+left alone even though it is the largest item on the volume.
+
+**Four orphan slot waiters, killed.** `/tmp/omnion-qa-slot-holders/` held a place owned by pid 2878882
+(w8, **dead**) and my own tree had **four** `qa-slot.sh` processes with `ppid 340` and no `run.sh`
+above them — passes from ticks 69 and 70 that were SIGKILLed and never ran their EXIT trap. Each
+would have taken a place and produced nothing. Judged by `ppid` + `readlink /proc/<pid>/cwd` (mine
+only), which is the same test the reaper uses. Two of them had been sleeping for an hour.
+
+**A note on the holder file**, recorded because it looks like a bug and is not: the place is named
+after the pid of `qa-slot.sh` itself, which exits within milliseconds of taking the place, and the
+real holder pid is the file's **last line**. Reading the filename gives a pid that is always dead,
+which is why the reaper reads the content. Both the stale w8 place and my own waiters would have
+been misjudged by name.
+
+**Next.** Acceptance 18 needs a completed pass on a volume with room; the reclaim is done, so the
+next tick should take the slot early and run `--only=members` (the legs that the tick-70 selector
+fix can finally answer). REQ-062's criterion 13 is the other open browser claim.
