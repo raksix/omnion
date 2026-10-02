@@ -10578,3 +10578,61 @@ reading `public renderer did not answer` were spent looking for a web defect in 
 web app was merely out of room. A gate that is not scoped to what the pass measures is a gate
 on the wrong axis, and the honest reading of "the pass died" is "the pass died", never "the
 product is broken".
+
+---
+
+## Tick 80 (wave3) — a gate on the wrong axis, and a cap that could not fail
+
+**Merge first.** `origin/main` had moved 5 commits (REQ-013's encryption slice), and the only
+conflict was this file. Both sides are diverging append-only tails off a common base, so it is a
+splice, not a choice — and `scripts/qa/merge-build-log.py` wants `rev:path` specs, not bare refs.
+Given a bare `HEAD` it diffed the **commit message** and reported every line as a non-append-only
+edit. With `1817fe6f:docs/BUILD-LOG.md` / `HEAD:…` / `MERGE_HEAD:…` it verified by exact multiset:
+base 126 + 50 ours-only + 3 theirs-only headings → 179 present, **zero lost**. A line count would
+also have read 179.
+
+**Two things were wrong with the box before any code was written, and both were mine to name.**
+
+`/mnt/apopic`'s root filesystem was at **100 %** (452 M free). The fat was not this worktree —
+475 M total, a 0-byte `target`. `/.tmp-target` (1.3 G) was a 5-day-old orphan with **no fd holder**
+(`/proc/*/fd` scan, not `lsof +D`) and no worktree symlink pointing at it. Reclaimed.
+
+Then the build lock was held by **my own** `cargo test -p omnion-api --test app_builder_routes`:
+pid 1486192, 1 h 47 m elapsed, `utime` frozen at 125 across two samples, both threads in
+`futex_do_wait`/`do_epoll_wait`. A hung test is not a slow test, and `cargo-slot.sh` makes it
+everybody's problem.
+
+**The gate was stricter than the thing it guarded.** `run.sh` exited 1 on a dead public renderer
+before the walkthrough ran. But the walkthrough wraps its public-renderer section in a try/catch
+and records `report.web.error` — **so the harness itself treats the renderer as optional.** The
+gate killed two consecutive focused passes over screens that live in the *admin* app, and the error
+named the one component none of those rows touch. `QA_REQUIRE_WEB=1` restores the hard gate for a
+full acceptance run; the default records the state, exports `WEB_ANSWERED`, and prints it in
+`QA-LATEST`, so "the pass ran" and "the renderer booted" stay two claims.
+
+**The guard that could not fail, and then the one that could.** `undo-selection-row.test.ts` failed
+at `window.length < 4000` on the `narrow-lock` row — a **correct** row of five gestures, each with
+its own settle helper. A byte cap cannot tell a long row from a mis-anchored window. Replacing it
+with a cap on *presses in the window* was also wrong, and measurably so: the windows this guard
+scans hold 1 and 5 presses while windows elsewhere in the same file hold 16. What is left is the
+claim itself — the window must contain the gesture's own settle helper.
+
+**The mutation attempts were the work.** Three rounds stayed green, and each round named its own
+mistake: the first reimplemented the gate instead of executing run.sh's block; the second read
+`/^fi$/` and stopped at the *pm2* block's `fi`, extracting setup with no gate in it; the third
+mutated the whole file when `BUILDER_PASS` is scoped to `runWorkflowBuilderDepth` — a function
+containing **two** `Delete` gestures, and the 4377-char one is the second. Only after mutating the
+narrow-lock row itself did the guard go red: removing every settle helper, and swapping the helper
+for a fixed sleep. Files restored byte-exact.
+
+**Proof.** apps/admin **376/376**, `cargo test -p omnion-workflows --lib` **157/157**,
+`pnpm typecheck` 2/2, `bash -n run.sh` clean, merge multiset exact. Gate proven by running its own
+block: dead port → continues (rc 0), dead port + flag → refuses (rc 1), live port → answered.
+
+**Not measured, and it is the same five rows.** The focused pass is queued behind a live w6 pass
+(holder 410133, `kill -0` alive, cwd `/mnt/apopic/omnion-w6`) on a box at load 26. `edge-delete.removed`,
+`edge-delete-undo.restored`, `listener.captureKind`, `plugin-palette` and `table-save-survives` are
+still unmeasured. The gate fix is what makes that pass able to run at all; it has not run yet.
+
+**Next.** Read the focused pass when the slot frees, and judge the `edge-delete` box off
+`edge-delete.removed` / `edge-delete-undo.restored` with the label no longer winning the hit test.
