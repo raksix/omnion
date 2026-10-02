@@ -25,6 +25,10 @@
 //!    a check that greps only for the token passes on a response that echoes the hash.
 //! 4. `the_request_log_records_the_permission_the_guard_resolved_and_never_the_query_string`
 //!    — the two log claims that only exist in the database.
+//! 5. `the_offered_environments_are_the_ones_the_server_accepts` — the picker's list against the
+//!    create route's parser, in both directions. Written after the route's doc comment claimed
+//!    it read a crate constant that does not exist; the claim was right and the code was not,
+//!    and only a round trip through the create endpoint can tell those apart.
 //!
 //! Every walk is `--test-threads=1`, and each creates and drops its own database, so a run never
 //! touches the development database.
@@ -827,6 +831,131 @@ async fn the_request_log_records_the_matched_permission_and_never_the_query_stri
     assert!(
         !listed.text.contains("super-secret-value"),
         "the log screen must not re-introduce what the store stripped"
+    );
+
+    harness.dispose().await;
+}
+
+/// The picker and the server must agree on the environment list, in both directions.
+///
+/// `GET /developer/scopes` is what the key form builds its environment picker from. If it offers
+/// a value the create endpoint refuses with `unknown_environment`, the person fills in a valid
+/// form and is rejected — the same failure shape as a picker offering an undelegable scope, which
+/// is why this route already derives `grantable` from the caller's effective permissions rather
+/// than from the catalogue.
+///
+/// Asserting that the response *equals* `Environment::ALL_STR` would only prove the two constants
+/// are equal, which a reader could satisfy by keeping both hardcoded — that is precisely the
+/// defect this walk was written for, so it is not enough on its own. What is asserted instead is
+/// the round trip: **every environment the endpoint offers is one the create endpoint accepts**,
+/// and every environment the create endpoint accepts is one the endpoint offers. The first
+/// direction mints a real key per offered value and reads the stored environment back out of the
+/// database rather than out of the response, so a route that echoes the request without validating
+/// it cannot pass. The second enumerates the crate's own `Environment::ALL`; an environment the
+/// crate accepts but the picker hides is a key nobody can create through the panel.
+#[tokio::test]
+async fn the_offered_environments_are_the_ones_the_server_accepts() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let organization_id = create_organization_row(&harness.db).await;
+    let (_user, credential) = account(&harness, Some(organization_id)).await;
+    grant(
+        &harness,
+        _user,
+        organization_id,
+        &["developer.read", "developer.keys.manage", PROBE_SCOPE],
+    )
+    .await;
+
+    let catalogue = harness
+        .call(get("/api/v1/developer/scopes", Some(&credential)))
+        .await;
+    assert_eq!(
+        catalogue.status,
+        StatusCode::OK,
+        "the scope catalogue must be readable: {}",
+        catalogue.text
+    );
+    let offered: Vec<String> = catalogue.body["environments"]
+        .as_array()
+        .expect("environments must be an array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("each environment is a string")
+                .to_owned()
+        })
+        .collect();
+    assert!(
+        !offered.is_empty(),
+        "an empty environment list would leave the key form with nothing to offer, which is \
+         indistinguishable in the UI from 'not implemented'"
+    );
+
+    // Direction one: every offered environment is accepted, and the value that was **stored** is
+    // the one that was offered. Read back from the row, not from the create response.
+    for (index, environment) in offered.iter().enumerate() {
+        let name = format!("Picker round trip {index} ({environment})");
+        let created = harness
+            .call(post(
+                "/api/v1/developer/api-keys",
+                json!({ "name": name, "scopes": [PROBE_SCOPE], "environment": environment }),
+                Some(&credential),
+            ))
+            .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "the picker offered {environment:?} but creating a key in it was refused — a form \
+             that submits and is then rejected: {}",
+            created.text
+        );
+        let id = Uuid::parse_str(created.body["key"]["id"].as_str().expect("the id must be there"))
+            .expect("the id must be a uuid");
+        let stored: (String,) = sqlx::query_as("select environment from api_keys where id = $1")
+            .bind(id)
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the stored environment must read");
+        assert_eq!(
+            &stored.0, environment,
+            "the environment the picker offered is not the environment the key was created in"
+        );
+    }
+
+    // Direction two: every environment the crate accepts is one the picker offers. Enumerated
+    // from the enum rather than from `ALL_STR`, so widening `parse` without widening the list
+    // the picker renders fails here instead of producing an environment no panel can create.
+    for accepted in omnion_developer::Environment::ALL {
+        let stored_form = accepted.as_str();
+        assert!(
+            offered.iter().any(|value| value == stored_form),
+            "the server accepts the environment {stored_form:?} but `GET /developer/scopes` does \
+             not offer it, so no panel can create a key in it"
+        );
+    }
+
+    // And the negative, or the two directions above are satisfied by offering everything: an
+    // environment nobody defined is still refused, with a named error rather than a 500.
+    let refused = harness
+        .call(post(
+            "/api/v1/developer/api-keys",
+            json!({ "name": "Nowhere", "scopes": [PROBE_SCOPE], "environment": "prod-eu-west" }),
+            Some(&credential),
+        ))
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "an undefined environment must be refused: {}",
+        refused.text
+    );
+    assert!(
+        refused.text.contains("unknown_environment"),
+        "the refusal must name the problem: {}",
+        refused.text
     );
 
     harness.dispose().await;

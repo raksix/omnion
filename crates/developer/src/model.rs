@@ -23,6 +23,24 @@ pub enum Environment {
 }
 
 impl Environment {
+    /// Every environment, in the order a picker should show them.
+    ///
+    /// The single place the set is written down. Anything that *offers* an environment —
+    /// `GET /developer/scopes`, the key form, the CLI's `--environment` help — reads this list
+    /// rather than repeating it, because a form that offers an environment the server then
+    /// refuses with `unknown_environment` is a picker that submits and is then rejected. Adding a
+    /// variant to this enum without adding it here is now a compile error at every call site that
+    /// iterates the list, which is the point.
+    pub const ALL: [Self; 2] = [Self::Live, Self::Sandbox];
+
+    /// The stored form of every environment, in [`Environment::ALL`] order.
+    ///
+    /// Built from [`Environment::as_str`] rather than written out literally: the whole point of
+    /// this list is that it cannot drift from the spellings the parser accepts, and a second
+    /// hand-written copy of the two strings is exactly the drift. `as_str` is `const` for this
+    /// reason — a derived constant is only possible if the function it derives from is.
+    pub const ALL_STR: [&'static str; 2] = [Self::Live.as_str(), Self::Sandbox.as_str()];
+
     /// Parse a stored or submitted value, refusing anything else rather than defaulting.
     pub fn parse(value: &str) -> Result<Self> {
         match value {
@@ -33,7 +51,10 @@ impl Environment {
     }
 
     /// The stored form.
-    pub fn as_str(self) -> &'static str {
+    ///
+    /// `const` so [`Environment::ALL_STR`] can be derived from it rather than restating the two
+    /// strings; see that constant for why the derivation is the point.
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Live => "live",
             Self::Sandbox => "sandbox",
@@ -401,6 +422,47 @@ impl RequestLogQuery {
 mod tests {
     use super::*;
     use time::macros::datetime;
+
+    /// The offered list and the parser must be the same set — asserted in both directions, so
+    /// neither half can be widened alone.
+    ///
+    /// `ALL` is `const` with a fixed length, so adding a variant to the enum without adding it
+    /// here is a *compile* error (`Environment::ALL` would not cover the match) and adding an
+    /// entry here that `parse` refuses is a test failure. What the test adds is the third way in:
+    /// a value that parses must round-trip back to the same string through `as_str`, which is the
+    /// property `ALL_STR` actually relies on — `ALL_STR` is built from `as_str` rather than
+    /// written out literally for exactly that reason, and a rewritten `as_str` arm that returned a
+    /// different spelling would silently become the picker's label.
+    #[test]
+    fn the_offered_environments_are_exactly_the_ones_the_parser_accepts() {
+        // Direction one: everything offered parses, and parses back to what was offered.
+        for offered in Environment::ALL_STR {
+            let parsed = Environment::parse(offered).expect("an offered environment must parse");
+            assert_eq!(
+                parsed.as_str(),
+                offered,
+                "{offered:?} is offered by the picker but does not survive a parse/round-trip"
+            );
+        }
+        // Direction two: everything the parser accepts is offered. `ALL` is the enum's own list,
+        // so this fails the moment a variant is added and not listed.
+        for accepted in Environment::ALL {
+            let stored_form = accepted.as_str();
+            assert!(
+                Environment::ALL_STR.contains(&stored_form),
+                "{stored_form:?} is accepted by the server but absent from the offered list, so \
+                 no panel can create a key in it"
+            );
+        }
+        // And the list is not trivially satisfied by being everything: a name nobody defined is
+        // still refused, by name.
+        let refused =
+            Environment::parse("prod-eu-west").expect_err("an undefined environment must be refused");
+        assert!(
+            matches!(&refused, DeveloperError::UnknownEnvironment(value) if value == "prod-eu-west"),
+            "the refusal must name the value it refused: {refused:?}"
+        );
+    }
 
     #[test]
     fn a_revoked_key_reads_as_revoked_even_when_it_has_also_expired() {

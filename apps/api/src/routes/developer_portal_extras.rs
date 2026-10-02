@@ -46,12 +46,13 @@ use serde_json::json;
 use crate::auth::CurrentSession;
 use crate::state::AppState;
 
-/// The environments a key may carry.
+/// The environments a key may carry, read from the crate rather than repeated here.
 ///
-/// `omnion_developer::ENVIRONMENTS` is the crate's closed list. Read from the crate rather than
-/// repeated here, because a picker that offers an environment the server refuses to create a key
-/// in is the same defect as offering a scope the caller cannot delegate.
-const ENVIRONMENTS: [&str; 2] = ["live", "sandbox"];
+/// [`omnion_developer::Environment::ALL`] is the closed list and the *server* refuses anything
+/// outside it with `unknown_environment`. A picker that offers an environment the server will not
+/// accept is the same defect as offering a scope the caller cannot delegate: a form that submits
+/// and is then refused. Reading the crate is what keeps the two halves from drifting, and
+/// `theOfferedEnvironmentsAreTheOnesTheServerAccepts` in `tests/developer.rs` is the gate.
 
 /// Body of `GET /api/v1/developer/scopes`.
 #[derive(Debug, Serialize)]
@@ -126,7 +127,7 @@ pub async fn list_scopes(
 
     Ok(Json(ScopeCatalogue {
         categories,
-        environments: ENVIRONMENTS.to_vec(),
+        environments: omnion_developer::Environment::ALL_STR.to_vec(),
     }))
 }
 
