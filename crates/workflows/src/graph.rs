@@ -250,6 +250,22 @@ impl Graph {
     /// A definition that is born valid is the cheapest way to make "a workflow created before
     /// this tick opens in the builder" true for every future row too — there is no shape an
     /// author has to repair.
+    ///
+    /// **The starter's params come from the REGISTRY, never from a literal here.** The builder's
+    /// inspector renders `nodeType.params` — the schema, not whatever the node happens to carry —
+    /// so a param the registry does not declare is invisible on the canvas while Table mode
+    /// renders `Object.keys(row.params)` and shows it as an editable field. This function used to
+    /// seed `{ "kind": kind }` on every starter node, and `trigger.manual` declares **no** params
+    /// at all, so every manual rule shipped with a field the canvas could not display and the
+    /// other mode could edit: `table-save-survives` read `cards: 2, clicked: 2, inspected: 2,
+    /// builderSeesTableEdit: false`, which is *unsatisfiable* — no product defect could turn it
+    /// green, because the row was checking a value on a screen whose renderer never had a field
+    /// to put it in. A starter that writes a param the schema does not declare makes the two
+    /// modes disagree about the same rule, and "consistent after a save in either mode" is the
+    /// criterion that names it.
+    ///
+    /// The trigger *kind* is not lost by dropping it: it lives on the workflow row
+    /// (`trigger_kind`), which is where the engine reads it from. It was never a node parameter.
     #[must_use]
     pub fn starter(kind: &str, event: Option<&str>) -> Self {
         let node_type = match kind {
@@ -257,9 +273,12 @@ impl Graph {
             "manual" => "trigger.manual",
             _ => "trigger.event",
         };
-        let mut params = json!({ "kind": kind });
-        if let Some(event) = event {
-            params["event"] = json!(event);
+        // Only the params this node type DECLARES, so the two modes are rendering the same set.
+        // `event` is the one the starter can legitimately fill, and only for the type that
+        // declares it — writing it onto `trigger.schedule` would be the same defect one key over.
+        let mut params = Value::Object(serde_json::Map::new());
+        if event.is_some() && declares_param(node_type, "event") {
+            params["event"] = json!(event.unwrap_or_default());
         }
         Self {
             nodes: vec![
@@ -651,6 +670,21 @@ pub const NODE_TYPES: &[NodeType] = &[
 #[must_use]
 pub fn find_node_type(key: &str) -> Option<&'static NodeType> {
     NODE_TYPES.iter().find(|node_type| node_type.key == key)
+}
+
+/// Whether this node type's form DECLARES a parameter with this key.
+///
+/// The registry is the single answer to "which fields does this node have", because the two
+/// projections of a rule read it from opposite places and disagree when they can: the builder's
+/// inspector maps over `nodeType.params` (so an undeclared key has no input to render into),
+/// while Table mode maps over `Object.keys(node.params)` (so it renders whatever the node happens
+/// to carry). Anything that SEEDS a node — [`Graph::starter`] most of all — has to ask here
+/// first, or it can hand the two modes different field sets for the same rule.
+#[must_use]
+pub fn declares_param(node_type: &str, key: &str) -> bool {
+    find_node_type(node_type).is_some_and(|found| {
+        found.params.iter().any(|field| field.key == key)
+    })
 }
 
 /// The node type that projects onto this step kind, for the SQL backfill's mapping.
@@ -1935,6 +1969,67 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn a_starter_graph_carries_only_params_the_registry_declares() {
+        // **This is the invariant two modes disagree on, and it is checked over EVERY kind
+        // rather than the one that happened to be measured.** The browser row that found the
+        // defect read `builderSeesTableEdit: false` with `clicked: 2, inspected: 2` on a manual
+        // rule — the canvas rendered, every card opened, and the value was simply not there,
+        // because the inspector draws `nodeType.params` and `trigger.manual` declares none while
+        // the starter had written one. Checking only `manual` would let `schedule` (which
+        // declares `cron`) keep a stray `kind`, and Table mode renders `Object.keys(params)` so
+        // any of them shows a field the canvas has no input for.
+        //
+        // The assertion is over the KEYS, not over emptiness: a starter that seeds a param the
+        // type does not declare is invisible to `validate()`, which only checks that required
+        // params are PRESENT, never that extras are absent. That asymmetry is why this could
+        // ship with 157 green tests.
+        for kind in ["manual", "schedule", "event"] {
+            let graph = Graph::starter(kind, Some("qa.starter.probe"));
+            for node in &graph.nodes {
+                let declared = find_node_type(&node.node_type)
+                    .map(|found| found.params.iter().map(|field| field.key).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                for key in node.params.as_object().map(|map| map.keys()).into_iter().flatten() {
+                    assert!(
+                        declared.contains(&key.as_str()),
+                        "the starter seeds `{kind}`'s {} node with `{key}`, which its form does \
+                         not declare — Table mode would show an editable field the canvas \
+                         inspector has no input for",
+                        node.node_type,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_starter_still_carries_the_event_the_author_chose() {
+        // The other direction of the fix: dropping the invented key must not drop the real one.
+        // `trigger.event` declares `event` and requires it, so a starter that stopped seeding it
+        // would leave every event rule born invalid — the defect the same fix was written to
+        // avoid, in the opposite direction.
+        let with_event = Graph::starter("event", Some("page.published"));
+        assert_eq!(with_event.nodes[0].params["event"], json!("page.published"));
+        // And it is seeded ONLY where it is declared: `trigger.schedule` wants `cron`, and an
+        // `event` key on it is the same class of stray.
+        let schedule = Graph::starter("schedule", Some("page.published"));
+        assert!(
+            !schedule.nodes[0].params.as_object().is_some_and(|map| map.contains_key("event")),
+            "a schedule trigger declares `cron`, not `event`",
+        );
+    }
+
+    #[test]
+    fn declares_param_answers_from_the_registry_and_nothing_else() {
+        assert!(declares_param("trigger.event", "event"));
+        assert!(!declares_param("trigger.manual", "event"));
+        assert!(!declares_param("trigger.manual", "kind"));
+        assert!(declares_param("end", "reason"));
+        // An unknown type declares nothing, so seeding it can never invent a field.
+        assert!(!declares_param("plugin.nope.action", "anything"));
     }
 
     #[test]
