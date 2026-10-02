@@ -940,18 +940,73 @@ async function settleRun(page, readRun, { attempts = 40, interval = 500 } = {}) 
     const steps = (run?.steps ?? []).map((s) => `${s.step_no}:${s.status}`).join(",");
     return { run, state: `${run?.status ?? "?"}|${steps}` };
   };
+  // Did the engine ever pick this run up? `settled` is a claim about a run that RAN, so it
+  // cannot be answered by a run that never left the queue. The evidence is a step that left
+  // `pending`, or a run status that is not itself the un-started state.
+  //
+  // **This is the condition the doc above always claimed and the code never asked.** Two polls
+  // 500ms apart on a run the engine has not claimed yet both read `pending|1:pending,2:pending`
+  // and are byte-identical, so the old stop condition returned `settled: true` on exactly the
+  // reading tick 61 recorded — `startedFrom: "wait-3"`, `statuses: ["pending"]`, `pillsPainted: 0`.
+  // The helper was added to kill that race and re-created it, because "identical twice" is
+  // satisfied by *not moving* as well as by *finishing*, and a run waiting to be claimed has
+  // not moved.
+  //
+  // `settleGraph` 30 lines below already gets this right and says why in its own doc: a graph
+  // that has not been written yet is *stable*, so it requires movement as well as stability.
+  // Two helpers with the same name and the same job, one requiring the witness and one not, is
+  // the tick-87 shape one level down — a gate that reads green on the state it was written to
+  // catch. `changed` names the witness so a caller can say "the run never started" out loud
+  // instead of reporting a mid-flight run as a settled one.
+  const hasStarted = (run) => {
+    if (!run) return false;
+    const status = run.status ?? null;
+    if (status && status !== "pending" && status !== "queued") return true;
+    return (run.steps ?? []).some((step) => step.status && step.status !== "pending");
+  };
+  // Did it FINISH, as opposed to merely having stopped moving?
+  //
+  // **The second hole, and it is a different one from the witness check above.** "Stopped
+  // moving" is the documented stop condition and a hung run satisfies it perfectly: an engine
+  // that claims a step and then wedges leaves `running|1:running,2:pending` on every poll, so
+  // two readings are identical and the helper reports `settled: true`. Every gate below then
+  // reads a half-finished `steps` array and reports it as a finished run — which is the shape
+  // of a product defect that does not exist. `settleRun`'s own old comment claimed to catch
+  // exactly this ("a pending step that never moves is a HUNG run, and returning that as
+  // `settled` is the same class of error one level up") and the code it was describing was a
+  // comment, because a run whose steps never move is not the only way to hang: a run that
+  // moved once and stopped is the more common one.
+  //
+  // So `settled` keeps its contract — the run stopped moving — and `finished` names the
+  // stronger fact separately. A hung run is then legible as `settled: true, finished: false`
+  // instead of being indistinguishable from a run that did its work.
+  const TERMINAL = new Set(["succeeded", "failed", "cancelled", "completed", "completed_with_errors"]);
+  const hasFinished = (run) => {
+    if (!run) return false;
+    const steps = run.steps ?? [];
+    if (TERMINAL.has(run.status ?? "")) return true;
+    // A run with no steps and a terminal-looking status is covered above; a run whose every
+    // step reached a terminal state has finished even if the run row has not caught up.
+    return steps.length > 0 && steps.every((step) => TERMINAL.has(step.status ?? ""));
+  };
   let previous = null;
+  let started = false;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const current = await read();
-    // Two identical readings in a row. One is not enough: two polls landing inside the same
-    // engine tick see the same bytes twice and call it settled.
-    if (current.state === previous) return { ...current, settled: true };
+    if (hasStarted(current.run)) started = true;
+    // Two identical readings in a row, AND the run was observed moving. One reading is not
+    // enough: two polls landing inside the same engine tick see the same bytes twice.
+    if (current.state === previous && started) {
+      return { ...current, settled: true, started: true, finished: hasFinished(current.run) };
+    }
     previous = current.state;
     await new Promise((resolve) => setTimeout(resolve, interval));
   }
-  // A pending step that never moves is a HUNG run, and returning that as "settled" is the
-  // same class of error one level up — so the caller can say "never settled" out loud.
-  return { ...(await read()), settled: false };
+  // A pending step that never moves is a HUNG run, and a run that never left the queue never
+  // started at all. Returning either as "settled" is the same class of error one level up —
+  // so the caller can say which of the two it was rather than only that it was not settled.
+  const last = await read();
+  return { ...last, settled: false, started: hasStarted(last.run) || started, finished: false };
 }
 
 /**
@@ -14214,6 +14269,8 @@ note({
 
     let after = null;
     let runSettled = null;
+    let runStarted = null;
+    let runFinished = null;
     if (canStart === "true") {
       await page.locator("[data-run-from-here-button]").first().click({ timeout: 8000 }).catch(() => {});
       // Read the run back from the API, not from the canvas: the canvas paints what the
@@ -14258,6 +14315,8 @@ note({
       const settled = await settleRun(page, readRun);
       after = settled.run;
       runSettled = settled.settled;
+      runStarted = settled.started;
+      runFinished = settled.finished;
     }
 
     // Criterion 2 reads the CANVAS, not the API: the pill is the thing being claimed, and
@@ -14334,7 +14393,20 @@ note({
       // It is a single field rather than a precondition woven into each gate for the same
       // reason `rowIsMeasurable` is: a conjunction nobody can hold in their head under time
       // pressure is how a vacuous gate gets closed. Read this one first.
+      //
+      // **AND IT IS TWO FIELDS, BECAUSE "NOT SETTLED" WAS ONE ANSWER TO TWO QUESTIONS.** A run
+      // the engine never claimed and a run the engine claimed and then hung are both `settled:
+      // false`, and they are not the same failure: the first is a run that never started — the
+      // button did not take, or the rule refused it — while the second is a run that started and
+      // stopped making progress. Every gate below reads a `steps` array, so the first case
+      // reports an all-`pending` array and the second reports a half-finished one, and a reader
+      // comparing `statuses: ["pending"]` against the gates has to re-derive which it is.
+      // `runStarted` names the witness directly and `runFinished` names the outcome: a run that
+      // stopped moving mid-way is `settled: true, runFinished: false`, which is a hung run and
+      // not a rule whose nodes failed to paint pills.
       runSettled,
+      runStarted,
+      runFinished,
       // Which node each card answered for, so a `canStart: "false"` can be told apart from
       // "the control never rendered for the node the criterion is about".
       scan,

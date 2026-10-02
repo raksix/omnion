@@ -228,9 +228,35 @@ test("the run is read AFTER IT SETTLES, and the note says whether it ever did", 
   const helperEnd = WALKTHROUGH.indexOf("async function settleGraph(", helperStart);
   assert.ok(helperStart !== -1 && helperEnd > helperStart, "the settle helper must exist");
   const helper = WALKTHROUGH.slice(helperStart, helperEnd);
-  assert.ok(
-    /if \(current\.state === previous\) return \{ \.\.\.current, settled: true \}/.test(helper),
-    "a poll that accepts ONE unchanged reading calls a run settled inside a single engine tick",
+  // **AND THE STOP CONDITION CARRIES A WITNESS, WHICH IS TICK 88'S FINDING ON TOP OF TICK 61's.**
+  //
+  // This assertion used to pin the one-line form
+  //
+  //     if (current.state === previous) return { ...current, settled: true };
+  //
+  // which is exactly the shape that reproduces tick 61's reading: two polls on a run the
+  // engine has not claimed are byte-identical, so the helper calls a run with three `pending`
+  // steps FINISHED. The guard below was written to police "two readings, not one" and it was
+  // satisfied by a condition that also accepts "never moved" — so it guarded half the claim and
+  // certified the whole thing, which is this REQ's own habit in a new place.
+  //
+  // The form changed to a block because the condition now has two parts, and the assertion
+  // follows it: the run must have STOPPED MOVING **and** have been observed STARTED. Note the
+  // `&& started` is load-bearing rather than cosmetic — dropping it turns every assertion
+  // below this one into a reading of a run in flight, which is what the four ticks of
+  // `pillsPainted: 0` were.
+  assert.match(
+    helper,
+    /if \(current\.state === previous && started\)/,
+    "the stop condition must require the run to have been observed moving, not merely to have stopped changing — a run waiting to be claimed has not moved either",
+  );
+  // The witness itself, and what counts as one: a step that left `pending`, or a run status
+  // that is not itself the un-started state.
+  assert.match(helper, /const hasStarted = /, "the witness check must exist, not merely be implied by the loop");
+  assert.match(
+    helper,
+    /step\.status && step\.status !== "pending"/,
+    "a step that left `pending` is the witness; without this the helper can never observe a start",
   );
   // And it must be able to say it never settled. A helper whose only answer is 'settled'
   // forces every caller to report a hung run as a finished one.
@@ -238,6 +264,10 @@ test("the run is read AFTER IT SETTLES, and the note says whether it ever did", 
     /settled: false/.test(helper),
     "a hung run reported as settled is the same defect one level up from the sleep it replaced",
   );
+  // `settled` alone is not enough, and that is the third field: a run that stopped moving
+  // HALFWAY also satisfies `settled: true`. The note must be able to say whether the run
+  // FINISHED, or a wedged engine and a rule whose nodes fail to paint pills read identically.
+  assert.match(helper, /finished: hasFinished/, "`settled` says stopped-moving; the note also needs to know it finished");
 });
 
 test("a canvas that drops the skipped prefix is distinguishable from a short run", () => {

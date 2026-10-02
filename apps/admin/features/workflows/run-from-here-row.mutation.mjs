@@ -109,9 +109,16 @@ const MUTATIONS = [
     // and left the real check in place, so the row still required two readings and the suite
     // stayed green — a strawman, and this harness now has a second one to report on. The
     // regression has to REMOVE the two-reading requirement, not sit next to it.
+    //
+    // **The anchor was the one-line form, and tick 88 replaced it with a block.** A `find`
+    // string that no longer occurs does not fail a mutation harness — the replace is a no-op,
+    // the suite runs green, and the line prints as a mutation that found nothing to say. It is
+    // the strawman wearing a green shirt: the shape this harness already documents twice, now
+    // as a MUTATION THAT MUTATES NOTHING rather than as a test that asserts the wrong thing.
+    // Every `find` below is therefore checked for occurrence by the harness itself.
     global: true,
-    find: "if (current.state === previous) return { ...current, settled: true };",
-    replace: "if (previous !== null) return { ...current, settled: true };",
+    find: "if (current.state === previous && started) {",
+    replace: "if (previous !== null) {",
   },
   {
     name: "M12 the note drops the field saying whether the run ever settled",
@@ -127,9 +134,20 @@ const MUTATIONS = [
   },
   {
     name: "M13 a run that never settles is reported as settled",
+    // The fallthrough return moved when tick 88 added the witness: the exhausted loop now
+    // reads once more into a named local, because the answer has to carry `started` and
+    // `finished` as well as `settled`. Same anchor-staleness as M11, and the same lesson.
     global: true,
-    find: "return { ...(await read()), settled: false };",
-    replace: "return { ...(await read()), settled: true };",
+    find: "settled: false, started: hasStarted(last.run) || started, finished: false",
+    replace: "settled: true, started: hasStarted(last.run) || started, finished: true",
+  },
+  {
+    name: "M14 the WITNESS is dropped from the stop condition (tick 88's defect, in this harness)",
+    // The mutation that matters most here, because it is the defect tick 88 found: a run the
+    // engine never claimed is stable, so stability alone calls it finished.
+    global: true,
+    find: "if (current.state === previous && started) {",
+    replace: "if (current.state === previous) {",
   },
 ];
 
