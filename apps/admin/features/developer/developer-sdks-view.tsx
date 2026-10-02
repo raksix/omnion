@@ -717,16 +717,27 @@ export function ManifestValidator({ kind }: { kind: SdkKind }) {
   return (
     <section data-dev-sdk-manifest className="space-y-2 rounded border border-line bg-surface p-3">
       <h3 className="text-[13px] font-medium text-ink">Validate a {kind} manifest</h3>
-      <p className="text-[12.5px] text-muted">
+      <p id="dev-sdk-manifest-hint" className="text-[12.5px] text-muted">
         The same rules the platform loads with, so a manifest this accepts is one that will
         install. Paste the file&apos;s text.
       </p>
+      {/* The label is a real `<label htmlFor>`, not a heading that happens to sit above the
+          field. The QA walkthrough reported `unlabeled-input` on this screen and it is right: a
+          screen reader announces "edit text, blank" for this textarea, and a heading three lines
+          above it is not an association. Every other field on this screen already wraps itself in
+          a label; this one was written as a bare textarea with a placeholder, and a placeholder is
+          not a label — it disappears the moment the field has content. */}
+      <label htmlFor="dev-sdk-manifest-input" className="text-[12px] text-muted">
+        Manifest text
+      </label>
       <textarea
+        id="dev-sdk-manifest-input"
         data-dev-sdk-manifest-input
         value={source}
         onChange={(event) => setSource(event.target.value)}
         rows={5}
         spellCheck={false}
+        aria-describedby="dev-sdk-manifest-hint"
         placeholder={'{\n  "kind": "plugin",\n  "name": "acme-invoices",\n  "version": "1.0.0",\n  "entry": "index.js"\n}'}
         className="w-full rounded border border-line bg-canvas p-2 font-mono text-[12px]"
       />

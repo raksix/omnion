@@ -144,13 +144,100 @@ for (const token of tokens) {
   }
 }
 
+// Every field on this screen must be labelled, not merely accompanied by a placeholder. The walk
+// reported `unlabeled-input` on `/developer/sdks` and it was right: the manifest textarea had a
+// heading above it and a JSON placeholder in it, and a screen reader announces "edit text, blank".
+// A placeholder is not a label -- it disappears as soon as the field has content, which is exactly
+// when a person is reading the screen to check what they typed.
+//
+// Counted per field rather than in aggregate, and the mutation run is why: the first version
+// compared "number of fields" with "number of label-ish tokens in the file", which
+// `aria-label="Developer tooling"` on the *tablist* satisfied -- so deleting the textarea's label
+// left the gate green. An aggregate count is satisfied by any one correct thing; only pairing each
+// field with its own label says what the claim says.
+// Every field on this screen must be labelled, not merely accompanied by a placeholder. The walk
+// reported `unlabeled-input` on `/developer/sdks` and it was right: the manifest textarea had a
+// heading above it and a JSON placeholder in it, and a screen reader announces "edit text, blank".
+// A placeholder is not a label -- it disappears as soon as the field has content, which is exactly
+// when a person is reading the screen to check what they typed.
+//
+// What this check can honestly prove from the source is that every field has EITHER an explicit
+// association (`htmlFor`/`aria-label`/`aria-labelledby` on the field's own tag) OR is nested in a
+// `<label>` element. It deliberately does not try to be a full JSX parser: the first three
+// versions of this check were regex attempts to read a field's attributes out of JSX, and each one
+// failed for a different reason (an arrow function's `>` ends the tag; a self-closing `/>` ends it
+// earlier; a comment containing `<label>` is found as a label) — and a gate that cannot tell
+// correct code from broken code is worse than no gate, because it is trusted.
+//
+// So: extract each field's opening tag to the first `>` that is not inside a `{…}` brace group,
+// and separately collect the bodies of `<label>…</label>` elements. A field passes if its own tag
+// carries an association, or if some label body contains it.
+function openingTags(src, tag) {
+  const out = [];
+  const re = new RegExp("<" + tag + "\\b", "g");
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    let i = m.index + m[0].length;
+    let depth = 0;
+    while (i < src.length) {
+      const c = src[i];
+      if (c === "{") depth += 1;
+      else if (c === "}") depth = Math.max(0, depth - 1);
+      else if (c === ">" && depth === 0) break;
+      i += 1;
+    }
+    out.push(src.slice(m.index, i + 1));
+    re.lastIndex = i;
+  }
+  return out;
+}
+
+const FIELD_TAGS = ["input", "textarea", "select"];
+const fieldTags = FIELD_TAGS.flatMap((t) => openingTags(view, t).map((tag) => [t, tag]));
+const labelBodies = [...view.matchAll(/<label\b[^>]*>([\s\S]*?)<\/label>/g)].map((m) => m[1]);
+
+const unlabelled = fieldTags
+  .filter(([tag, opening]) => {
+    // An explicit association, which is either on the field itself (`aria-label`, and the odd
+    // `htmlFor`) or the ordinary one: the field carries an `id`, and a `<label htmlFor>` elsewhere
+    // in the file names that same id. Both are real label associations; only the first is visible
+    // on the field's own tag, so the `htmlFor` scan covers the second.
+    const explicit =
+      /aria-label(?:ledby)?=/.test(opening) ||
+      /\bid=["']([^"']+)["']/.test(opening) &&
+        [...view.matchAll(/<label\b[^>]*>/g)].some((m) =>
+          m[0].includes('htmlFor="' + opening.match(/\bid=["']([^"']+)["']/)[1] + '"') ||
+          m[0].includes("htmlFor='" + opening.match(/\bid=["']([^"']+)["']/)[1] + "'"),
+        );
+    // The implicit form — the field nested in a `<label>` element — has to be checked against the
+    // label body that actually CONTAINS THIS occurrence, not "some label body contains a field of
+    // this tag". Two same-tag inputs on one screen made that mistake survivable: unwrapping the
+    // first field's label left the second label's `<input>` in scope, and the mutation passed.
+    //
+    // The honest pairing is positional: take each label body, and check that the field's own
+    // opening tag appears inside one of them.
+    const implicit = labelBodies.some((body) => body.includes(opening.slice(0, 60)));
+    return !explicit && !implicit;
+  })
+  .map(([tag]) => tag);
+
+if (fieldTags.length > 0 && unlabelled.length === 0) {
+  pass(`all ${fieldTags.length} fields on the screen carry their own label`);
+} else {
+  fail(
+    `${unlabelled.length} of ${fieldTags.length} field(s) have no label ` +
+      `(${unlabelled.join(", ")}) — a placeholder is not a label, and it vanishes once the ` +
+      `field has content`,
+  );
+}
+
 if (/(?:text|bg|border)-danger/.test(view)) {
   fail("this view uses a `danger` token, which globals.css does not define — use `caution`");
 } else {
   pass("no `danger` token in the view — the palette's warning colour is `caution`");
 }
 
-const total = demanded.length + tokens.length + 6;
+const total = demanded.length + tokens.length + 7;
 console.log(
   failures === 0
     ? `\n${total}/${total} dev-sdk screen checks passed`
