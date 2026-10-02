@@ -14898,6 +14898,27 @@ note({
       const editableOnTable = await page.locator("[data-workflow-table-edit], [data-table-edit]").count();
       tableSaves = { landedOnTable: onTable, editControls: editableOnTable };
       await shot(page, "page-workflow-builder-locked-table");
+
+      // **Come back.** This row navigates the pass to `/table` and the next two rows read the
+      // builder's own panels, so a row that left the builder on screen made the `listener`
+      // row report `panelFound: false` and the `plugin-palette` row read an empty palette —
+      // neither a product defect, both a *navigation leak* from a row three steps earlier.
+      // The tell is in the readings themselves: the `listener` row's `retargeted` succeeded
+      // (a real `PUT /graph` on the real rule) while `panelFound` was false, which is
+      // impossible for a live builder and only possible on a different page.
+      //
+      // So the return is part of this row, and it is verified rather than assumed: the
+      // builder has to be back on screen before the next row reads a single pixel of it.
+      await page.goto(
+        `${new URL(page.url()).origin}/workflows/${workflowId}/builder`,
+        { waitUntil: "domcontentloaded" },
+      ).catch(() => {});
+      await page.waitForSelector("[data-builder-canvas]", { timeout: 20000 }).catch(() => {});
+      await page.waitForTimeout(1200);
+      tableSaves = {
+        ...tableSaves,
+        returnedToBuilder: (await page.locator("[data-builder-canvas]").count()) > 0,
+      };
     }
 
     note({

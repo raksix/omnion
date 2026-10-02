@@ -10295,3 +10295,62 @@ two next measurements.
 `listener.captureKind`, and re-read `edge-delete` against the hit-test (a probe clicking a point
 the node's own text covers is a *hit-testing* question, not a selection one). Then the ⌘/ row
 against the fix in `92fba4af`, which has not been in a browser.
+
+## Tick 79 — the edge drew, was walkable, and could not be clicked at all
+
+**What.** Two things, both from the readings tick 78 promised. The first is a product defect
+the pass's own evidence had already named and I had not read closely enough: `edge-delete` came
+back `onEdge: true, blockedBy: "text", inViewport: true, selected: false`. The second is a
+probe navigation leak that made the next two rows unreadable.
+
+**The edge.** `onEdge: true` reads as "the click was on the edge", which is the conclusion the
+field is **not** there to support — it says the point resolved *inside* the `[data-edge]` group,
+not which of the group's three children won. `blockedBy: "text"` is the child: the port label
+(`next`, `result`) at `(from + to) / 2 + CARD_W / 2` with `textAnchor="middle"`, which is **the
+curve's own midpoint**. That is the one point a person aims at and the one point
+`getPointAtLength(len / 2)` returns, so it is not an occasional obstruction — it is the
+guaranteed-obstructed point on the whole edge. With SVG's default `pointer-events: auto` a
+`<text>` is a hit target and wins against the `strokeWidth={14}` transparent stroke beneath it,
+whose `onPointerDown` is the only writer of `selectedEdge`. The edge drew, was reachable by
+keyboard (`tabIndex={-1}` is right there), and could not be selected by pointer **at all**.
+"Del on a selected edge removes it" had no way in, for anyone.
+
+Two earlier readings of this row each called it a probe problem — a bounding-box click landing
+on empty canvas, then a hit-test report — and both were true *and* incomplete. A probe fix that
+lands the click on the curve exactly produces this reading, which is the point: it is what made
+the row name its obstruction instead of its symptom.
+
+**The guard is two-sided on purpose.** `edge-label-hit.test.ts` pins the label inert **and** pins
+the 14px stroke, its `pointerEvents: "stroke"` and its handler, because the obvious wrong fix is
+worse than the bug: a rule that forbade `pointerEvents` outright would be satisfied by deleting
+the hit area along with the label, and an edge with no hit area is this defect wearing a
+different hat.
+
+**The navigation leak.** `narrow-lock` follows the banner's own "Table mode" link to `/table`
+and stays there; `plugin-palette` and `listener` then read a page with no canvas and no
+inspector. The tell was inside the readings: `listener.retargeted` **succeeded** (a real
+`PUT /graph` on the real rule) while `panelFound: false` — impossible on a live builder, trivial
+on a different page. The row now returns to `/workflows/{id}/builder` and records
+`tableSaves.returnedToBuilder` so a future leak is a named red rather than two silent empties.
+
+**Proof.**
+- `edge-label-hit.test.ts` 4/4. **5 mutations, each red on a NAMED assertion** (drop the label's
+  `none`, flip it to `auto`, narrow the hit stroke to 2px, make the hit stroke inert, make the
+  visible hairline live) — file restored **byte-exact** (md5).
+- apps/admin **376/376** (372 before, +4). `tsc --noEmit` clean, run **directly** —
+  `pnpm typecheck` reported `cache hit` for the third tick running.
+- Focused pass launched on the private `w3` stack (`QA_ONLY=workflow-builder`,
+  `QA_OUT_ROOT=/dev/shm/w3-qa`) for the rows this pass cannot decide from a source read.
+
+**The harness bugs this file contains, kept as a matter of record.** Three of the four
+assertions went red against a *correct* fix before the fix was right, all from the same shape:
+`edgeBlock()` first cut at the first `markerEnd`, which is inside an attribute list, so the slice
+ended before the `style` it was asked about; then the guard regex was written against a midpoint
+that reads `from.position.x)` and the code reads `(from.position.x + to.position.x)`. **A regex
+that has to be re-read next to its subject is one more thing to get wrong than the defect it
+guards**, and an extraction window that stops before its own subject is the harness defect this
+file exists to prevent — caught in the harness, this time, which is the only place it can be.
+
+**Next.** Read the focused pass: `edge-delete.removed` / `edge-delete-undo.restored` off the fix,
+then `listener.captureKind` and `plugin-palette` now that the pass is on the builder when it
+reads them, and `table-save-survives` — the row that never ran at all.
