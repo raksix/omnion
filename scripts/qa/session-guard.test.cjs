@@ -88,7 +88,14 @@ say(
 );
 say(
   "a failed depth pass becomes a high finding",
-  /pushFindings\(\s*"high",\s*"depth-pass-failed"/.test(src),
+  // **Inside the roll-up**, not merely present somewhere. A finding is only raised when the loop
+  // walks the collected list, so a `pushFindings` call that survives the loop's deletion is
+  // unreachable code that reads exactly like the guard it replaced. The mutation below deletes
+  // the loop and the gate stayed green: the assertion proved the string existed, not that
+  // anything reached it. One `[\s\S]*?` hop to the loop's own closing brace is the whole fix.
+  /for \(const failure of failedDepthPasses\) \{[\s\S]*?pushFindings\(\s*"high",\s*"depth-pass-failed"/.test(
+    src,
+  ),
 );
 say(
   "the mobile unmeasured finding carries the reason",
@@ -108,7 +115,10 @@ function gateGoesRed(mutant) {
     (s) => faultCallSites(s) === 2,
     (s) => /action: "route-not-measured"/.test(s) && /notMeasured: true/.test(s),
     (s) => /^const failedDepthPasses = \[\];$/m.test(s) && /failedDepthPasses\.push\(\{/.test(s),
-    (s) => /pushFindings\(\s*"high",\s*"depth-pass-failed"/.test(s),
+    (s) =>
+      /for \(const failure of failedDepthPasses\) \{[\s\S]*?pushFindings\(\s*"high",\s*"depth-pass-failed"/.test(
+        s,
+      ),
   ];
   return !checks.every((check) => check(mutant));
 }
