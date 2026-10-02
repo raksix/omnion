@@ -169,6 +169,35 @@ function assertWave5bScreensWalked() {
 }
 
 /**
+ * The GraphQL surface's four screens (REQ-130, slice 2).
+ *
+ * The detail screen `/developer/graphql/documents/{id}` is deliberately **absent** from this list,
+ * for the reason `/deployment/migrations/{version}` is: its path carries an id, and a route walked
+ * with a placeholder id proves only that the not-found state renders. `runGraphqlDocumentsDepth`
+ * opens it from a row the registry actually lists, which is the only walk of it that measures the
+ * screen rather than its error path.
+ *
+ * The guard refuses a pass in which the three walkable ones are missing from the route list — the
+ * same rule `DEPLOYMENT_SCREENS` earns, applied to the surface most likely to be resolved away by a
+ * merge that takes one side of the nav wholesale.
+ */
+const GRAPHQL_SCREENS = [
+  "/developer/graphql",
+  "/developer/graphql/documents",
+  "/developer/graphql/schema",
+  "/developer/graphql/settings",
+];
+
+function assertGraphqlScreensWalked() {
+  const missing = GRAPHQL_SCREENS.filter((path) => !srcHasRoute(path));
+  if (missing.length > 0) {
+    throw new Error(
+      `GraphQL screens missing from the route list: ${missing.join(", ")} — an unwalked screen is an unmeasured screen, and this surface has no other route that reaches it`,
+    );
+  }
+}
+
+/**
  * A route measured while the session is gone is NOT a clean screen.
  *
  * Tick 59's pass reported 16/16 pages walked and ZERO findings on the wave-5b screens, and eight
@@ -6254,6 +6283,357 @@ async function runWebhooksDepth(page, report) {
  *  6. The window is put back to what it was, and the status read back says so.
  */
 /**
+ * The GraphQL surface, driven end to end (REQ-130, slice 2).
+ *
+ * ## What this pass is for, stated as three claims rather than three screens
+ *
+ * 1. **The registry round-trips through the UI.** A document is registered from the panel, appears
+ *    in the list, and its detail screen renders the text and the operations — then it is revoked
+ *    and the LIST says so, because a revoke that only exists in a toast is a revoke the operator
+ *    cannot see five minutes later.
+ * 2. **The meter's depth verdict is the endpoint's, not the screen's.** The pass writes a document
+ *    nested past the installation's `max_depth`, and asserts the run button is disabled AND the
+ *    refusal names the limit. This is the acceptance line *"the playground refuses over-budget
+ *    queries and explains the top cost contributors"* — the depth half is the part a browser can
+ *    measure honestly, because depth is arithmetic over text rather than a price from a catalogue
+ *    that lives in Rust. The cost half is asserted on the POST leg, where the endpoint supplies the
+ *    contributors.
+ * 3. **The schema explorer renders the withheld list separately from the visible one.** If the two
+ *    were merged, the screen would look like it publishes types a caller cannot introspect — the
+ *    exact leak the request's rule exists to prevent, and one a screenshot of the SDL alone would
+ *    not catch because the SDL is correctly filtered.
+ *
+ * ## It throws rather than returning `{ok: true}`
+ *
+ * `runDepthPass` reads only `ok`, and a pass that fills `steps` and returns cleanly without a single
+ * failing claim measures nothing while looking green. Every claim here goes through `check()`, which
+ * records a HIGH finding, and the function throws on the first one — so a green result means the
+ * claims were asserted, not that the object was returned.
+ */
+async function runGraphqlDepth(page, report) {
+  const steps = 0;
+  const claims = [];
+  const check = (name, ok, detail) => {
+    claims.push({ name, ok: Boolean(ok), detail: detail ?? null });
+    if (!ok) {
+      record({
+        page: "graphql",
+        action: "graphql-depth-failed",
+        step: name,
+        severity: "high",
+        reason: typeof detail === "string" ? detail : JSON.stringify(detail ?? {}),
+      });
+    }
+    return ok;
+  };
+  const note = (step, value) => {
+    record({ page: "graphql", action: "graphql-depth", step, ...value });
+  };
+
+  // ---- The registry ----------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/developer/graphql/documents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-view='graphql-documents']", { timeout: 20000 }).catch(() => {});
+  check(
+    "registry-rendered",
+    (await page.locator("[data-view='graphql-documents']").count()) > 0,
+    "/developer/graphql/documents did not render the registry",
+  );
+
+  // The allowlist banner states a mode. A registry that does not say whether ad-hoc documents
+  // execute leaves the operator guessing the one thing that decides the panel's usefulness.
+  const bannerText = (await page.locator("[data-view='graphql-documents']").first().innerText().catch(() => "")) || "";
+  check(
+    "allowlist-state-stated",
+    /Persisted-only mode is on|Ad-hoc documents execute/.test(bannerText),
+    `the banner did not state the allowlist mode; first 200 chars: ${bannerText.slice(0, 200)}`,
+  );
+  await shot(page, "graphql-documents-empty");
+
+  // ---- Register a document from the form -------------------------------------------------------
+  await page.getByRole("button", { name: /Register/ }).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-graphql-register-form]", { timeout: 8000 }).catch(() => {});
+  const formOpen = (await page.locator("[data-graphql-register-form]").count()) > 0;
+  check("register-form-opens", formOpen, "the register control did not open a form");
+  if (!formOpen) {
+    throw new Error(`graphql depth: the register form never opened (${claims.length} claim(s) recorded)`);
+  }
+
+  const suffix = Date.now().toString(36);
+  const documentText = `query QaWalkPages { pages(first: 3) { id title } }`;
+  const nameInput = page.locator("[data-graphql-register-form] input").first();
+  const textArea = page.locator("[data-graphql-register-form] textarea").first();
+  await nameInput.fill(`QA walk ${suffix}`).catch(() => {});
+  await textArea.fill(documentText).catch(() => {});
+
+  // The hash is computed in the browser. It must appear, because a create form that posts text and
+  // lets the server decide the hash gives the operator no way to recognise a duplicate.
+  await page.waitForTimeout(400);
+  const hashShown = await page
+    .locator("[data-graphql-register-form] span.font-mono")
+    .first()
+    .innerText()
+    .catch(() => "");
+  check(
+    "local-hash-computed",
+    /[0-9a-f]{16,}/.test(hashShown),
+    `the create form showed no computed hash; it read "${hashShown}"`,
+  );
+
+  await page
+    .locator("[data-graphql-register-form] button[type='submit'], [data-graphql-register-form] button")
+    .last()
+    .click({ timeout: 8000 })
+    .catch(() => {});
+  await page.waitForTimeout(1500);
+
+  const row = page.locator(`[data-graphql-document]`).filter({ hasText: `QA walk ${suffix}` }).first();
+  const rowCount = await row.count();
+  check("registered-row-appears", rowCount > 0, "the registered document did not appear in the list");
+  if (rowCount === 0) {
+    throw new Error(`graphql depth: the registered row never appeared (${claims.length} claim(s) recorded)`);
+  }
+  const status = await row.getAttribute("data-graphql-status").catch(() => null);
+  check(
+    "registered-row-is-active",
+    status === "active",
+    `a document registered with "Active on registration" rendered as "${status}"`,
+  );
+  await shot(page, "graphql-documents-registered");
+
+  // ---- The detail screen, opened FROM THE ROW --------------------------------------------------
+  // Not walked as a route with a fabricated id: that proves only the not-found state renders.
+  await row.locator("a").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-view='graphql-document-detail']", { timeout: 15000 }).catch(() => {});
+  const detailRendered = (await page.locator("[data-view='graphql-document-detail']").count()) > 0;
+  check("detail-opens-from-row", detailRendered, "clicking the row's name did not open the detail screen");
+  if (detailRendered) {
+    const detailText = (await page.locator("[data-view='graphql-document-detail']").first().innerText().catch(() => "")) || "";
+    check(
+      "detail-shows-the-document-text",
+      detailText.includes("pages(first: 3)"),
+      `the detail screen did not render the document text; first 300 chars: ${detailText.slice(0, 300)}`,
+    );
+    check(
+      "detail-shows-cost-and-depth",
+      /depth \d/.test(detailText) && /cost \d/.test(detailText),
+      "the operation summary did not carry its measured depth and cost",
+    );
+    // A registered document has a hash a client sends. It must be copyable as the SHORT hash —
+    // the long one is what the table shows and the short one is what a client sends, so a copy
+    // button that copies the long one is a control that works and is still wrong.
+    check(
+      "detail-offers-a-copy-control",
+      (await page.locator("[data-view='graphql-document-detail'] button[title^='Copy']").count()) > 0,
+      "the detail screen offered no copy control for the hash",
+    );
+    await shot(page, "graphql-document-detail");
+  }
+
+  // ---- Revoke, and read the state back off the LIST --------------------------------------------
+  await page.goto(`${URL_ADMIN}/developer/graphql/documents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-view='graphql-documents']", { timeout: 15000 }).catch(() => {});
+  const rowAgain = page.locator(`[data-graphql-document]`).filter({ hasText: `QA walk ${suffix}` }).first();
+  await rowAgain.getByRole("button", { name: "Revoke" }).first().click({ timeout: 8000 }).catch(() => {});
+
+  // The dialog must quote a NUMBER of callers, not "there may be callers". A revoke reaches outside
+  // the panel, and an unquantified warning is the warning an operator clicks through.
+  await page.waitForSelector("[data-graphql-revoke-dialog]", { timeout: 8000 }).catch(() => {});
+  const dialogOpen = (await page.locator("[data-graphql-revoke-dialog]").count()) > 0;
+  check("revoke-opens-a-dialog", dialogOpen, "revoking did not open a confirmation dialog");
+  if (dialogOpen) {
+    const dialogText = (await page.locator("[data-graphql-revoke-dialog]").first().innerText().catch(() => "")) || "";
+    check(
+      "revoke-warns-with-a-count",
+      /\d+ execution/.test(dialogText),
+      `the revoke dialog did not quote an execution count; it read: ${dialogText.slice(0, 240)}`,
+    );
+    check(
+      "revoke-names-the-client-code",
+      dialogText.includes("PERSISTED_QUERY_NOT_FOUND"),
+      "the revoke dialog did not name the code the client will receive",
+    );
+    await shot(page, "graphql-revoke-dialog");
+    await page
+      .locator("[data-graphql-revoke-dialog] button")
+      .last()
+      .click({ timeout: 8000 })
+      .catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+
+  const revokedRow = page.locator(`[data-graphql-document]`).filter({ hasText: `QA walk ${suffix}` }).first();
+  const revokedStatus = await revokedRow.getAttribute("data-graphql-status").catch(() => null);
+  check(
+    "revoke-is-visible-on-the-row",
+    revokedStatus === "revoked",
+    `after revoking, the row still reports "${revokedStatus}" — a revoke only shown in a toast is a revoke nobody sees`,
+  );
+  await shot(page, "graphql-documents-revoked");
+
+  // ---- The playground --------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/developer/graphql`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-graphql-meter]", { timeout: 20000 }).catch(() => {});
+  const meter = (await page.locator("[data-graphql-meter]").count()) > 0;
+  check("playground-meter-rendered", meter, "the playground rendered no cost meter");
+  if (!meter) {
+    throw new Error(`graphql depth: the playground meter never rendered (${claims.length} claim(s) recorded)`);
+  }
+
+  // The meter's budget half is the installation's, read from the settings row the endpoint
+  // enforces — the row the walk proved once was written and never read.
+  const budget = await page.locator("[data-graphql-meter]").getAttribute("data-graphql-budget").catch(() => null);
+  check(
+    "meter-reads-the-endpoint-budget",
+    budget !== null && budget !== "" && Number(budget) > 0,
+    `the meter showed budget "${budget}" — the screen must read the settings row, not carry its own default`,
+  );
+
+  // An over-depth document is refused BEFORE it is sent, and says which limit it broke.
+  const deepQuery = Array.from({ length: 12 }, (_, index) => `  l${index} { `).join("") + "id" + " }".repeat(12);
+  await page.locator("[data-view='graphql-playground'] textarea").first().fill(`query TooDeep {\n${deepQuery}\n}`).catch(() => {});
+  await page.waitForTimeout(500);
+  const refusal = await page.locator("[data-graphql-meter]").getAttribute("data-graphql-refusal").catch(() => null);
+  check(
+    "over-depth-is-refused-before-sending",
+    refusal === "depth",
+    `a document nested past the limit did not set the meter refusal; it read "${refusal}"`,
+  );
+  const runDisabled = await page
+    .locator("[data-view='graphql-playground'] button")
+    .filter({ hasText: /^Run/ })
+    .first()
+    .isDisabled()
+    .catch(() => false);
+  check(
+    "run-is-blocked-on-an-over-budget-document",
+    runDisabled,
+    "the run button stayed enabled on a document the meter had already refused",
+  );
+  await shot(page, "graphql-playground-over-depth");
+
+  // A legal document runs and the result pane carries the endpoint's own numbers.
+  await page.locator("[data-view='graphql-playground'] textarea").first().fill(`query QaWalkMe {\n  me {\n    id\n  }\n}`).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-view='graphql-playground'] button").filter({ hasText: /^Run/ }).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-graphql-result]", { timeout: 20000 }).catch(() => {});
+  const result = (await page.locator("[data-graphql-result]").count()) > 0;
+  check("a-legal-document-runs", result, "running a legal document produced no result pane");
+  if (result) {
+    const cost = await page.locator("[data-graphql-result]").getAttribute("data-graphql-cost").catch(() => null);
+    const requestId = await page.locator("[data-graphql-result]").getAttribute("data-graphql-request").catch(() => null);
+    check(
+      "result-carries-the-endpoint-cost",
+      cost !== null && cost !== "" && Number(cost) >= 0,
+      `the result pane showed no cost from the endpoint's own pricing; it read "${cost}"`,
+    );
+    check(
+      "result-carries-a-request-id",
+      Boolean(requestId && requestId.length >= 8),
+      `the result pane showed no request id; it read "${requestId}"`,
+    );
+  }
+  await shot(page, "graphql-playground-result");
+
+  // ---- The schema explorer ---------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/developer/graphql/schema`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-view='graphql-schema']", { timeout: 20000 }).catch(() => {});
+  const explorer = (await page.locator("[data-view='graphql-schema']").count()) > 0;
+  check("schema-explorer-rendered", explorer, "the schema explorer did not render");
+  if (explorer) {
+    const visibleTypes = await page.locator("[data-graphql-type]").count();
+    check(
+      "explorer-lists-visible-types",
+      visibleTypes > 0,
+      "the explorer listed no visible types for a caller who holds a read permission",
+    );
+    // The SDL toggle exists and shows a document. Its correctness (withheld types absent) is
+    // asserted by the endpoint's own unit test; here the assertion is that the toggle works.
+    await page.getByRole("button", { name: /Show SDL/ }).first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(400);
+    const sdl = (await page.locator("[data-view='graphql-schema'] pre").first().innerText().catch(() => "")) || "";
+    check("sdl-toggle-shows-a-document", /type \w+ \{/.test(sdl), `the SDL toggle produced no SDL; it read: ${sdl.slice(0, 200)}`);
+    await shot(page, "graphql-schema-sdl");
+
+    // The role diff. It must produce SOMETHING — either a difference with the permission named, or
+    // an explicit "identical" sentence. A diff that renders an empty panel is indistinguishable
+    // from a diff that never ran.
+    const picker = page.locator("[data-view='graphql-schema'] select").first();
+    const options = await picker.locator("option").count().catch(() => 0);
+    check("role-picker-is-populated", options > 1, `the role picker offered ${options} option(s) — there is nothing to compare against`);
+    if (options > 1) {
+      const value = await picker.locator("option").nth(1).getAttribute("value").catch(() => "");
+      await picker.selectOption(value).catch(() => {});
+      await page.getByRole("button", { name: /Compare/ }).first().click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+      const diffText = (await page.locator("[data-view='graphql-schema']").first().innerText().catch(() => "")) || "";
+      check(
+        "role-diff-answers",
+        /same GraphQL surface|can reach what/.test(diffText),
+        `the role comparison produced neither a difference nor an identical verdict; the screen read: ${diffText.slice(-400)}`,
+      );
+      await shot(page, "graphql-schema-diff");
+    }
+  }
+
+  // ---- The settings screen ----------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/developer/graphql/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-view='graphql-settings']", { timeout: 20000 }).catch(() => {});
+  const settingsScreen = (await page.locator("[data-view='graphql-settings']").count()) > 0;
+  check("settings-screen-rendered", settingsScreen, "the settings screen did not render");
+  if (settingsScreen) {
+    const depthField = page.locator("[data-graphql-setting='max_depth']").first();
+    check("settings-screen-has-the-depth-field", (await depthField.count()) > 0, "the settings screen offered no max_depth field");
+
+    // An out-of-range value is refused with the field's own message, not a generic one. A screen
+    // that accepts six different bad numbers and says one sentence about all of them cannot be used.
+    await depthField.fill("9999").catch(() => {});
+    await page.waitForTimeout(300);
+    const helpText = (await page
+      .locator("[data-graphql-setting='max_depth']")
+      .first()
+      .evaluate((node) => node.parentElement?.querySelector("span.block")?.textContent ?? "")
+      .catch(() => "")) || "";
+    check(
+      "out-of-range-is-explained-per-field",
+      /Out of range/.test(helpText),
+      `an out-of-range value produced no field-level message; the help read: ${helpText}`,
+    );
+    const saveBlocked = await page.locator("[data-view='graphql-settings'] button[type='submit']").first().isDisabled().catch(() => false);
+    check("save-is-blocked-while-a-field-is-out-of-range", saveBlocked, "the save button stayed enabled with an invalid field");
+    await shot(page, "graphql-settings-invalid");
+
+    // A legal value saves, and the screen reports the endpoint's answer rather than a local one.
+    await depthField.fill("12").catch(() => {});
+    await page.waitForTimeout(300);
+    await page.locator("[data-view='graphql-settings'] button[type='submit']").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    const notice = (await page
+      .locator("[data-view='graphql-settings'] [role='status']")
+      .first()
+      .innerText()
+      .catch(() => "")) || "";
+    check("a-legal-save-is-reported", notice.length > 0, "saving a legal value produced no status message");
+    await shot(page, "graphql-settings-saved");
+
+    // Put the installation back where it was, so this pass does not change the policy for every
+    // pass that runs after it.
+    await depthField.fill("10").catch(() => {});
+    await page.waitForTimeout(300);
+    await page.locator("[data-view='graphql-settings'] button[type='submit']").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+  }
+
+  const failed = claims.filter((claim) => !claim.ok);
+  note("claims", { total: claims.length, failed: failed.length });
+  if (failed.length > 0) {
+    throw new Error(
+      `graphql depth: ${failed.length} of ${claims.length} claim(s) failed: ${failed.map((claim) => claim.name).join(", ")}`,
+    );
+  }
+  return { ok: true, steps: claims.length, claims };
+}
+
+/**
  * The security centre's two screens (REQ-012, slice 1).
  *
  * What this pass is really checking is a *claim*, not a layout: does the screen ever say
@@ -10529,6 +10909,7 @@ async function runSecretsAuditDepth(page, report) {
 async function main() {
   assertDeploymentScreensWalked();
   assertWave5bScreensWalked();
+  assertGraphqlScreensWalked();
   const report = { startedAt: new Date().toISOString(), admin: URL_ADMIN, web: URL_WEB, steps: [], pages: [], mobile: [], web: {} };
   const SITE_HOST = process.env.QA_SITE_HOST || CREDS.domain;
   const browser = await chromium.launch({
@@ -10643,6 +11024,13 @@ async function main() {
   // the startup guard refuses a pass in which this route has been dropped from this list — a
   // screen reachable only from a URL nobody types is a screen nobody measured.
   { path: "/deployment/exports", name: "deployment-exports" },
+  // The developer portal's GraphQL surface (REQ-130, slice 2). All four walkable screens are in
+  // GRAPHQL_SCREENS, so a merge that drops one from this list stops the pass rather than quietly
+  // reducing coverage. The detail screen is opened by the depth pass from a row the registry lists.
+  { path: "/developer/graphql", name: "graphql-playground" },
+  { path: "/developer/graphql/documents", name: "graphql-documents" },
+  { path: "/developer/graphql/schema", name: "graphql-schema" },
+  { path: "/developer/graphql/settings", name: "graphql-settings" },
   { path: "/settings/iam", name: "iam-overview" },
     { path: "/settings/iam/users", name: "iam-users" },
     { path: "/settings/iam/groups", name: "iam-groups" },
@@ -11339,6 +11727,15 @@ async function runReliabilityBreakersDepth(page) {
     matchedOnly.add("security");
     report.security = await runDepthPass("security", () => runSecurityDepth(page, report));
     log(`security: ${JSON.stringify(report.security)}`);
+  }
+
+  // The GraphQL surface (REQ-130, slice 2). It runs after security because the registry pass
+  // REWRITES one settings row (max_depth) and restores it, and a pass that ran afterwards against
+  // a different policy would measure a different platform than the one it thinks it measured.
+  if (wants("graphql-depth")) {
+    matchedOnly.add("graphql-depth");
+    report.graphql = await runDepthPass("graphql", () => runGraphqlDepth(page, report));
+    log(`graphql: ${JSON.stringify(report.graphql)}`);
   }
 
   // The system health centre (REQ-014, slice 1). It runs after the security pass

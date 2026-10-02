@@ -95,6 +95,7 @@ pub mod exports;
 pub mod graphql;
 pub mod graphql_documents;
 pub mod graphql_manager;
+pub mod graphql_schema;
 pub mod graphql_settings;
 pub mod health;
 pub mod health_incidents;
@@ -1973,6 +1974,16 @@ pub fn router(state: AppState) -> Router {
         .route("/graphql/settings", put(graphql_manager::save_settings))
         .route_layer(guards::require(&state, graphql_manager::MANAGE_PERMISSION));
 
+    // The schema explorer (REQ-130 slice 2). Reads only — it changes nothing, so it needs no write
+    // guard, and its two routes are one router rather than a pair because both are `get` on keys
+    // the caller already holds. `graphql_schema::READ_PERMISSION` is the endpoint's own read key, so
+    // an administrator who can use the playground can also see the schema that playground validates
+    // against; a different key here would let somebody read a schema they could not query.
+    let graphql_schema = Router::new()
+        .route("/graphql/schema", get(graphql_schema::read))
+        .route("/graphql/schema/diff", get(graphql_schema::diff))
+        .route_layer(guards::require(&state, graphql_schema::READ_PERMISSION));
+
     // Redemption is the ONE handler with no session guard. It is authenticated by the
     // deployment key in the header instead, so it lives on its own router and is never
     // reachable by a cookie: a browser cannot redeem a lease, which is the property the whole
@@ -2170,6 +2181,7 @@ pub fn router(state: AppState) -> Router {
         .merge(graphql_documents_write)
         .merge(graphql_settings_routes)
         .merge(graphql_settings_writes)
+        .merge(graphql_schema)
         .merge(secrets_lease_write)
         .merge(secrets_deploy_key_write)
         .merge(secrets_lease_redeem)

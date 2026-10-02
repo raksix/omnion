@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, ArrowUpCircle, BarChart3, Bell, BellRing, Bot, Boxes, ClipboardCheck, Database, FileDown, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Radio, Route, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
+import { Activity, ArrowUpCircle, BarChart3, Bell, BellRing, Blocks, Bot, Boxes, ClipboardCheck, Database, FileCode2, FileDown, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Radio, Route, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Waypoints, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -72,6 +72,15 @@ const NAV = [
   // for in the middle of an incident, and the two questions beside it are the same one — "what
   // does this installation know, and what may it hand over".
   { href: "/deployment/exports", label: "Anonymised exports", icon: FileDown },
+  // The developer portal's GraphQL surface (REQ-130, slice 2). It sits beside the deployment
+  // release surface rather than under a settings sub-path because both answer the same integrator
+  // question — "what can a client of this installation do, and what does it cost me" — and an
+  // integrator never goes looking under Settings for it. The playground is the entry, the registry
+  // beside it, and the schema explorer under it because those two are read together.
+  { href: "/developer/graphql", label: "GraphQL playground", icon: Waypoints },
+  { href: "/developer/graphql/documents", label: "Persisted documents", icon: FileCode2 },
+  { href: "/developer/graphql/schema", label: "GraphQL schema", icon: Blocks },
+  { href: "/developer/graphql/settings", label: "GraphQL settings", icon: SlidersHorizontal },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },

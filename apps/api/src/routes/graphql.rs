@@ -494,7 +494,13 @@ fn refusal_envelope(message: &str) -> GraphqlEnvelope {
 }
 
 /// Resolve the caller's permissions once, into the shape the resolvers take.
-async fn resolve_caller(state: &AppState, caller: &ApiCaller) -> Result<Caller, ApiError> {
+///
+/// **Public because the explorer route resolves the same way and must not resolve differently.**
+/// Slice 2's schema screen needs the caller's `PermissionSet` to compose a schema from, and the
+/// two ways to get it are a shared function or a second derivation. A second derivation is the
+/// cache bug the request names — one role's schema served to another — wearing a different hat, so
+/// this is `pub` and [`crate::routes::graphql_schema`] calls it rather than re-deriving.
+pub async fn resolve_caller(state: &AppState, caller: &ApiCaller) -> Result<Caller, ApiError> {
     let (subject, organization_id, user_id, api_key_id) = match caller {
         ApiCaller::Session(session) => (
             omnion_permissions::model::Subject::User(session.user.id),
@@ -523,12 +529,7 @@ async fn resolve_caller(state: &AppState, caller: &ApiCaller) -> Result<Caller, 
 
     // Derived by NAME from the resolved set, never written by hand: a hand-written list here is
     // exactly the defect the parity gate was written for, in a new place.
-    let known = PermissionSet::from_known(
-        KNOWN_PERMISSIONS
-            .iter()
-            .copied()
-            .filter(|known| effective.allows(known.as_str())),
-    );
+    let known = known_from_effective(&effective);
 
     Ok(Caller {
         user_id,
@@ -538,6 +539,24 @@ async fn resolve_caller(state: &AppState, caller: &ApiCaller) -> Result<Caller, 
         permissions: effective,
         known,
     })
+}
+
+/// The GraphQL-visible permissions inside one resolved set.
+///
+/// Derived by NAME and never written by hand, because a hand-written list is the defect the parity
+/// gate exists to catch and it would recur here. Exposed so the schema explorer's role diff
+/// derives a role's set the same way the endpoint derives a caller's — **two derivations of the
+/// same thing is the cache bug the request warns about, in a different place.**
+#[must_use]
+pub fn known_from_effective(
+    effective: &omnion_permissions::evaluate::EffectivePermissions,
+) -> PermissionSet {
+    PermissionSet::from_known(
+        KNOWN_PERMISSIONS
+            .iter()
+            .copied()
+            .filter(|known| effective.allows(known.as_str())),
+    )
 }
 
 /// The cache key an installation's composed schemas are stored under.
